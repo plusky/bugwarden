@@ -310,8 +310,6 @@ action.
 
 - Attachment **download** with operator-configured size caps (currently only
   metadata listing is exposed).
-- MCP **tool annotations** (read-only/destructive hints) so clients can apply
-  their own confirmation UX.
 - **OBS / openSUSE packaging** for installation via zypper.
 
 ## License

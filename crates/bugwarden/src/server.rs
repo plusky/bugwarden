@@ -387,7 +387,8 @@ impl BugWarden {
 #[tool_router]
 impl BugWarden {
     #[tool(
-        description = "Returns the entire information for one or more bugzilla bug ids. Bugs that are not accessible through this server are listed under 'restricted'."
+        description = "Returns the entire information for one or more bugzilla bug ids. Bugs that are not accessible through this server are listed under 'restricted'.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn bug_info(
         &self,
@@ -463,7 +464,8 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Returns the history of given bug id. new_since allows filtering history newer than the given date."
+        description = "Returns the history of given bug id. new_since allows filtering history newer than the given date.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn bug_history(
         &self,
@@ -484,7 +486,8 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Returns the comments of given bug id. Private comments are not included by default but can be explicitly requested (subject to server policy). new_since allows filtering comments newer than the given date."
+        description = "Returns the comments of given bug id. Private comments are not included by default but can be explicitly requested (subject to server policy). new_since allows filtering comments newer than the given date.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn bug_comments(
         &self,
@@ -513,7 +516,8 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Search bugs using bugzilla's quicksearch syntax.\n\nTo reduce the token limit & response time, only returns a subset of fields for each bug. The user can query full details of each bug using the bug_info tool. Returns the top-level bug data envelope containing the matched bugs."
+        description = "Search bugs using bugzilla's quicksearch syntax.\n\nTo reduce the token limit & response time, only returns a subset of fields for each bug. The user can query full details of each bug using the bug_info tool. Returns the top-level bug data envelope containing the matched bugs.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn bugs_quicksearch(
         &self,
@@ -572,7 +576,13 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Add a comment to a bug. It can optionally be private. If success, returns the created comment id."
+        description = "Add a comment to a bug. It can optionally be private. If success, returns the created comment id.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn add_comment(
         &self,
@@ -600,7 +610,13 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Update the status of a bug. Optionally add a comment explaining the status change.\n\nValid statuses: NEW, ASSIGNED, MODIFIED, ON_QA, VERIFIED, CLOSED.\nFor CLOSED, you MUST also provide a resolution (FIXED, WONTFIX, NOTABUG, DUPLICATE, etc.)"
+        description = "Update the status of a bug. Optionally add a comment explaining the status change.\n\nValid statuses: NEW, ASSIGNED, MODIFIED, ON_QA, VERIFIED, CLOSED.\nFor CLOSED, you MUST also provide a resolution (FIXED, WONTFIX, NOTABUG, DUPLICATE, etc.)",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn update_bug_status(
         &self,
@@ -644,7 +660,15 @@ impl BugWarden {
         }
     }
 
-    #[tool(description = "Assign a bug to a user. Optionally add a comment.")]
+    #[tool(
+        description = "Assign a bug to a user. Optionally add a comment.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
     async fn assign_bug(
         &self,
         Parameters(p): Parameters<AssignBugParams>,
@@ -669,7 +693,13 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Update various bug fields. All fields are optional, but at least one must be specified. Custom field names must start with 'cf_' (e.g. {\"cf_fixed_in\": \"1.2.3\"})."
+        description = "Update various bug fields. All fields are optional, but at least one must be specified. Custom field names must start with 'cf_' (e.g. {\"cf_fixed_in\": \"1.2.3\"}).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn update_bug_fields(
         &self,
@@ -729,7 +759,13 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Update bug dependency relationships (blocks/depends_on). At least one change must be specified. Optionally add a comment explaining the changes."
+        description = "Update bug dependency relationships (blocks/depends_on). At least one change must be specified. Optionally add a comment explaining the changes.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn update_bug_dependencies(
         &self,
@@ -810,7 +846,15 @@ impl BugWarden {
         }
     }
 
-    #[tool(description = "Add an email address to the CC list of a bug.")]
+    #[tool(
+        description = "Add an email address to the CC list of a bug.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
     async fn add_cc_to_bug(
         &self,
         Parameters(p): Parameters<AddCcParams>,
@@ -828,7 +872,15 @@ impl BugWarden {
         }
     }
 
-    #[tool(description = "Mark a bug as a duplicate of another bug and close it.")]
+    #[tool(
+        description = "Mark a bug as a duplicate of another bug and close it.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
     async fn mark_as_duplicate(
         &self,
         Parameters(p): Parameters<MarkAsDuplicateParams>,
@@ -883,7 +935,8 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "List the metadata of all attachments of a bug. Attachment data itself is excluded. Metadata of private attachments is not included by default but can be explicitly requested (subject to server policy)."
+        description = "List the metadata of all attachments of a bug. Attachment data itself is excluded. Metadata of private attachments is not included by default but can be explicitly requested (subject to server policy).",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn list_attachments(
         &self,
@@ -922,7 +975,10 @@ impl BugWarden {
         }
     }
 
-    #[tool(description = "Returns the bug url")]
+    #[tool(
+        description = "Returns the bug url",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
     fn bug_url(&self, Parameters(p): Parameters<BugUrlParams>) -> Result<CallToolResult, McpError> {
         tracing::info!(bug_id = p.bug_id, "tool: bug_url");
         // I8 exception: computes a URL string locally, contacts nothing.
@@ -931,7 +987,8 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Returns comprehensive bugzilla server information (url, version, extensions, timezone, time, parameters)."
+        description = "Returns comprehensive bugzilla server information (url, version, extensions, timezone, time, parameters).",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn bugzilla_server_info(
         &self,
@@ -948,7 +1005,8 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Access the documentation of the bugzilla quicksearch syntax. LLM can learn using this tool. Response is in HTML"
+        description = "Access the documentation of the bugzilla quicksearch syntax. LLM can learn using this tool. Response is in HTML",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn quicksearch_syntax(&self) -> Result<CallToolResult, McpError> {
         tracing::info!("tool: quicksearch_syntax");
@@ -961,7 +1019,8 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Returns information about this MCP server instance (version, bugzilla server, transport) and a summary of the active guard policy."
+        description = "Returns information about this MCP server instance (version, bugzilla server, transport) and a summary of the active guard policy.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     fn mcp_server_info(&self) -> Result<CallToolResult, McpError> {
         tracing::info!("tool: mcp_server_info");
@@ -988,7 +1047,8 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Summarizes all the comments of a bug. Returns a prompt to be used for summarization."
+        description = "Summarizes all the comments of a bug. Returns a prompt to be used for summarization.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn summarize_bug(
         &self,
