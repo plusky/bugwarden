@@ -55,6 +55,64 @@ fn action_name(action: Action) -> &'static str {
     }
 }
 
+/// Assemble the `bug_info` envelope, re-classifying every body before it is
+/// served.
+///
+/// The Read verdict came from the classification fetch; the body comes from a
+/// second, later request. Between the two, a bug can be embargoed, moved into
+/// a group, or otherwise become something the policy would refuse — and the
+/// server's key is privileged enough to keep returning it. So the body is put
+/// back through the guard and served on its OWN verdict, never on a verdict
+/// about an earlier version of itself. `download_attachment` already re-checks
+/// its blob response for the same reason.
+///
+/// This costs no upstream request: the full fetch returns a superset of the
+/// classification fields, so the re-check reads what is already in hand. If
+/// the body somehow lacks a field the policy consults, classification fails
+/// closed on it (I4) rather than assuming the earlier verdict still holds.
+///
+/// A downgrade is honoured rather than refused: a body that now classifies
+/// summary-only is served as a summary view, matching what a fresh call would
+/// return. Anything that no longer classifies at all becomes the uniform
+/// restricted entry, byte-identical to a bug that never existed (I2).
+fn assemble_bug_info(
+    guard: &Guard,
+    ids: &[u64],
+    assessments: &BTreeMap<u64, (Access, Value)>,
+    full: &BTreeMap<u64, Value>,
+) -> Value {
+    let mut bugs: Vec<Value> = Vec::new();
+    let mut restricted: Vec<Value> = Vec::new();
+    for id in ids {
+        let served = match assessments.get(id) {
+            Some((access, _)) if access.allows(Capability::Read) => full
+                .get(id)
+                // Absent from the body response => fail closed (I4).
+                .and_then(|body| {
+                    let (kept, dropped) = guard.filter_bug_list(vec![body.clone()]);
+                    if dropped > 0 {
+                        // The verdict flipped between the two fetches — the
+                        // anomaly this re-check exists for. Server-side only
+                        // (I3): the client just sees the uniform denial.
+                        tracing::info!(id, "bug_info: body no longer passes the guard; refusing");
+                    }
+                    kept.into_iter().next()
+                }),
+            // Summary grants are served from the classification objects the
+            // verdict was made on, so they carry no second-fetch window.
+            Some((access, meta)) if access.allows(Capability::Summary) => {
+                Some(Guard::summary_view(meta))
+            }
+            _ => None,
+        };
+        match served {
+            Some(bug) => bugs.push(bug),
+            None => restricted.push(json!({ "id": id, "note": Guard::denial(*id) })),
+        }
+    }
+    json!({ "bugs": bugs, "restricted": restricted })
+}
+
 /// Refuse a call naming more distinct bug ids than the guard will classify.
 ///
 /// The bound itself is [`Guard::MAX_ASSESS_IDS`], defined next to the loop it
@@ -505,32 +563,24 @@ impl BugWarden {
                     }
                 }
                 Err(e) => {
-                    return Ok(err_text(format!("Failed to fetch bug info\nReason: {e}")));
+                    // Server-side only. Bugzilla's own message names the bug
+                    // and says whether it exists ("Bug #N does not exist."),
+                    // so forwarding it would hand the client the very
+                    // distinction I2 exists to erase. The ids simply stay
+                    // absent from `full` and fall to the uniform denial
+                    // below, which is also what a fetch failure should look
+                    // like (I4) — one bad body no longer voids the call.
+                    tracing::warn!(error = %e, "bug_info: body fetch failed");
                 }
             }
         }
 
-        let mut bugs: Vec<Value> = Vec::new();
-        let mut restricted: Vec<Value> = Vec::new();
-        for id in &ids {
-            match assessments.get(id) {
-                Some((access, _)) if access.allows(Capability::Read) => {
-                    // Absent from the full response => fail closed (I4).
-                    match full.get(id) {
-                        Some(bug) => bugs.push(bug.clone()),
-                        None => {
-                            restricted.push(json!({ "id": id, "note": Guard::denial(*id) }));
-                        }
-                    }
-                }
-                Some((access, meta)) if access.allows(Capability::Summary) => {
-                    bugs.push(Guard::summary_view(meta));
-                }
-                _ => restricted.push(json!({ "id": id, "note": Guard::denial(*id) })),
-            }
-        }
-
-        Ok(ok_json(json!({ "bugs": bugs, "restricted": restricted })))
+        Ok(ok_json(assemble_bug_info(
+            &self.guard,
+            &ids,
+            &assessments,
+            &full,
+        )))
     }
 
     #[tool(
@@ -1325,6 +1375,206 @@ impl ServerHandler for BugWarden {
 
 #[cfg(test)]
 mod tests {
+
+    /// Policy denying anything in an embargo group, allowing the rest.
+    fn embargo_guard() -> Guard {
+        Guard {
+            policy: Policy::from_toml_str(concat!(
+                "default_action = \"allow\"\n",
+                "[[rule]]\nname = \"embargo\"\naction = \"deny\"\n",
+                "[rule.match]\ngroups = [\"embargo*\"]\n",
+            ))
+            .expect("policy parses"),
+        }
+    }
+
+    fn granted(caps: &[Capability]) -> Access {
+        Access::Granted {
+            caps: caps.iter().copied().collect(),
+            rule: "test".into(),
+        }
+    }
+
+    fn body(id: u64, groups: &[&str]) -> Value {
+        json!({
+            "id": id,
+            "summary": "a bug",
+            "groups": groups,
+            "product": "P",
+            "component": "C",
+            "status": "NEW",
+            "creation_time": "2020-01-01T00:00:00Z",
+            "depends_on": [1, 2],
+        })
+    }
+
+    #[test]
+    fn bug_info_serves_a_body_that_still_passes() {
+        let g = embargo_guard();
+        let assessments = BTreeMap::from([(7u64, (granted(&[Capability::Read]), Value::Null))]);
+        let full = BTreeMap::from([(7u64, body(7, &[]))]);
+
+        let out = assemble_bug_info(&g, &[7], &assessments, &full);
+        assert_eq!(out["bugs"].as_array().unwrap().len(), 1);
+        assert_eq!(out["bugs"][0]["id"], json!(7));
+        // The full body is served intact, not a redacted view.
+        assert_eq!(out["bugs"][0]["depends_on"], json!([1, 2]));
+        assert!(out["restricted"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bug_info_refuses_a_body_embargoed_after_the_verdict() {
+        // The race the re-check exists for: classification said Read, then the
+        // bug was moved into an embargo group before the body was fetched.
+        // The server's key is privileged enough that Bugzilla still returns
+        // it, so only the re-check can catch this.
+        let g = embargo_guard();
+        let assessments = BTreeMap::from([(7u64, (granted(&[Capability::Read]), Value::Null))]);
+        let full = BTreeMap::from([(7u64, body(7, &["embargo-security"]))]);
+
+        let out = assemble_bug_info(&g, &[7], &assessments, &full);
+        assert!(
+            out["bugs"].as_array().unwrap().is_empty(),
+            "a body that no longer passes must not be served"
+        );
+        assert_eq!(out["restricted"][0]["id"], json!(7));
+        assert_eq!(out["restricted"][0]["note"], json!(Guard::denial(7)));
+    }
+
+    #[test]
+    fn bug_info_denial_is_identical_for_hidden_missing_and_nonexistent() {
+        // I2: whichever way a bug fails to be served, the client sees the
+        // same bytes. Here: re-check refusal, body absent from the response
+        // (fetch failure or upstream omission), and a policy denial.
+        let g = embargo_guard();
+        let assessments = BTreeMap::from([
+            (1u64, (granted(&[Capability::Read]), Value::Null)),
+            (2u64, (granted(&[Capability::Read]), Value::Null)),
+            (
+                3u64,
+                (
+                    Access::Denied {
+                        rule: "embargo".into(),
+                    },
+                    Value::Null,
+                ),
+            ),
+        ]);
+        // 1 turns out embargoed, 2 never arrived, 3 was denied up front.
+        let full = BTreeMap::from([(1u64, body(1, &["embargo-x"]))]);
+
+        let out = assemble_bug_info(&g, &[1, 2, 3], &assessments, &full);
+        assert!(out["bugs"].as_array().unwrap().is_empty());
+        let entries = out["restricted"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        for (entry, id) in entries.iter().zip([1u64, 2, 3]) {
+            assert_eq!(entry["id"], json!(id));
+            assert_eq!(
+                entry["note"],
+                json!(Guard::denial(id)),
+                "every failure mode yields the same note"
+            );
+            assert_eq!(
+                entry.as_object().unwrap().len(),
+                2,
+                "no extra field distinguishes the cases"
+            );
+        }
+    }
+
+    #[test]
+    fn bug_info_downgrades_to_a_summary_view_when_the_body_only_earns_summary() {
+        // A body that now classifies summary-only is served as the summary
+        // view a fresh call would return — not refused, not served in full.
+        let g = Guard {
+            policy: Policy::from_toml_str(concat!(
+                "default_action = \"allow\"\n",
+                "[[rule]]\nname = \"peek\"\naction = \"restrict\"\n",
+                "capabilities = [\"summary\"]\n",
+                "[rule.match]\ngroups = [\"internal\"]\n",
+            ))
+            .expect("policy parses"),
+        };
+        let assessments = BTreeMap::from([(9u64, (granted(&[Capability::Read]), Value::Null))]);
+        let full = BTreeMap::from([(9u64, body(9, &["internal"]))]);
+
+        let out = assemble_bug_info(&g, &[9], &assessments, &full);
+        let served = &out["bugs"][0];
+        assert_eq!(served["_redacted"], json!(true), "served redacted");
+        assert!(
+            served.get("depends_on").is_none(),
+            "the full body must not survive a downgrade: {served}"
+        );
+    }
+
+    #[test]
+    fn bug_info_refuses_a_body_that_now_grants_neither_read_nor_summary() {
+        // The third outcome of the re-check: a body that still classifies,
+        // but to a grant that conveys no way to view it at all.
+        let g = Guard {
+            policy: Policy::from_toml_str(concat!(
+                "default_action = \"allow\"\n",
+                "[[rule]]\nname = \"comments-only\"\naction = \"restrict\"\n",
+                "capabilities = [\"comments\"]\n",
+                "[rule.match]\ngroups = [\"internal\"]\n",
+            ))
+            .expect("policy parses"),
+        };
+        let assessments = BTreeMap::from([(3u64, (granted(&[Capability::Read]), Value::Null))]);
+        let full = BTreeMap::from([(3u64, body(3, &["internal"]))]);
+
+        let out = assemble_bug_info(&g, &[3], &assessments, &full);
+        assert!(out["bugs"].as_array().unwrap().is_empty());
+        assert_eq!(out["restricted"][0]["note"], json!(Guard::denial(3)));
+    }
+
+    #[test]
+    fn bug_info_mixes_served_and_restricted_in_request_order() {
+        // A realistic call: one body survives the re-check, one does not, one
+        // was denied up front. Order follows the request, and every id is
+        // accounted for exactly once.
+        let g = embargo_guard();
+        let assessments = BTreeMap::from([
+            (5u64, (granted(&[Capability::Read]), Value::Null)),
+            (6u64, (granted(&[Capability::Read]), Value::Null)),
+            (
+                8u64,
+                (
+                    Access::Denied {
+                        rule: "embargo".into(),
+                    },
+                    Value::Null,
+                ),
+            ),
+        ]);
+        let full = BTreeMap::from([(5u64, body(5, &[])), (6u64, body(6, &["embargo-late"]))]);
+
+        let out = assemble_bug_info(&g, &[5, 6, 8], &assessments, &full);
+        assert_eq!(out["bugs"].as_array().unwrap().len(), 1);
+        assert_eq!(out["bugs"][0]["id"], json!(5));
+        let restricted = out["restricted"].as_array().unwrap();
+        assert_eq!(
+            restricted
+                .iter()
+                .map(|r| r["id"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![6, 8],
+            "restricted follows request order"
+        );
+    }
+
+    #[test]
+    fn bug_info_summary_grants_are_served_from_the_classified_object() {
+        // Summary-only grants never involve the second fetch, so there is no
+        // window to re-check: the object the verdict was made on is served.
+        let g = embargo_guard();
+        let meta = body(4, &[]);
+        let assessments = BTreeMap::from([(4u64, (granted(&[Capability::Summary]), meta.clone()))]);
+
+        let out = assemble_bug_info(&g, &[4], &assessments, &BTreeMap::new());
+        assert_eq!(out["bugs"][0]["id"], json!(4));
+        assert_eq!(out["bugs"][0]["_redacted"], json!(true));
+    }
 
     #[test]
     fn id_cap_counts_distinct_ids_and_reads_only_the_request() {

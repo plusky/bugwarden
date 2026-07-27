@@ -335,7 +335,7 @@ constraints the model must know.
 
 | tool | params (schemars struct) | guard capability | notes |
 |---|---|---|---|
-| bug_info | bug_ids: Vec<u64> | per-id: Read => full, else Summary => redacted, else restricted entry | envelope `{"bugs":[..], "restricted":[{"id":N,"note":denial(N)}]}`; full fetch only for Read-granted ids |
+| bug_info | bug_ids: Vec<u64> | per-id: Read => full, else Summary => redacted, else restricted entry | envelope `{"bugs":[..], "restricted":[{"id":N,"note":denial(N)}]}`; full fetch only for Read-granted ids. Every fetched body is RE-CLASSIFIED before it is served (assemble_bug_info): the verdict came from the classification fetch and the body from a later request, so a bug embargoed in between must not be served on the stale verdict (TOCTOU; same reason download_attachment re-checks). Costs no request — the body is a superset of CLASSIFY_FIELDS — and a body that now earns only summary is served as the summary view, one that earns nothing becomes the uniform restricted entry. A failed body fetch is logged server-side ONLY and leaves those ids restricted: Bugzilla's message names the bug and says whether it exists, so forwarding it would undo I2 |
 | bug_history | id, new_since?: DateTime<Utc> | history | |
 | bug_comments | id, include_private: bool = false, new_since? | comments | filter_comments applied (I5) |
 | bugs_quicksearch | query, status: String = "ALL", include_fields: String = "id,product,component,assigned_to,status,resolution,summary,last_change_time", limit: u32 = 50, offset: u32 = 0 | post-filter | fetch include_fields = requested ∪ CLASSIFY_FIELDS; after filter, project kept bugs to requested fields (keep `_redacted` marker); envelope `{"bugs":[..]}` only (I3) |
@@ -399,6 +399,11 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   (fail closed); younger_than_days matcher; restrict caps; read-implies-summary;
   read_only strips write caps; default deny; summary redaction; comment
   filtering; validation errors (unknown TOML keys, restrict without caps).
+- Unit tests (#[cfg(test)] in crates/bugwarden/src/server.rs): assemble_bug_info
+  re-classification — a body embargoed after the verdict is refused, a body
+  that now earns only summary is downgraded, a body granting neither read nor
+  summary is refused, and refused/absent/up-front-denied ids yield byte-
+  identical restricted entries; the distinct-id bound.
 - Integration tests (crates/bugwarden-core/tests/guard_wiremock.rs, wiremock):
   assess() deny for embargoed group; min-age deny; one request per distinct
   id whatever the answer (nonexistent vs withheld cost the same), repeated
