@@ -63,7 +63,7 @@ pub enum Capability {
     Comments,
     /// Read change history.
     History,
-    /// List attachment metadata.
+    /// List attachment metadata and download attachment content.
     Attachments,
     /// Write: add a comment.
     Comment,
@@ -307,7 +307,7 @@ pub struct Rule {
 }
 
 /// Policy-wide guards applied on top of (and before) the rule list.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlobalGuards {
     /// Deny every bug younger than this many days; `0` disables the gate.
@@ -329,6 +329,30 @@ pub struct GlobalGuards {
     /// Enforcement lives in the `bugwarden` binary crate.
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+    /// Largest attachment (decoded bytes, as reported by Bugzilla) that
+    /// `download_attachment` may return; `0` removes the cap. Defaults to
+    /// 2 MiB — attachment blobs are base64-embedded in tool results and land
+    /// in the model's context, so unlimited is an explicit operator choice.
+    #[serde(default = "default_max_attachment_bytes")]
+    pub max_attachment_bytes: u64,
+}
+
+fn default_max_attachment_bytes() -> u64 {
+    2 * 1024 * 1024
+}
+
+// Hand-written so the no-policy-file default carries the 2 MiB attachment
+// cap: a derived `Default` would zero it, which means "no cap" (fail open).
+impl Default for GlobalGuards {
+    fn default() -> Self {
+        Self {
+            min_bug_age_days: 0,
+            allow_private_comments: false,
+            read_only: false,
+            disabled_tools: Vec::new(),
+            max_attachment_bytes: default_max_attachment_bytes(),
+        }
+    }
 }
 
 fn default_default_action() -> Action {

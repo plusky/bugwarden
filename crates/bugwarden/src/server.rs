@@ -96,6 +96,47 @@ fn dep_change(add: Option<&Vec<u64>>, remove: Option<&Vec<u64>>) -> Option<Value
     }
 }
 
+/// Decoded byte length of a base64 payload, counting the `=` padding out.
+///
+/// Used to re-check an attachment against the size cap without decoding the
+/// blob. Whitespace inside the payload (some encoders wrap lines) is ignored,
+/// so a wrapped body is not mistaken for a larger one.
+fn decoded_len(blob: &str) -> u64 {
+    let chars = blob.chars().filter(|c| !c.is_whitespace()).count() as u64;
+    let padding = blob
+        .trim_end()
+        .chars()
+        .rev()
+        .take_while(|&c| c == '=')
+        .count() as u64;
+    // 4 encoded chars carry 3 bytes; an unpadded tail of 2 or 3 chars carries
+    // 1 or 2 bytes respectively.
+    let full = chars / 4 * 3;
+    let tail = (chars % 4).saturating_sub(1);
+    (full + tail).saturating_sub(padding)
+}
+
+/// Whether attachment content of this media type may be returned as MCP
+/// image content rather than an opaque blob resource.
+///
+/// The media type comes from whoever uploaded the attachment, so this is a
+/// strict allowlist of raster formats, not a `image/` prefix test. Anything
+/// else — notably `image/svg+xml`, which is script-bearing markup in a client
+/// webview — travels as a blob resource, keeping attacker-chosen bytes out of
+/// the model's image channel and out of client image renderers.
+fn is_inline_image(mime: &str) -> bool {
+    let base = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp"
+    )
+}
+
 fn default_status() -> String {
     "ALL".to_string()
 }
@@ -257,6 +298,15 @@ pub struct ListAttachmentsParams {
     /// Bug ID.
     pub bug_id: u64,
     /// Include metadata of private attachments (subject to server policy).
+    #[serde(default)]
+    pub include_private: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DownloadAttachmentParams {
+    /// Attachment id (as returned by list_attachments).
+    pub attachment_id: u64,
+    /// Allow downloading a private attachment (subject to server policy).
     #[serde(default)]
     pub include_private: bool,
 }
@@ -976,6 +1026,148 @@ impl BugWarden {
     }
 
     #[tool(
+        description = "Download the content of a single attachment by its attachment id (see list_attachments). Raster images are returned as image content, everything else as a base64 blob resource. Subject to server policy: a size limit applies, and private attachments must be requested explicitly.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn download_attachment(
+        &self,
+        Parameters(p): Parameters<DownloadAttachmentParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        tracing::info!(
+            attachment_id = p.attachment_id,
+            include_private = p.include_private,
+            "tool: download_attachment"
+        );
+        let key = self.api_key(&ctx)?;
+
+        // Metadata first, never the blob: it names the owning bug for guard
+        // assessment and feeds the private/size gates, all BEFORE any content
+        // is pulled (I8). Every refusal on this path is the uniform
+        // attachment denial (I2) — a fetch error, an unknown id, a denied
+        // owning bug and a private attachment must be indistinguishable.
+        let meta = match self.bz.attachment_meta(&key, p.attachment_id).await {
+            Ok(Some(meta)) => Some(meta),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::debug!(
+                    attachment_id = p.attachment_id,
+                    error = %e,
+                    "attachment metadata fetch failed"
+                );
+                None
+            }
+        };
+        // Bug id 0 never exists, so the classification below is a pure
+        // constant-cost stand-in when there is no metadata. Without it the
+        // "no metadata" paths would issue one upstream request and the
+        // "metadata found" paths two, letting a client time its calls to
+        // learn which attachment ids exist — the very oracle the uniform
+        // denial closes (I2).
+        let assess_id = meta
+            .as_ref()
+            .and_then(|m| m.get("bug_id"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let assessments = self.assess(&key, &[assess_id]).await;
+        let allowed = assessments
+            .get(&assess_id)
+            .is_some_and(|(access, _)| access.allows(Capability::Attachments));
+
+        let Some(meta) = meta.filter(|_| allowed && assess_id != 0) else {
+            // Missing metadata, missing bug id, or a denied owning bug: one
+            // uniform denial. The bug-level denial text is deliberately NOT
+            // reused — it would confirm which bug owns the attachment.
+            return Ok(err_text(Guard::attachment_denial(p.attachment_id)));
+        };
+        if let Some(refusal) = self.guard.attachment_gate(&meta, p.include_private) {
+            return Ok(err_text(refusal));
+        }
+
+        let attachment = match self.bz.attachment_data(&key, p.attachment_id).await {
+            Ok(Some(att)) => att,
+            // A failed blob fetch gets the same uniform denial as an unknown
+            // id: the upstream status and message would otherwise distinguish
+            // the two and disclose server detail.
+            Ok(None) => return Ok(err_text(Guard::attachment_denial(p.attachment_id))),
+            Err(e) => {
+                tracing::debug!(
+                    attachment_id = p.attachment_id,
+                    error = %e,
+                    "attachment data fetch failed"
+                );
+                return Ok(err_text(Guard::attachment_denial(p.attachment_id)));
+            }
+        };
+        // The gate ran on the metadata response; the bytes come from a second,
+        // later request. Re-run it on what actually arrived and re-check the
+        // owning bug, so an attachment that turns private (or moves to another
+        // bug) between the two calls cannot be served.
+        if attachment.get("bug_id").and_then(Value::as_u64) != Some(assess_id) {
+            return Ok(err_text(Guard::attachment_denial(p.attachment_id)));
+        }
+        if let Some(refusal) = self.guard.attachment_gate(&attachment, p.include_private) {
+            return Ok(err_text(refusal));
+        }
+
+        let Some(blob) = attachment
+            .get("data")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return Ok(err_text("Attachment has no data"));
+        };
+        // Defense in depth: the size gate trusted the upstream-REPORTED size;
+        // re-check the payload itself so a wrong or lying `size` cannot
+        // smuggle an oversized blob past the cap. The decoded length is
+        // computed exactly (4 base64 chars per 3 bytes, minus the padding)
+        // so the cap stays inclusive, matching the metadata gate.
+        let cap = self.guard.policy.global.max_attachment_bytes;
+        if cap > 0 && decoded_len(&blob) > cap {
+            return Ok(err_text(format!(
+                "Attachment {} exceeds the size limit of this server",
+                p.attachment_id
+            )));
+        }
+
+        let mime = attachment
+            .get("content_type")
+            .and_then(Value::as_str)
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let file_name = attachment
+            .get("file_name")
+            .and_then(Value::as_str)
+            .unwrap_or("attachment")
+            .to_string();
+        let summary = json!({
+            "id": p.attachment_id,
+            "bug_id": assess_id,
+            "file_name": file_name,
+            "content_type": mime,
+            "size": attachment.get("size").cloned().unwrap_or(Value::Null),
+        });
+        let content = if is_inline_image(&mime) {
+            ContentBlock::image(blob, mime)
+        } else {
+            // The uri carries only the attachment id: `file_name` is chosen by
+            // whoever uploaded the attachment and may contain `../`, control
+            // characters, or query/fragment syntax. It is reported in the
+            // summary block above, where it is inert.
+            ContentBlock::resource(ResourceContents::BlobResourceContents {
+                uri: format!("bugzilla://attachment/{}", p.attachment_id),
+                mime_type: Some(mime),
+                blob,
+                meta: None,
+            })
+        };
+        Ok(CallToolResult::success(vec![
+            ContentBlock::text(serde_json::to_string_pretty(&summary).unwrap_or_default()),
+            content,
+        ]))
+    }
+
+    #[tool(
         description = "Returns the bug url",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
@@ -1170,5 +1362,19 @@ mod tests {
             );
         }
         assert!(server.tool_router.has_route("bug_info"));
+    }
+
+    #[test]
+    fn inline_image_allowlist_excludes_svg_and_unknown_types() {
+        assert!(is_inline_image("image/png"));
+        assert!(is_inline_image("IMAGE/PNG"));
+        assert!(is_inline_image("image/jpeg; charset=binary"));
+        // Script-bearing or unverified media types must travel as blobs.
+        assert!(!is_inline_image("image/svg+xml"));
+        assert!(!is_inline_image("image/svg+xml; charset=utf-8"));
+        assert!(!is_inline_image("text/html"));
+        assert!(!is_inline_image("application/octet-stream"));
+        assert!(!is_inline_image("image/"));
+        assert!(!is_inline_image("imagexpng"));
     }
 }

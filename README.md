@@ -21,8 +21,8 @@ touched or data is returned.
 
 ## Features
 
-- **Complete Bugzilla tool surface**: bug details,
-  history, comments, attachment metadata, quicksearch, comment/status/field/
+- **Complete Bugzilla tool surface**: bug details, history, comments,
+  attachment metadata and content, quicksearch, comment/status/field/
   assignee/CC/dependency updates, duplicate marking, server info, quicksearch
   syntax docs, and a bug-summarization prompt tool.
 - **Guard policy engine**: per-bug `allow` / `deny` / `restrict` decisions
@@ -219,9 +219,10 @@ A complete, commented example ships in
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `min_bug_age_days` | integer | `0` (disabled) | Bugs created less than N days ago are **invisible** — treated exactly like nonexistent bugs, evaluated before any rule. A bug whose `creation_time` is missing or unparsable is denied (fail closed) |
-| `allow_private_comments` | boolean | `false` | Master switch for private comments. Even when `true`, each `bug_comments` call must also pass `include_private = true` |
+| `allow_private_comments` | boolean | `false` | Master switch for **all** private content: comments, attachment metadata, and attachment downloads. Even when `true`, each call must also pass `include_private = true`. On an attachment download a *missing* privacy flag counts as private |
 | `read_only` | boolean | `false` | Strip write capabilities from every grant and remove write tools from the tool listing. The `--read-only` flag ORs into this |
 | `disabled_tools` | array of strings | `[]` | Tool names to remove from the tool listing entirely |
+| `max_attachment_bytes` | integer | `2097152` (2 MiB) | Largest attachment `download_attachment` may return (decoded size). `0` removes the cap. Attachment content is embedded base64 in the tool result and lands in the model's context — raise deliberately |
 
 ### `[[rule]]`
 
@@ -272,7 +273,7 @@ Eleven capabilities exist. `read` implies `summary`; nothing else is implied.
 | `summary` | read | redacted summary-only view (id, summary, status, resolution, product, component, severity, priority, creation/last-change time) |
 | `comments` | read | reading comments (also needed by `summarize_bug`) |
 | `history` | read | reading the bug's change history |
-| `attachments` | read | listing attachment metadata |
+| `attachments` | read | listing attachment metadata and downloading attachment content |
 | `comment` | write | adding a comment |
 | `status` | write | changing status/resolution, marking duplicates |
 | `fields` | write | changing priority, severity, resolution, `cf_*` custom fields |
@@ -294,6 +295,7 @@ action.
 | `bugs_quicksearch` | Bugzilla [quicksearch](https://bugzilla.readthedocs.io/en/latest/using/finding.html#quicksearch); results are silently policy-filtered (denied dropped, summary-only redacted) | per result: `read` / `summary` |
 | `summarize_bug` | Returns a summarization prompt built from the bug's public comments | `comments` |
 | `list_attachments` | Attachment metadata (never attachment content) | `attachments` |
+| `download_attachment` | Content of one attachment (raster images as image content, everything else as a base64 blob resource), capped by `max_attachment_bytes`; private attachments need the private-content double opt-in and, on download, a *missing* privacy flag counts as private | `attachments` on the owning bug |
 | `add_comment` | Add a comment to a bug | `comment` |
 | `update_bug_status` | Change status/resolution (CLOSED requires a resolution) | `status` |
 | `assign_bug` | Set the assignee | `assign` |
@@ -308,8 +310,6 @@ action.
 
 ## Roadmap
 
-- Attachment **download** with operator-configured size caps (currently only
-  metadata listing is exposed).
 - **OBS / openSUSE packaging** for installation via zypper.
 
 ## License

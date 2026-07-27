@@ -1,16 +1,12 @@
 # bugwarden guard policy — worked example
 # =======================================
 #
-# This is the scenario bugwarden was built for: an AI agent may work with a
-# public Bugzilla instance, but
+# The scenario this file implements:
 #
-#   * bugs younger than one week do not exist for it (they are the ones most
-#     likely to carry not-yet-triaged sensitive details),
-#   * embargoed security bugs are completely invisible,
-#   * on the security product it may only see redacted summaries and add
-#     comments,
-#   * on a partner component it may only see redacted summaries,
-#   * everything else is fully allowed.
+#   * embargoed security bugs are completely invisible, always;
+#   * bugs labelled "security" are invisible while they are fresher than
+#     5 days (the window in which details are typically still unreviewed);
+#   * everything else is shown to the user in full.
 #
 # The policy is read once at server startup (--policy / BUGWARDEN_POLICY) and
 # is never visible to the MCP client. Parsing is strict: unknown keys anywhere
@@ -25,21 +21,22 @@
 # priorities): case-insensitive match of the whole value; '*' matches any
 # (possibly empty) substring; everything else is literal.
 
-# What happens to bugs that no rule below matches.
+# What happens to bugs that no rule below matches: everything not caught by a
+# rule stays fully visible.
 # One of "allow" | "deny" ("restrict" is not permitted here — use a catch-all
 # restrict rule as the last [[rule]] instead).
 default_action = "allow"
 
 [global]
-# Bugs created less than N days ago are treated exactly like nonexistent bugs:
-# same denial text, silently dropped from search results. A bug whose
-# creation_time cannot be determined is also denied (fail closed).
-# 0 disables the check.
-min_bug_age_days = 7
+# Blanket minimum age for EVERY bug, regardless of labels. This example does
+# not use it — freshness is only restricted for security bugs, via the rules
+# below — but set it to N to make all bugs younger than N days invisible.
+min_bug_age_days = 0
 
-# Master switch for private comments. Even with `true`, a bug_comments call
-# must additionally pass include_private = true to receive them.
-# Default (and recommended): false.
+# Master switch for private content: comments, attachment metadata, and
+# attachment downloads. Even with `true`, each call must additionally pass
+# include_private = true. On an attachment download a MISSING privacy flag
+# counts as private. Default (and recommended): false.
 allow_private_comments = false
 
 # Strip all write capabilities from every grant and remove the write tools
@@ -51,8 +48,13 @@ read_only = false
 # them). Works independently of read_only.
 #disabled_tools = ["update_bug_dependencies", "mark_as_duplicate"]
 
+# Largest attachment (decoded bytes) download_attachment may return; the
+# content is embedded base64 in the tool result and consumes model context.
+# 0 removes the cap. Default: 2 MiB.
+#max_attachment_bytes = 2097152
+
 # ---------------------------------------------------------------------------
-# Embargoed security bugs: fully invisible.
+# 1. Embargoed security bugs: fully invisible, at any age.
 #
 # NOTE: criteria inside one `match` are AND-ed (a bug must satisfy all of
 # them), while entries inside one list are ORed. "In an embargo group OR
@@ -65,7 +67,7 @@ read_only = false
 
 [[rule]]
 name = "embargoed-groups"
-description = "Bugs restricted to security/embargo groups are invisible to the agent"
+description = "Bugs restricted to security/embargo groups are invisible"
 action = "deny"
 [rule.match]
 # Matches if ANY of the bug's group names matches ANY of these globs.
@@ -73,72 +75,87 @@ groups = ["security-team", "embargo*"]
 
 [[rule]]
 name = "embargo-keyword"
-description = "Bugs flagged with the embargo keyword are invisible to the agent"
+description = "Bugs flagged with an embargo keyword are invisible"
 action = "deny"
 [rule.match]
-keywords = ["security-embargo"]
+keywords = ["security-embargo", "embargo*"]
 
 # ---------------------------------------------------------------------------
-# Security product: the agent may triage (see redacted summaries, leave
-# comments) but not read full bug bodies, comments, history or attachments,
-# and not perform any other write.
+# 2. Fresh security bugs: invisible until they are 5 days old.
 #
-# "read" is NOT granted here; note that granting "read" would implicitly
-# grant "summary" as well (read implies summary — the only implication).
+# Both criteria are AND-ed, so these rules hide a bug only while it is BOTH
+# security-labelled AND younger than 5 days. Once it ages past the window no
+# rule matches it any more and default_action ("allow") applies — the bug
+# becomes fully visible without any policy change.
+#
+# A bug whose creation_time is missing or unparsable MATCHES younger_than_days
+# (fail closed): an age that cannot be established is treated as fresh.
+#
+# Three rules because "security" can be expressed three ways; drop the ones
+# your instance does not use.
 # ---------------------------------------------------------------------------
 
 [[rule]]
-name = "security-product-comment-only"
-description = "Summary view plus commenting on the security product; nothing else"
-action = "restrict"
-# Required (non-empty) because action = "restrict"; must be absent for
-# allow/deny rules. Full vocabulary, for reference:
-#   read summary comments history attachments   (read capabilities)
-#   comment status fields assign cc deps        (write capabilities)
-capabilities = ["summary", "comment"]
+name = "fresh-security-keyword"
+description = "Security-keyworded bugs are hidden for their first 5 days"
+action = "deny"
 [rule.match]
-products = ["Security*"]
-
-# ---------------------------------------------------------------------------
-# Partner component: redacted summaries only, read-only.
-# ---------------------------------------------------------------------------
+keywords = ["security*"]
+younger_than_days = 5
 
 [[rule]]
-name = "partner-summary-only"
-description = "Partner bugs expose only the redacted summary view"
-action = "restrict"
-capabilities = ["summary"]
+name = "fresh-security-group"
+description = "Bugs in a security group are hidden for their first 5 days"
+action = "deny"
 [rule.match]
-# Matches if ANY of the bug's components matches ANY of these globs,
-# regardless of product. Add e.g. products = ["SUSE *"] to narrow it —
-# criteria in one match table are AND-ed.
-components = ["Partner*"]
+groups = ["security*"]
+younger_than_days = 5
+
+[[rule]]
+name = "fresh-security-whiteboard"
+description = "Bugs whiteboard-tagged security are hidden for their first 5 days"
+action = "deny"
+[rule.match]
+# Case-insensitive substring search in the bug's whiteboard.
+whiteboard_contains = ["security"]
+younger_than_days = 5
 
 # ---------------------------------------------------------------------------
-# Inactive example: every remaining match criterion, in one rule.
+# Inactive examples: the remaining actions and match criteria.
 # Uncomment and adapt as needed. A rule with NO match table at all is a
 # catch-all that matches every bug.
 # ---------------------------------------------------------------------------
 
+# Redacted summary view plus commenting, nothing else. Note that "read" is NOT
+# granted here; granting "read" would implicitly grant "summary" as well
+# (read implies summary — the only implication).
 #[[rule]]
-#name = "fresh-hot-bugs-look-dont-touch"
-#description = "Recent, escalated, still-open bugs: readable but frozen"
+#name = "security-product-comment-only"
+#description = "Summary view plus commenting on the security product"
+#action = "restrict"
+## Required (non-empty) because action = "restrict"; must be absent for
+## allow/deny rules. Full vocabulary, for reference:
+##   read summary comments history attachments   (read capabilities)
+##   comment status fields assign cc deps        (write capabilities)
+#capabilities = ["summary", "comment"]
+#[rule.match]
+#products = ["Security*"]
+
+# Every remaining match criterion, in one rule.
+#[[rule]]
+#name = "hot-bugs-look-dont-touch"
+#description = "Escalated, still-open bugs: readable but frozen"
 #action = "restrict"
 #capabilities = ["read", "comments", "history", "attachments"]
 #[rule.match]
+## Matches if ANY of the bug's components matches ANY of these globs.
+#components = ["Partner*"]
 ## Bug status must match one of these globs...
 #statuses = ["NEW", "IN_PROGRESS", "CONFIRMED"]
 ## ...AND severity one of these...
 #severities = ["critical", "urgent"]
-## ...AND priority one of these...
+## ...AND priority one of these.
 #priorities = ["P0", "P1"]
-## ...AND the whiteboard must contain one of these case-insensitive
-## substrings...
-#whiteboard_contains = ["escalation", "hot"]
-## ...AND the bug must have been created within the last 30 days. A bug whose
-## creation_time is missing MATCHES this criterion (fail closed: a deny or
-## restrict rule still catches bugs of unknown age).
-#younger_than_days = 30
 
 # No catch-all rule: bugs that reach the end of the list get default_action
 # ("allow" above), minus write capabilities whenever the server runs

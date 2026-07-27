@@ -30,9 +30,11 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
 - **I4** Fail closed: classification-fetch failure, bug absent from the
   response, or missing/unparsable `creation_time` when an age rule applies =>
   Denied.
-- **I5** Private comments (`is_private: true`) are returned only when policy
+- **I5** Private content (`is_private: true`) is returned only when policy
   `global.allow_private_comments = true` AND the call sets
-  `include_private = true`. Default policy (no file) has
+  `include_private = true`. This one switch governs private comments,
+  private attachment metadata, and private attachment content alike; on a
+  content download a MISSING flag counts as private (I4). Default policy (no file) has
   `allow_private_comments = false` — private data is strictly opt-in.
 - **I6** Capability implication: `read` implies `summary`. Nothing else is
   implied.
@@ -77,7 +79,7 @@ pub enum Capability {
     Summary,     // redacted summary-only view
     Comments,    // read comments
     History,     // read history
-    Attachments, // list attachment metadata
+    Attachments, // list attachment metadata + download attachment content
     Comment,     // write: add comment
     Status,      // write: status/resolution/duplicate
     Fields,      // write: priority/severity/resolution/custom cf_* fields
@@ -126,14 +128,19 @@ pub struct Rule {
     #[serde(default)] pub capabilities: Vec<Capability>, // only for action = "restrict"
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlobalGuards {
     #[serde(default)] pub min_bug_age_days: i64,        // 0 = disabled
     #[serde(default)] pub allow_private_comments: bool, // default false
     #[serde(default)] pub read_only: bool,
     #[serde(default)] pub disabled_tools: Vec<String>,
+    // Cap on download_attachment content (decoded bytes); 0 = no cap.
+    // serde default AND the hand-written `Default` impl are BOTH 2 MiB — a
+    // derived Default would zero it, silently removing the cap (fail open).
+    #[serde(default = "default_max_attachment_bytes")] pub max_attachment_bytes: u64,
 }
+impl Default for GlobalGuards; // all fields as above, max_attachment_bytes = 2 MiB
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -211,6 +218,23 @@ impl Guard {
 
     /// Drops is_private comments unless include_private && policy allows (I5).
     pub fn filter_comments(&self, comments: Vec<serde_json::Value>, include_private: bool) -> Vec<serde_json::Value>;
+
+    /// Same I5 double opt-in for private attachment METADATA (listing).
+    pub fn filter_attachments(&self, attachments: Vec<serde_json::Value>, include_private: bool) -> Vec<serde_json::Value>;
+
+    /// Uniform denial text for attachments (I2 analogue): blocked and
+    /// nonexistent attachment ids must be indistinguishable.
+    pub fn attachment_denial(id: u64) -> String; // "Attachment {id} is not accessible through this server"
+
+    /// Pre-download gate on attachment METADATA (run before the blob fetch,
+    /// I8): private needs the I5 double opt-in and a MISSING is_private flag
+    /// counts as private on download (stricter than listing; the blob is the
+    /// payload, fail closed I4); reported size must fit
+    /// global.max_attachment_bytes (0 = no cap; missing size under an active
+    /// cap fails closed; the refusal names neither the size nor the cap —
+    /// max_attachment_bytes is not I1-disclosable). Returns
+    /// Some(refusal_text) when blocked.
+    pub fn attachment_gate(&self, attachment: &serde_json::Value, include_private: bool) -> Option<String>;
 }
 ```
 
@@ -234,6 +258,8 @@ impl BugzillaClient {
     pub async fn update_bug(&self, key: &str, id: u64, payload: serde_json::Value) -> anyhow::Result<serde_json::Value>;
     pub async fn attachments(&self, key: &str, id: u64) -> anyhow::Result<serde_json::Value>;
     pub async fn quicksearch_syntax_html(&self) -> anyhow::Result<String>;
+    pub async fn attachment_meta(&self, key: &str, attachment_id: u64) -> anyhow::Result<Option<serde_json::Value>>; // exclude_fields=data
+    pub async fn attachment_data(&self, key: &str, attachment_id: u64) -> anyhow::Result<Option<serde_json::Value>>; // includes base64 `data`
 }
 ```
 
@@ -250,6 +276,8 @@ Endpoint mapping:
 | quicksearch | GET /rest/bug?quicksearch={status}+" "+{query}&include_fields=..&limit=..&offset=..&order=relevance | envelope |
 | update_bug | PUT /rest/bug/{id} with caller-built payload (caller adds `"comment": {"body": ..}` when set) | envelope |
 | attachments | GET /rest/bug/{id}/attachment?exclude_fields=data | `envelope.bugs.{id}` array as Value |
+| attachment_meta | GET /rest/bug/attachment/{attachment_id}?exclude_fields=data | `envelope.attachments.{id}` object, `None` when absent |
+| attachment_data | GET /rest/bug/attachment/{attachment_id} | `envelope.attachments.{id}` object incl. base64 `data`, `None` when absent |
 | quicksearch_syntax_html | GET {base_url}/page.cgi?id=quicksearch.html (no auth needed) | HTML string |
 
 Auth per request: `use_auth_header` ? header `Authorization: Bearer {key}` :
@@ -261,7 +289,8 @@ HTTP status and Bugzilla `message` field; reqwest errors sanitized with
 ## MCP tool surface (crates/bugwarden/src/server.rs)
 
 Result convention: success => `CallToolResult::success` with ONE text block of
-pretty-printed JSON. Guard refusals and input-validation failures =>
+pretty-printed JSON. The sole exception is `download_attachment`, which
+returns a JSON summary text block PLUS one image or blob-resource block. Guard refusals and input-validation failures =>
 `CallToolResult::error` with a text block (NOT a protocol error). Protocol
 issues (missing API key header) => `McpError::invalid_request`.
 
@@ -282,6 +311,7 @@ constraints the model must know.
 | add_cc_to_bug | bug_id, cc_email | cc (write) | payload `{"cc": {"add": [email]}}` |
 | mark_as_duplicate | bug_id, duplicate_of, comment = "" | status on bug_id + summary on duplicate_of (I11) | default comment "Marking as duplicate of bug {duplicate_of}"; payload status CLOSED, resolution DUPLICATE, dupe_of |
 | list_attachments | bug_id | attachments | metadata only (`exclude_fields=data`) |
+| download_attachment | attachment_id, include_private: bool = false | attachments (on the owning bug) | metadata fetched FIRST (no blob) for guard assessment + attachment_gate; unknown id, metadata OR blob fetch failure, denied owning bug, missing bug_id, and private-without-opt-in all yield the uniform attachment denial. Constant upstream request count on every path (a metadata miss still runs one classify call against bug id 0) so call latency is not an existence oracle. The gate AND the bug-id check re-run on the blob response (TOCTOU), then the actual base64 size is re-checked against the cap (a lying `size` cannot bypass it). Raster image types from a strict allowlist => ContentBlock::image; everything else (incl. image/svg+xml) => BlobResourceContents whose uri carries only the attachment id (uploader-chosen file_name never enters the uri) |
 | bug_url | bug_id | none (I8 exception) | `{base_url}/show_bug.cgi?id={id}` |
 | bugzilla_server_info | — | none | client.server_info |
 | quicksearch_syntax | — | none | HTML doc page |

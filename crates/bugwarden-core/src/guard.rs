@@ -211,6 +211,60 @@ impl Guard {
         self.filter_private(attachments, include_private)
     }
 
+    /// The uniform attachment denial text.
+    ///
+    /// Mirrors `denial` (I2): a policy-blocked attachment and a nonexistent
+    /// attachment id MUST be indistinguishable, so an MCP client can never
+    /// probe attachment ids to learn whether hidden attachments exist.
+    pub fn attachment_denial(id: u64) -> String {
+        format!("Attachment {id} is not accessible through this server")
+    }
+
+    /// Gate for downloading a single attachment's content, evaluated on its
+    /// metadata BEFORE the blob is fetched. Returns the refusal text when
+    /// the download must be blocked, `None` when it may proceed.
+    ///
+    /// Two checks:
+    /// - private attachments need the I5 double opt-in — stricter than the
+    ///   metadata listing: a MISSING `is_private` flag on a full-content
+    ///   download is treated as private (fail closed, I4), because the blob
+    ///   is the payload the guard exists to protect;
+    /// - the upstream-reported `size` must fit
+    ///   `global.max_attachment_bytes` (`0` = no cap); a missing size while
+    ///   a cap is active fails closed.
+    pub fn attachment_gate(&self, attachment: &Value, include_private: bool) -> Option<String> {
+        let id = attachment.get("id").and_then(Value::as_u64).unwrap_or(0);
+        let is_private = attachment
+            .get("is_private")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if is_private && !(include_private && self.policy.global.allow_private_comments) {
+            return Some(Self::attachment_denial(id));
+        }
+        // The refusal names neither the attachment's size nor the configured
+        // cap: `max_attachment_bytes` is not among the policy fields I1
+        // permits a client to learn, and one oversized download must not
+        // disclose the operator's configuration.
+        let cap = self.policy.global.max_attachment_bytes;
+        if cap > 0 {
+            match attachment.get("size").and_then(Value::as_u64) {
+                Some(size) if size <= cap => {}
+                Some(_) => {
+                    return Some(format!(
+                        "Attachment {id} exceeds the size limit of this server"
+                    ));
+                }
+                None => {
+                    return Some(format!(
+                        "Attachment {id} has no reported size and cannot be \
+                         checked against the size limit of this server"
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     /// Shared I5 double-opt-in filter for objects carrying an `is_private`
     /// flag. A missing flag means public.
     fn filter_private(&self, items: Vec<Value>, include_private: bool) -> Vec<Value> {
@@ -548,5 +602,98 @@ products = ["NoView*"]
         assert_eq!(dropped, 1);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0]["id"], json!(2));
+    }
+
+    // ---------- attachment_gate ----------
+
+    fn public_attachment(size: u64) -> Value {
+        json!({ "id": 7, "is_private": false, "size": size })
+    }
+
+    #[test]
+    fn attachment_denial_matches_bug_denial_shape_i2() {
+        assert_eq!(
+            Guard::attachment_denial(7),
+            "Attachment 7 is not accessible through this server"
+        );
+    }
+
+    #[test]
+    fn attachment_gate_allows_public_within_cap() {
+        let g = Guard {
+            policy: Policy::default(),
+        };
+        assert_eq!(g.attachment_gate(&public_attachment(1024), false), None);
+    }
+
+    #[test]
+    fn attachment_gate_denies_private_without_double_opt_in_i5() {
+        let allowing = Guard {
+            policy: policy("[global]\nallow_private_comments = true"),
+        };
+        let strict = Guard {
+            policy: Policy::default(),
+        };
+        let private = json!({ "id": 7, "is_private": true, "size": 10 });
+        // Policy alone is not enough...
+        assert!(allowing.attachment_gate(&private, false).is_some());
+        // ...the flag alone is not enough...
+        assert!(strict.attachment_gate(&private, true).is_some());
+        // ...both together are.
+        assert_eq!(allowing.attachment_gate(&private, true), None);
+        // The private denial is the uniform text (I2).
+        assert_eq!(
+            strict.attachment_gate(&private, true),
+            Some(Guard::attachment_denial(7))
+        );
+    }
+
+    #[test]
+    fn attachment_gate_missing_is_private_fails_closed_i4() {
+        let g = Guard {
+            policy: Policy::default(),
+        };
+        assert!(g
+            .attachment_gate(&json!({ "id": 7, "size": 10 }), false)
+            .is_some());
+    }
+
+    #[test]
+    fn attachment_gate_enforces_size_cap() {
+        let g = Guard {
+            policy: policy("[global]\nmax_attachment_bytes = 100"),
+        };
+        assert_eq!(g.attachment_gate(&public_attachment(100), false), None);
+        let refusal = g.attachment_gate(&public_attachment(101), false);
+        assert!(refusal.is_some_and(|r| r.contains("size limit")));
+    }
+
+    #[test]
+    fn attachment_gate_missing_size_fails_closed_under_cap_i4() {
+        let g = Guard {
+            policy: Policy::default(),
+        };
+        let no_size = json!({ "id": 7, "is_private": false });
+        assert!(g.attachment_gate(&no_size, false).is_some());
+        // Without a cap there is nothing to check against.
+        let uncapped = Guard {
+            policy: policy("[global]\nmax_attachment_bytes = 0"),
+        };
+        assert_eq!(uncapped.attachment_gate(&no_size, false), None);
+    }
+
+    #[test]
+    fn default_policy_caps_attachments_at_two_mib() {
+        assert_eq!(
+            Policy::default().global.max_attachment_bytes,
+            2 * 1024 * 1024
+        );
+        // TOML without the key gets the same non-zero default (fail closed).
+        assert_eq!(
+            policy("default_action = \"allow\"")
+                .global
+                .max_attachment_bytes,
+            2 * 1024 * 1024
+        );
     }
 }

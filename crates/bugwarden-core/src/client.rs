@@ -279,6 +279,43 @@ impl BugzillaClient {
             .unwrap_or_else(|| Value::Array(Vec::new())))
     }
 
+    /// GET `/rest/bug/attachment/{attachment_id}?exclude_fields=data` — the
+    /// metadata of one attachment, without its content. Returns `None` when
+    /// the response carries no entry for the id.
+    pub async fn attachment_meta(&self, key: &str, attachment_id: u64) -> Result<Option<Value>> {
+        self.attachment_envelope(
+            key,
+            attachment_id,
+            &[("exclude_fields", "data".to_string())],
+        )
+        .await
+    }
+
+    /// GET `/rest/bug/attachment/{attachment_id}` — one attachment including
+    /// its base64 `data` field. Returns `None` when the response carries no
+    /// entry for the id.
+    ///
+    /// Callers must run the guard's attachment gate on the metadata BEFORE
+    /// calling this (I8): the blob is the sensitive payload.
+    pub async fn attachment_data(&self, key: &str, attachment_id: u64) -> Result<Option<Value>> {
+        self.attachment_envelope(key, attachment_id, &[]).await
+    }
+
+    async fn attachment_envelope(
+        &self,
+        key: &str,
+        attachment_id: u64,
+        query: &[(&str, String)],
+    ) -> Result<Option<Value>> {
+        let path = format!("/bug/attachment/{attachment_id}");
+        let v = self.get_json(key, &path, query).await?;
+        let id_key = attachment_id.to_string();
+        Ok(v.get("attachments")
+            .and_then(|atts| atts.get(id_key.as_str()))
+            .cloned()
+            .filter(|att| !att.is_null()))
+    }
+
     /// GET `{base_url}/page.cgi?id=quicksearch.html` — the quicksearch
     /// syntax documentation page. This is a plain HTML page, not a REST
     /// endpoint, and needs no authentication: no API key is attached.
