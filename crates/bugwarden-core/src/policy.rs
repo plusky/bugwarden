@@ -204,7 +204,7 @@ pub struct Matcher {
     pub whiteboard_contains: Vec<String>,
     /// Matches when `creation_time` is newer than `now - N days`.
     ///
-    /// A bug with a missing/unparseable `creation_time` MATCHES this
+    /// A bug with a missing/unparsable `creation_time` MATCHES this
     /// criterion (fail closed, I4): this matcher exists to deny or restrict
     /// young bugs, so a bug of unknown age must be treated as young.
     #[serde(default)]
@@ -440,7 +440,7 @@ impl Policy {
     /// Evaluation order (normative):
     ///
     /// 1. `global.min_bug_age_days` — a bug younger than the minimum age is
-    ///    Denied before any rule runs. A missing/unparseable `creation_time`
+    ///    Denied before any rule runs. A missing/unparsable `creation_time`
     ///    while this gate is active is also Denied (fail closed, I4).
     /// 2. Rules in file order, first match wins.
     /// 3. `default_action`.
@@ -520,7 +520,7 @@ pub struct BugMeta {
     pub groups: Vec<String>,
     /// Whiteboard text.
     pub whiteboard: String,
-    /// Creation time; `None` when absent or unparseable, which fails closed
+    /// Creation time; `None` when absent or unparsable, which fails closed
     /// wherever an age criterion applies (I4).
     pub creation_time: Option<DateTime<Utc>>,
 }
@@ -555,7 +555,7 @@ impl BugMeta {
     /// REST `component` field may be a string or an array of strings; `groups`
     /// elements may be plain names or objects carrying a `name` key; the
     /// whiteboard may arrive as `whiteboard` or (XML-RPC style)
-    /// `status_whiteboard`. An unparseable `creation_time` becomes `None`,
+    /// `status_whiteboard`. An unparsable `creation_time` becomes `None`,
     /// which is treated fail-closed by every age criterion (I4).
     pub fn from_json(v: &Value) -> BugMeta {
         let whiteboard = {
@@ -986,7 +986,7 @@ products = ["SUSE*"]
 
     #[test]
     fn reject_unknown_top_level_key() {
-        let err = Policy::from_toml_str("defualt_action = \"deny\"").unwrap_err();
+        let err = Policy::from_toml_str("unknown_option = \"deny\"").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("unknown field"), "unexpected error: {msg}");
     }

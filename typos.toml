@@ -7,3 +7,6 @@
 extend-exclude = []
 
 [default.extend-words]
+# glob_match backtracking test data in bugwarden-core/src/policy.rs: the
+# pattern "*a*b*" must NOT match the deliberately reversed string "ba".
+ba = "ba"

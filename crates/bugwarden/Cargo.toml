@@ -11,7 +11,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-bugwarden-core = { path = "../bugwarden-core" }
+bugwarden-core = { path = "../bugwarden-core", version = "0.1.0" }
 
 rmcp = { version = "2.2", features = [
     "server",
