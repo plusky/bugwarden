@@ -1,0 +1,145 @@
+# bugwarden guard policy — worked example
+# =======================================
+#
+# This is the scenario bugwarden was built for: an AI agent may work with a
+# public Bugzilla instance, but
+#
+#   * bugs younger than one week do not exist for it (they are the ones most
+#     likely to carry not-yet-triaged sensitive details),
+#   * embargoed security bugs are completely invisible,
+#   * on the security product it may only see redacted summaries and add
+#     comments,
+#   * on a partner component it may only see redacted summaries,
+#   * everything else is fully allowed.
+#
+# The policy is read once at server startup (--policy / BUGWARDEN_POLICY) and
+# is never visible to the MCP client. Parsing is strict: unknown keys anywhere
+# are a startup error, so typos cannot silently disable a guard.
+#
+# Rule evaluation order:
+#   1. global.min_bug_age_days (a too-young bug is invisible, no rule runs)
+#   2. [[rule]] entries top to bottom — FIRST MATCH WINS
+#   3. default_action for bugs no rule matched
+#
+# Glob syntax (products/components/groups/keywords/statuses/severities/
+# priorities): case-insensitive match of the whole value; '*' matches any
+# (possibly empty) substring; everything else is literal.
+
+# What happens to bugs that no rule below matches.
+# One of "allow" | "deny" ("restrict" is not permitted here — use a catch-all
+# restrict rule as the last [[rule]] instead).
+default_action = "allow"
+
+[global]
+# Bugs created less than N days ago are treated exactly like nonexistent bugs:
+# same denial text, silently dropped from search results. A bug whose
+# creation_time cannot be determined is also denied (fail closed).
+# 0 disables the check.
+min_bug_age_days = 7
+
+# Master switch for private comments. Even with `true`, a bug_comments call
+# must additionally pass include_private = true to receive them.
+# Default (and recommended): false.
+allow_private_comments = false
+
+# Strip all write capabilities from every grant and remove the write tools
+# from the MCP tool listing. The --read-only CLI flag ORs into this — the CLI
+# can tighten this policy but never loosen it.
+read_only = false
+
+# Tool names to remove from the MCP tool listing entirely (clients never see
+# them). Works independently of read_only.
+#disabled_tools = ["update_bug_dependencies", "mark_as_duplicate"]
+
+# ---------------------------------------------------------------------------
+# Embargoed security bugs: fully invisible.
+#
+# NOTE: criteria inside one `match` are ANDed (a bug must satisfy all of
+# them), while entries inside one list are ORed. "In an embargo group OR
+# carrying the embargo keyword" therefore needs two consecutive deny rules.
+#
+# NOTE: group and keyword names vary per Bugzilla instance — check yours
+# (e.g. openSUSE uses different security group names than Red Hat or Mozilla)
+# and adjust the globs below before deploying this file.
+# ---------------------------------------------------------------------------
+
+[[rule]]
+name = "embargoed-groups"
+description = "Bugs restricted to security/embargo groups are invisible to the agent"
+action = "deny"
+[rule.match]
+# Matches if ANY of the bug's group names matches ANY of these globs.
+groups = ["security-team", "embargo*"]
+
+[[rule]]
+name = "embargo-keyword"
+description = "Bugs flagged with the embargo keyword are invisible to the agent"
+action = "deny"
+[rule.match]
+keywords = ["security-embargo"]
+
+# ---------------------------------------------------------------------------
+# Security product: the agent may triage (see redacted summaries, leave
+# comments) but not read full bug bodies, comments, history or attachments,
+# and not perform any other write.
+#
+# "read" is NOT granted here; note that granting "read" would implicitly
+# grant "summary" as well (read implies summary — the only implication).
+# ---------------------------------------------------------------------------
+
+[[rule]]
+name = "security-product-comment-only"
+description = "Summary view plus commenting on the security product; nothing else"
+action = "restrict"
+# Required (non-empty) because action = "restrict"; must be absent for
+# allow/deny rules. Full vocabulary, for reference:
+#   read summary comments history attachments   (read capabilities)
+#   comment status fields assign cc deps        (write capabilities)
+capabilities = ["summary", "comment"]
+[rule.match]
+products = ["Security*"]
+
+# ---------------------------------------------------------------------------
+# Partner component: redacted summaries only, read-only.
+# ---------------------------------------------------------------------------
+
+[[rule]]
+name = "partner-summary-only"
+description = "Partner bugs expose only the redacted summary view"
+action = "restrict"
+capabilities = ["summary"]
+[rule.match]
+# Matches if ANY of the bug's components matches ANY of these globs,
+# regardless of product. Add e.g. products = ["SUSE *"] to narrow it —
+# criteria in one match table are ANDed.
+components = ["Partner*"]
+
+# ---------------------------------------------------------------------------
+# Inactive example: every remaining match criterion, in one rule.
+# Uncomment and adapt as needed. A rule with NO match table at all is a
+# catch-all that matches every bug.
+# ---------------------------------------------------------------------------
+
+#[[rule]]
+#name = "fresh-hot-bugs-look-dont-touch"
+#description = "Recent, escalated, still-open bugs: readable but frozen"
+#action = "restrict"
+#capabilities = ["read", "comments", "history", "attachments"]
+#[rule.match]
+## Bug status must match one of these globs...
+#statuses = ["NEW", "IN_PROGRESS", "CONFIRMED"]
+## ...AND severity one of these...
+#severities = ["critical", "urgent"]
+## ...AND priority one of these...
+#priorities = ["P0", "P1"]
+## ...AND the whiteboard must contain one of these case-insensitive
+## substrings...
+#whiteboard_contains = ["escalation", "hot"]
+## ...AND the bug must have been created within the last 30 days. A bug whose
+## creation_time is missing MATCHES this criterion (fail closed: a deny or
+## restrict rule still catches bugs of unknown age).
+#younger_than_days = 30
+
+# No catch-all rule: bugs that reach the end of the list get default_action
+# ("allow" above), minus write capabilities whenever the server runs
+# read-only.

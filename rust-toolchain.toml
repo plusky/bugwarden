@@ -1,0 +1,6 @@
+# Pinned toolchain for reproducible local checks. Keep in sync with the CI
+# toolchain input in .github/workflows/ci.yml; the workspace MSRV
+# (rust-version in Cargo.toml) is a separate, lower bound.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]

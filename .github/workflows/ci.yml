@@ -1,0 +1,111 @@
+---
+name: ci
+on:
+  push:
+    branches: [main]
+    tags: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded PR runs, but let main/tag runs finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        # Pin a commit from the action's master branch (commits of the
+        # toolchain branches are garbage-collected upstream) and select the
+        # toolchain via the input instead of the ref.
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
+        with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: "1.97.0"
+          components: rustfmt, clippy
+      - name: Cache cargo
+        # Tag runs re-verify a release: keep them off restored build state;
+        # PR/main runs keep the cache.
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          workspaces: . -> target
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace --all-targets --locked
+
+  rust-beta:
+    # Early warning on the upcoming compiler: never blocks, but surfaces
+    # new-lint and regression noise before beta becomes stable. No fmt leg
+    # (beta rustfmt formatting may legitimately drift).
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain (beta)
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
+        with:
+          toolchain: beta
+          components: clippy
+      - name: Cache cargo
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          workspaces: . -> target
+      - name: Clippy (beta)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test (beta)
+        run: cargo test --workspace --all-targets --locked
+
+  rust-deny:
+    # Dependency policy for the Rust workspace. Config: deny.toml
+    # next to the workspace manifest (auto-discovered by cargo-deny).
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # v2
+        with:
+          manifest-path: Cargo.toml
+          command: check
+          # Empty arguments: do not force --all-features.
+          arguments: ""
+
+  rust-msrv:
+    # Build with the minimum supported Rust version (rust-version in
+    # Cargo.toml) so MSRV cannot silently drift.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain (MSRV)
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
+        with:
+          # Keep in sync with rust-version in Cargo.toml.
+          toolchain: "1.85"
+      - name: Cache cargo
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          workspaces: . -> target
+      - name: Build (MSRV)
+        run: cargo build --workspace --locked

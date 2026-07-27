@@ -1,0 +1,24 @@
+# Virtual workspace manifest — the sources live under crates/.
+[workspace]
+resolver = "2"
+members = [
+    "crates/bugwarden-core",
+    "crates/bugwarden",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Martin Pluskal <martin@pluskal.org>"]
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Pedantic is informative locally; CI uses -D warnings on the default set only
+# (do not enable pedantic as warn-as-error — it blocks scaffolding with style
+# nits).
+pedantic = { level = "allow", priority = -1 }

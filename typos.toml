@@ -1,0 +1,9 @@
+# Configuration for crate-ci/typos (https://github.com/crate-ci/typos).
+# Allowlist ONLY: every entry is a deliberate, load-bearing spelling or a
+# generated/captured artifact — never a masked real typo. Retire an entry only
+# once its last real occurrence is gone, and say so.
+
+[files]
+extend-exclude = []
+
+[default.extend-words]
