@@ -1,0 +1,36 @@
+---
+# Dependabot configuration.
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates
+version: 2
+updates:
+  # Rust dependencies for the root cargo workspace.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # GitHub Actions used by the workflows. Keeps the SHA-pinned actions in
+  # ci.yml / release.yml current so they cannot silently rot.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    # dtolnay/rust-toolchain is pinned to a master-branch commit SHA and the
+    # toolchain is selected via its `toolchain:` input; the action has no
+    # semver releases for Dependabot to bump to. The toolchain must only
+    # change deliberately alongside Cargo.toml `rust-version` and
+    # rust-toolchain.toml.
+    ignore:
+      - dependency-name: "dtolnay/rust-toolchain"
+    groups:
+      actions-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
