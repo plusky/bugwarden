@@ -128,3 +128,26 @@ are never a justification for undoing them.
 - Changes to guard behavior get an adversarial review against the DESIGN.md
   invariants before the PR is opened, and the findings addressed or
   explicitly rebutted in the PR body.
+
+## Releases
+
+A release is one push of an annotated tag; nothing is released by hand.
+
+- The tag is the bare version, no `v` prefix (`0.1.0`, `0.2.0rc1`), and must
+  equal `[workspace.package] version` — the workflow refuses to build a tag
+  that disagrees with the manifest. Bump the version in a normal PR first,
+  then tag the merge commit on `main`.
+- `.github/workflows/release.yml` then does everything: hermetic builds for
+  x86_64-unknown-linux-gnu and aarch64-apple-darwin, a GitHub release with
+  both tarballs and their `.sha256` files, and finally the crates.io publish
+  — `bugwarden-core` before `bugwarden`, because the binary crate resolves
+  its dependency from the index and cannot be packaged before core is there.
+- Publishing uses crates.io Trusted Publishing over the workflow's OIDC
+  token, so the repository stores no registry credential. Both crates must
+  have this repository, workflow `release.yml`, and no environment
+  configured under their crates.io *Trusted Publishing* settings; without
+  that the publish job fails to authenticate.
+- The publish step skips a crate whose version is already on crates.io, so a
+  re-run of a partially failed release is safe. A published version can be
+  yanked but never replaced: treat the tag push as irreversible, and prefer
+  fixing forward with a new patch version.
