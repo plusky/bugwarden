@@ -8,9 +8,6 @@
 //! request logging records only the HTTP method and path — never the query
 //! string.
 
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
@@ -73,36 +70,80 @@ impl BugzillaClient {
             .ok_or_else(|| anyhow!("bugzilla /version response is missing the \"version\" field"))
     }
 
-    /// Concurrent GET of `/rest/version`, `/rest/extensions`, `/rest/time`
+    /// Sequential GET of `/rest/version`, `/rest/extensions`, `/rest/time`
     /// and `/rest/parameters`, combined into
     /// `{url, version, extensions, timezone, time, parameters}`.
+    ///
+    /// The endpoints are fetched one at a time — some Bugzilla deployments
+    /// drop connections when a single client opens several at once — and a
+    /// failing endpoint degrades only its own fields, with the sanitized
+    /// reason collected under `"unavailable"`. The call errors only when
+    /// every endpoint fails.
     pub async fn server_info(&self, key: &str) -> Result<Value> {
-        let ((version, extensions), (time, parameters)) = join2(
-            join2(
-                self.get_json(key, "/version", &[]),
-                self.get_json(key, "/extensions", &[]),
-            ),
-            join2(
-                self.get_json(key, "/time", &[]),
-                self.get_json(key, "/parameters", &[]),
-            ),
-        )
-        .await;
-        let (version, extensions, time, parameters) = (version?, extensions?, time?, parameters?);
-        Ok(serde_json::json!({
+        let mut unavailable: Vec<String> = Vec::new();
+        let version = self.info_endpoint(key, "/version", &mut unavailable).await;
+        let extensions = self
+            .info_endpoint(key, "/extensions", &mut unavailable)
+            .await;
+        let time = self.info_endpoint(key, "/time", &mut unavailable).await;
+        let parameters = self
+            .info_endpoint(key, "/parameters", &mut unavailable)
+            .await;
+        if version.is_none() && extensions.is_none() && time.is_none() && parameters.is_none() {
+            bail!(
+                "all bugzilla server-info endpoints failed: {}",
+                unavailable.join("; ")
+            );
+        }
+        let mut info = serde_json::json!({
             "url": self.base_url,
-            "version": version.get("version").cloned().unwrap_or(Value::Null),
+            "version": version
+                .as_ref()
+                .and_then(|v| v.get("version"))
+                .cloned()
+                .unwrap_or(Value::Null),
             "extensions": extensions
-                .get("extensions")
+                .as_ref()
+                .and_then(|v| v.get("extensions"))
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({})),
-            "timezone": time.get("tz_name").cloned().unwrap_or(Value::Null),
-            "time": time.get("web_time").cloned().unwrap_or(Value::Null),
+            "timezone": time
+                .as_ref()
+                .and_then(|v| v.get("tz_name"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "time": time
+                .as_ref()
+                .and_then(|v| v.get("web_time"))
+                .cloned()
+                .unwrap_or(Value::Null),
             "parameters": parameters
-                .get("parameters")
+                .as_ref()
+                .and_then(|v| v.get("parameters"))
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({})),
-        }))
+        });
+        if !unavailable.is_empty() {
+            info["unavailable"] = serde_json::json!(unavailable);
+        }
+        Ok(info)
+    }
+
+    /// GET one server-info endpoint, degrading a failure into `None` and
+    /// recording the sanitized reason.
+    async fn info_endpoint(
+        &self,
+        key: &str,
+        path: &'static str,
+        unavailable: &mut Vec<String>,
+    ) -> Option<Value> {
+        match self.get_json(key, path, &[]).await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                unavailable.push(format!("{path}: {e:#}"));
+                None
+            }
+        }
     }
 
     /// GET `/rest/bug?id=1,2,3[&include_fields=..]` — returns the whole
@@ -350,54 +391,6 @@ fn parse_response(status: reqwest::StatusCode, body: &str) -> Result<Value> {
             status.as_u16()
         )
     })
-}
-
-/// Minimal two-future concurrent join (both futures make progress on every
-/// poll; resolves when both complete). Hand-rolled so `bugwarden-core` needs
-/// no direct dependency on an executor or futures crate.
-fn join2<A: Future, B: Future>(fa: A, fb: B) -> Join2<A, B> {
-    Join2 {
-        fa: Box::pin(fa),
-        fb: Box::pin(fb),
-        oa: None,
-        ob: None,
-    }
-}
-
-struct Join2<A: Future, B: Future> {
-    fa: Pin<Box<A>>,
-    fb: Pin<Box<B>>,
-    oa: Option<A::Output>,
-    ob: Option<B::Output>,
-}
-
-// Sound: the inner futures are heap-pinned (`Pin<Box<_>>`), so `Join2`
-// itself has no structurally pinned fields.
-impl<A: Future, B: Future> Unpin for Join2<A, B> {}
-
-impl<A: Future, B: Future> Future for Join2<A, B> {
-    type Output = (A::Output, B::Output);
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = &mut *self;
-        if this.oa.is_none() {
-            if let Poll::Ready(v) = this.fa.as_mut().poll(cx) {
-                this.oa = Some(v);
-            }
-        }
-        if this.ob.is_none() {
-            if let Poll::Ready(v) = this.fb.as_mut().poll(cx) {
-                this.ob = Some(v);
-            }
-        }
-        match (this.oa.is_some(), this.ob.is_some()) {
-            (true, true) => Poll::Ready((
-                this.oa.take().expect("checked above"),
-                this.ob.take().expect("checked above"),
-            )),
-            _ => Poll::Pending,
-        }
-    }
 }
 
 #[cfg(test)]

@@ -107,6 +107,12 @@ works if you build without the pin.
 
 ## Usage
 
+> **Note:** some Bugzilla deployments protect their interactive host with an
+> anti-bot challenge that rejects API clients regardless of credentials. If
+> tools fail with "response body is not valid JSON", check whether the
+> instance offers a dedicated API host (for example `apibugzilla.suse.com`
+> instead of `bugzilla.suse.com`) and point `--bugzilla-server` at that.
+
 ### HTTP transport (default)
 
 The server listens on `http://<host>:<port>/mcp`. Each client request carries
