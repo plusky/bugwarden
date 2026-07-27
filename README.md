@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="bugwarden logo" width="180">
+</p>
+
 # bugwarden
 
 **bugwarden** is a Model Context Protocol (MCP) server, written in Rust, with
