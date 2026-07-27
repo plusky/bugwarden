@@ -28,7 +28,7 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
 - **I3** Search filtering is silent: counts of dropped/filtered results are
   never returned to the client (server-side debug logging is fine).
 - **I4** Fail closed: classification-fetch failure, bug absent from the
-  response, or missing/unparseable `creation_time` when an age rule applies =>
+  response, or missing/unparsable `creation_time` when an age rule applies =>
   Denied.
 - **I5** Private comments (`is_private: true`) are returned only when policy
   `global.allow_private_comments = true` AND the call sets

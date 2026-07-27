@@ -209,7 +209,7 @@ A complete, commented example ships in
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `min_bug_age_days` | integer | `0` (disabled) | Bugs created less than N days ago are **invisible** — treated exactly like nonexistent bugs, evaluated before any rule. A bug whose `creation_time` is missing or unparseable is denied (fail closed) |
+| `min_bug_age_days` | integer | `0` (disabled) | Bugs created less than N days ago are **invisible** — treated exactly like nonexistent bugs, evaluated before any rule. A bug whose `creation_time` is missing or unparsable is denied (fail closed) |
 | `allow_private_comments` | boolean | `false` | Master switch for private comments. Even when `true`, each `bug_comments` call must also pass `include_private = true` |
 | `read_only` | boolean | `false` | Strip write capabilities from every grant and remove write tools from the tool listing. The `--read-only` flag ORs into this |
 | `disabled_tools` | array of strings | `[]` | Tool names to remove from the tool listing entirely |

@@ -54,7 +54,7 @@ read_only = false
 # ---------------------------------------------------------------------------
 # Embargoed security bugs: fully invisible.
 #
-# NOTE: criteria inside one `match` are ANDed (a bug must satisfy all of
+# NOTE: criteria inside one `match` are AND-ed (a bug must satisfy all of
 # them), while entries inside one list are ORed. "In an embargo group OR
 # carrying the embargo keyword" therefore needs two consecutive deny rules.
 #
@@ -111,7 +111,7 @@ capabilities = ["summary"]
 [rule.match]
 # Matches if ANY of the bug's components matches ANY of these globs,
 # regardless of product. Add e.g. products = ["SUSE *"] to narrow it —
-# criteria in one match table are ANDed.
+# criteria in one match table are AND-ed.
 components = ["Partner*"]
 
 # ---------------------------------------------------------------------------
