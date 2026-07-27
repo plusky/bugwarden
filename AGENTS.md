@@ -101,3 +101,30 @@ are never a justification for undoing them.
 - `typos` runs as its own workflow and is not part of the four verification
   commands; `typos.toml` is an allowlist of deliberate spellings, never a
   mask for a real typo.
+
+## Commits and Pull Requests
+
+- One logical, self-contained change per pull request. Independent concerns —
+  two unrelated features, a feature and a drive-by refactor, mechanical
+  reformatting and behavior changes — are separate PRs, even when they were
+  developed together. A reviewer should be able to hold the whole PR in their
+  head.
+- Commit subjects follow Conventional Commits (repose practice):
+  `type(scope): imperative lowercase subject`, no trailing period, at most
+  ~72 characters. Types in use: `feat`, `fix`, `docs`, `test`, `refactor`,
+  `chore`, `ci`; Dependabot owns `build(deps)`. The scope is the crate or
+  area (`core` for bugwarden-core, `server` for the binary crate, `policy`,
+  `release`, …) and is omitted for cross-cutting changes. The body explains
+  what and why, wrapped at ~72 columns.
+- `main` takes rebase merges only, so every commit in a PR lands on `main`
+  verbatim: each commit must build and pass the workspace verification
+  commands on its own (bisectability). Squash fixup noise before pushing;
+  "address review" commits do not land on `main`.
+- PR titles equal the primary commit subject and name the change, not the
+  activity ("feat(server): add attachment download", never "Adding…" /
+  "Updates for…" / "Misc fixes"). The PR body states what changed, why, and
+  how it was verified; security-relevant changes name the DESIGN.md
+  invariants they touch.
+- Changes to guard behavior get an adversarial review against the DESIGN.md
+  invariants before the PR is opened, and the findings addressed or
+  explicitly rebutted in the PR body.
