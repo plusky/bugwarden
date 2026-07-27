@@ -3,9 +3,10 @@
 //! The policy comes ONLY from a TOML file given at startup (`--policy` /
 //! `BUGWARDEN_POLICY`) and is immutable at runtime (invariant I1). It decides,
 //! per bug, which [`Capability`] set the MCP client is granted. The engine is
-//! deliberately fail-closed (I4): whenever information needed for a decision
-//! is missing — most importantly `creation_time` while an age criterion
-//! applies — the decision falls on the restrictive side.
+//! deliberately fail-closed (I4): whenever a rule asks about a field the bug
+//! object did not carry — absent, null, wrongly typed, or a list that could
+//! only be read in part — that rule is undecidable and the bug is denied,
+//! whatever the rule's action.
 //!
 //! TOML shape (all keys are strict; unknown keys are rejected so a typo can
 //! never silently weaken a policy):
@@ -161,6 +162,12 @@ fn any_glob_multi(patterns: &[String], values: &[String]) -> bool {
         .any(|p| values.iter().any(|v| glob_match(p, v)))
 }
 
+/// Whether `haystack` contains any of `needles`, case-insensitively.
+fn contains_any(needles: &[String], haystack: &str) -> bool {
+    let hay = haystack.to_lowercase();
+    needles.iter().any(|n| hay.contains(&n.to_lowercase()))
+}
+
 /// `now - days`, or `None` when the subtraction is not representable.
 ///
 /// Callers must treat `None` as "the cutoff cannot be computed" and fail
@@ -200,8 +207,32 @@ pub struct Matcher {
     #[serde(default)]
     pub priorities: Vec<String>,
     /// Case-insensitive substrings searched in the bug's whiteboard.
+    ///
+    /// A whiteboard the classification data does not carry is unknown, not
+    /// empty, and unknown resolves per `unknown_matches` in
+    /// [`Matcher::matches`] (I4). An empty whiteboard is knowledge: it
+    /// simply contains no substring.
     #[serde(default)]
     pub whiteboard_contains: Vec<String>,
+    /// Case-insensitive substrings searched in the bug's summary.
+    ///
+    /// Security teams routinely mark an undisclosed issue in the bug title,
+    /// and for such a bug the one-line summary is itself the sensitive part,
+    /// so this criterion exists to deny on the title alone. An unreadable
+    /// summary is handled like an unreadable whiteboard (I4).
+    #[serde(default)]
+    pub summary_contains: Vec<String>,
+    /// Matches on whether the bug carries a group restriction at all:
+    /// `true` selects bugs readable only by at least one Bugzilla group,
+    /// `false` selects world-readable bugs.
+    ///
+    /// Group NAMES differ per instance, so a policy that must hold on any
+    /// Bugzilla cannot enumerate them; this criterion asks the
+    /// instance-independent question instead. A bug whose group list could
+    /// not be read answers neither way and resolves per `unknown_matches`
+    /// (I4), whichever side the rule asked about.
+    #[serde(default)]
+    pub group_restricted: Option<bool>,
     /// Matches when `creation_time` is newer than `now - N days`.
     ///
     /// A bug with a missing/unparsable `creation_time` MATCHES this
@@ -211,60 +242,133 @@ pub struct Matcher {
     pub younger_than_days: Option<i64>,
 }
 
+/// The result of testing a bug against a [`Matcher`].
+///
+/// The third state is what makes fail-closed classification possible: a rule
+/// can hold, not hold, or be undecidable because the classification data did
+/// not carry a field the rule asks about. [`Policy::classify`] must never
+/// resolve `Unknown` into a grant (I4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchOutcome {
+    /// Every criterion held, on data that could be read.
+    Yes,
+    /// A criterion definitively did not hold; the rule does not apply.
+    No,
+    /// No criterion ruled the bug out, but at least one could not be
+    /// evaluated because its field was absent or unreadable.
+    Unknown,
+}
+
+impl MatchOutcome {
+    /// Whether every criterion held on readable data.
+    pub fn is_yes(self) -> bool {
+        self == MatchOutcome::Yes
+    }
+}
+
 impl Matcher {
-    /// Whether `bug` satisfies every criterion present in this matcher.
+    /// Test `bug` against every criterion present in this matcher.
     ///
     /// `now` is passed in (rather than read from the clock) so that
     /// classification of a batch is consistent and tests are deterministic.
-    pub fn matches(&self, bug: &BugMeta, now: DateTime<Utc>) -> bool {
-        if !self.products.is_empty() && !any_glob(&self.products, &bug.product) {
-            return false;
-        }
-        if !self.components.is_empty() && !any_glob_multi(&self.components, &bug.components) {
-            return false;
-        }
-        if !self.groups.is_empty() && !any_glob_multi(&self.groups, &bug.groups) {
-            return false;
-        }
-        if !self.keywords.is_empty() && !any_glob_multi(&self.keywords, &bug.keywords) {
-            return false;
-        }
-        if !self.statuses.is_empty() && !any_glob(&self.statuses, &bug.status) {
-            return false;
-        }
-        if !self.severities.is_empty() && !any_glob(&self.severities, &bug.severity) {
-            return false;
-        }
-        if !self.priorities.is_empty() && !any_glob(&self.priorities, &bug.priority) {
-            return false;
-        }
-        if !self.whiteboard_contains.is_empty() {
-            let wb = bug.whiteboard.to_lowercase();
-            if !self
-                .whiteboard_contains
-                .iter()
-                .any(|s| wb.contains(&s.to_lowercase()))
-            {
-                return false;
+    ///
+    /// A criterion whose field is `None` in [`BugMeta`] — absent from the
+    /// bug object, or present in a shape the parser could not read — cannot
+    /// be evaluated and yields [`MatchOutcome::Unknown`], unless some other
+    /// criterion already ruled the bug out (a definitive `No` wins, because
+    /// then the unreadable field cannot change the answer).
+    pub fn evaluate(&self, bug: &BugMeta, now: DateTime<Utc>) -> MatchOutcome {
+        let mut unknown = false;
+
+        // Globs against a single value.
+        for (patterns, value) in [
+            (&self.products, &bug.product),
+            (&self.statuses, &bug.status),
+            (&self.severities, &bug.severity),
+            (&self.priorities, &bug.priority),
+        ] {
+            if patterns.is_empty() {
+                continue;
+            }
+            match value {
+                None => unknown = true,
+                Some(v) => {
+                    if !any_glob(patterns, v) {
+                        return MatchOutcome::No;
+                    }
+                }
             }
         }
+
+        // Globs against any element of a list.
+        for (patterns, values) in [
+            (&self.components, &bug.components),
+            (&self.groups, &bug.groups),
+            (&self.keywords, &bug.keywords),
+        ] {
+            if patterns.is_empty() {
+                continue;
+            }
+            match values {
+                None => unknown = true,
+                Some(vs) => {
+                    if !any_glob_multi(patterns, vs) {
+                        return MatchOutcome::No;
+                    }
+                }
+            }
+        }
+
+        // Case-insensitive substring searches in free text.
+        for (needles, text) in [
+            (&self.whiteboard_contains, &bug.whiteboard),
+            (&self.summary_contains, &bug.summary),
+        ] {
+            if needles.is_empty() {
+                continue;
+            }
+            match text {
+                None => unknown = true,
+                Some(t) => {
+                    if !contains_any(needles, t) {
+                        return MatchOutcome::No;
+                    }
+                }
+            }
+        }
+
+        if let Some(want_restricted) = self.group_restricted {
+            match &bug.groups {
+                None => unknown = true,
+                Some(groups) => {
+                    if !groups.is_empty() != want_restricted {
+                        return MatchOutcome::No;
+                    }
+                }
+            }
+        }
+
         if let Some(days) = self.younger_than_days {
             match (bug.creation_time, age_cutoff(now, days)) {
-                // Missing creation_time: the bug's age is unknown, treat it
-                // as young so deny/restrict rules still apply (fail closed).
-                (None, _) => {}
+                // Age unreadable: undecidable like any other missing field.
+                (None, _) => unknown = true,
                 // Cutoff not representable: the window covers all of
                 // representable time, so every bug counts as young.
                 (Some(_), None) => {}
                 (Some(ct), Some(cutoff)) => {
                     if ct <= cutoff {
                         // Strictly older than N days => not "younger than".
-                        return false;
+                        return MatchOutcome::No;
                     }
                 }
             }
         }
-        true
+
+        if unknown {
+            MatchOutcome::Unknown
+        } else {
+            MatchOutcome::Yes
+        }
     }
 }
 
@@ -490,14 +594,38 @@ impl Policy {
             }
         }
         for rule in &self.rules {
-            if rule.matcher.matches(bug, now) {
-                return match rule.action {
-                    Action::Deny => Access::Denied {
-                        rule: rule.name.clone(),
-                    },
-                    Action::Allow => self.grant(Capability::ALL.iter().copied(), &rule.name),
-                    Action::Restrict => self.grant(rule.capabilities.iter().copied(), &rule.name),
-                };
+            match rule.matcher.evaluate(bug, now) {
+                // The rule definitively does not apply; try the next one.
+                MatchOutcome::No => continue,
+                MatchOutcome::Yes => {
+                    return match rule.action {
+                        Action::Deny => Access::Denied {
+                            rule: rule.name.clone(),
+                        },
+                        Action::Allow => self.grant(Capability::ALL.iter().copied(), &rule.name),
+                        Action::Restrict => {
+                            self.grant(rule.capabilities.iter().copied(), &rule.name)
+                        }
+                    };
+                }
+                // The rule's verdict hinges on metadata that could not be
+                // read. A deny rule denies — the bug may well be what the
+                // rule looks for. A granting rule (allow, and restrict:
+                // under a denying default a restrict rule GRANTS) must not
+                // hand out access on data nobody could check, and must not
+                // be skipped either, because skipping would pass the bug to
+                // a later granting rule or to an allowing default. Both
+                // horns lead to the same fail-closed answer (I4).
+                MatchOutcome::Unknown => {
+                    return match rule.action {
+                        Action::Deny => Access::Denied {
+                            rule: rule.name.clone(),
+                        },
+                        Action::Allow | Action::Restrict => Access::Denied {
+                            rule: format!("{}:unreadable-metadata", rule.name),
+                        },
+                    };
+                }
             }
         }
         match self.default_action {
@@ -524,82 +652,111 @@ impl Policy {
 }
 
 /// The subset of bug fields the policy engine classifies on.
+///
+/// Every field is optional and `None` means UNKNOWN — the bug object did not
+/// carry it, or carried it in a shape the parser could not read. Unknown is
+/// never silently downgraded to empty: an unreadable field makes the
+/// criteria that consult it undecidable, which [`Policy::classify`] resolves
+/// on the restrictive side (I4).
 #[derive(Debug, Clone, Default)]
 pub struct BugMeta {
     /// Bug id (`0` when absent from the JSON — never a valid Bugzilla id).
     pub id: u64,
+    /// One-line summary (bug title).
+    pub summary: Option<String>,
     /// Product name.
-    pub product: String,
+    pub product: Option<String>,
     /// Component names; the REST `component` field may be a string or array.
-    pub components: Vec<String>,
+    pub components: Option<Vec<String>>,
     /// Current status.
-    pub status: String,
+    pub status: Option<String>,
     /// Severity.
-    pub severity: String,
+    pub severity: Option<String>,
     /// Priority.
-    pub priority: String,
+    pub priority: Option<String>,
     /// Keywords.
-    pub keywords: Vec<String>,
-    /// Group names the bug is in (embargo/security groups live here).
-    pub groups: Vec<String>,
+    pub keywords: Option<Vec<String>>,
+    /// Group names the bug is in. An empty list means world-readable, which
+    /// is knowledge; `None` means the group list could not be read, which is
+    /// not.
+    pub groups: Option<Vec<String>>,
     /// Whiteboard text.
-    pub whiteboard: String,
-    /// Creation time; `None` when absent or unparsable, which fails closed
-    /// wherever an age criterion applies (I4).
+    pub whiteboard: Option<String>,
+    /// Creation time; `None` when absent or unparsable.
     pub creation_time: Option<DateTime<Utc>>,
 }
 
-fn json_str(v: &Value, key: &str) -> String {
-    v.get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
+/// A string field, or `None` when absent or not a string.
+fn str_field(v: &Value, key: &str) -> Option<String> {
+    match v.get(key) {
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None,
+    }
 }
 
-fn json_str_list(v: &Value, key: &str) -> Vec<String> {
+/// A list-of-names field, or `None` when it cannot be read IN FULL.
+///
+/// Bugzilla returns these as a single name, an array of names, or an array
+/// of objects carrying a `name` key. An element in none of those shapes
+/// makes the WHOLE list unknown rather than being dropped: a partially
+/// recovered list looks like a shorter list, and a group list that lost its
+/// only element would look exactly like a world-readable bug.
+fn list_field(v: &Value, key: &str) -> Option<Vec<String>> {
     match v.get(key) {
-        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::String(s)) => Some(vec![s.clone()]),
         Some(Value::Array(items)) => items
             .iter()
-            .filter_map(|item| match item {
+            .map(|item| match item {
                 Value::String(s) => Some(s.clone()),
-                // Some Bugzilla versions return groups as objects.
                 Value::Object(o) => o.get("name").and_then(Value::as_str).map(str::to_string),
                 _ => None,
             })
             .collect(),
-        _ => Vec::new(),
+        _ => None,
+    }
+}
+
+/// The whiteboard, which arrives as `whiteboard` or (XML-RPC style)
+/// `status_whiteboard`.
+///
+/// `whiteboard` wins when it carries text; an empty one falls back to the
+/// legacy key. A key that is present but unreadable makes the whiteboard
+/// unknown — it may have held the very marker a rule looks for.
+fn whiteboard_field(v: &Value) -> Option<String> {
+    let unreadable = |key: &str| v.get(key).is_some() && str_field(v, key).is_none();
+    match (
+        str_field(v, "whiteboard"),
+        str_field(v, "status_whiteboard"),
+    ) {
+        (Some(wb), _) if !wb.is_empty() => Some(wb),
+        (Some(wb), Some(legacy)) => Some(if legacy.is_empty() { wb } else { legacy }),
+        (Some(wb), None) if !unreadable("status_whiteboard") => Some(wb),
+        (None, Some(legacy)) if !unreadable("whiteboard") => Some(legacy),
+        _ => None,
     }
 }
 
 impl BugMeta {
     /// Build classification metadata from a Bugzilla REST bug object.
     ///
-    /// Tolerant on shape: missing or oddly-typed fields become defaults. The
-    /// REST `component` field may be a string or an array of strings; `groups`
-    /// elements may be plain names or objects carrying a `name` key; the
-    /// whiteboard may arrive as `whiteboard` or (XML-RPC style)
-    /// `status_whiteboard`. An unparsable `creation_time` becomes `None`,
-    /// which is treated fail-closed by every age criterion (I4).
+    /// Tolerant on shape — the `component` field may be a string or an array
+    /// of strings, `groups` elements may be plain names or objects carrying a
+    /// `name` key, the whiteboard may arrive under either key — but tolerance
+    /// stops short of pretending a field was there. Anything absent, null,
+    /// oddly typed, or only partially recoverable becomes `None`, i.e.
+    /// unknown, which fails closed during classification (I4).
     pub fn from_json(v: &Value) -> BugMeta {
-        let whiteboard = {
-            let wb = json_str(v, "whiteboard");
-            if wb.is_empty() {
-                json_str(v, "status_whiteboard")
-            } else {
-                wb
-            }
-        };
         BugMeta {
             id: v.get("id").and_then(Value::as_u64).unwrap_or(0),
-            product: json_str(v, "product"),
-            components: json_str_list(v, "component"),
-            status: json_str(v, "status"),
-            severity: json_str(v, "severity"),
-            priority: json_str(v, "priority"),
-            keywords: json_str_list(v, "keywords"),
-            groups: json_str_list(v, "groups"),
-            whiteboard,
+            summary: str_field(v, "summary"),
+            product: str_field(v, "product"),
+            components: list_field(v, "component"),
+            status: str_field(v, "status"),
+            severity: str_field(v, "severity"),
+            priority: str_field(v, "priority"),
+            keywords: list_field(v, "keywords"),
+            groups: list_field(v, "groups"),
+            whiteboard: whiteboard_field(v),
             creation_time: v
                 .get("creation_time")
                 .and_then(Value::as_str)
@@ -660,17 +817,19 @@ mod tests {
         t("2026-01-15T12:00:00Z")
     }
 
+    /// A bug whose every classification field is readable.
     fn meta() -> BugMeta {
         BugMeta {
             id: 42,
-            product: "openSUSE Tumbleweed".into(),
-            components: vec!["Kernel".into(), "Base".into()],
-            status: "NEW".into(),
-            severity: "Major".into(),
-            priority: "P2".into(),
-            keywords: vec!["regression".into()],
-            groups: vec![],
-            whiteboard: "needs-triage [qa:blocked]".into(),
+            summary: Some("kernel panic on boot".into()),
+            product: Some("openSUSE Tumbleweed".into()),
+            components: Some(vec!["Kernel".into(), "Base".into()]),
+            status: Some("NEW".into()),
+            severity: Some("Major".into()),
+            priority: Some("P2".into()),
+            keywords: Some(vec!["regression".into()]),
+            groups: Some(vec![]),
+            whiteboard: Some("needs-triage [qa:blocked]".into()),
             creation_time: Some(t("2025-06-01T00:00:00Z")),
         }
     }
@@ -779,8 +938,15 @@ mod tests {
 
     #[test]
     fn empty_matcher_matches_everything() {
-        assert!(Matcher::default().matches(&meta(), now()));
-        assert!(Matcher::default().matches(&BugMeta::default(), now()));
+        assert!(Matcher::default().evaluate(&meta(), now()).is_yes());
+        assert!(Matcher::default()
+            .evaluate(&BugMeta::default(), now())
+            .is_yes());
+        // A catch-all stays a catch-all in an allow rule: with no criteria
+        // there is nothing for unknown metadata to resolve.
+        assert!(Matcher::default()
+            .evaluate(&BugMeta::default(), now())
+            .is_yes());
     }
 
     #[test]
@@ -789,12 +955,12 @@ mod tests {
             products: vec!["opensuse*".into()],
             ..Default::default()
         };
-        assert!(m.matches(&meta(), now()));
+        assert!(m.evaluate(&meta(), now()).is_yes());
         let m = Matcher {
             products: vec!["SLE*".into()],
             ..Default::default()
         };
-        assert!(!m.matches(&meta(), now()));
+        assert!(!m.evaluate(&meta(), now()).is_yes());
     }
 
     #[test]
@@ -803,7 +969,7 @@ mod tests {
             products: vec!["SLE*".into(), "openSUSE*".into()],
             ..Default::default()
         };
-        assert!(m.matches(&meta(), now()));
+        assert!(m.evaluate(&meta(), now()).is_yes());
     }
 
     #[test]
@@ -814,14 +980,14 @@ mod tests {
             statuses: vec!["RESOLVED".into()],
             ..Default::default()
         };
-        assert!(!m.matches(&meta(), now()));
+        assert!(!m.evaluate(&meta(), now()).is_yes());
         // Both match => match.
         let m = Matcher {
             products: vec!["openSUSE*".into()],
             statuses: vec!["new".into()],
             ..Default::default()
         };
-        assert!(m.matches(&meta(), now()));
+        assert!(m.evaluate(&meta(), now()).is_yes());
     }
 
     #[test]
@@ -830,25 +996,25 @@ mod tests {
             components: vec!["base".into()],
             ..Default::default()
         };
-        assert!(m.matches(&meta(), now())); // second component, case folded
+        assert!(m.evaluate(&meta(), now()).is_yes()); // second component, case folded
         let m = Matcher {
             components: vec!["YaST*".into()],
             ..Default::default()
         };
-        assert!(!m.matches(&meta(), now()));
+        assert!(!m.evaluate(&meta(), now()).is_yes());
     }
 
     #[test]
     fn matcher_groups_any_of() {
         let mut bug = meta();
-        bug.groups = vec!["suse-security".into()];
+        bug.groups = Some(vec!["suse-security".into()]);
         let m = Matcher {
             groups: vec!["*security*".into()],
             ..Default::default()
         };
-        assert!(m.matches(&bug, now()));
+        assert!(m.evaluate(&bug, now()).is_yes());
         // A bug with no groups cannot satisfy a group criterion.
-        assert!(!m.matches(&meta(), now()));
+        assert!(!m.evaluate(&meta(), now()).is_yes());
     }
 
     #[test]
@@ -857,18 +1023,18 @@ mod tests {
             keywords: vec!["REGRESSION".into()],
             ..Default::default()
         };
-        assert!(m.matches(&meta(), now()));
+        assert!(m.evaluate(&meta(), now()).is_yes());
         let m = Matcher {
             severities: vec!["major".into()],
             priorities: vec!["p2".into()],
             ..Default::default()
         };
-        assert!(m.matches(&meta(), now()));
+        assert!(m.evaluate(&meta(), now()).is_yes());
         let m = Matcher {
             priorities: vec!["P0".into()],
             ..Default::default()
         };
-        assert!(!m.matches(&meta(), now()));
+        assert!(!m.evaluate(&meta(), now()).is_yes());
     }
 
     #[test]
@@ -877,12 +1043,254 @@ mod tests {
             whiteboard_contains: vec!["QA:BLOCKED".into()],
             ..Default::default()
         };
-        assert!(m.matches(&meta(), now()));
+        assert!(m.evaluate(&meta(), now()).is_yes());
         let m = Matcher {
             whiteboard_contains: vec!["embargo".into()],
             ..Default::default()
         };
-        assert!(!m.matches(&meta(), now()));
+        assert!(!m.evaluate(&meta(), now()).is_yes());
+    }
+
+    #[test]
+    fn matcher_unreadable_text_is_unknown_not_empty() {
+        // A field the classification data did not carry cannot be searched,
+        // so the criterion is undecidable — distinct from a field that is
+        // present and simply contains nothing.
+        let m = Matcher {
+            whiteboard_contains: vec!["embargo".into()],
+            ..Default::default()
+        };
+        let unreadable = BugMeta {
+            whiteboard: None,
+            ..meta()
+        };
+        assert_eq!(m.evaluate(&unreadable, now()), MatchOutcome::Unknown);
+        let empty = BugMeta {
+            whiteboard: Some(String::new()),
+            ..meta()
+        };
+        assert_eq!(m.evaluate(&empty, now()), MatchOutcome::No);
+
+        let m = Matcher {
+            summary_contains: vec!["embargo".into()],
+            ..Default::default()
+        };
+        let unreadable = BugMeta {
+            summary: None,
+            ..meta()
+        };
+        assert_eq!(m.evaluate(&unreadable, now()), MatchOutcome::Unknown);
+    }
+
+    #[test]
+    fn matcher_summary_substring_case_insensitive() {
+        let m = Matcher {
+            summary_contains: vec!["PANIC".into()],
+            ..Default::default()
+        };
+        assert!(m.evaluate(&meta(), now()).is_yes());
+        let m = Matcher {
+            summary_contains: vec!["embargo".into()],
+            ..Default::default()
+        };
+        assert_eq!(m.evaluate(&meta(), now()), MatchOutcome::No);
+        let marked = BugMeta {
+            summary: Some("EMBARGOED: CVE-2026-1: openssl: heap overflow".into()),
+            ..meta()
+        };
+        assert!(m.evaluate(&marked, now()).is_yes());
+    }
+
+    #[test]
+    fn matcher_group_restricted() {
+        let restricted = BugMeta {
+            groups: Some(vec!["security-internal".into()]),
+            ..meta()
+        };
+        let public = meta(); // groups: Some(vec![]) — readable and empty
+
+        let want_restricted = Matcher {
+            group_restricted: Some(true),
+            ..Default::default()
+        };
+        assert!(want_restricted.evaluate(&restricted, now()).is_yes());
+        assert_eq!(want_restricted.evaluate(&public, now()), MatchOutcome::No);
+
+        let want_public = Matcher {
+            group_restricted: Some(false),
+            ..Default::default()
+        };
+        assert!(want_public.evaluate(&public, now()).is_yes());
+        assert_eq!(want_public.evaluate(&restricted, now()), MatchOutcome::No);
+    }
+
+    #[test]
+    fn matcher_group_restricted_unreadable_is_unknown_either_way() {
+        // Whichever side the rule asks about, a group list that could not be
+        // read answers neither — the outcome is undecidable, and it is
+        // classify() that resolves it on the restrictive side.
+        let unreadable = BugMeta {
+            groups: None,
+            ..meta()
+        };
+        for asked in [true, false] {
+            let m = Matcher {
+                group_restricted: Some(asked),
+                ..Default::default()
+            };
+            assert_eq!(
+                m.evaluate(&unreadable, now()),
+                MatchOutcome::Unknown,
+                "asked for group_restricted = {asked}"
+            );
+        }
+    }
+
+    #[test]
+    fn matcher_every_criterion_reports_unknown_on_an_unreadable_field() {
+        // No criterion may silently treat "could not read" as "empty".
+        let cases: Vec<(Matcher, BugMeta)> = vec![
+            (
+                Matcher {
+                    products: vec!["*".into()],
+                    ..Default::default()
+                },
+                BugMeta {
+                    product: None,
+                    ..meta()
+                },
+            ),
+            (
+                Matcher {
+                    components: vec!["*".into()],
+                    ..Default::default()
+                },
+                BugMeta {
+                    components: None,
+                    ..meta()
+                },
+            ),
+            (
+                Matcher {
+                    groups: vec!["*".into()],
+                    ..Default::default()
+                },
+                BugMeta {
+                    groups: None,
+                    ..meta()
+                },
+            ),
+            (
+                Matcher {
+                    keywords: vec!["*".into()],
+                    ..Default::default()
+                },
+                BugMeta {
+                    keywords: None,
+                    ..meta()
+                },
+            ),
+            (
+                Matcher {
+                    statuses: vec!["*".into()],
+                    ..Default::default()
+                },
+                BugMeta {
+                    status: None,
+                    ..meta()
+                },
+            ),
+            (
+                Matcher {
+                    severities: vec!["*".into()],
+                    ..Default::default()
+                },
+                BugMeta {
+                    severity: None,
+                    ..meta()
+                },
+            ),
+            (
+                Matcher {
+                    priorities: vec!["*".into()],
+                    ..Default::default()
+                },
+                BugMeta {
+                    priority: None,
+                    ..meta()
+                },
+            ),
+            (
+                Matcher {
+                    summary_contains: vec!["x".into()],
+                    ..Default::default()
+                },
+                BugMeta {
+                    summary: None,
+                    ..meta()
+                },
+            ),
+            (
+                Matcher {
+                    whiteboard_contains: vec!["x".into()],
+                    ..Default::default()
+                },
+                BugMeta {
+                    whiteboard: None,
+                    ..meta()
+                },
+            ),
+            (
+                Matcher {
+                    younger_than_days: Some(5),
+                    ..Default::default()
+                },
+                BugMeta {
+                    creation_time: None,
+                    ..meta()
+                },
+            ),
+        ];
+        for (i, (m, bug)) in cases.into_iter().enumerate() {
+            assert_eq!(m.evaluate(&bug, now()), MatchOutcome::Unknown, "case {i}");
+        }
+    }
+
+    #[test]
+    fn matcher_definitive_no_wins_over_unknown() {
+        // An unreadable field cannot rescue a rule that another criterion
+        // already ruled out; such a rule genuinely does not apply.
+        let m = Matcher {
+            products: vec!["SomethingElse".into()],
+            summary_contains: vec!["embargo".into()],
+            ..Default::default()
+        };
+        let bug = BugMeta {
+            summary: None,
+            ..meta()
+        };
+        assert_eq!(m.evaluate(&bug, now()), MatchOutcome::No);
+    }
+
+    #[test]
+    fn matcher_criteria_are_anded() {
+        // A marker rule scoped by age must need BOTH, not either.
+        let m = Matcher {
+            summary_contains: vec!["embargo".into()],
+            younger_than_days: Some(30),
+            ..Default::default()
+        };
+        let old_marked = BugMeta {
+            summary: Some("EMBARGOED: CVE-2026-1".into()),
+            creation_time: Some(t("2025-01-01T00:00:00Z")),
+            ..meta()
+        };
+        assert!(!m.evaluate(&old_marked, now()).is_yes());
+        let fresh_marked = BugMeta {
+            creation_time: Some(t("2026-01-14T00:00:00Z")),
+            ..old_marked
+        };
+        assert!(m.evaluate(&fresh_marked, now()).is_yes());
     }
 
     #[test]
@@ -893,9 +1301,9 @@ mod tests {
         };
         let mut bug = meta();
         bug.creation_time = Some(t("2026-01-10T00:00:00Z")); // 5 days old
-        assert!(m.matches(&bug, now()));
+        assert!(m.evaluate(&bug, now()).is_yes());
         bug.creation_time = Some(t("2025-06-01T00:00:00Z")); // months old
-        assert!(!m.matches(&bug, now()));
+        assert!(!m.evaluate(&bug, now()).is_yes());
     }
 
     #[test]
@@ -907,22 +1315,23 @@ mod tests {
         let mut bug = meta();
         // Exactly 7 days old: not strictly newer than the cutoff => no match.
         bug.creation_time = Some(t("2026-01-08T12:00:00Z"));
-        assert!(!m.matches(&bug, now()));
+        assert!(!m.evaluate(&bug, now()).is_yes());
         // One second younger => match.
         bug.creation_time = Some(t("2026-01-08T12:00:01Z"));
-        assert!(m.matches(&bug, now()));
+        assert!(m.evaluate(&bug, now()).is_yes());
     }
 
     #[test]
-    fn matcher_younger_than_days_missing_creation_time_fails_closed() {
+    fn matcher_younger_than_days_missing_creation_time_is_unknown() {
         let m = Matcher {
             younger_than_days: Some(30),
             ..Default::default()
         };
         let mut bug = meta();
         bug.creation_time = None;
-        // Unknown age counts as young so deny/restrict rules still apply (I4).
-        assert!(m.matches(&bug, now()));
+        // An age that cannot be established makes the criterion undecidable;
+        // classify() is what turns that into a denial (I4).
+        assert_eq!(m.evaluate(&bug, now()), MatchOutcome::Unknown);
     }
 
     #[test]
@@ -932,7 +1341,7 @@ mod tests {
             younger_than_days: Some(i64::MAX),
             ..Default::default()
         };
-        assert!(m.matches(&meta(), now()));
+        assert!(m.evaluate(&meta(), now()).is_yes());
     }
 
     // ---------- Policy parsing + validation ----------
@@ -1171,7 +1580,7 @@ products = ["*"]
         }
         // A bug the first rule does not match falls through to the second.
         let mut other_bug = meta();
-        other_bug.product = "GNOME".into();
+        other_bug.product = Some("GNOME".into());
         match p.classify(&other_bug, now()) {
             Access::Granted { rule, .. } => assert_eq!(rule, "second"),
             other => panic!("expected grant from catch-all, got {other:?}"),
@@ -1191,7 +1600,7 @@ groups = ["*security*", "*embargo*"]
 "#;
         let p = Policy::from_toml_str(s).unwrap();
         let mut bug = meta();
-        bug.groups = vec!["suse-security-internal".into()];
+        bug.groups = Some(vec!["suse-security-internal".into()]);
         match p.classify(&bug, now()) {
             Access::Denied { rule } => assert_eq!(rule, "embargo"),
             other => panic!("embargoed bug must be denied, got {other:?}"),
@@ -1398,6 +1807,107 @@ capabilities = ["summary", "comment", "status"]
     }
 
     #[test]
+    fn classify_unreadable_metadata_never_grants() {
+        // A granting rule whose verdict hinges on a field nobody could read
+        // must not grant, and must not be skipped into a permissive default
+        // either. Both an allow rule under an allowing default and a
+        // restrict rule under a denying default are grants (I4).
+        let unreadable = BugMeta {
+            creation_time: None,
+            ..meta()
+        };
+        let known_fresh = BugMeta {
+            creation_time: Some(t("2026-01-14T00:00:00Z")),
+            ..meta()
+        };
+
+        let allow_rule = Policy::from_toml_str(concat!(
+            "default_action = \"allow\"\n",
+            "[[rule]]\nname = \"fresh\"\naction = \"allow\"\n",
+            "[rule.match]\nyounger_than_days = 30\n",
+        ))
+        .unwrap();
+        assert!(matches!(
+            allow_rule.classify(&unreadable, now()),
+            Access::Denied { .. }
+        ));
+        assert!(allow_rule
+            .classify(&known_fresh, now())
+            .allows(Capability::Read));
+
+        // The case a permissive default would hide: under `deny`, a restrict
+        // rule is the only thing granting anything at all.
+        let restrict_rule = Policy::from_toml_str(concat!(
+            "default_action = \"deny\"\n",
+            "[[rule]]\nname = \"recent-summaries\"\naction = \"restrict\"\n",
+            "capabilities = [\"summary\"]\n",
+            "[rule.match]\nyounger_than_days = 30\n",
+        ))
+        .unwrap();
+        assert!(matches!(
+            restrict_rule.classify(&unreadable, now()),
+            Access::Denied { .. }
+        ));
+        assert!(restrict_rule
+            .classify(&known_fresh, now())
+            .allows(Capability::Summary));
+    }
+
+    #[test]
+    fn classify_unreadable_metadata_does_not_slip_past_a_later_deny_rule() {
+        // First-match-wins: a granting rule that matches only because of an
+        // unreadable field must not short-circuit the deny rule that would
+        // have caught the bug had the field been readable.
+        let p = Policy::from_toml_str(concat!(
+            "default_action = \"allow\"\n",
+            "[[rule]]\nname = \"triage\"\naction = \"restrict\"\n",
+            "capabilities = [\"summary\", \"comments\"]\n",
+            "[rule.match]\nwhiteboard_contains = [\"needs-triage\"]\n",
+            "[[rule]]\nname = \"undisclosed\"\naction = \"deny\"\n",
+            "[rule.match]\nsummary_contains = [\"embargo\"]\n",
+        ))
+        .unwrap();
+        // Readable: the deny rule catches it.
+        let readable = BugMeta {
+            summary: Some("EMBARGOED: CVE-2026-1: openssl".into()),
+            whiteboard: Some(String::new()),
+            ..meta()
+        };
+        assert!(matches!(
+            p.classify(&readable, now()),
+            Access::Denied { .. }
+        ));
+        // The same bug with neither field readable must not do better.
+        let unreadable = BugMeta {
+            summary: None,
+            whiteboard: None,
+            ..meta()
+        };
+        assert!(matches!(
+            p.classify(&unreadable, now()),
+            Access::Denied { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_unreadable_field_no_rule_asks_about_is_harmless() {
+        // Fail-closed must not degenerate into "deny everything with a gap":
+        // only the criteria a rule actually uses can make it undecidable.
+        let p = Policy::from_toml_str(concat!(
+            "default_action = \"allow\"\n",
+            "[[rule]]\nname = \"undisclosed\"\naction = \"deny\"\n",
+            "[rule.match]\nsummary_contains = [\"embargo\"]\n",
+        ))
+        .unwrap();
+        let no_whiteboard = BugMeta {
+            summary: Some("ordinary bug".into()),
+            whiteboard: None,
+            ..meta()
+        };
+        assert!(p.classify(&no_whiteboard, now()).allows(Capability::Read));
+    }
+
+    #[test]
     fn classify_hand_built_restrict_default_fails_closed() {
         // Validation forbids default_action = restrict; a hand-constructed
         // Policy carrying it must still deny, never grant.
@@ -1413,58 +1923,116 @@ capabilities = ["summary", "comment", "status"]
 
     #[test]
     fn bugmeta_from_json_full_object() {
-        let v = json!({
-            "id": 123,
-            "product": "openSUSE",
-            "component": ["Kernel", "Base"],
+        let m = BugMeta::from_json(&json!({
+            "id": 7,
+            "summary": "boom",
+            "product": "P",
+            "component": "C",
             "status": "NEW",
-            "severity": "major",
+            "severity": "Major",
             "priority": "P1",
-            "keywords": ["regression"],
-            "groups": ["secgroup"],
+            "keywords": ["k1", "k2"],
+            "groups": ["g1"],
             "whiteboard": "wb-text",
-            "creation_time": "2026-01-10T00:00:00Z",
-        });
-        let m = BugMeta::from_json(&v);
-        assert_eq!(m.id, 123);
-        assert_eq!(m.product, "openSUSE");
-        assert_eq!(m.components, vec!["Kernel", "Base"]);
-        assert_eq!(m.status, "NEW");
-        assert_eq!(m.severity, "major");
-        assert_eq!(m.priority, "P1");
-        assert_eq!(m.keywords, vec!["regression"]);
-        assert_eq!(m.groups, vec!["secgroup"]);
-        assert_eq!(m.whiteboard, "wb-text");
-        assert_eq!(m.creation_time, Some(t("2026-01-10T00:00:00Z")));
+            "creation_time": "2025-01-02T03:04:05Z"
+        }));
+        assert_eq!(m.id, 7);
+        assert_eq!(m.summary.as_deref(), Some("boom"));
+        assert_eq!(m.product.as_deref(), Some("P"));
+        assert_eq!(m.components, Some(vec!["C".to_string()]));
+        assert_eq!(m.status.as_deref(), Some("NEW"));
+        assert_eq!(m.severity.as_deref(), Some("Major"));
+        assert_eq!(m.priority.as_deref(), Some("P1"));
+        assert_eq!(m.keywords, Some(vec!["k1".to_string(), "k2".to_string()]));
+        assert_eq!(m.groups, Some(vec!["g1".to_string()]));
+        assert_eq!(m.whiteboard.as_deref(), Some("wb-text"));
+        assert!(m.creation_time.is_some());
     }
 
     #[test]
     fn bugmeta_component_string_or_array() {
-        let m = BugMeta::from_json(&json!({"component": "Kernel"}));
-        assert_eq!(m.components, vec!["Kernel"]);
-        let m = BugMeta::from_json(&json!({"component": ["A", "B"]}));
-        assert_eq!(m.components, vec!["A", "B"]);
+        assert_eq!(
+            BugMeta::from_json(&json!({"component": "One"})).components,
+            Some(vec!["One".to_string()])
+        );
+        assert_eq!(
+            BugMeta::from_json(&json!({"component": ["One", "Two"]})).components,
+            Some(vec!["One".to_string(), "Two".to_string()])
+        );
     }
 
     #[test]
     fn bugmeta_group_objects_with_name_key() {
         let m = BugMeta::from_json(&json!({"groups": [{"name": "sec"}, "plain"]}));
-        assert_eq!(m.groups, vec!["sec", "plain"]);
+        assert_eq!(m.groups, Some(vec!["sec".to_string(), "plain".to_string()]));
     }
 
     #[test]
-    fn bugmeta_missing_fields_become_defaults() {
+    fn bugmeta_partially_readable_list_is_unknown() {
+        // A group list whose elements cannot be read must NOT collapse into
+        // a shorter list: dropping the only element would make a restricted
+        // bug look world-readable, the most permissive answer there is.
+        for shape in [
+            json!({"groups": [{"id": 12}]}),
+            json!({"groups": [12, 13]}),
+            json!({"groups": [{"name": "sec"}, {"id": 9}]}),
+            json!({"groups": [null]}),
+        ] {
+            let m = BugMeta::from_json(&shape);
+            assert_eq!(m.groups, None, "shape {shape}");
+        }
+        // An empty list is fully readable: the bug really is world-readable.
+        assert_eq!(
+            BugMeta::from_json(&json!({"groups": []})).groups,
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn bugmeta_missing_fields_are_unknown_not_empty() {
         let m = BugMeta::from_json(&json!({}));
         assert_eq!(m.id, 0);
-        assert!(m.product.is_empty());
-        assert!(m.components.is_empty());
-        assert!(m.groups.is_empty());
-        assert!(m.keywords.is_empty());
-        assert!(m.whiteboard.is_empty());
+        assert!(m.summary.is_none());
+        assert!(m.product.is_none());
+        assert!(m.components.is_none());
+        assert!(m.groups.is_none());
+        assert!(m.keywords.is_none());
+        assert!(m.whiteboard.is_none());
         assert!(m.creation_time.is_none());
         // Even a non-object is tolerated.
         let m = BugMeta::from_json(&Value::Null);
         assert_eq!(m.id, 0);
+        assert!(m.groups.is_none());
+    }
+
+    #[test]
+    fn bugmeta_present_but_empty_is_knowledge() {
+        let m = BugMeta::from_json(&json!({
+            "summary": "", "groups": [], "whiteboard": ""
+        }));
+        assert_eq!(m.summary.as_deref(), Some(""));
+        assert_eq!(m.groups, Some(vec![]));
+        assert_eq!(m.whiteboard.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn bugmeta_wrong_typed_fields_are_unknown() {
+        // null or an unexpected type is not "empty" — the policy cannot read
+        // it, so it must not be mistaken for a bug that carries nothing.
+        let m = BugMeta::from_json(&json!({
+            "summary": null, "groups": null, "whiteboard": null, "product": null
+        }));
+        assert!(m.summary.is_none());
+        assert!(m.groups.is_none());
+        assert!(m.whiteboard.is_none());
+        assert!(m.product.is_none());
+        let m = BugMeta::from_json(&json!({
+            "summary": 7, "groups": {"name": "sec"}, "whiteboard": ["a"], "status": true
+        }));
+        assert!(m.summary.is_none());
+        assert!(m.groups.is_none());
+        assert!(m.whiteboard.is_none());
+        assert!(m.status.is_none());
     }
 
     #[test]
@@ -1478,9 +2046,18 @@ capabilities = ["summary", "comment", "status"]
     #[test]
     fn bugmeta_status_whiteboard_fallback() {
         let m = BugMeta::from_json(&json!({"status_whiteboard": "legacy"}));
-        assert_eq!(m.whiteboard, "legacy");
+        assert_eq!(m.whiteboard.as_deref(), Some("legacy"));
         // "whiteboard" wins when both are present.
         let m = BugMeta::from_json(&json!({"whiteboard": "new", "status_whiteboard": "old"}));
-        assert_eq!(m.whiteboard, "new");
+        assert_eq!(m.whiteboard.as_deref(), Some("new"));
+        // An empty primary falls back to the legacy key.
+        let m = BugMeta::from_json(&json!({"whiteboard": "", "status_whiteboard": "old"}));
+        assert_eq!(m.whiteboard.as_deref(), Some("old"));
+        // An unreadable key on either side makes the whiteboard unknown: the
+        // text that could not be read may have held the marker.
+        let m = BugMeta::from_json(&json!({"whiteboard": 7, "status_whiteboard": ""}));
+        assert!(m.whiteboard.is_none());
+        let m = BugMeta::from_json(&json!({"whiteboard": "", "status_whiteboard": 7}));
+        assert!(m.whiteboard.is_none());
     }
 }

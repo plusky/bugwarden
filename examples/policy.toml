@@ -3,10 +3,12 @@
 #
 # The scenario this file implements:
 #
-#   * embargoed security bugs are completely invisible, always;
+#   * undisclosed (embargoed) security bugs are completely invisible, always;
+#   * so is every bug that is not world-readable — see rule 1, which is
+#     deliberately broader than "security" and can be narrowed;
 #   * bugs labelled "security" are invisible while they are fresher than
 #     5 days (the window in which details are typically still unreviewed);
-#   * everything else is shown to the user in full.
+#   * every other bug is shown to the user in full.
 #
 # The policy is read once at server startup (--policy / BUGWARDEN_POLICY) and
 # is never visible to the MCP client. Parsing is strict: unknown keys anywhere
@@ -16,6 +18,13 @@
 #   1. global.min_bug_age_days (a too-young bug is invisible, no rule runs)
 #   2. [[rule]] entries top to bottom — FIRST MATCH WINS
 #   3. default_action for bugs no rule matched
+#
+# Unreadable metadata: if a bug object does not carry a field some rule asks
+# about — absent, null, wrongly typed, or a list with an unreadable element —
+# that rule cannot be decided and the bug is DENIED, whatever the rule's
+# action. This holds for every criterion below, so none of them repeats it.
+# A field that is present but empty ("" or []) is knowledge, not ignorance,
+# and matches normally.
 #
 # Glob syntax (products/components/groups/keywords/statuses/severities/
 # priorities): case-insensitive match of the whole value; '*' matches any
@@ -54,45 +63,68 @@ read_only = false
 #max_attachment_bytes = 2097152
 
 # ---------------------------------------------------------------------------
-# 1. Embargoed security bugs: fully invisible, at any age.
+# 1. Undisclosed security bugs: fully invisible, at any age.
+#
+# An issue under embargo is one whose public disclosure date has not arrived
+# yet, and it is normally recognisable two ways, independently: the bug is
+# readable only through a Bugzilla group, and its title carries a marker the
+# security team removes when the issue goes public. Either signal alone is
+# enough to hide the bug here, which means a bug that loses one of them (a
+# permission edited by hand, a marker typo) is still covered by the other.
 #
 # NOTE: criteria inside one `match` are AND-ed (a bug must satisfy all of
-# them), while entries inside one list are ORed. "In an embargo group OR
-# carrying the embargo keyword" therefore needs two consecutive deny rules.
+# them), while entries inside one list are ORed. "Restricted OR marked"
+# therefore needs two consecutive deny rules, not one.
 #
-# NOTE: group and keyword names vary per Bugzilla instance — check yours
-# (e.g. openSUSE uses different security group names than Red Hat or Mozilla)
-# and adjust the globs below before deploying this file.
+# NOTE: a bug's title is itself sensitive while the issue is undisclosed — it
+# names the package and often the flaw. That is why these rules use `deny`
+# and not `restrict` with a `summary` capability: a summary view would hand
+# the client exactly the line that must not leak.
 # ---------------------------------------------------------------------------
 
 [[rule]]
-name = "embargoed-groups"
-description = "Bugs restricted to security/embargo groups are invisible"
+name = "group-restricted"
+description = "Bugs that are not world-readable are invisible"
 action = "deny"
 [rule.match]
-# Matches if ANY of the bug's group names matches ANY of these globs.
-groups = ["security-team", "embargo*"]
+# true = the bug is readable only through at least one Bugzilla group. This
+# asks the question in an instance-independent way, so it needs no knowledge
+# of local group names and cannot be defeated by a group being renamed.
+#
+# This is deliberately broad: it also hides non-security bugs that happen to
+# be group-restricted (partner-confidential reports, internal-only products).
+# To hide only the security groups instead, replace this rule with a glob on
+# the names your instance actually uses, e.g. groups = ["*security*"].
+group_restricted = true
+
+[[rule]]
+name = "undisclosed-marker"
+description = "Bugs whose title marks them as not yet disclosed are invisible"
+action = "deny"
+[rule.match]
+# Case-insensitive substring search in the bug's one-line summary.
+summary_contains = ["embargo"]
 
 [[rule]]
 name = "embargo-keyword"
 description = "Bugs flagged with an embargo keyword are invisible"
 action = "deny"
 [rule.match]
+# Keyword vocabularies are per-instance; check yours and adjust these globs.
 keywords = ["security-embargo", "embargo*"]
 
 # ---------------------------------------------------------------------------
 # 2. Fresh security bugs: invisible until they are 5 days old.
 #
 # Both criteria are AND-ed, so these rules hide a bug only while it is BOTH
-# security-labelled AND younger than 5 days. Once it ages past the window no
-# rule matches it any more and default_action ("allow") applies — the bug
-# becomes fully visible without any policy change.
+# security-labelled AND younger than 5 days. Once a world-readable bug ages
+# past the window, no rule matches it any more and default_action ("allow")
+# applies — it becomes fully visible without any policy change. (A
+# group-restricted bug stays hidden at any age: rule 1 catches it first.)
 #
-# A bug whose creation_time is missing or unparsable MATCHES younger_than_days
-# (fail closed): an age that cannot be established is treated as fresh.
-#
-# Three rules because "security" can be expressed three ways; drop the ones
-# your instance does not use.
+# Two rules because "security" can be expressed two ways here; drop the one
+# your instance does not use. A group-based variant would be pointless: any
+# bug in a security group is already denied by rule 1.
 # ---------------------------------------------------------------------------
 
 [[rule]]
@@ -101,14 +133,6 @@ description = "Security-keyworded bugs are hidden for their first 5 days"
 action = "deny"
 [rule.match]
 keywords = ["security*"]
-younger_than_days = 5
-
-[[rule]]
-name = "fresh-security-group"
-description = "Bugs in a security group are hidden for their first 5 days"
-action = "deny"
-[rule.match]
-groups = ["security*"]
 younger_than_days = 5
 
 [[rule]]

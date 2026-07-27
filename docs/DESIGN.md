@@ -28,8 +28,12 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
 - **I3** Search filtering is silent: counts of dropped/filtered results are
   never returned to the client (server-side debug logging is fine).
 - **I4** Fail closed: classification-fetch failure, bug absent from the
-  response, or missing/unparsable `creation_time` when an age rule applies =>
-  Denied.
+  response, or a rule that cannot be decided because the bug object did not
+  carry a field that rule asks about (absent, null, wrongly typed, or only
+  partially recoverable — including an unparsable `creation_time`) => Denied.
+  Unreadable metadata never yields more access than readable metadata would:
+  it satisfies no granting rule, and it does not let a bug slip past a rule
+  that would otherwise have caught it.
 - **I5** Private content (`is_private: true`) is returned only when policy
   `global.allow_private_comments = true` AND the call sets
   `include_private = true`. This one switch governs private comments,
@@ -108,10 +112,21 @@ pub struct Matcher {
     #[serde(default)] pub severities: Vec<String>,         // globs vs severity
     #[serde(default)] pub priorities: Vec<String>,         // globs vs priority
     #[serde(default)] pub whiteboard_contains: Vec<String>,// case-insensitive substrings
-    #[serde(default)] pub younger_than_days: Option<i64>,  // creation_time newer than now-N days; missing creation_time => matches (fail closed)
+    #[serde(default)] pub summary_contains: Vec<String>,   // case-insensitive substrings in the one-line summary
+    #[serde(default)] pub group_restricted: Option<bool>,  // true: readable only via >=1 Bugzilla group; false: world-readable
+    #[serde(default)] pub younger_than_days: Option<i64>,  // creation_time newer than now-N days
 }
+pub enum MatchOutcome { Yes, No, Unknown }
+
 impl Matcher {
-    pub fn matches(&self, bug: &BugMeta, now: chrono::DateTime<chrono::Utc>) -> bool;
+    // Yes: every criterion held. No: one definitively did not (it wins over
+    // Unknown — the rule cannot apply either way). Unknown: nothing ruled the
+    // bug out but a criterion consulted a None field. classify() maps
+    // Unknown to Denied for EVERY action: a deny rule denies, and a granting
+    // rule (allow, or restrict under a denying default) may neither grant nor
+    // be skipped, since skipping would fall through to a later granting rule
+    // or an allowing default. "Present but empty" is knowledge, not Unknown.
+    pub fn evaluate(&self, bug: &BugMeta, now: chrono::DateTime<chrono::Utc>) -> MatchOutcome;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -161,21 +176,28 @@ impl Policy {
     // Every grant (rule or default) strips write caps when global.read_only.
 }
 
+// Every field is Option: None means UNKNOWN (absent, null, wrongly typed, or
+// only partially recoverable), never "empty". A criterion consulting a None
+// field is undecidable, which classify() resolves fail-closed (I4).
 #[derive(Debug, Clone, Default)]
 pub struct BugMeta {
     pub id: u64,
-    pub product: String,
-    pub components: Vec<String>, // REST "component" may be string or array
-    pub status: String,
-    pub severity: String,
-    pub priority: String,
-    pub keywords: Vec<String>,
-    pub groups: Vec<String>,     // group names
-    pub whiteboard: String,
+    pub summary: Option<String>,
+    pub product: Option<String>,
+    pub components: Option<Vec<String>>, // REST "component" may be string or array
+    pub status: Option<String>,
+    pub severity: Option<String>,
+    pub priority: Option<String>,
+    pub keywords: Option<Vec<String>>,
+    pub groups: Option<Vec<String>>,     // group names; Some(vec![]) = world-readable
+    pub whiteboard: Option<String>,      // "whiteboard", falling back to "status_whiteboard"
     pub creation_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 impl BugMeta {
-    pub fn from_json(v: &serde_json::Value) -> BugMeta; // tolerant: missing fields => defaults
+    // Tolerant on SHAPE (component as string or array, group elements as
+    // names or {name} objects, either whiteboard key) but never invents a
+    // value: a list with an unreadable element is None, not a shorter list.
+    pub fn from_json(v: &serde_json::Value) -> BugMeta;
 }
 
 #[derive(Debug, Clone)]

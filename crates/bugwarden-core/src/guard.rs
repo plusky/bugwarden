@@ -543,6 +543,39 @@ products = ["NoView*"]
     }
 
     #[test]
+    fn filter_bug_list_drops_undisclosed_bugs() {
+        // The two signals an undisclosed issue carries — a marker in the
+        // title and a group restriction — each suffice on their own, and a
+        // list entry that cannot answer either question is dropped too.
+        let g = Guard {
+            policy: policy(concat!(
+                "default_action = \"allow\"\n",
+                "[[rule]]\nname = \"restricted\"\naction = \"deny\"\n",
+                "[rule.match]\ngroup_restricted = true\n",
+                "[[rule]]\nname = \"marked\"\naction = \"deny\"\n",
+                "[rule.match]\nsummary_contains = [\"embargo\"]\n",
+            )),
+        };
+        let bugs = vec![
+            json!({"id": 1, "summary": "plain bug", "groups": []}),
+            json!({"id": 2, "summary": "plain bug", "groups": ["security-internal"]}),
+            json!({"id": 3, "summary": "EMBARGOED: CVE-2026-1: pkg", "groups": []}),
+            // Group list in a shape the parser cannot read: the restriction
+            // is unknown, which must not read as "world-readable" (I4).
+            json!({"id": 4, "summary": "plain bug", "groups": [{"id": 12}]}),
+            // Projection carrying neither classification field.
+            json!({"id": 5, "assigned_to": "a@b"}),
+            // Readable groups, unreadable title: the marker rule cannot be
+            // evaluated, so this one goes too.
+            json!({"id": 6, "groups": []}),
+        ];
+        let (kept, dropped) = g.filter_bug_list(bugs);
+        assert_eq!(dropped, 5, "only the plain, world-readable bug survives");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0]["id"], json!(1));
+    }
+
+    #[test]
     fn filter_bug_list_read_restrict_keeps_full_object() {
         let g = Guard {
             policy: policy(

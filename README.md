@@ -68,8 +68,9 @@ is `bug_url`, which computes a URL string locally and contacts nothing.
   filtering happened at all. (Server-side debug logs do record it for the
   operator.)
 - **Fail closed.** If the classification fetch fails, if a bug is absent from
-  the response, or if a bug has no parseable `creation_time` while an age rule
-  applies, the bug is treated as denied — never as allowed.
+  the response, or if a rule cannot be decided because the bug object did not
+  carry a field that rule asks about, the bug is treated as denied — never as
+  allowed.
 - **Private-comment gate.** Private comments are returned only when the policy
   sets `allow_private_comments = true` **and** the individual call opts in
   with `include_private = true`. Either alone is not enough.
@@ -255,7 +256,30 @@ write two consecutive rules.
 | `severities` | array of globs | the bug's severity |
 | `priorities` | array of globs | the bug's priority |
 | `whiteboard_contains` | array of strings | case-insensitive substring search in the whiteboard |
-| `younger_than_days` | integer | matches bugs created within the last N days; a bug with missing `creation_time` **matches** (fail closed, so deny/restrict rules still apply to it) |
+| `summary_contains` | array of strings | case-insensitive substring search in the bug's one-line summary |
+| `group_restricted` | boolean | `true` matches bugs readable only through at least one Bugzilla group, `false` matches world-readable bugs |
+| `younger_than_days` | integer | matches bugs created within the last N days |
+
+#### Unreadable metadata
+
+Every criterion needs a field the bug object may not carry — absent, `null`,
+of an unexpected type, or a list with an element the parser cannot read. Such
+a field is **unknown**, and a rule that consults one is undecidable: it neither
+holds nor fails.
+
+bugwarden resolves an undecidable rule by **denying the bug**, whatever the
+rule's action. A `deny` rule denies because the bug may well be what it was
+written to catch. An `allow` or `restrict` rule denies too — it may not grant
+access on data nobody could check, and it may not simply be skipped either,
+because skipping would hand the bug to a later rule or to `default_action`. So
+unreadable metadata never buys a bug more access than readable metadata would.
+
+Two things this deliberately does *not* do. A criterion that already failed
+definitively wins over an unknown one, so a rule ruled out by another criterion
+stays ruled out. And only the fields a rule actually consults matter — a
+missing whiteboard is irrelevant to a rule that never mentions the whiteboard.
+A field that is present but empty (`""`, `[]`) is knowledge, not ignorance, and
+is matched normally.
 
 #### Glob syntax
 
