@@ -34,6 +34,24 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
   Unreadable metadata never yields more access than readable metadata would:
   it satisfies no granting rule, and it does not let a bug slip past a rule
   that would otherwise have caught it.
+- **I14** A bug id the policy would deny must not appear inside something the
+  client IS shown: dependency/duplicate/see_also fields of a served bug,
+  history changes naming other bugs, or Bugzilla's auto-generated duplicate
+  marker comments. The bar is `Capability::Summary` — the same one the write
+  paths apply before CREATING such a link (I8/I11), since a link read out and
+  a link written in disclose the same fact. Candidate ids come from Bugzilla,
+  not the client, so they are assessed in ONE batched request (Guard::
+  disclosable) rather than per id; a failed fetch scrubs everything (I4).
+  Applies to bug_info, bugs_quicksearch (the client picks the projection, so
+  it can ask for link fields), bug_history, bug_comments and summarize_bug.
+  Only ids actually SERVED in the same response are exempt — a requested id
+  that was DENIED must not be whitelisted, or asking about a hidden bug
+  reveals it through the links of one the client may read.
+  Known limits, deliberate: free-text comments naming a bug number are not
+  touched (unfixable without destroying comments); the duplicate-marker match
+  covers both stock templates but not localised/customised ones; and an
+  instance reachable under a second hostname is not recognised in see_also
+  (scheme and case are).
 - **I5** Private content (`is_private: true`) is returned only when policy
   `global.allow_private_comments = true` AND the call sets
   `include_private = true`. This one switch governs private comments,
@@ -226,10 +244,11 @@ impl Guard {
     /// Fetch CLASSIFY_FIELDS with exactly ONE request per DISTINCT id,
     /// sequentially, whatever each answer turns out to be: the upstream
     /// request count is a function of the requested ids alone, never of the
-    /// verdicts (I2). No batching — Bugzilla signals a nonexistent id by
-    /// failing the whole request but a withheld one by omitting it from a
-    /// success, so any batch-failure reaction spends different work on "no
-    /// such bug" than on "hidden bug". Per-id also makes batch poisoning
+    /// verdicts (I2). No batching — how a batch answers for an id it will not
+    /// serve is deployment-dependent (stock /rest/bug?id=.. omits it, other
+    /// versions and proxies fail the request), and the old retry-on-failure
+    /// therefore spent different work on "no such bug" than on "hidden bug"
+    /// wherever failure is the behaviour. Per-id also makes batch poisoning
     /// impossible, which is what the former retry existed to repair.
     /// A response is credited to an id only when the SERVER labels it with
     /// that id. Any id failing or absent from its own response =>
@@ -247,6 +266,21 @@ impl Guard {
     // of results. Returns the classified objects themselves.
     pub struct SearchRequest<'a> { query, status, include_fields: &'a str, limit, offset: u32 }
     pub const MAX_SEARCH_WINDOW: u32;
+
+    // I14 link scrubbing. Candidate ids come from Bugzilla, not the client,
+    // so ONE batched classify (bounded, and always issued — an empty set
+    // still costs a request, or "no links" and "all links hidden" differ by
+    // the clock). Summary bar, the same one the write paths use.
+    pub const LINKED_ID_FIELDS: &[&str];
+    pub async fn disclosable(&self, bz: &BugzillaClient, key: &str,
+        ids: &BTreeSet<u64>) -> BTreeSet<u64>;
+    pub fn linked_bug_ids(bug: &Value, base_url: &str) -> BTreeSet<u64>;
+    pub fn scrub_bug_links(bug: &mut Value, base_url: &str, ok: &BTreeSet<u64>);
+    pub fn history_bug_ids(history: &Value, base_url: &str) -> BTreeSet<u64>;
+    pub fn scrub_history(history: Value, base_url: &str, ok: &BTreeSet<u64>) -> Value;
+    pub fn duplicate_marker_id(text: &str) -> Option<u64>;      // both stock templates
+    pub fn duplicate_marker_ids(comments: &[Value]) -> BTreeSet<u64>;
+    pub fn scrub_duplicate_markers(comments: Vec<Value>, ok: &BTreeSet<u64>) -> Vec<Value>;
     pub async fn quicksearch_window(&self, bz: &BugzillaClient, key: &str,
         req: &SearchRequest<'_>) -> anyhow::Result<Vec<serde_json::Value>>;
 

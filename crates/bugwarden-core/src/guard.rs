@@ -92,13 +92,15 @@ impl Guard {
     /// therefore a function of the requested ids alone and never of what the
     /// answers turn out to be (I2).
     ///
-    /// This is why the batch is gone. Bugzilla reports a nonexistent id by
-    /// failing the WHOLE request, while a bug the caller may not see is
-    /// silently omitted from a successful one — so any scheme that reacts to
-    /// a batch failure spends different work on "no such bug" than on "hidden
-    /// bug", and a client with a clock can tell the two apart. Per-id also
-    /// removes batch poisoning outright: one bad id can no longer take the
-    /// others down with it, which is what the old retry existed to repair.
+    /// This is why the batch is gone. How a batch answers for an id it will
+    /// not serve is deployment-dependent: `/rest/bug?id=..` routes to
+    /// Bug.search on stock Bugzilla and simply omits it, while other versions
+    /// and proxies fail the whole request. The old code retried per id ONLY
+    /// on failure, so wherever a batch does fail, "no such bug" cost a retry
+    /// and "hidden bug" did not — a difference a clock can read. Fetching per
+    /// id always removes the dependency on which behaviour an instance has,
+    /// and removes batch poisoning outright: one bad id can no longer take
+    /// the others down with it, which is what the retry existed to repair.
     ///
     /// Any id that fails or is absent from its response maps to
     /// `(Access::Denied { rule: "unavailable" }, Value::Null)` — every
@@ -335,6 +337,357 @@ impl Guard {
         Ok(visible[start..end].to_vec())
     }
 
+    /// Bug fields that carry references to OTHER bugs, as id lists.
+    ///
+    /// `dupe_of` is a scalar rather than a list and is handled separately.
+    /// Legacy and instance-specific spellings are included: an unknown
+    /// id-bearing field is a leak, so the list errs towards over-matching.
+    pub const LINKED_ID_FIELDS: &[&str] = &[
+        "blocks",
+        "depends_on",
+        "dependson",
+        "duplicates",
+        "regressed_by",
+        "regressions",
+        "blocked",
+    ];
+
+    /// Which of `ids` may be NAMED inside something the client is being
+    /// shown.
+    ///
+    /// The bar is [`Capability::Summary`] — the same one the write paths
+    /// already apply to link targets (I8/I11), because a link and a written
+    /// link disclose the same fact: that this bug exists.
+    ///
+    /// One batched request whatever the ids, unlike [`Guard::assess`]: these
+    /// ids come from Bugzilla's own answer, not from the client, so their
+    /// number is not something a client can choose to probe with. A failed
+    /// fetch yields the empty set — everything is scrubbed (I4).
+    pub async fn disclosable(
+        &self,
+        bz: &BugzillaClient,
+        key: &str,
+        ids: &BTreeSet<u64>,
+    ) -> BTreeSet<u64> {
+        let now = Utc::now();
+        // Bug id 0 never exists, so an empty candidate set still costs one
+        // request: otherwise "this bug has no links" and "every link is
+        // hidden" would be told apart by the clock (I2).
+        let wanted: Vec<u64> = if ids.is_empty() {
+            vec![0]
+        } else {
+            // Bounded like assess(): a tracker bug can name hundreds of
+            // others, and the excess is simply not disclosable (I4).
+            ids.iter().copied().take(Self::MAX_ASSESS_IDS * 8).collect()
+        };
+        let envelope = match bz.get_bugs(key, &wanted, Some(CLASSIFY_FIELDS)).await {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::debug!(error = %err, "link disclosure fetch failed; scrubbing all");
+                return BTreeSet::new();
+            }
+        };
+        let mut out = BTreeSet::new();
+        if let Some(bugs) = envelope.get("bugs").and_then(Value::as_array) {
+            for bug in bugs {
+                let Some(id) = bug.get("id").and_then(Value::as_u64) else {
+                    continue;
+                };
+                if !ids.contains(&id) {
+                    continue;
+                }
+                let meta = BugMeta::from_json(bug);
+                if self.policy.classify(&meta, now).allows(Capability::Summary) {
+                    out.insert(id);
+                }
+            }
+        }
+        out
+    }
+
+    /// Bug ids this bug object points at, from every field that can carry one.
+    pub fn linked_bug_ids(bug: &Value, base_url: &str) -> BTreeSet<u64> {
+        let mut out = BTreeSet::new();
+        for field in Self::LINKED_ID_FIELDS {
+            match bug.get(*field) {
+                Some(Value::Array(items)) => {
+                    out.extend(items.iter().filter_map(Value::as_u64));
+                }
+                Some(v) => out.extend(v.as_u64()),
+                None => {}
+            }
+        }
+        out.extend(bug.get("dupe_of").and_then(Value::as_u64));
+        out.extend(bug.get("dup_id").and_then(Value::as_u64));
+        // bug_file_loc: a plain URL field that routinely points at a bug.
+        out.extend(
+            bug.get("url")
+                .and_then(Value::as_str)
+                .and_then(|u| Self::see_also_local_id(u, base_url)),
+        );
+        if let Some(Value::Array(entries)) = bug.get("see_also") {
+            out.extend(
+                entries
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(|e| Self::see_also_local_id(e, base_url)),
+            );
+        }
+        out
+    }
+
+    /// The bug id a `see_also` entry points at, when it points at THIS
+    /// Bugzilla. Entries for other trackers are somebody else's to disclose.
+    fn see_also_local_id(entry: &str, base_url: &str) -> Option<u64> {
+        // Compare host-and-path only, case-insensitively: Bugzilla stores
+        // see_also with the host as the user typed it, so scheme and case
+        // vary freely for the same instance. An instance reachable under a
+        // second hostname is still missed — recorded in I14, not fixed here.
+        let strip_scheme = |u: &str| {
+            u.trim()
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .to_ascii_lowercase()
+        };
+        let base = strip_scheme(base_url);
+        let base = base.trim_end_matches('/');
+        let entry_l = strip_scheme(entry);
+        let rest = entry_l.strip_prefix(base)?.to_string();
+        let rest = rest.as_str();
+        let digits = rest
+            .strip_prefix("/show_bug.cgi?id=")
+            .or_else(|| rest.strip_prefix("/rest/bug/"))?;
+        digits
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .filter(|d| !d.is_empty())
+            .and_then(|d| d.parse().ok())
+    }
+
+    /// Remove references to bugs outside `disclosable` from a bug object.
+    ///
+    /// A link naming a bug the policy hides tells the client that bug exists,
+    /// which is the whole of what I2 withholds — and the write paths already
+    /// refuse to CREATE such a link, so reading one back out must not be the
+    /// way around that.
+    pub fn scrub_bug_links(bug: &mut Value, base_url: &str, disclosable: &BTreeSet<u64>) {
+        let Some(obj) = bug.as_object_mut() else {
+            return;
+        };
+        for field in Self::LINKED_ID_FIELDS {
+            match obj.get_mut(*field) {
+                Some(Value::Array(items)) => {
+                    items.retain(|v| v.as_u64().is_some_and(|id| disclosable.contains(&id)));
+                }
+                // A scalar in an id-bearing field: blank it unless allowed.
+                Some(slot) if !slot.as_u64().is_some_and(|id| disclosable.contains(&id)) => {
+                    *slot = Value::Null;
+                }
+                _ => {}
+            }
+        }
+        if let Some(slot) = obj.get_mut("url") {
+            let hidden = slot
+                .as_str()
+                .and_then(|u| Self::see_also_local_id(u, base_url))
+                .is_some_and(|id| !disclosable.contains(&id));
+            if hidden {
+                *slot = Value::Null;
+            }
+        }
+        for field in ["dupe_of", "dup_id"] {
+            let Some(slot) = obj.get_mut(field) else {
+                continue;
+            };
+            if !slot.as_u64().is_some_and(|id| disclosable.contains(&id)) {
+                *slot = Value::Null;
+            }
+        }
+        if let Some(Value::Array(entries)) = obj.get_mut("see_also") {
+            entries.retain(|e| {
+                e.as_str().is_none_or(|entry| {
+                    Self::see_also_local_id(entry, base_url)
+                        .is_none_or(|id| disclosable.contains(&id))
+                })
+            });
+        }
+    }
+
+    /// Bug ids named by a history response.
+    pub fn history_bug_ids(history: &Value, base_url: &str) -> BTreeSet<u64> {
+        let mut out = BTreeSet::new();
+        Self::walk_history(history, |field, value| {
+            out.extend(Self::history_ids_in(field, value, base_url));
+        });
+        out
+    }
+
+    /// Remove history changes that name bugs outside `disclosable`.
+    ///
+    /// A change is edited down to the ids that may be named; one left with
+    /// nothing to say is dropped entirely, rather than shown as an empty
+    /// change that still marks the moment something happened.
+    pub fn scrub_history(mut history: Value, base_url: &str, disclosable: &BTreeSet<u64>) -> Value {
+        let Some(entries) = history.as_array_mut() else {
+            return history;
+        };
+        for entry in entries.iter_mut() {
+            let Some(changes) = entry.get_mut("changes").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            changes.retain_mut(|change| {
+                let field = change
+                    .get("field_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !Self::is_id_bearing_history_field(&field) {
+                    return true;
+                }
+                let mut anything_left = false;
+                for slot in ["added", "removed"] {
+                    let Some(v) = change.get_mut(slot) else {
+                        continue;
+                    };
+                    let kept = Self::keep_disclosable_ids(
+                        v.as_str().unwrap_or_default(),
+                        base_url,
+                        disclosable,
+                    );
+                    anything_left |= !kept.is_empty();
+                    *v = Value::String(kept);
+                }
+                anything_left
+            });
+        }
+        entries.retain(|entry| {
+            entry
+                .get("changes")
+                .and_then(Value::as_array)
+                .is_none_or(|c| !c.is_empty())
+        });
+        history
+    }
+
+    fn is_id_bearing_history_field(field: &str) -> bool {
+        Self::LINKED_ID_FIELDS.contains(&field)
+            || matches!(field, "dupe_of" | "dup_id" | "see_also" | "url")
+    }
+
+    /// Keep only the disclosable ids in a comma-separated history value.
+    fn keep_disclosable_ids(value: &str, base_url: &str, disclosable: &BTreeSet<u64>) -> String {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|piece| !piece.is_empty())
+            .filter(|piece| match piece.parse::<u64>() {
+                Ok(id) => disclosable.contains(&id),
+                // A see_also URL, or something unrecognised: keep it only if
+                // it does not name a local bug that must stay hidden.
+                Err(_) => Self::see_also_local_id(piece, base_url)
+                    .is_none_or(|id| disclosable.contains(&id)),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn walk_history(history: &Value, mut visit: impl FnMut(&str, &str)) {
+        let Some(entries) = history.as_array() else {
+            return;
+        };
+        for entry in entries {
+            let Some(changes) = entry.get("changes").and_then(Value::as_array) else {
+                continue;
+            };
+            for change in changes {
+                let field = change
+                    .get("field_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !Self::is_id_bearing_history_field(field) {
+                    continue;
+                }
+                for slot in ["added", "removed"] {
+                    if let Some(v) = change.get(slot).and_then(Value::as_str) {
+                        visit(field, v);
+                    }
+                }
+            }
+        }
+    }
+
+    fn history_ids_in(_field: &str, value: &str, base_url: &str) -> BTreeSet<u64> {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .filter_map(|p| {
+                p.parse::<u64>()
+                    .ok()
+                    .or_else(|| Self::see_also_local_id(p, base_url))
+            })
+            .collect()
+    }
+
+    /// The bug id in Bugzilla's auto-generated duplicate marker, if this
+    /// comment is one.
+    ///
+    /// Bugzilla writes these itself when a bug is closed as a duplicate, so
+    /// the text is templated rather than typed by a person:
+    /// `*** Bug 12345 has been marked as a duplicate of this bug ***`.
+    /// Matching a template is inherently brittle — a localised or customised
+    /// instance writes something else and this will not recognise it — so it
+    /// is a mitigation for the common case, not a guarantee. Free text where
+    /// a person simply mentions a bug number is out of reach entirely without
+    /// destroying the usefulness of comments.
+    pub fn duplicate_marker_id(text: &str) -> Option<u64> {
+        // Bugzilla writes BOTH directions, from two templates, and the
+        // "*** This bug ***" form is preceded by whatever the closer typed —
+        // so neither can be found by looking at the start of the comment.
+        //   on the duplicate: *** This bug has been marked as a duplicate of bug N ***
+        //   on the target:    *** Bug N has been marked as a duplicate of this bug ***
+        if let Some(at) = text.find("*** This bug has been marked as a duplicate of bug ") {
+            let rest = &text[at + "*** This bug has been marked as a duplicate of bug ".len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            return digits.parse().ok();
+        }
+        let at = text.find("*** Bug ")?;
+        let rest = &text[at + "*** Bug ".len()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        let tail = &rest[digits.len()..];
+        tail.starts_with(" has been marked as a duplicate")
+            .then(|| digits.parse().ok())
+            .flatten()
+    }
+
+    /// Bug ids named by duplicate markers among these comments.
+    pub fn duplicate_marker_ids(comments: &[Value]) -> BTreeSet<u64> {
+        comments
+            .iter()
+            .filter_map(|c| c.get("text").and_then(Value::as_str))
+            .filter_map(Self::duplicate_marker_id)
+            .collect()
+    }
+
+    /// Drop duplicate-marker comments naming bugs outside `disclosable`.
+    pub fn scrub_duplicate_markers(
+        comments: Vec<Value>,
+        disclosable: &BTreeSet<u64>,
+    ) -> Vec<Value> {
+        comments
+            .into_iter()
+            .filter(|c| {
+                c.get("text")
+                    .and_then(Value::as_str)
+                    .and_then(Self::duplicate_marker_id)
+                    .is_none_or(|id| disclosable.contains(&id))
+            })
+            .collect()
+    }
+
     /// Project a bug object down to [`SUMMARY_FIELDS`] and add a
     /// `"_redacted": true` marker so clients (and tests) can tell a summary
     /// view from a full bug. Fields absent from the input are simply omitted.
@@ -474,6 +827,226 @@ impl Guard {
 
 #[cfg(test)]
 mod tests {
+
+    // ---------- link / history / duplicate-marker scrubbing (I2) ----------
+
+    const BASE: &str = "https://bugzilla.example.com";
+
+    #[test]
+    fn linked_ids_are_collected_from_every_id_bearing_field() {
+        let bug = json!({
+            "id": 1,
+            "blocks": [10, 11],
+            "depends_on": [12],
+            "dupe_of": 13,
+            "regressed_by": [14],
+            "see_also": [
+                "https://bugzilla.example.com/show_bug.cgi?id=15",
+                "https://bugzilla.example.com/rest/bug/16",
+                "https://bugs.other.example/show_bug.cgi?id=999",
+                "not a url at all"
+            ],
+        });
+        let ids = Guard::linked_bug_ids(&bug, BASE);
+        assert_eq!(
+            ids.into_iter().collect::<Vec<_>>(),
+            vec![10, 11, 12, 13, 14, 15, 16],
+            "another tracker's ids are not ours to disclose or scrub"
+        );
+    }
+
+    #[test]
+    fn scrubbing_removes_only_the_ids_that_may_not_be_named() {
+        let mut bug = json!({
+            "id": 1,
+            "blocks": [10, 11],
+            "depends_on": [12],
+            "dupe_of": 13,
+            "see_also": [
+                "https://bugzilla.example.com/show_bug.cgi?id=15",
+                "https://bugs.other.example/show_bug.cgi?id=999"
+            ],
+        });
+        let allowed: BTreeSet<u64> = [10, 12].into_iter().collect();
+        Guard::scrub_bug_links(&mut bug, BASE, &allowed);
+
+        assert_eq!(bug["blocks"], json!([10]));
+        assert_eq!(bug["depends_on"], json!([12]));
+        assert_eq!(bug["dupe_of"], Value::Null, "a hidden duplicate is blanked");
+        assert_eq!(
+            bug["see_also"],
+            json!(["https://bugs.other.example/show_bug.cgi?id=999"]),
+            "local hidden bug dropped, foreign tracker kept"
+        );
+        assert_eq!(bug["id"], json!(1), "the bug's own id is untouched");
+    }
+
+    #[test]
+    fn history_changes_are_edited_down_and_emptied_ones_dropped() {
+        let history = json!([
+            {
+                "when": "2026-01-01T00:00:00Z",
+                "who": "a@b",
+                "changes": [
+                    { "field_name": "depends_on", "added": "10, 11", "removed": "" },
+                    { "field_name": "status", "added": "RESOLVED", "removed": "NEW" }
+                ]
+            },
+            {
+                "when": "2026-01-02T00:00:00Z",
+                "who": "a@b",
+                "changes": [
+                    { "field_name": "blocks", "added": "11", "removed": "" }
+                ]
+            }
+        ]);
+        let allowed: BTreeSet<u64> = [10].into_iter().collect();
+        let out = Guard::scrub_history(history, BASE, &allowed);
+
+        let first = &out[0]["changes"];
+        assert_eq!(first[0]["added"], json!("10"), "hidden id 11 removed");
+        assert_eq!(first[1]["added"], json!("RESOLVED"), "other fields intact");
+        assert_eq!(
+            out.as_array().unwrap().len(),
+            1,
+            "an entry whose only change named a hidden bug is dropped, not              served empty — an empty change still marks that something happened"
+        );
+    }
+
+    #[test]
+    fn history_ids_are_found_in_both_directions_and_in_see_also_urls() {
+        let history = json!([{
+            "changes": [
+                { "field_name": "blocks", "added": "1", "removed": "2, 3" },
+                { "field_name": "see_also",
+                  "added": "https://bugzilla.example.com/show_bug.cgi?id=4",
+                  "removed": "" },
+                { "field_name": "cc", "added": "someone@example.com", "removed": "" }
+            ]
+        }]);
+        let ids = Guard::history_bug_ids(&history, BASE);
+        assert_eq!(ids.into_iter().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn duplicate_marker_is_recognised_and_scrubbed() {
+        let marker = "*** Bug 4242 has been marked as a duplicate of this bug ***";
+        assert_eq!(Guard::duplicate_marker_id(marker), Some(4242));
+        // A human writing about a bug number is not a marker, and is out of
+        // reach anyway.
+        assert_eq!(Guard::duplicate_marker_id("see bug 4242 for context"), None);
+        assert_eq!(
+            Guard::duplicate_marker_id("*** Bug 4242 was closed ***"),
+            None
+        );
+
+        let comments = vec![
+            json!({ "id": 1, "text": marker }),
+            json!({ "id": 2, "text": "a normal comment" }),
+            json!({ "id": 3, "text": "*** Bug 7 has been marked as a duplicate of this bug ***" }),
+        ];
+        let allowed: BTreeSet<u64> = [7].into_iter().collect();
+        let kept = Guard::scrub_duplicate_markers(comments, &allowed);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0]["id"], json!(2));
+        assert_eq!(kept[1]["id"], json!(3), "a disclosable duplicate stays");
+    }
+
+    #[test]
+    fn both_stock_duplicate_marker_templates_are_recognised() {
+        // Bugzilla writes one on the duplicate and one on the target, from
+        // two different templates, and the first is preceded by whatever the
+        // closer typed — so neither can be found at the start of the text.
+        assert_eq!(
+            Guard::duplicate_marker_id(
+                "*** Bug 2058193 has been marked as a duplicate of this bug. ***"
+            ),
+            Some(2058193)
+        );
+        assert_eq!(
+            Guard::duplicate_marker_id(
+                "closing this, wrong component\n\n*** This bug has been marked as a \
+                 duplicate of bug 2057935 ***"
+            ),
+            Some(2057935)
+        );
+        assert_eq!(Guard::duplicate_marker_id("*** Bug 5 was closed ***"), None);
+        assert_eq!(Guard::duplicate_marker_id("see bug 5 for context"), None);
+    }
+
+    #[test]
+    fn see_also_matching_survives_scheme_and_case_differences() {
+        // Bugzilla stores see_also with the host as the user typed it, so the
+        // same instance appears with either scheme and in any case.
+        for entry in [
+            "http://bugzilla.example.com/show_bug.cgi?id=7",
+            "https://BUGZILLA.EXAMPLE.COM/show_bug.cgi?id=7",
+            "https://bugzilla.example.com/show_bug.cgi?id=7",
+        ] {
+            assert_eq!(
+                Guard::see_also_local_id(entry, BASE),
+                Some(7),
+                "must recognise {entry} as local"
+            );
+        }
+    }
+
+    #[test]
+    fn url_and_legacy_id_fields_are_scrubbed_too() {
+        // bug_file_loc ("url") routinely points at another bug, and the
+        // legacy dup_id/blocked spellings are still emitted by some
+        // instances.
+        let mut bug = json!({
+            "id": 1,
+            "url": "https://bugzilla.example.com/show_bug.cgi?id=7",
+            "dup_id": 8,
+            "blocked": [9, 10],
+        });
+        let allowed: BTreeSet<u64> = [10].into_iter().collect();
+        Guard::scrub_bug_links(&mut bug, BASE, &allowed);
+        assert_eq!(bug["url"], Value::Null);
+        assert_eq!(bug["dup_id"], Value::Null);
+        assert_eq!(bug["blocked"], json!([10]));
+    }
+
+    #[test]
+    fn every_link_field_is_scrubbed_including_the_rarer_ones() {
+        let mut bug = json!({
+            "id": 1,
+            "duplicates": [2, 3],
+            "regressed_by": [4],
+            "regressions": [5],
+            "dependson": [6],
+        });
+        let allowed: BTreeSet<u64> = [3].into_iter().collect();
+        Guard::scrub_bug_links(&mut bug, BASE, &allowed);
+        assert_eq!(bug["duplicates"], json!([3]));
+        assert_eq!(bug["regressed_by"], json!([]));
+        assert_eq!(bug["regressions"], json!([]));
+        assert_eq!(bug["dependson"], json!([]));
+    }
+
+    #[test]
+    fn see_also_matching_is_anchored_to_this_instance() {
+        // A host that merely starts with ours, or a path that merely contains
+        // an id, must not be mistaken for a local bug link.
+        assert_eq!(
+            Guard::see_also_local_id("https://bugzilla.example.com/show_bug.cgi?id=5", BASE),
+            Some(5)
+        );
+        assert_eq!(
+            Guard::see_also_local_id("https://bugzilla.example.com/rest/bug/5", BASE),
+            Some(5)
+        );
+        assert_eq!(
+            Guard::see_also_local_id("https://bugzilla.example.com/other.cgi?id=5", BASE),
+            None
+        );
+        assert_eq!(
+            Guard::see_also_local_id("https://evil.example/show_bug.cgi?id=5", BASE),
+            None
+        );
+    }
     use super::*;
     use serde_json::json;
 

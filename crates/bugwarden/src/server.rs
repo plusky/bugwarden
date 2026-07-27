@@ -575,12 +575,44 @@ impl BugWarden {
             }
         }
 
-        Ok(ok_json(assemble_bug_info(
-            &self.guard,
-            &ids,
-            &assessments,
-            &full,
-        )))
+        // The bodies name other bugs through blocks/depends_on/dupe_of/
+        // see_also/url. Those ids come from Bugzilla, not the client, so one
+        // batched assessment covers them all; anything that fails to earn a
+        // summary is removed before the body is served (I2, and the same bar
+        // update_bug_dependencies applies before WRITING such a link).
+        let mut envelope = assemble_bug_info(&self.guard, &ids, &assessments, &full);
+        let base_url = self.bz.base_url();
+        // Only ids actually SERVED in this envelope are already answered for.
+        // A requested id that was denied must not be whitelisted: asking
+        // about a hidden bug would then reveal it through the links of one
+        // the client may read.
+        let served: BTreeSet<u64> = envelope
+            .get("bugs")
+            .and_then(Value::as_array)
+            .map(|bugs| bugs.iter().filter_map(|b| b["id"].as_u64()).collect())
+            .unwrap_or_default();
+        let named: BTreeSet<u64> = envelope
+            .get("bugs")
+            .and_then(Value::as_array)
+            .map(|bugs| {
+                bugs.iter()
+                    .flat_map(|b| Guard::linked_bug_ids(b, base_url))
+                    .filter(|id| !served.contains(id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Always assess, even with nothing to assess: skipping the call when
+        // every link is hidden would make "no links" and "links, all hidden"
+        // cost different round trips (I2). download_attachment pads the same
+        // way.
+        let mut allowed = self.guard.disclosable(&self.bz, &key, &named).await;
+        allowed.extend(served);
+        if let Some(bugs) = envelope.get_mut("bugs").and_then(Value::as_array_mut) {
+            for bug in bugs.iter_mut() {
+                Guard::scrub_bug_links(bug, base_url, &allowed);
+            }
+        }
+        Ok(ok_json(envelope))
     }
 
     #[tool(
@@ -598,10 +630,23 @@ impl BugWarden {
             return Ok(denied);
         }
         match self.bz.bug_history(&key, p.id, p.new_since).await {
-            Ok(history) => Ok(ok_json(history)),
-            Err(e) => Ok(err_text(format!(
-                "Failed to fetch bug history\nReason: {e}"
-            ))),
+            Ok(history) => {
+                // Dependency, duplicate and see_also changes carry the ids of
+                // OTHER bugs in their added/removed values, so history is a
+                // way to read out the existence of bugs the policy hides.
+                let base_url = self.bz.base_url();
+                let named = Guard::history_bug_ids(&history, base_url);
+                let disclosable = self.guard.disclosable(&self.bz, &key, &named).await;
+                Ok(ok_json(Guard::scrub_history(
+                    history,
+                    base_url,
+                    &disclosable,
+                )))
+            }
+            Err(e) => {
+                tracing::warn!(id = p.id, error = %e, "bug_history: fetch failed");
+                Ok(err_text("Failed to fetch bug history"))
+            }
         }
     }
 
@@ -627,11 +672,18 @@ impl BugWarden {
         match self.bz.bug_comments(&key, p.id, p.new_since).await {
             Ok(comments) => {
                 let filtered = self.guard.filter_comments(comments, p.include_private);
-                Ok(ok_json(Value::Array(filtered)))
+                // Bugzilla writes "*** Bug N has been marked as a duplicate
+                // of this bug ***" itself, so a hidden bug can name itself in
+                // the comments of one the client may read (I2).
+                let named = Guard::duplicate_marker_ids(&filtered);
+                let disclosable = self.guard.disclosable(&self.bz, &key, &named).await;
+                let scrubbed = Guard::scrub_duplicate_markers(filtered, &disclosable);
+                Ok(ok_json(Value::Array(scrubbed)))
             }
-            Err(e) => Ok(err_text(format!(
-                "Failed to fetch bug comments\nReason: {e}"
-            ))),
+            Err(e) => {
+                tracing::warn!(id = p.id, error = %e, "bug_comments: fetch failed");
+                Ok(err_text("Failed to fetch bug comments"))
+            }
         }
     }
 
@@ -692,10 +744,27 @@ impl BugWarden {
                 return Ok(err_text("Search failed"));
             }
         };
-        let projected: Vec<Value> = kept
+        let mut projected: Vec<Value> = kept
             .iter()
             .map(|bug| project_fields(bug, &requested))
             .collect();
+
+        // The client chooses the projection, so it can ask for depends_on,
+        // blocks, dupe_of or see_also here and read out the ids of bugs the
+        // policy hides — wholesale, rather than one guessed id at a time
+        // (I14). Same treatment as bug_info.
+        let base_url = self.bz.base_url();
+        let served: BTreeSet<u64> = projected.iter().filter_map(|b| b["id"].as_u64()).collect();
+        let named: BTreeSet<u64> = projected
+            .iter()
+            .flat_map(|b| Guard::linked_bug_ids(b, base_url))
+            .filter(|id| !served.contains(id))
+            .collect();
+        let mut allowed = self.guard.disclosable(&self.bz, &key, &named).await;
+        allowed.extend(served);
+        for bug in projected.iter_mut() {
+            Guard::scrub_bug_links(bug, base_url, &allowed);
+        }
 
         Ok(ok_json(json!({ "bugs": projected })))
     }
@@ -1337,6 +1406,11 @@ impl BugWarden {
             }
         };
         let comments = self.guard.filter_comments(comments, false);
+        // Same scrub as bug_comments: otherwise a client that would be
+        // scrubbed there just asks for a summary instead (I14).
+        let named = Guard::duplicate_marker_ids(&comments);
+        let disclosable = self.guard.disclosable(&self.bz, &key, &named).await;
+        let comments = Guard::scrub_duplicate_markers(comments, &disclosable);
         let comments_json =
             serde_json::to_string_pretty(&comments).unwrap_or_else(|_| "[]".to_string());
         let prompt = format!(
