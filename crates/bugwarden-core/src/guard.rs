@@ -47,6 +47,25 @@ pub struct Guard {
     pub policy: Policy,
 }
 
+/// A quicksearch as the client asked for it.
+///
+/// `limit`/`offset` address the bugs the client may SEE — see
+/// [`Guard::quicksearch_window`], which is what makes that true.
+#[derive(Debug, Clone, Copy)]
+pub struct SearchRequest<'a> {
+    /// Bugzilla quicksearch expression.
+    pub query: &'a str,
+    /// Status filter prepended to the expression ("ALL" for none).
+    pub status: &'a str,
+    /// Comma-separated projection; callers must include the classification
+    /// fields or the guard cannot judge what it is filtering.
+    pub include_fields: &'a str,
+    /// How many visible bugs to return.
+    pub limit: u32,
+    /// How many visible bugs to skip.
+    pub offset: u32,
+}
+
 impl Guard {
     /// The uniform denial text (invariant I2).
     ///
@@ -170,6 +189,150 @@ impl Guard {
             out.insert(id, entry);
         }
         out
+    }
+
+    /// Largest `offset + limit` a search may address.
+    ///
+    /// Paging past this truncates rather than scanning forever; the client
+    /// sees the same thing it sees at the genuine end of a result set.
+    pub const MAX_SEARCH_WINDOW: u32 = 1_000;
+
+    /// Rows requested from Bugzilla per scan step.
+    const SEARCH_SCAN_CHUNK: u32 = 200;
+
+    /// Ceiling on upstream rows examined for one search, i.e. at most
+    /// `SEARCH_SCAN_MAX / SEARCH_SCAN_CHUNK` sequential requests.
+    const SEARCH_SCAN_MAX: u32 = 2_000;
+
+    /// Run a search whose `limit`/`offset` address the bugs the client may
+    /// actually SEE, not the rows Bugzilla happens to return.
+    ///
+    /// Filtering a page after Bugzilla has already applied `limit`/`offset`
+    /// leaves a hole exactly where a hidden bug sat: the page comes back
+    /// short while the next offset still yields results, which says "a bug
+    /// exists here that you may not see". Because quicksearch matches summary
+    /// text, that hole is a probe — append a word to the query, see whether
+    /// the hole survives, and the hidden bug's title can be reconstructed one
+    /// word at a time. Uniform denials (I2) and silent filtering (I3) are
+    /// worth nothing while the window itself reports what was removed.
+    ///
+    /// So pagination is applied AFTER the guard: scan the upstream result
+    /// from row 0, classify each chunk, and keep going until enough visible
+    /// bugs have accumulated to fill the requested window. A hidden bug now
+    /// costs nothing but a row of upstream scanning — it never shortens a
+    /// page and never contradicts a later offset.
+    ///
+    /// Scanning from row 0 every time is not laziness: a visible-space offset
+    /// cannot be mapped onto an upstream offset without first classifying
+    /// everything before it, and how many bugs that is, is exactly what the
+    /// client must not learn.
+    ///
+    /// The bugs returned are the objects that were classified, so no second
+    /// fetch can serve something the verdict never saw.
+    ///
+    /// Bounds: at most [`Guard::MAX_SEARCH_WINDOW`] addressable, and at most
+    /// `SEARCH_SCAN_MAX` upstream rows examined. Hitting either truncates the
+    /// page, which is indistinguishable from running out of results — the
+    /// safe direction, since it hides more rather than less.
+    ///
+    /// Residual, and deliberately accepted: filling a window of VISIBLE bugs
+    /// takes more upstream rows when bugs are hidden, so the request count
+    /// cannot be made independent of hidden-bug density without either
+    /// scanning the worst case on every search or letting pages go short
+    /// again. What a stopwatch can still learn is one bit per scanned block —
+    /// "this block was not entirely visible" — because the scan target is
+    /// quantised to whole chunks; without that quantisation the client could
+    /// binary-search `limit` and recover the exact hidden count of every
+    /// block, which is why it is there. A long way from reconstructing a
+    /// title, which is what this replaces.
+    pub async fn quicksearch_window(
+        &self,
+        bz: &BugzillaClient,
+        key: &str,
+        req: &SearchRequest<'_>,
+    ) -> anyhow::Result<Vec<Value>> {
+        let SearchRequest {
+            query,
+            status,
+            include_fields,
+            limit,
+            offset,
+        } = *req;
+        let needed = offset.saturating_add(limit).min(Self::MAX_SEARCH_WINDOW);
+        if limit == 0 || needed == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Scan for a whole number of chunks' worth of visible bugs rather
+        // than for exactly `needed`. Stopping the moment the window is full
+        // makes the stopping point a function of the client's `limit` AND of
+        // how many bugs were hidden, and a client can binary-search `limit`
+        // against the clock to recover the hidden count of each block
+        // exactly. Quantising collapses that: every limit inside a block asks
+        // for the same work, so the timing says at most "this block was not
+        // entirely visible" instead of how many went missing. Costs nothing
+        // in the common case — an unfiltered chunk already fills the target.
+        let target = needed
+            .div_ceil(Self::SEARCH_SCAN_CHUNK)
+            .saturating_mul(Self::SEARCH_SCAN_CHUNK);
+
+        let mut visible: Vec<Value> = Vec::new();
+        let mut seen: BTreeSet<u64> = BTreeSet::new();
+        let mut scanned: u32 = 0;
+        let mut dropped_total = 0usize;
+
+        while (visible.len() as u32) < target && scanned < Self::SEARCH_SCAN_MAX {
+            let chunk = Self::SEARCH_SCAN_CHUNK.min(Self::SEARCH_SCAN_MAX - scanned);
+            let envelope = bz
+                .quicksearch(key, query, status, include_fields, chunk, scanned)
+                .await?;
+            let rows: Vec<Value> = envelope
+                .get("bugs")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let returned = rows.len() as u32;
+
+            // Relevance ordering is not stable between calls, so chunks can
+            // overlap; dedupe on the id the server reported. A row without a
+            // readable id cannot be classified and is dropped (I4).
+            let fresh: Vec<Value> = rows
+                .into_iter()
+                .filter(|b| {
+                    b.get("id")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|id| seen.insert(id))
+                })
+                .collect();
+            let (kept, dropped) = self.filter_bug_list(fresh);
+            dropped_total += dropped;
+            visible.extend(kept);
+            scanned += returned;
+
+            if returned < chunk {
+                break; // upstream has no more rows
+            }
+        }
+
+        if dropped_total > 0 {
+            // Server-side only, never a count to the client (I3).
+            tracing::debug!(
+                dropped = dropped_total,
+                scanned,
+                "quicksearch: withheld policy-denied bugs"
+            );
+        }
+
+        // `start` is clamped to `end`, not merely to the length. The window
+        // stops at MAX_SEARCH_WINDOW but the scan overshoots it whenever a
+        // chunk yields fewer visible bugs than it holds — which happens only
+        // when bugs WERE hidden. An unclamped start would therefore panic
+        // exactly when something was hidden past the window, answering the
+        // one question this whole function exists to refuse (and taking the
+        // session down with it).
+        let end = (needed as usize).min(visible.len());
+        let start = (offset as usize).min(end);
+        Ok(visible[start..end].to_vec())
     }
 
     /// Project a bug object down to [`SUMMARY_FIELDS`] and add a

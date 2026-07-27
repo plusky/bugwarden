@@ -241,6 +241,15 @@ impl Guard {
     /// lists outright (server::too_many_ids) rather than answering partially.
     pub const MAX_ASSESS_IDS: usize;
 
+    // limit/offset address VISIBLE bugs: scan upstream from row 0 in chunks,
+    // classify, fill the window from survivors. Bounded by MAX_SEARCH_WINDOW
+    // (1000 addressable) and 2000 scanned rows; truncation looks like the end
+    // of results. Returns the classified objects themselves.
+    pub struct SearchRequest<'a> { query, status, include_fields: &'a str, limit, offset: u32 }
+    pub const MAX_SEARCH_WINDOW: u32;
+    pub async fn quicksearch_window(&self, bz: &BugzillaClient, key: &str,
+        req: &SearchRequest<'_>) -> anyhow::Result<Vec<serde_json::Value>>;
+
     pub async fn assess(&self, bz: &crate::client::BugzillaClient, key: &str, ids: &[u64])
         -> std::collections::BTreeMap<u64, (Access, serde_json::Value)>;
 
@@ -338,7 +347,7 @@ constraints the model must know.
 | bug_info | bug_ids: Vec<u64> | per-id: Read => full, else Summary => redacted, else restricted entry | envelope `{"bugs":[..], "restricted":[{"id":N,"note":denial(N)}]}`; full fetch only for Read-granted ids. Every fetched body is RE-CLASSIFIED before it is served (assemble_bug_info): the verdict came from the classification fetch and the body from a later request, so a bug embargoed in between must not be served on the stale verdict (TOCTOU; same reason download_attachment re-checks). Costs no request — the body is a superset of CLASSIFY_FIELDS — and a body that now earns only summary is served as the summary view, one that earns nothing becomes the uniform restricted entry. A failed body fetch is logged server-side ONLY and leaves those ids restricted: Bugzilla's message names the bug and says whether it exists, so forwarding it would undo I2 |
 | bug_history | id, new_since?: DateTime<Utc> | history | |
 | bug_comments | id, include_private: bool = false, new_since? | comments | filter_comments applied (I5) |
-| bugs_quicksearch | query, status: String = "ALL", include_fields: String = "id,product,component,assigned_to,status,resolution,summary,last_change_time", limit: u32 = 50, offset: u32 = 0 | post-filter | fetch include_fields = requested ∪ CLASSIFY_FIELDS; after filter, project kept bugs to requested fields (keep `_redacted` marker); envelope `{"bugs":[..]}` only (I3) |
+| bugs_quicksearch | query, status: String = "ALL", include_fields: String = "id,product,component,assigned_to,status,resolution,summary,last_change_time", limit: u32 = 50, offset: u32 = 0 | post-filter | fetch include_fields = requested ∪ CLASSIFY_FIELDS; after filter, project kept bugs to requested fields (keep `_redacted` marker); envelope `{"bugs":[..]}` only (I3) | **limit/offset address the bugs the client may SEE, not upstream rows** (Guard::quicksearch_window): filtering an already-paginated page left a hole exactly where a hidden bug sat — a short page the next offset contradicted — and since quicksearch matches summary text that hole was a probe for the hidden title, one word at a time. The guard now scans upstream from row 0 in 200-row chunks, classifies each, and fills the window from the survivors; rows are deduped on the server-reported id (relevance order is not stable between calls) and an id-less row is dropped (I4). Bounds: MAX_SEARCH_WINDOW=1000 addressable, 2000 rows scanned (<=10 sequential requests); hitting either truncates, which looks exactly like the end of results. The objects returned are the ones classified. The scan target is quantised to whole chunks so the stopping point does not track the client's `limit`; without that, `limit` could be binary-searched against the clock to recover each block's exact hidden count. Residual, accepted: filling a window of VISIBLE bugs needs more rows when bugs are hidden, so a stopwatch still learns one bit per scanned block ("not entirely visible"). Removing that would mean scanning the worst case on every search, or letting pages go short again. Search failure returns a bare "Search failed"; the upstream text is logged server-side only (it can name a bug and say whether it exists) |
 | add_comment | bug_id, comment, is_private: bool = false | comment (write) | |
 | update_bug_status | bug_id, status, resolution?, comment: String = "" | status (write) | CLOSED requires resolution (error otherwise); when reopening (status not CLOSED/VERIFIED and no resolution given) set `"resolution": ""` |
 | assign_bug | bug_id, assignee (email), comment = "" | assign (write) | payload `{"assigned_to": ..}` |
@@ -405,6 +414,14 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   summary is refused, and refused/absent/up-front-denied ids yield byte-
   identical restricted entries; the distinct-id bound.
 - Integration tests (crates/bugwarden-core/tests/guard_wiremock.rs, wiremock):
+  quicksearch_window — pages stay full while visible bugs remain (no hole),
+  consecutive pages tile the visible sequence disjointly (against a stable
+  upstream order; an unstable one can drop a bug from every page, which hides
+  more rather than less), a hidden bug never shortens a page, a deep offset is
+  an empty page whether or not bugs were hidden, the scan bound is counted in
+  requests, the scan target does not track `limit`, id-less rows are dropped,
+  rows repeated across chunks are served once, exhaustion and scan truncation look alike, zero limit
+  touches nothing, and the returned objects are the classified ones;
   assess() deny for embargoed group; min-age deny; one request per distinct
   id whatever the answer (nonexistent vs withheld cost the same), repeated
   ids fetched once, no batch to poison; per-id

@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bugwarden_core::client::{BugzillaClient, CLASSIFY_FIELDS};
-use bugwarden_core::guard::Guard;
+use bugwarden_core::guard::{Guard, SearchRequest};
 use bugwarden_core::policy::{Access, Action, Capability};
 use chrono::{DateTime, Utc};
 use rmcp::{
@@ -668,25 +668,30 @@ impl BugWarden {
         fetch.extend(CLASSIFY_FIELDS.split(',').map(|f| f.trim().to_string()));
         let fetch_fields = fetch.into_iter().collect::<Vec<_>>().join(",");
 
-        let envelope = match self
-            .bz
-            .quicksearch(&key, &p.query, &p.status, &fetch_fields, p.limit, p.offset)
+        // limit/offset address the bugs the client may see; the guard scans
+        // and filters upstream rows to fill that window (I2/I3).
+        let kept = match self
+            .guard
+            .quicksearch_window(
+                &self.bz,
+                &key,
+                &SearchRequest {
+                    query: &p.query,
+                    status: &p.status,
+                    include_fields: &fetch_fields,
+                    limit: p.limit,
+                    offset: p.offset,
+                },
+            )
             .await
         {
-            Ok(v) => v,
-            Err(e) => return Ok(err_text(format!("Search failed: {e}"))),
+            Ok(kept) => kept,
+            // Uniform: a failing search never says which bug or why (I2).
+            Err(e) => {
+                tracing::warn!(error = %e, "bugs_quicksearch: upstream search failed");
+                return Ok(err_text("Search failed"));
+            }
         };
-        let bugs = envelope
-            .get("bugs")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-
-        let (kept, dropped) = self.guard.filter_bug_list(bugs);
-        if dropped > 0 {
-            // Server-side logging only — never reported to the client (I3).
-            tracing::debug!(dropped, "bugs_quicksearch: dropped policy-denied bugs");
-        }
         let projected: Vec<Value> = kept
             .iter()
             .map(|bug| project_fields(bug, &requested))
