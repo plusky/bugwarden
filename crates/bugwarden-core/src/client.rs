@@ -1,8 +1,6 @@
 //! Async Bugzilla REST client.
 //!
-//! A faithful port of the HTTP behavior of the Python original
-//! (`mcp-bugzilla/src/mcp_bugzilla/mcp_utils.py`) with one deliberate
-//! hardening change: the API key is passed per request instead of being
+//! The API key is passed per request instead of being
 //! stored on the client, and it must never appear in logs, error messages,
 //! or tool results (security invariant I12). Because the key may travel as
 //! a URL query parameter (`api_key=...`), every [`reqwest::Error`] is
@@ -23,8 +21,8 @@ use serde_json::Value;
 pub const CLASSIFY_FIELDS: &str =
     "id,summary,product,component,status,resolution,severity,priority,keywords,groups,whiteboard,creation_time,last_change_time";
 
-/// Bugzilla `new_since` timestamp format (mirrors the Python
-/// `strftime("%Y-%m-%dT%H:%M:%SZ")`).
+/// Bugzilla `new_since` timestamp format (UTC, second precision, `Z`
+/// suffix).
 const TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%SZ";
 
 /// Async client for the Bugzilla REST API.
@@ -45,7 +43,7 @@ pub struct BugzillaClient {
 
 impl BugzillaClient {
     /// Create a client for the Bugzilla instance at `base_url` (trailing
-    /// slashes are trimmed, mirroring the Python `url.rstrip("/")`).
+    /// slashes are trimmed).
     pub fn new(base_url: &str, use_auth_header: bool) -> Result<Self> {
         let base_url = base_url.trim_end_matches('/').to_string();
         let api_url = format!("{base_url}/rest");
@@ -422,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_format_matches_python_strftime() {
+    fn timestamp_format_renders_utc_z() {
         let ts = Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap();
         assert_eq!(
             ts.format(TIMESTAMP_FORMAT).to_string(),

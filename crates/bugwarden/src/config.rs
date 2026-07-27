@@ -1,7 +1,6 @@
 //! CLI configuration for bugwarden.
 //!
-//! Env fallbacks mirror the Python original (`mcp-bugzilla`): CLI argument >
-//! environment variable > hardcoded default.
+//! Precedence: CLI argument > environment variable > hardcoded default.
 
 use std::path::PathBuf;
 

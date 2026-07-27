@@ -60,14 +60,13 @@ never a reason to relax them.
   removed from the tool listing (`ToolRouter::remove_route`), not merely
   made to error (I13).
 
-## The Python Original Is Not an Authority
+## DESIGN.md Records Deliberate Decisions
 
-bugwarden is a Rust rewrite of `mcp-bugzilla` (Python). The Python tree
-informs tool description wording and the REST endpoint mapping where
-DESIGN.md says so — nothing more. DESIGN.md records deliberate departures
-(for example the stricter `allow_private_comments = false` default, I5, and
-the intentionally unported `get_current_headers` tool, I10); "Python did X"
-is never a justification for undoing them.
+docs/DESIGN.md is the sole design authority. It records decisions that may
+look like accidents but are deliberate (for example the strict
+`allow_private_comments = false` default, I5, and the absence of any
+header-echo tool, I10); convenience, precedent, or other implementations
+are never a justification for undoing them.
 
 ## Rust Style and APIs
 

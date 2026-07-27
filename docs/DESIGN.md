@@ -1,7 +1,7 @@
 # bugwarden — design contract
 
-Rust rewrite of `mcp-bugzilla` (Python original: `/home/mpluskal/devel/mcp-bugzilla`)
-extended with operator-controlled security guards. This document is the binding
+An MCP server exposing Bugzilla to LLM clients, hardened with
+operator-controlled security guards. This document is the binding
 contract between modules. If an implementation must deviate, note the deviation
 explicitly in your report.
 
@@ -33,8 +33,7 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
 - **I5** Private comments (`is_private: true`) are returned only when policy
   `global.allow_private_comments = true` AND the call sets
   `include_private = true`. Default policy (no file) has
-  `allow_private_comments = false` (intentionally stricter than the Python
-  original).
+  `allow_private_comments = false` — private data is strictly opt-in.
 - **I6** Capability implication: `read` implies `summary`. Nothing else is
   implied.
 - **I7** `update_bug_fields.custom_fields`: every key must start with `cf_`;
@@ -45,8 +44,8 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
   locally, contacts nothing).
 - **I9** CLI/env can only tighten policy: `--read-only` ORs into
   `global.read_only`.
-- **I10** The Python tool `get_current_headers` is intentionally NOT ported
-  (it echoes the API-key header back to the model).
+- **I10** No tool may echo incoming request headers back to the client —
+  that would leak the API-key header to the model.
 - **I11** `mark_as_duplicate` requires capability `status` on `bug_id` AND at
   least `summary` on `duplicate_of`.
 - **I12** The Bugzilla API key must never appear in logs, error messages, or
@@ -238,7 +237,7 @@ impl BugzillaClient {
 }
 ```
 
-Endpoint mapping (mirrors Python `mcp_utils.py`):
+Endpoint mapping:
 
 | method | request | returns |
 |---|---|---|
@@ -266,8 +265,8 @@ pretty-printed JSON. Guard refusals and input-validation failures =>
 `CallToolResult::error` with a text block (NOT a protocol error). Protocol
 issues (missing API key header) => `McpError::invalid_request`.
 
-Tool descriptions: reuse the Python docstrings (`server.py`) wording where a
-tool is a direct port.
+Tool descriptions: concise and action-oriented; state the defaults and
+constraints the model must know.
 
 | tool | params (schemars struct) | guard capability | notes |
 |---|---|---|---|
@@ -287,11 +286,11 @@ tool is a direct port.
 | bugzilla_server_info | — | none | client.server_info |
 | quicksearch_syntax | — | none | HTML doc page |
 | mcp_server_info | — | none | version (CARGO_PKG_VERSION), bugzilla server url, transport, and policy summary per I1 |
-| summarize_bug | id | comments | fetches comments (private filtered with include_private=false), returns the summarization prompt text (port the Python template) |
+| summarize_bug | id | comments | fetches comments (private filtered with include_private=false), returns the summarization prompt text (fixed prompt template) |
 
 ## CLI (crates/bugwarden/src/config.rs)
 
-clap derive `Cli`, env fallbacks exactly as the Python original:
+clap derive `Cli`, with env fallbacks:
 
 | flag | env | default | notes |
 |---|---|---|---|

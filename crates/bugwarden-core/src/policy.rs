@@ -317,7 +317,7 @@ pub struct GlobalGuards {
     pub min_bug_age_days: i64,
     /// Whether private comments may ever be returned. Even when `true` a
     /// call must also pass `include_private = true` to see them (I5).
-    /// Defaults to `false` — intentionally stricter than the Python original.
+    /// Defaults to `false` — private data is strictly opt-in.
     #[serde(default)]
     pub allow_private_comments: bool,
     /// Strip write capabilities from every grant. The CLI `--read-only` flag

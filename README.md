@@ -1,8 +1,8 @@
 # bugwarden
 
-**bugwarden** is a Rust rewrite of [mcp-bugzilla](https://github.com/openSUSE/mcp-bugzilla)
-with operator-controlled security guards. It is a Model Context Protocol (MCP)
-server that exposes a Bugzilla instance to LLM clients — querying bugs,
+**bugwarden** is a Model Context Protocol (MCP) server, written in Rust, with
+operator-controlled security guards. It exposes a Bugzilla instance to LLM
+clients — querying bugs,
 searching, reading comments and history, and (where permitted) updating bugs —
 while a policy file that the model can neither see nor change decides, per bug,
 what the model is allowed to do.
@@ -17,7 +17,7 @@ touched or data is returned.
 
 ## Features
 
-- **Full mcp-bugzilla tool surface**, reimplemented in Rust: bug details,
+- **Complete Bugzilla tool surface**: bug details,
   history, comments, attachment metadata, quicksearch, comment/status/field/
   assignee/CC/dependency updates, duplicate marking, server info, quicksearch
   syntax docs, and a bug-summarization prompt tool.
@@ -78,12 +78,11 @@ is `bug_url`, which computes a URL string locally and contacts nothing.
 - **CLI can only tighten.** `--read-only` ORs into the policy's read-only
   flag; there is no CLI switch that loosens the policy.
 
-### Intentional differences from the Python original
+### Deliberate omissions and strict defaults
 
-- **`get_current_headers` is not ported.** In the original it echoes request
-  headers — including the API-key header — back to the model. Gone.
-- **Private comments default to off.** Without a policy file the Python
-  original returns private comments when asked; bugwarden's default policy has
+- **No header-echo tool.** Incoming request headers — including the API-key
+  header — are never exposed to the model.
+- **Private comments default to off.** The default policy has
   `allow_private_comments = false`, so a policy file is required to enable
   them.
 - **`update_bug_fields` custom fields are restricted** to `cf_*` keys as
@@ -92,7 +91,7 @@ is `bug_url`, which computes a URL string locally and contacts nothing.
 ## Installation / build
 
 ```bash
-git clone https://github.com/openSUSE/bugwarden
+git clone https://github.com/plusky/bugwarden
 cd bugwarden
 cargo build --release
 # binary at target/release/bugwarden
