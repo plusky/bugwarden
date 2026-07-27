@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["bugzilla", "mcp", "llm", "security", "server"]
+categories = ["command-line-utilities", "web-programming::http-server"]
 
 [lints]
 workspace = true
