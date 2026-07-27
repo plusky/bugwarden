@@ -102,18 +102,74 @@ async fn assess_min_bug_age_denies_young_and_missing_creation_time() {
 }
 
 #[tokio::test]
-async fn assess_batch_failure_falls_back_per_id_and_fails_closed() {
+async fn assess_costs_one_request_per_distinct_id_whatever_the_answer() {
+    // The heart of it: a bug that does not exist and a bug the policy hides
+    // must cost the SAME upstream work. Bugzilla reports the first by failing
+    // the request and the second by quietly omitting it, so the two answers
+    // arrive by different routes — the request count must not follow.
     let server = MockServer::start().await;
-    // The batched request (both ids) fails with a 500 ...
+    // id 1: served normally.
     Mock::given(method("GET"))
         .and(path("/rest/bug"))
-        .and(query_param("id", "1,2"))
+        .and(query_param("id", "1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "bugs": [bug(1, &[], OLD)] })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    // id 2: nonexistent — Bugzilla errors the request.
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "2"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": true, "code": 101, "message": "Bug #2 does not exist."
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // id 3: exists but is withheld upstream — a 200 that simply omits it.
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let g = guard(""); // default allow-all policy
+    let bz = client(&server);
+    let out = g.assess(&bz, KEY, &[1, 2, 3]).await;
+
+    assert_eq!(out.len(), 3, "every requested id has an entry (I4)");
+    assert!(out[&1].0.allows(Capability::Read));
+    for id in [2u64, 3] {
+        match &out[&id].0 {
+            Access::Denied { rule } => assert_eq!(rule, "unavailable"),
+            other => panic!("bug {id} must be denied, got {other:?}"),
+        }
+        assert!(out[&id].1.is_null());
+    }
+    // The .expect(1) assertions above are verified on drop: each id is
+    // fetched exactly once. (They bound the mocked paths only — wiremock does
+    // not fail on requests that match no mock — but a batched `id=1,2,3`
+    // would match none of these three and leave all counts at zero.)
+}
+
+#[tokio::test]
+async fn assess_never_batches_so_one_bad_id_cannot_poison_the_others() {
+    // The batch this replaced could be failed wholesale by a single bad id,
+    // taking healthy ids down with it. Per-id fetching makes that impossible
+    // without any retry logic to re-open the timing gap.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "9"))
         .respond_with(ResponseTemplate::new(500).set_body_json(json!({
             "error": true, "message": "internal server error"
         })))
         .mount(&server)
         .await;
-    // ... the per-id retry succeeds (200) for 1 ...
     Mock::given(method("GET"))
         .and(path("/rest/bug"))
         .and(query_param("id", "1"))
@@ -122,62 +178,78 @@ async fn assess_batch_failure_falls_back_per_id_and_fails_closed() {
         )
         .mount(&server)
         .await;
-    // ... and keeps failing for 2.
-    Mock::given(method("GET"))
-        .and(path("/rest/bug"))
-        .and(query_param("id", "2"))
-        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
-            "error": true, "message": "internal server error"
-        })))
-        .mount(&server)
-        .await;
+    // A request naming both ids at once would not match either mock: proof
+    // that no batch is attempted.
 
-    let g = guard(""); // default allow-all policy
+    let g = guard("");
     let bz = client(&server);
-    let out = g.assess(&bz, KEY, &[1, 2]).await;
+    let out = g.assess(&bz, KEY, &[9, 1]).await;
 
-    assert_eq!(out.len(), 2, "every requested id has an entry (I4)");
-    assert!(out[&1].0.allows(Capability::Read));
-    match &out[&2].0 {
+    assert!(out[&1].0.allows(Capability::Read), "healthy id survives");
+    match &out[&9].0 {
         Access::Denied { rule } => assert_eq!(rule, "unavailable"),
-        other => panic!("unavailable bug must be denied, got {other:?}"),
+        other => panic!("failed id must be denied, got {other:?}"),
     }
-    assert!(out[&2].1.is_null());
 }
 
 #[tokio::test]
-async fn assess_single_id_failure_makes_exactly_one_request() {
-    // A failing single-id batch must NOT trigger the per-id fallback: the
-    // retry would repeat the identical request, and the extra round trip
-    // would give a timing client an existence oracle (nonexistent id => two
-    // requests, policy-denied id => one) that I2's uniform text hides.
+async fn assess_fan_out_is_bounded_and_the_excess_is_denied() {
+    // assess() is public API: an out-of-tree caller that forgets to bound its
+    // input must not be able to turn one call into an unbounded run of
+    // upstream requests. Past the bound nothing is fetched and everything
+    // falls through to the denial (I4).
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/rest/bug"))
-        .and(query_param("id", "7"))
-        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "error": true, "code": 101, "message": "Bug #7 does not exist."
-        })))
-        .expect(1) // exactly one upstream request, no retry
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .expect(Guard::MAX_ASSESS_IDS as u64) // never more, whatever was asked
         .mount(&server)
         .await;
 
-    let g = guard(""); // default allow-all policy
+    let ids: Vec<u64> = (1..=Guard::MAX_ASSESS_IDS as u64 * 4).collect();
+    let g = guard("");
     let bz = client(&server);
-    let out = g.assess(&bz, KEY, &[7]).await;
+    let out = g.assess(&bz, KEY, &ids).await;
 
-    assert_eq!(out.len(), 1, "the requested id has an entry (I4)");
-    match &out[&7].0 {
-        Access::Denied { rule } => assert_eq!(rule, "unavailable"),
-        other => panic!("unavailable bug must be denied, got {other:?}"),
+    assert_eq!(out.len(), ids.len(), "every id still gets an entry (I4)");
+    for id in &ids {
+        match &out[id].0 {
+            Access::Denied { .. } => {}
+            other => panic!("bug {id} must be denied, got {other:?}"),
+        }
     }
-    assert!(out[&7].1.is_null());
 }
 
 #[tokio::test]
-async fn assess_id_absent_from_successful_batch_is_denied() {
+async fn assess_repeated_ids_are_fetched_once() {
+    // A caller cannot multiply the upstream cost — or read anything into it —
+    // by naming the same bug several times.
     let server = MockServer::start().await;
-    // Successful batch that simply lacks bug 2 (server-side hidden).
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "5"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "bugs": [bug(5, &[], OLD)] })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let g = guard("");
+    let bz = client(&server);
+    let out = g.assess(&bz, KEY, &[5, 5, 5]).await;
+
+    assert_eq!(out.len(), 1);
+    assert!(out[&5].0.allows(Capability::Read));
+}
+
+#[tokio::test]
+async fn assess_id_absent_from_its_own_response_is_denied() {
+    // A 200 that does not contain the bug is Bugzilla's way of saying "not
+    // for you". It must land on the same denial as an outright failure, and
+    // the response for one id must never be credited to another (the mock
+    // answers every id with bug 1's body).
+    let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/rest/bug"))
         .respond_with(
@@ -195,6 +267,36 @@ async fn assess_id_absent_from_successful_batch_is_denied() {
         Access::Denied { rule } => assert_eq!(rule, "unavailable"),
         other => panic!("absent bug must be denied (I4), got {other:?}"),
     }
+    assert!(
+        out[&2].1.is_null(),
+        "a mismatched body must never be attached to the requested id"
+    );
+}
+
+#[tokio::test]
+async fn assess_single_id_failure_makes_exactly_one_request() {
+    // Unchanged contract, now the general rule rather than a special case.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": true, "code": 101, "message": "Bug #7 does not exist."
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let g = guard(""); // default allow-all policy
+    let bz = client(&server);
+    let out = g.assess(&bz, KEY, &[7]).await;
+
+    assert_eq!(out.len(), 1, "the requested id has an entry (I4)");
+    match &out[&7].0 {
+        Access::Denied { rule } => assert_eq!(rule, "unavailable"),
+        other => panic!("unavailable bug must be denied, got {other:?}"),
+    }
+    assert!(out[&7].1.is_null());
 }
 
 #[tokio::test]

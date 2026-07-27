@@ -55,6 +55,23 @@ fn action_name(action: Action) -> &'static str {
     }
 }
 
+/// Refuse a call naming more distinct bug ids than the guard will classify.
+///
+/// The bound itself is [`Guard::MAX_ASSESS_IDS`], defined next to the loop it
+/// bounds. Refusing here rather than letting the guard silently deny the
+/// excess turns a confusing partial answer into a clear one, and the check
+/// reads only the request — never a verdict — so it discloses nothing about
+/// any bug (I1/I2).
+fn too_many_ids(ids: &[u64]) -> Option<CallToolResult> {
+    let distinct = ids.iter().collect::<BTreeSet<_>>().len();
+    (distinct > Guard::MAX_ASSESS_IDS).then(|| {
+        err_text(format!(
+            "At most {} bug ids may be named in one call, got {distinct}",
+            Guard::MAX_ASSESS_IDS
+        ))
+    })
+}
+
 /// Project a bug object to the requested field set, preserving the
 /// `_redacted` marker when present.
 fn project_fields(bug: &Value, fields: &BTreeSet<String>) -> Value {
@@ -151,7 +168,7 @@ fn default_limit() -> u32 {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct BugInfoParams {
-    /// Bug ids to fetch.
+    /// Bug ids to fetch. At most 25 distinct ids per call.
     pub bug_ids: Vec<u64>,
 }
 
@@ -458,6 +475,9 @@ impl BugWarden {
             .collect();
         if ids.is_empty() {
             return Ok(err_text("At least one bug id must be provided"));
+        }
+        if let Some(refusal) = too_many_ids(&ids) {
+            return Ok(refusal);
         }
 
         let assessments = self.assess(&key, &ids).await;
@@ -866,6 +886,9 @@ impl BugWarden {
         }
         let mut seen = BTreeSet::new();
         ids.retain(|id| seen.insert(*id));
+        if let Some(refusal) = too_many_ids(&ids) {
+            return Ok(refusal);
+        }
 
         let key = self.api_key(&ctx)?;
         let assessments = self.assess(&key, &ids).await;
@@ -1302,6 +1325,33 @@ impl ServerHandler for BugWarden {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn id_cap_counts_distinct_ids_and_reads_only_the_request() {
+        // The refusal must depend on how many DISTINCT bugs were named and on
+        // nothing else — never on which bugs they are (I1/I2).
+        let at_cap: Vec<u64> = (1..=Guard::MAX_ASSESS_IDS as u64).collect();
+        assert!(
+            too_many_ids(&at_cap).is_none(),
+            "exactly the bound is allowed"
+        );
+
+        let over: Vec<u64> = (1..=Guard::MAX_ASSESS_IDS as u64 + 1).collect();
+        let refusal = too_many_ids(&over).expect("over the bound must be refused");
+        let text = format!("{:?}", refusal.content);
+        assert!(
+            text.contains(&Guard::MAX_ASSESS_IDS.to_string()),
+            "refusal states the limit: {text}"
+        );
+
+        // Repeats cost one fetch, so they must not count towards the bound.
+        let repeated = vec![7u64; Guard::MAX_ASSESS_IDS * 4];
+        assert!(
+            too_many_ids(&repeated).is_none(),
+            "naming one bug many times is one bug"
+        );
+        assert!(too_many_ids(&[]).is_none());
+    }
     use super::*;
     use bugwarden_core::policy::Policy;
 

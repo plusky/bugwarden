@@ -223,10 +223,24 @@ impl Guard {
     /// Exact I2 text.
     pub fn denial(id: u64) -> String; // format!("Bug {id} is not accessible through this server")
 
-    /// Fetch CLASSIFY_FIELDS for ids in one batch; if the batch call fails,
-    /// retry each id individually; any id still failing or absent from the
-    /// response => (Access::Denied{rule:"unavailable".into()}, Value::Null).
+    /// Fetch CLASSIFY_FIELDS with exactly ONE request per DISTINCT id,
+    /// sequentially, whatever each answer turns out to be: the upstream
+    /// request count is a function of the requested ids alone, never of the
+    /// verdicts (I2). No batching — Bugzilla signals a nonexistent id by
+    /// failing the whole request but a withheld one by omitting it from a
+    /// success, so any batch-failure reaction spends different work on "no
+    /// such bug" than on "hidden bug". Per-id also makes batch poisoning
+    /// impossible, which is what the former retry existed to repair.
+    /// A response is credited to an id only when the SERVER labels it with
+    /// that id. Any id failing or absent from its own response =>
+    /// (Access::Denied{rule:"unavailable".into()}, Value::Null).
     /// Every requested id has an entry in the returned map (fail closed, I4).
+    /// Bounded by Guard::MAX_ASSESS_IDS (25): ids past the bound are denied
+    /// without being fetched, so a caller that forgets to check cannot turn
+    /// one call into an unbounded run of requests. Tools refuse over-long id
+    /// lists outright (server::too_many_ids) rather than answering partially.
+    pub const MAX_ASSESS_IDS: usize;
+
     pub async fn assess(&self, bz: &crate::client::BugzillaClient, key: &str, ids: &[u64])
         -> std::collections::BTreeMap<u64, (Access, serde_json::Value)>;
 
@@ -386,7 +400,9 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   read_only strips write caps; default deny; summary redaction; comment
   filtering; validation errors (unknown TOML keys, restrict without caps).
 - Integration tests (crates/bugwarden-core/tests/guard_wiremock.rs, wiremock):
-  assess() deny for embargoed group; min-age deny; batch failure => per-id
+  assess() deny for embargoed group; min-age deny; one request per distinct
+  id whatever the answer (nonexistent vs withheld cost the same), repeated
+  ids fetched once, no batch to poison; per-id
   fallback fail closed; comment privacy; error mapping; API key absent from
   error text (I12).
 - CI: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,

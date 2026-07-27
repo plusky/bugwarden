@@ -15,7 +15,7 @@
 //!   per-call opt-in in [`Guard::filter_comments`]; the same double opt-in
 //!   gates private attachment metadata in [`Guard::filter_attachments`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::Utc;
 use serde_json::{Map, Value};
@@ -57,15 +57,39 @@ impl Guard {
         format!("Bug {id} is not accessible through this server")
     }
 
+    /// Largest number of distinct ids one [`Guard::assess`] call will fetch.
+    ///
+    /// Classification costs one upstream request per distinct id, so the id
+    /// count multiplies the work a caller can demand of the Bugzilla behind
+    /// this server. The bound lives here, in the crate that owns the fan-out,
+    /// rather than in whichever binary happens to call it: `assess` is public
+    /// API and must not hand an unbounded loop to an out-of-tree caller.
+    pub const MAX_ASSESS_IDS: usize = 25;
+
     /// Classify `ids` against the policy.
     ///
-    /// Fetches `CLASSIFY_FIELDS` for all ids in one batched request; if the
-    /// batch call fails, retries each id individually so one bad id cannot
-    /// take down the whole batch. Any id that still fails or is absent from
-    /// the response maps to `(Access::Denied { rule: "unavailable" },
-    /// Value::Null)` — every requested id has an entry in the returned map,
-    /// and unavailability is indistinguishable from policy denial downstream
-    /// (fail closed, I4 + I2).
+    /// Fetches `CLASSIFY_FIELDS` with exactly ONE request per distinct id,
+    /// sequentially, whatever the outcome. The upstream request count is
+    /// therefore a function of the requested ids alone and never of what the
+    /// answers turn out to be (I2).
+    ///
+    /// This is why the batch is gone. Bugzilla reports a nonexistent id by
+    /// failing the WHOLE request, while a bug the caller may not see is
+    /// silently omitted from a successful one — so any scheme that reacts to
+    /// a batch failure spends different work on "no such bug" than on "hidden
+    /// bug", and a client with a clock can tell the two apart. Per-id also
+    /// removes batch poisoning outright: one bad id can no longer take the
+    /// others down with it, which is what the old retry existed to repair.
+    ///
+    /// Any id that fails or is absent from its response maps to
+    /// `(Access::Denied { rule: "unavailable" }, Value::Null)` — every
+    /// requested id has an entry in the returned map, and unavailability is
+    /// indistinguishable from policy denial downstream (fail closed, I4 + I2).
+    ///
+    /// Cost: one sequential upstream request per distinct id, bounded by
+    /// [`Guard::MAX_ASSESS_IDS`]; ids beyond the bound are denied without
+    /// being fetched. Sequential rather than concurrent because some Bugzilla
+    /// deployments drop parallel connections (see `client::server_info`).
     ///
     /// The API key is only forwarded to the client and never logged (I12).
     pub async fn assess(
@@ -83,45 +107,48 @@ impl Guard {
         // Classification objects fetched from Bugzilla, keyed by the id the
         // SERVER reported. Requested ids are only trusted when the response
         // actually contains a bug with that id (fail closed).
+        //
+        // One request per DISTINCT id, unconditionally: the work done must not
+        // depend on the answers, or the clock becomes an oracle (I2). Repeats
+        // in `ids` are collapsed so a caller cannot inflate the cost, or read
+        // anything into it, by asking for the same bug twice.
         let mut fetched: BTreeMap<u64, Value> = BTreeMap::new();
-        match bz.get_bugs(key, ids, Some(CLASSIFY_FIELDS)).await {
-            Ok(envelope) => {
-                if let Some(bugs) = envelope.get("bugs").and_then(Value::as_array) {
-                    for bug in bugs {
-                        if let Some(id) = bug.get("id").and_then(Value::as_u64) {
-                            fetched.insert(id, bug.clone());
-                        }
-                    }
-                }
+        let mut requested: BTreeSet<u64> = BTreeSet::new();
+        for &id in ids {
+            if !requested.insert(id) {
+                continue;
             }
-            Err(err) if ids.len() > 1 => {
-                // Batch failed (e.g. one denied id poisoning the whole
-                // request on some Bugzilla versions): retry per id.
-                tracing::debug!(error = %err, "batch classification fetch failed; retrying per id");
-                for &id in ids {
-                    match bz.get_bugs(key, &[id], Some(CLASSIFY_FIELDS)).await {
-                        Ok(envelope) => {
-                            if let Some(bugs) = envelope.get("bugs").and_then(Value::as_array) {
-                                for bug in bugs {
-                                    if bug.get("id").and_then(Value::as_u64) == Some(id) {
-                                        fetched.insert(id, bug.clone());
-                                    }
-                                }
+            if requested.len() > Self::MAX_ASSESS_IDS {
+                // Past the bound nothing is fetched, so every remaining id
+                // falls through to the denial below (I4). Callers are
+                // expected to refuse the request outright with a message;
+                // this is the backstop that keeps the fan-out finite even
+                // when they do not.
+                tracing::warn!(
+                    ids = ids.len(),
+                    max = Self::MAX_ASSESS_IDS,
+                    "assess called with more ids than the bound; denying the excess"
+                );
+                break;
+            }
+            match bz.get_bugs(key, &[id], Some(CLASSIFY_FIELDS)).await {
+                Ok(envelope) => {
+                    if let Some(bugs) = envelope.get("bugs").and_then(Value::as_array) {
+                        for bug in bugs {
+                            // Only the bug the server itself labels with this
+                            // id counts — never the position in the response.
+                            if bug.get("id").and_then(Value::as_u64) == Some(id) {
+                                fetched.insert(id, bug.clone());
                             }
                         }
-                        Err(err) => {
-                            tracing::debug!(id, error = %err, "per-id classification fetch failed");
-                        }
                     }
                 }
-            }
-            Err(err) => {
-                // Single-id batch: a per-id retry would repeat the identical
-                // request and could never recover anything. Skipping it also
-                // keeps the upstream request count (and thus latency)
-                // identical for a nonexistent id and a policy-denied one, so
-                // a client timing its calls gets no existence oracle (I2).
-                tracing::debug!(error = %err, "single-id classification fetch failed");
+                Err(err) => {
+                    // Nonexistent, forbidden upstream, or a transport failure:
+                    // all indistinguishable from here, and all fail closed
+                    // below (I4). Never logged with the key (I12).
+                    tracing::debug!(id, error = %err, "classification fetch failed");
+                }
             }
         }
 
