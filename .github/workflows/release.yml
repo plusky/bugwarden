@@ -1,0 +1,103 @@
+---
+name: release
+# yamllint disable-line rule:truthy
+on:
+  push:
+    tags:
+      # Version tags: 0.1.0, optionally with a pre-release suffix (0.1.0rc1).
+      # The project tags without a "v" prefix.
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.triple }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # Build every platform even if one fails, so a single broken target
+      # surfaces on its own. The release job needs all legs to succeed, so a
+      # failure still blocks publishing a partial set of artifacts.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+          - os: macos-latest  # Apple Silicon
+            triple: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
+        with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: "1.97.0"
+      # No cargo cache here: releases are built hermetically so restored
+      # build state can never influence published artifacts.
+
+      - name: Verify tag matches workspace version
+        shell: bash
+        run: |
+          pkg="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$pkg" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag '$GITHUB_REF_NAME' != workspace version '$pkg'"
+            exit 1
+          fi
+
+      - name: Build release binary
+        run: cargo build --release --locked -p bugwarden
+
+      - name: Package release artifact
+        shell: bash
+        run: |
+          triple="${{ matrix.triple }}"
+          dist="bugwarden-${GITHUB_REF_NAME}-${triple}"
+          mkdir "$dist"
+          cp target/release/bugwarden LICENSE README.md "$dist/"
+          mkdir "$dist/examples"
+          cp examples/policy.toml "$dist/examples/"
+          tar czf "${dist}.tar.gz" "$dist"
+          # shasum -a 256 exists on both the ubuntu and macOS runners and its
+          # output is compatible with `sha256sum -c`.
+          shasum -a 256 "${dist}.tar.gz" >"${dist}.tar.gz.sha256"
+          echo "DIST=$dist" >>"$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ${{ matrix.triple }}
+          path: |
+            ${{ env.DIST }}.tar.gz
+            ${{ env.DIST }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    # Publish only after every platform built successfully, so a release never
+    # ships a partial artifact set.
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # required for `gh release create`
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131  # v7.0.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # No checkout in this job, so tell gh which repo to act on.
+          GH_REPO: ${{ github.repository }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          --title "$GITHUB_REF_NAME"
+          --generate-notes
+          dist/*
