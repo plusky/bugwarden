@@ -8,5 +8,7 @@
 //! as a unit. The supported product remains the `bugwarden` binary; this
 //! API carries no stability promise of its own.
 
+/// Operator-facing audit event stream: record schema and JSONL file sink.
+pub mod audit;
 pub mod config;
 pub mod server;

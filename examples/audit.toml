@@ -1,0 +1,101 @@
+# bugwarden audit stream — worked example
+# ========================================
+#
+# The guard hides things from the MCP client by design: a denied bug is
+# indistinguishable from a nonexistent one, filtered search results vanish
+# without a trace, and no rule is ever named in a response. This file
+# configures the other half of that bargain — the operator's own record of
+# what was asked and what the guard decided. Audit records carry exactly
+# the facts the client must never see (guard verdicts, matched rule names,
+# suppressed bug ids), which is why they go only to a local file you
+# control: the stream is never exposed through any MCP surface, and it is
+# never mixed into the diagnostic stderr stream.
+#
+# Format: one JSON object per line (JSONL), schema version 1. Three record
+# kinds: `tool_call` (one MCP tool invocation, request through outcome,
+# with the guard's decision), `initialize` (a client opened a session),
+# and `audit_gap` (records were lost — see fail_mode below; the gap is
+# reported in the stream itself, so silent loss is impossible to miss).
+#
+# The schema is closed: fixed structs, fixed vocabularies, and no
+# dedicated field for the Bugzilla API key, request headers, or free-text
+# bug content. The one open field, `request.params`, is fed exclusively
+# through a per-tool allowlist of client-authored values at the recording
+# call site; nothing fetched FROM Bugzilla is ever written here.
+#
+# Parsing is strict: unknown keys anywhere in this file are a startup
+# error, so a typo cannot silently disable a setting.
+
+# The audit file. REQUIRED — this is the only key without a default.
+# The parent directory is created mode 0700 if missing; the file is
+# created mode 0600 and only ever appended to. A symlink at this path is
+# refused at startup: the check catches a misconfigured path, it is not a
+# defense against a hostile local user — keep the directory operator-owned.
+path = "/var/log/bugwarden/audit.jsonl"
+
+# Flush to stable storage (sync_data) after every record. `false` already
+# survives a killed or crashed process — each record is handed to the
+# kernel before the tool response is returned — but only `true` also
+# survives power loss or a kernel panic, at a per-record latency cost on
+# every single tool call. Turn it on when the audit trail matters more
+# than tail latency. Default: false.
+fsync = false
+
+# What happens to tool calls while audit records CANNOT be persisted
+# (disk full, rotation failing, file removed). One of:
+#
+#   "open"                   Keep serving. Lost records surface later as
+#                            an `audit_gap` record with a drop count, but
+#                            what exactly was asked during the outage is
+#                            gone. Availability over accountability.
+#
+#   "closed_writes_denials"  Reads the guard fully allows still proceed
+#                            unaudited; write operations and any call
+#                            where the guard suppressed or denied
+#                            something are refused until records persist
+#                            again. The security-relevant events are the
+#                            ones that must not happen off the record.
+#
+#   "closed_all"             Every tool call is refused until its record
+#                            can be persisted. Accountability over
+#                            availability — BE AWARE what this buys you:
+#                            audit unavailable = the server refuses
+#                            everything, so an unmonitored full disk turns
+#                            the server off. Monitor your disk.
+#
+# When this key is ABSENT the server derives the mode from the transport
+# at startup: stdio (a local, single-operator session) defaults to
+# "open", http (remote clients) defaults to "closed_all". Set it only to
+# override that choice.
+#fail_mode = "closed_all"
+
+# Built-in size-based rotation: rotate before a record would push the
+# live file past this many bytes. Rotation shifts audit.jsonl.1 ->
+# audit.jsonl.2 and so on, moves the live file to audit.jsonl.1, and
+# starts a fresh live file. 0 disables built-in rotation entirely — do
+# that if logrotate or similar owns this file; never let both rotate.
+# Default: 67108864 (64 MiB).
+rotate_max_bytes = 67108864
+
+# How many rotated files to keep; older ones are deleted at rotation
+# time. With the sizes above this bounds the stream at roughly
+# (rotate_keep + 1) * rotate_max_bytes on disk. Must be at least 1 while
+# rotate_max_bytes is non-zero — "rotate but keep nothing" would delete
+# records the moment they age out of the live file, and a policy of
+# keeping nothing is spelled `rotate_max_bytes = 0` plus an external tool
+# that truncates. At most 10000: every rotation shifts each kept file
+# with a rename while audit writes wait. Shrinking this between runs
+# strands existing higher-numbered .N files — bugwarden never deletes
+# them; remove them manually. Default: 8.
+rotate_keep = 8
+
+# Whether records may name the bug ids the guard suppressed from a
+# response (`guard.suppressed_ids`). With `false`, records carry only the
+# count. The trade: the ids are precisely the hidden-bug numbers this
+# server exists to withhold from clients, so with `true` the audit file
+# is itself sensitive — anyone who can read it can enumerate hidden bugs.
+# Keep `true` (the default) when the file stays operator-only and you
+# want to answer "which bugs did that agent almost see?"; set `false`
+# when the stream is shipped into a broader log platform where readers
+# are less trusted than the operator. Default: true.
+suppressed_ids = true
