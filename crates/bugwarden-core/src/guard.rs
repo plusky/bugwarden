@@ -1641,6 +1641,99 @@ products = ["NoView*"]
     }
 
     #[test]
+    fn shipped_example_policy_denies_security_named_groups_on_their_own() {
+        // The example stacks two rules over security-group bugs: the broad
+        // "group-restricted" (any group at all) and "security-groups" (the
+        // names, by glob). The second is the backstop the file promises: an
+        // operator who narrows or removes the broad rule — as its own
+        // comment invites — must not thereby expose security-group bugs.
+        // Pin both layers on a bug carrying NO other deniable signal: no
+        // marker in the summary, no keywords, empty whiteboard, years past
+        // every freshness window.
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/policy.toml");
+        let toml = std::fs::read_to_string(path).expect("example policy must exist in-repo");
+        let bug = BugMeta::from_json(&json!({
+            "id": 42,
+            "summary": "kernel oops when unplugging a USB dock",
+            "groups": ["team-security"],
+            "keywords": [],
+            "whiteboard": "",
+            "product": "Base System",
+            "component": "Kernel",
+            "status": "NEW",
+            "severity": "major",
+            "priority": "P2",
+            "creation_time": "2020-01-01T00:00:00Z",
+        }));
+
+        // The shipped file as-is: denied (the broad rule reaches it first).
+        let full = policy(&toml);
+        assert!(
+            matches!(full.classify(&bug, Utc::now()), Access::Denied { .. }),
+            "shipped policy must deny a security-group bug"
+        );
+
+        // Excise the whole group-restricted rule (everything up to the next
+        // [[rule]] header) and classify again: still denied, and by the
+        // named-group rule itself — proof the backstop carries its weight.
+        let start = toml
+            .find("[[rule]]\nname = \"group-restricted\"")
+            .expect("the broad rule must exist in the example");
+        let after = start + "[[rule]]".len();
+        let end = after
+            + toml[after..]
+                .find("[[rule]]")
+                .expect("a rule must follow the broad rule");
+        let narrowed = policy(&format!("{}{}", &toml[..start], &toml[end..]));
+        match narrowed.classify(&bug, Utc::now()) {
+            Access::Denied { rule } => assert_eq!(
+                rule, "security-groups",
+                "the named-group rule itself must be the one denying"
+            ),
+            Access::Granted { .. } => {
+                panic!("removing the broad rule must not expose security-group bugs")
+            }
+        }
+
+        // A restricted-but-not-security bug is exactly what an operator
+        // removes the broad rule FOR: under the narrowed policy it falls
+        // through to default_action and becomes visible.
+        let partner = BugMeta::from_json(&json!({
+            "id": 43,
+            "summary": "invoice import fails for partner deployments",
+            "groups": ["partnerconfidential"],
+            "keywords": [],
+            "whiteboard": "",
+            "product": "Base System",
+            "component": "Billing",
+            "status": "NEW",
+            "severity": "major",
+            "priority": "P2",
+            "creation_time": "2020-01-01T00:00:00Z",
+        }));
+        assert!(
+            matches!(full.classify(&partner, Utc::now()), Access::Denied { .. }),
+            "shipped policy hides every restricted bug"
+        );
+        assert!(
+            matches!(
+                narrowed.classify(&partner, Utc::now()),
+                Access::Granted { .. }
+            ),
+            "narrowing is meant to expose non-security restricted bugs"
+        );
+
+        // Creation stays refused under the narrowed file too: the backstop
+        // still consults the group list, which is unknowable pre-creation.
+        let g = Guard { policy: narrowed };
+        assert!(
+            !g.may_create(&create_request("openSUSE")),
+            "narrowed policy must still refuse all creation"
+        );
+    }
+
+    #[test]
     fn may_create_group_rules_ruled_out_by_other_criteria_do_not_block() {
         // Forcing groups to unknown must not turn every group-consulting
         // rule into a blanket refusal: a rule some OTHER criterion already

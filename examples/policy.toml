@@ -6,6 +6,9 @@
 #   * undisclosed (embargoed) security bugs are completely invisible, always;
 #   * so is every bug that is not world-readable — see rule 1, which is
 #     deliberately broader than "security" and can be narrowed;
+#   * bugs in groups NAMED like security groups are invisible in their own
+#     right — see "security-groups", which keeps denying them even after
+#     rule 1 is narrowed or removed;
 #   * bugs labelled "security" are invisible while they are fresher than
 #     5 days (the window in which details are typically still unreviewed);
 #   * every other bug is shown to the user in full;
@@ -97,9 +100,36 @@ action = "deny"
 #
 # This is deliberately broad: it also hides non-security bugs that happen to
 # be group-restricted (partner-confidential reports, internal-only products).
-# To hide only the security groups instead, replace this rule with a glob on
-# the names your instance actually uses, e.g. groups = ["*security*"].
+# If that is more than you want, narrow this rule (replace
+# `group_restricted = true` with a `groups = [...]` glob list) or drop it —
+# but FIRST check the "security-groups" rule below against the group names
+# your instance actually uses. It keeps hiding security groups by name only
+# where its globs match; names built from other stems ("infosec", "psirt",
+# "secteam", ...) must be added to its list before this rule stops covering
+# them.
 group_restricted = true
+
+[[rule]]
+name = "security-groups"
+description = "Bugs in security/internal-named groups are invisible"
+action = "deny"
+[rule.match]
+# Backstop for the rule above, and redundant only as long as that rule keeps
+# its full breadth: "group-restricted" already hides these bugs, but it hides
+# every other restricted bug too, and the moment an operator narrows or
+# deletes it (say, to let partner-confidential bugs through) the security
+# groups must not slip out with them. This rule names them, so it keeps
+# denying entirely on its own.
+#
+# Matches if ANY of the bug's groups matches ANY of these globs. The three
+# stems cover the names instances commonly build their sensitive groups
+# from: the security team's own groups ("security", "corp-security",
+# "Security Internal"), groups named for the embargo state, and groups named
+# for internality rather than security ("internal-only"). Group vocabularies
+# are per-instance, though: check the names your instance actually uses and
+# extend the list. Erring broad is safe here — an extra match only hides a
+# bug; a missed name is what the rule above exists to catch.
+groups = ["*security*", "*embargo*", "*internal*"]
 
 [[rule]]
 name = "undisclosed-marker"
