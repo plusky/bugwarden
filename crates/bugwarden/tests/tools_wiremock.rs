@@ -11,7 +11,11 @@
 //! - swapping `Capability::Attach` for `Capability::Attachments` at the
 //!   add_attachment gate;
 //! - deleting the `may_create` call from create_bug;
-//! - deleting the upload size-cap call from add_attachment.
+//! - deleting the upload size-cap call from add_attachment;
+//! - attaching the quicksearch id-list advisory only when the served `bugs`
+//!   array is non-empty;
+//! - suppressing the quicksearch id-list advisory when I14 link scrubbing
+//!   removed anything.
 
 use std::sync::Arc;
 
@@ -377,6 +381,268 @@ async fn add_attachment_size_cap_blocks_before_any_upload() {
         text_of(&result),
         "Attachment exceeds the size limit of this server"
     );
+}
+
+// ---------- bugs_quicksearch id-list advisory ----------
+
+/// Mount an upstream that answers every quicksearch scan with `rows` and the
+/// I14 link-disclosure padding fetch (`id=0`) with an empty envelope.
+async fn mount_search(mock: &MockServer, rows: Vec<Value>) {
+    // Mounted first so it wins for the id=0 fetch; search requests carry no
+    // `id` parameter and fall through to the catch-all below.
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": rows })))
+        .mount(mock)
+        .await;
+}
+
+/// Parsed JSON of a successful quicksearch call for `query`.
+async fn quicksearch_json(client: &RunningService<RoleClient, ()>, query: &str) -> Value {
+    quicksearch_json_args(client, json!({ "query": query })).await
+}
+
+/// Parsed JSON of a successful quicksearch call with full `args`.
+async fn quicksearch_json_args(client: &RunningService<RoleClient, ()>, args: Value) -> Value {
+    let result = call(client, "bugs_quicksearch", args).await;
+    assert!(!is_error(&result), "search failed: {}", text_of(&result));
+    serde_json::from_str(&text_of(&result)).expect("quicksearch returns JSON")
+}
+
+#[tokio::test]
+async fn quicksearch_id_list_advisory_tracks_the_query_alone() {
+    // The upstream serves the same rows whatever the query, so any
+    // difference between the two results below is the server's own doing.
+    let mock = MockServer::start().await;
+    mount_search(
+        &mock,
+        vec![world_readable_bug(101), world_readable_bug(102)],
+    )
+    .await;
+    let client = client_for("", &mock).await;
+
+    // (a) A pure id-list query carries the advisory note.
+    let mut with_note = quicksearch_json(&client, "#101, 102").await;
+    let note = with_note["note"]
+        .as_str()
+        .expect("an id-list query must carry the advisory")
+        .to_string();
+    assert!(note.contains("bug_info"), "the note must steer to bug_info");
+
+    // (b) A content query — even one containing a number — carries none.
+    let without = quicksearch_json(&client, "kernel crash 101").await;
+    assert!(
+        without.get("note").is_none(),
+        "a content query must not carry the advisory"
+    );
+
+    // (c) Apart from the note the envelopes are identical: same bugs, same
+    // order — the advisory never changes what is returned.
+    with_note.as_object_mut().unwrap().remove("note");
+    assert_eq!(with_note, without);
+}
+
+#[tokio::test]
+async fn quicksearch_advisory_ignores_hidden_bugs() {
+    // Same policy, same id-list query, two upstreams: in one a returned bug
+    // is policy-hidden. The hidden bug is silently dropped (I3), but the
+    // advisory — presence and text — must not move: a note that tracked
+    // verdicts would be a brand-new oracle.
+    let policy = concat!(
+        "[[rule]]\nname = \"hide-secret\"\naction = \"deny\"\n",
+        "[rule.match]\nproducts = [\"Secret*\"]\n",
+    );
+
+    let plain = MockServer::start().await;
+    mount_search(
+        &plain,
+        vec![world_readable_bug(101), world_readable_bug(102)],
+    )
+    .await;
+    let client = client_for(policy, &plain).await;
+    let served_both = quicksearch_json(&client, "101, 102").await;
+    assert_eq!(served_both["bugs"].as_array().unwrap().len(), 2);
+    let note_both = served_both["note"]
+        .as_str()
+        .expect("note present")
+        .to_string();
+
+    let hiding = MockServer::start().await;
+    let mut hidden = world_readable_bug(101);
+    hidden["product"] = json!("SecretSauce");
+    mount_search(&hiding, vec![hidden, world_readable_bug(102)]).await;
+    let client = client_for(policy, &hiding).await;
+    let served_one = quicksearch_json(&client, "101, 102").await;
+    let bugs = served_one["bugs"].as_array().unwrap();
+    assert_eq!(bugs.len(), 1, "the hidden bug is silently dropped");
+    assert_eq!(bugs[0]["id"], json!(102));
+    assert_eq!(
+        served_one["note"].as_str().expect("note still present"),
+        note_both,
+        "a hidden bug must not change the advisory"
+    );
+}
+
+#[tokio::test]
+async fn quicksearch_advisory_survives_an_all_hidden_result() {
+    // Every matching bug is policy-hidden: the served `bugs` array is empty
+    // (I3), and the advisory must still be present, byte-identical to the
+    // note the same query carries when everything is visible. A note gated
+    // on served results would tell "no match" apart from "all matches
+    // hidden" — a fresh oracle.
+    let policy = concat!(
+        "[[rule]]\nname = \"hide-secret\"\naction = \"deny\"\n",
+        "[rule.match]\nproducts = [\"Secret*\"]\n",
+    );
+
+    let plain = MockServer::start().await;
+    mount_search(
+        &plain,
+        vec![world_readable_bug(101), world_readable_bug(102)],
+    )
+    .await;
+    let client = client_for(policy, &plain).await;
+    let visible = quicksearch_json(&client, "101, 102").await;
+    assert_eq!(visible["bugs"].as_array().unwrap().len(), 2);
+    let reference_note = visible["note"].as_str().expect("note").to_string();
+
+    let hiding = MockServer::start().await;
+    let mut h1 = world_readable_bug(101);
+    h1["product"] = json!("SecretSauce");
+    let mut h2 = world_readable_bug(102);
+    h2["product"] = json!("SecretSauce");
+    mount_search(&hiding, vec![h1, h2]).await;
+    let client = client_for(policy, &hiding).await;
+    let empty = quicksearch_json(&client, "101, 102").await;
+    assert_eq!(
+        empty["bugs"].as_array().unwrap().len(),
+        0,
+        "every match is policy-hidden"
+    );
+    assert_eq!(
+        empty["note"]
+            .as_str()
+            .expect("the note must survive an empty result"),
+        reference_note,
+        "an all-hidden result must not move the advisory"
+    );
+}
+
+#[tokio::test]
+async fn quicksearch_advisory_unmoved_by_link_scrubbing() {
+    // A served bug's depends_on names bug 666. Two upstreams, same policy,
+    // same request: in one 666 is world-readable, in the other it is
+    // policy-hidden, so I14 scrubbing empties the link field. The note —
+    // presence and bytes — must not move with it: scrubbed ids are invisible
+    // to the client, so a note that tracked scrubbing would be a covert
+    // verdict channel.
+    let policy = concat!(
+        "[[rule]]\nname = \"hide-secret\"\naction = \"deny\"\n",
+        "[rule.match]\nproducts = [\"Secret*\"]\n",
+    );
+    let args = json!({
+        "query": "101, 102",
+        "include_fields": "id,summary,depends_on",
+    });
+    let mut linked = world_readable_bug(101);
+    linked["depends_on"] = json!([666]);
+
+    // Control: the linked bug is disclosable, nothing is scrubbed. The
+    // id=666 mock is mounted before mount_search's catch-all so it wins the
+    // link-disclosure fetch; search requests carry no `id` parameter.
+    let plain = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "666"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "bugs": [world_readable_bug(666)] })),
+        )
+        .mount(&plain)
+        .await;
+    mount_search(&plain, vec![linked.clone()]).await;
+    let client = client_for(policy, &plain).await;
+    let unscrubbed = quicksearch_json_args(&client, args.clone()).await;
+    assert_eq!(unscrubbed["bugs"][0]["depends_on"], json!([666]));
+    let reference_note = unscrubbed["note"].as_str().expect("note").to_string();
+
+    // Same request, but 666 is policy-hidden: the link is scrubbed (I14)
+    // and the advisory must not react.
+    let hiding = MockServer::start().await;
+    let mut secret = world_readable_bug(666);
+    secret["product"] = json!("SecretSauce");
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "666"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [secret] })))
+        .mount(&hiding)
+        .await;
+    mount_search(&hiding, vec![linked]).await;
+    let client = client_for(policy, &hiding).await;
+    let scrubbed = quicksearch_json_args(&client, args).await;
+    assert_eq!(
+        scrubbed["bugs"][0]["depends_on"],
+        json!([]),
+        "the hidden link must actually be scrubbed (I14)"
+    );
+    assert_eq!(
+        scrubbed["note"]
+            .as_str()
+            .expect("the note must survive link scrubbing"),
+        reference_note,
+        "link scrubbing must not move the advisory"
+    );
+}
+
+#[tokio::test]
+async fn quicksearch_advisory_wording_tracks_status_and_id_count() {
+    // Request-only steering, end to end: with an empty status the query
+    // goes upstream bare, where an all-number query is an exact id lookup,
+    // so the note must not claim content matching there; and a list longer
+    // than bug_info's per-call cap must steer to batching, not straight
+    // into the too_many_ids refusal. The upstream serves no rows at all,
+    // so every note below also rides on an empty `bugs` array.
+    let mock = MockServer::start().await;
+    mount_search(&mock, vec![]).await;
+    let client = client_for("", &mock).await;
+
+    // Default (non-empty) status: content-matching wording, no batching.
+    let dflt = quicksearch_json(&client, "101, 102").await;
+    let dflt_note = dflt["note"].as_str().expect("id-list note");
+    assert!(dflt_note.contains("matches bug text"), "{dflt_note}");
+    assert!(!dflt_note.contains("id lookup"), "{dflt_note}");
+
+    // Explicitly empty status: id-lookup wording, still steering to
+    // bug_info.
+    let bare = quicksearch_json_args(&client, json!({ "query": "101, 102", "status": "" })).await;
+    let bare_note = bare["note"].as_str().expect("note on the bare path");
+    assert!(bare_note.contains("exact id lookup"), "{bare_note}");
+    assert!(!bare_note.contains("matches bug text"), "{bare_note}");
+    assert!(bare_note.contains("bug_info"), "{bare_note}");
+
+    // 26 distinct ids: the steering mentions the cap and batching.
+    let long_query = (1..=26)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let long = quicksearch_json(&client, &long_query).await;
+    let long_note = long["note"].as_str().expect("note on a long id list");
+    assert!(long_note.contains("at most 25 ids"), "{long_note}");
+    assert!(long_note.contains("batch"), "{long_note}");
+
+    // 25 distinct ids: no batching talk.
+    let cap_query = (1..=25)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cap = quicksearch_json(&client, &cap_query).await;
+    let cap_note = cap["note"].as_str().expect("note at the cap");
+    assert!(!cap_note.contains("batch"), "{cap_note}");
 }
 
 #[tokio::test]

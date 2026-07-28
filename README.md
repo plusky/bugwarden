@@ -331,7 +331,7 @@ action.
 | `bug_info` | Details for a set of bug ids. Per id: full details with `read`, redacted summary with `summary`, otherwise a uniform "not accessible" entry | `read` / `summary` |
 | `bug_history` | Change history of a bug, optionally only entries newer than a timestamp | `history` |
 | `bug_comments` | Comments on a bug; private comments only per the private-comment gate | `comments` |
-| `bugs_quicksearch` | Bugzilla [quicksearch](https://bugzilla.readthedocs.io/en/latest/using/finding.html#quicksearch); results are silently policy-filtered (denied dropped, summary-only redacted) | per result: `read` / `summary` |
+| `bugs_quicksearch` | Bugzilla [quicksearch](https://bugzilla.readthedocs.io/en/latest/using/finding.html#quicksearch) — the `status` filter (default `ALL`) is prefixed to the query, and under any non-empty status a number in the query is content-matched, so it also matches bugs that merely mention it; with an empty `status` the query goes to Bugzilla bare, where a query of nothing but numbers is an exact id lookup (use `bug_info` for an exact set of known ids; an all-ids query gets an advisory note saying so). Results are silently policy-filtered (denied dropped, summary-only redacted) | per result: `read` / `summary` |
 | `summarize_bug` | Returns a summarization prompt built from the bug's public comments | `comments` |
 | `list_attachments` | Attachment metadata (never attachment content) | `attachments` |
 | `download_attachment` | Content of one attachment (raster images as image content, everything else as a base64 blob resource), capped by `max_attachment_bytes`; private attachments need the private-content double opt-in and, on download, a *missing* privacy flag counts as private | `attachments` on the owning bug |

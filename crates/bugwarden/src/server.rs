@@ -132,6 +132,69 @@ fn too_many_ids(ids: &[u64]) -> Option<CallToolResult> {
     })
 }
 
+/// Advisory attached to a quicksearch envelope when the query is nothing but
+/// bug ids (comma/whitespace-separated numbers, each optionally prefixed
+/// with '#').
+///
+/// With a non-empty `status` the tool prefixes it to the query, so upstream
+/// content-matches the whole expression and a client holding an exact set of
+/// ids is better served by `bug_info` — this note says so. With an empty
+/// `status` the query goes upstream bare, and Bugzilla routes a bare query
+/// of nothing but numbers to an exact id lookup instead; the note still
+/// steers to `bug_info` there, with wording that is true on that path. A
+/// query naming more distinct ids than [`Guard::MAX_ASSESS_IDS`] gets
+/// steering that mentions the per-call cap and batching — the cap is already
+/// public in bug_info's refusal text and parameter doc — so the advice does
+/// not walk the client straight into a refusal.
+///
+/// The note is computed from the CLIENT'S OWN REQUEST ALONE (the query and
+/// status strings): never from search results, guard verdicts, or anything
+/// upstream said. That keeps it off the oracle surface — its presence and
+/// wording tell the client nothing it did not already know (I2/I3) — and
+/// the `bugs` array it accompanies is byte-identical to what the same
+/// request returns without it. The query is NOT rerouted: a client genuinely
+/// searching for a number still gets the search it asked for.
+fn id_list_advisory(query: &str, status: &str) -> Option<String> {
+    let mut ids: BTreeSet<&str> = BTreeSet::new();
+    for token in query.split(|c: char| c == ',' || c.is_whitespace()) {
+        if token.is_empty() {
+            continue;
+        }
+        let digits = token.strip_prefix('#').unwrap_or(token);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        // Distinct ids, not distinct spellings: "07" names bug 7.
+        let canonical = digits.trim_start_matches('0');
+        ids.insert(if canonical.is_empty() { "0" } else { canonical });
+    }
+    if ids.is_empty() {
+        return None;
+    }
+    let semantics = if status.is_empty() {
+        "This query is only bug ids and, because status is empty, it is \
+         passed to Bugzilla bare; Bugzilla treats a bare query of nothing \
+         but numbers as an exact id lookup, not a content search."
+    } else {
+        "This query is only bug ids, but quicksearch matches bug text, so a \
+         number also matches bugs that merely mention it."
+    };
+    let steer = if ids.len() > Guard::MAX_ASSESS_IDS {
+        format!(
+            "For an exact set of known ids call bug_info with its bug_ids \
+             array, at most {} ids per call — batch a longer list across \
+             calls: every requested id comes back either as a bug or under \
+             'restricted'.",
+            Guard::MAX_ASSESS_IDS
+        )
+    } else {
+        "For an exact set of known ids call bug_info with its bug_ids array: \
+         every requested id comes back either as a bug or under 'restricted'."
+            .to_string()
+    };
+    Some(format!("{semantics} {steer}"))
+}
+
 /// Project a bug object to the requested field set, preserving the
 /// `_redacted` marker when present.
 fn project_fields(bug: &Value, fields: &BTreeSet<String>) -> Value {
@@ -271,9 +334,17 @@ pub struct BugCommentsParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct QuicksearchParams {
-    /// Query in bugzilla quicksearch syntax.
+    /// Query in bugzilla quicksearch syntax. Under any non-empty status
+    /// (the default is ALL) this is content matching, not id lookup: a
+    /// number in the query is matched as text and returns bugs that merely
+    /// mention that number. With an empty status the query is sent to
+    /// bugzilla bare, and a bare query of nothing but numbers is an exact
+    /// id lookup. For an exact set of known bug ids use the bug_info tool
+    /// instead.
     pub query: String,
-    /// Status filter (e.g., ALL, OPEN, CLOSED).
+    /// Status filter (e.g., ALL, OPEN, CLOSED), prefixed to the query.
+    /// Empty means bugzilla's default search over open bugs — and a bare
+    /// query of nothing but numbers then becomes an exact id lookup.
     #[serde(default = "default_status")]
     pub status: String,
     /// Comma-separated list of fields to return for each bug.
@@ -765,7 +836,7 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Search bugs using bugzilla's quicksearch syntax.\n\nTo reduce the token limit & response time, only returns a subset of fields for each bug. The user can query full details of each bug using the bug_info tool. Returns the top-level bug data envelope containing the matched bugs.",
+        description = "Search bugs by CONTENT using bugzilla's quicksearch syntax (full-text matching over bug summaries and text). The status filter is prefixed to the query expression, and under any non-empty status (the default is ALL) a number in the query is matched as text like any other word — it returns bugs that merely MENTION that number, not an id lookup. The one exception: an empty status sends the query to bugzilla bare, and bugzilla treats a bare query of nothing but numbers as an exact id lookup. Either way, for an exact set of known bug ids call bug_info with its bug_ids array instead: every requested id comes back either as a bug or under 'restricted', so an inaccessible id is reported rather than silently missing from a search.\n\nTo reduce the token limit & response time, only returns a subset of fields for each bug. The user can query full details of each bug using the bug_info tool. Returns the top-level bug data envelope containing the matched bugs.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn bugs_quicksearch(
@@ -843,7 +914,14 @@ impl BugWarden {
             Guard::scrub_bug_links(bug, base_url, &allowed);
         }
 
-        Ok(ok_json(json!({ "bugs": projected })))
+        let mut envelope = json!({ "bugs": projected });
+        // Steering only, computed from the request the client itself sent
+        // (query and status) — never from results or verdicts (see
+        // id_list_advisory).
+        if let Some(note) = id_list_advisory(&p.query, &p.status) {
+            envelope["note"] = json!(note);
+        }
+        Ok(ok_json(envelope))
     }
 
     #[tool(
@@ -1559,7 +1637,7 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Access the documentation of the bugzilla quicksearch syntax. LLM can learn using this tool. Response is in HTML",
+        description = "Access the documentation of the bugzilla quicksearch syntax. LLM can learn using this tool. Response is in HTML. Note: through this server's bugs_quicksearch the status filter is prefixed to the query, so under any non-empty status (the default is ALL) a number in the query is content-matched as text; the syntax page's jump-to-bug-number shortcut applies only when status is empty and the query is nothing but numbers. Look up known bug ids with the bug_info tool.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn quicksearch_syntax(&self) -> Result<CallToolResult, McpError> {
@@ -1895,6 +1973,61 @@ mod tests {
             "naming one bug many times is one bug"
         );
         assert!(too_many_ids(&[]).is_none());
+    }
+
+    #[test]
+    fn id_list_advisory_fires_on_pure_id_lists_only() {
+        // Pure id lists: commas and/or whitespace, optional '#' per id.
+        assert!(id_list_advisory("123456", "ALL").is_some());
+        assert!(id_list_advisory("#123456", "ALL").is_some());
+        assert!(id_list_advisory("111, 222,333", "ALL").is_some());
+        assert!(id_list_advisory("#111 #222\t333,", "ALL").is_some());
+
+        // Anything else is a content search and gets no note.
+        assert!(id_list_advisory("", "ALL").is_none());
+        assert!(id_list_advisory("  ,\t", "ALL").is_none());
+        assert!(id_list_advisory("#", "ALL").is_none());
+        assert!(id_list_advisory("kernel crash 123", "ALL").is_none());
+        assert!(id_list_advisory("123x", "ALL").is_none());
+        assert!(id_list_advisory("product:openSUSE 42", "ALL").is_none());
+    }
+
+    #[test]
+    fn id_list_advisory_wording_tracks_status_and_id_count() {
+        // Non-empty status: the tool prefixes it, upstream content-matches.
+        let prefixed = id_list_advisory("101, 102", "ALL").expect("note");
+        assert!(prefixed.contains("matches bug text"), "{prefixed}");
+        assert!(!prefixed.contains("id lookup"), "{prefixed}");
+
+        // Empty status: the query goes upstream bare, where an all-number
+        // query is an exact id lookup — no content-matching claim there.
+        let bare = id_list_advisory("101, 102", "").expect("note");
+        assert!(bare.contains("exact id lookup"), "{bare}");
+        assert!(!bare.contains("matches bug text"), "{bare}");
+        assert!(bare.contains("bug_info"), "{bare}");
+
+        // Over bug_info's per-call cap the steering mentions batching
+        // instead of walking the client into the too_many_ids refusal; the
+        // cap value is already public in that refusal's own text.
+        let over: Vec<String> = (1..=Guard::MAX_ASSESS_IDS as u64 + 1)
+            .map(|i| i.to_string())
+            .collect();
+        let long = id_list_advisory(&over.join(" "), "ALL").expect("note");
+        assert!(
+            long.contains(&format!("at most {} ids", Guard::MAX_ASSESS_IDS)),
+            "{long}"
+        );
+        assert!(long.contains("batch"), "{long}");
+
+        // At the cap — and for repeated spellings of one id — no batching
+        // talk: the count is of distinct ids, like the refusal it averts.
+        let at_cap: Vec<String> = (1..=Guard::MAX_ASSESS_IDS as u64)
+            .map(|i| i.to_string())
+            .collect();
+        let short = id_list_advisory(&at_cap.join(" "), "ALL").expect("note");
+        assert!(!short.contains("batch"), "{short}");
+        let repeats = id_list_advisory(&"7 07 #7 ".repeat(30), "ALL").expect("note");
+        assert!(!repeats.contains("batch"), "{repeats}");
     }
     use super::*;
     use bugwarden_core::policy::Policy;
