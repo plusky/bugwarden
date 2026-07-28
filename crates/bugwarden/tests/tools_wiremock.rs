@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use bugwarden::config::Cli;
-use bugwarden::server::BugWarden;
+use bugwarden::server::{BugWarden, WRITE_TOOLS};
 use bugwarden_core::client::BugzillaClient;
 use bugwarden_core::guard::Guard;
 use bugwarden_core::policy::Policy;
@@ -671,4 +671,49 @@ async fn add_attachment_comment_travels_as_a_plain_string() {
     let result = call(&client, "add_attachment", args).await;
     assert!(!is_error(&result), "result: {}", text_of(&result));
     assert!(text_of(&result).contains("55"));
+}
+
+/// Tool names a client sees when it lists the server's tools — a real
+/// `tools/list` request over the wire, so the handler's own listing path
+/// is what answers.
+async fn listed_tools(client: &RunningService<RoleClient, ()>) -> Vec<String> {
+    client
+        .list_all_tools()
+        .await
+        .expect("list_tools must succeed")
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn list_tools_serves_the_pruned_instance_router_i13() {
+    // The listing must come from the instance router `BugWarden::new`
+    // pruned, not a freshly built default one: a listing that resurrects
+    // stripped tools would advertise operations the policy removed (I13).
+    let mock = MockServer::start().await;
+
+    let client = client_for("[global]\nread_only = true\n", &mock).await;
+    let names = listed_tools(&client).await;
+    for tool in WRITE_TOOLS {
+        assert!(
+            !names.iter().any(|n| n == tool),
+            "read-only mode must delist write tool {tool} (I13): {names:?}"
+        );
+    }
+    assert!(
+        names.iter().any(|n| n == "bug_info"),
+        "a read tool stays listed: {names:?}"
+    );
+
+    let client = client_for("[global]\ndisabled_tools = [\"bug_history\"]\n", &mock).await;
+    let names = listed_tools(&client).await;
+    assert!(
+        !names.iter().any(|n| n == "bug_history"),
+        "a policy-disabled tool must be delisted (I13): {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "bug_info"),
+        "a read tool stays listed: {names:?}"
+    );
 }

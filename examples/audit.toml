@@ -20,8 +20,12 @@
 # The schema is closed: fixed structs, fixed vocabularies, and no
 # dedicated field for the Bugzilla API key, request headers, or free-text
 # bug content. The one open field, `request.params`, is fed exclusively
-# through a per-tool allowlist of client-authored values at the recording
+# through an allowlist of client-authored parameter keys at the recording
 # call site; nothing fetched FROM Bugzilla is ever written here.
+#
+# bugwarden loads this file via --audit-config or the
+# BUGWARDEN_AUDIT_CONFIG environment variable; without that flag no audit
+# stream is written.
 #
 # Parsing is strict: unknown keys anywhere in this file are a startup
 # error, so a typo cannot silently disable a setting.

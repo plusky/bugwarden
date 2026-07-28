@@ -8,6 +8,9 @@
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
+use bugwarden::audit::{
+    policy_hash_of, AuditConfig, AuditSink, AuditState, FailMode, TransportKind,
+};
 use bugwarden::{config, server};
 use bugwarden_core::{client::BugzillaClient, guard::Guard, policy::Policy};
 use clap::Parser;
@@ -72,8 +75,54 @@ async fn main() -> anyhow::Result<()> {
     );
     let guard = Arc::new(Guard { policy });
     let cfg = Arc::new(cli);
+
+    // Audit stream, when configured. The fail mode falls back to the
+    // transport-derived default; the policy digest ties every record to
+    // the policy document in force.
+    let audit = match &cfg.audit_config {
+        Some(path) => {
+            let audit_cfg = AuditConfig::load(path)?;
+            let transport = match cfg.transport {
+                Transport::Stdio => TransportKind::Stdio,
+                Transport::Http => TransportKind::Http,
+            };
+            let fail_mode = FailMode::resolve(audit_cfg.fail_mode, transport);
+            // The digest re-reads the file Policy::load parsed above
+            // (load also owns the unix permission warning, so it stays
+            // the one parse path). A rewrite between the two reads could
+            // hash different bytes than were parsed; the window is
+            // operator-local and harmless — the operator who swaps the
+            // policy mid-startup gets the digest of what is on disk.
+            let policy_hash = match &cfg.policy {
+                Some(policy_path) => {
+                    let bytes = std::fs::read(policy_path).with_context(|| {
+                        format!(
+                            "failed to read guard policy from {} for the audit digest",
+                            policy_path.display()
+                        )
+                    })?;
+                    Some(policy_hash_of(&bytes))
+                }
+                None => None,
+            };
+            let sink = AuditSink::open(audit_cfg).context("failed to open the audit sink")?;
+            Some(Arc::new(AuditState::new(sink, fail_mode, policy_hash)))
+        }
+        None => None,
+    };
+    if audit.is_none() && cfg.transport == Transport::Http {
+        tracing::warn!(
+            "auditing is OFF: remote tool calls over http will leave no audit \
+             record — pass --audit-config / BUGWARDEN_AUDIT_CONFIG to enable it"
+        );
+    }
+
     let server = server::BugWarden::new(cfg.clone(), guard, bz)
         .context("failed to build the MCP server from the guard policy")?;
+    let server = match audit {
+        Some(audit) => server.with_audit(audit),
+        None => server,
+    };
 
     match cfg.transport {
         Transport::Stdio => {
@@ -98,12 +147,17 @@ async fn main() -> anyhow::Result<()> {
             let tcp_listener = tokio::net::TcpListener::bind(&addr)
                 .await
                 .with_context(|| format!("failed to bind {addr}"))?;
-            axum::serve(tcp_listener, router)
-                .with_graceful_shutdown(async move {
-                    let _ = tokio::signal::ctrl_c().await;
-                    ct.cancel();
-                })
-                .await?;
+            // Connect-info makes the remote peer address available in the
+            // request extensions, where the audit session info reads it.
+            axum::serve(
+                tcp_listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                ct.cancel();
+            })
+            .await?;
         }
     }
 

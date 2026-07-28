@@ -85,6 +85,13 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
 - **I13** In read-only mode (policy or CLI) write tools are removed from the
   tool listing via `ToolRouter::remove_route`, not merely erroring. Same for
   `global.disabled_tools`.
+- **I15** The audit stream is never reachable through any MCP surface.
+  When auditing is enabled, every tool call produces exactly one audit
+  record, persisted before the response is returned. The API key and
+  free-text bug content are unrepresentable in the audit event type.
+  Client-visible responses are byte-identical with auditing on, off, or
+  failing — except the scoped fail-closed refusals, which reuse the tools'
+  existing uniform failure texts and never vary with the guard's verdict.
 
 ## bugwarden-core API (exact signatures)
 
@@ -474,9 +481,52 @@ clap derive `Cli`, with env fallbacks:
 | --use-auth-header | — | false | Bearer to Bugzilla instead of api_key query param |
 | --read-only | MCP_READ_ONLY | false | tighten-only (I9) |
 | --policy | BUGWARDEN_POLICY | — | path to guard policy TOML |
+| --audit-config | BUGWARDEN_AUDIT_CONFIG | — | path to audit configuration TOML; without it no audit stream is written |
 
 Startup validation: stdio without api_key => exit with error; http with
-api_key => tracing::warn (ignored).
+api_key => tracing::warn (ignored); http without audit_config =>
+tracing::warn (remote tool calls leave no audit record).
+
+## Audit stream (crates/bugwarden/src/audit.rs + the server.rs wrapper)
+
+The operator-side record of what was asked and what the guard decided —
+the counterpart of the client-side invisibility the invariants mandate.
+Decisions, all deliberate:
+
+- **One record per call (I15).** The hand-written `call_tool` owns the
+  record; tools only enrich it through a per-request cell in the request
+  extensions (verdict worst-wins merged, suppressed ids unioned). An
+  unknown tool, a protocol error, or a missed enrichment still yields
+  exactly one record — a poorer record is possible, an audit gap is not.
+  The record is persisted (sink is synchronous) before the response is
+  returned. `initialize` is always recorded, with no configuration knob
+  to turn it off; `list_tools` is not recorded in schema v1 — no event
+  kind exists for a listing, deliberately.
+- **Boundary.** Records go only to the operator's JSONL file (0600,
+  parent 0700) — never stderr, never any MCP surface. The schema has no
+  field that could carry the API key or free-text bug content; client
+  parameters pass a key allowlist (identifiers and routing/vocabulary
+  fields by value, strings capped at 1024 chars) and every other key is
+  recorded as `{"_len": N}` — presence and size, never content.
+- **Fail modes** (`fail_mode` in audit.toml): `open` keeps serving and
+  accounts for the outage with an `audit_gap` record; `closed_writes_denials`
+  refuses writes and any call where the guard suppressed, denied, or
+  refused something; `closed_all` refuses every call. Unset, the mode derives
+  from the transport: stdio → `open` (availability for a single local
+  user), http → `closed_all` (accountability for a fleet). A sink
+  already in failure also gates matching calls BEFORE dispatch, so an
+  outage cannot be farmed for unaudited upstream work.
+- **Refusals are not a fingerprint.** A fail-closed refusal reuses the
+  tool's existing uniform failure text, chosen by tool name alone; a
+  protocol error from the router stands unchanged (swapping it would
+  create an outage-only distinguisher). Every routed tool must have a
+  refusal mapping (tested against the full router).
+- **Record provenance.** `guard.policy_hash` is `sha256:<hex>` over the
+  policy file bytes, so a record ties to the exact policy that produced
+  it (`None` under the built-in default policy). stdio sessions are
+  anchored by `<pid>-<startup epoch>`; http sessions by the
+  `mcp-session-id` header, with the remote address when the listener
+  provides connect-info.
 
 ## rmcp 2.2 usage notes
 
@@ -549,5 +599,15 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   on `attach`; the upload size cap refuses before anything is POSTed; and
   the attachment `comment` travels as a plain string (Bug.add_attachment
   API shape), pinned by a wiremock body matcher.
+- Audit tests (crates/bugwarden/tests/audit_wiremock.rs + #[cfg(test)] in
+  server.rs and audit.rs): one record per call for EVERY routed tool,
+  refusal paths and protocol errors included; the refusal map is total
+  over the full router; responses byte-identical with auditing off, on,
+  and failing-open; suppressed ids in the record and never in the
+  envelope; content and API-key canaries never reach the file; the
+  fail-closed scopes (pre-dispatch gate proven by upstream request
+  counts) via the sink's cfg(test) fault injection; the transport-derived
+  fail-mode defaults bound to their documented wording; the params
+  allowlist (free text to `_len`, 1024-char truncation).
 - CI: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace --locked`, `cargo deny check`.

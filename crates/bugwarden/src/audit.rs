@@ -28,8 +28,8 @@
 //! every enum is a fixed vocabulary, and no dedicated field exists for
 //! the Bugzilla API key, incoming request headers, or free-text bug
 //! content (summaries, comments, attachments). The one open field is
-//! [`RequestInfo::params`]: it is fed exclusively through a per-tool
-//! allowlist of client-authored values at the recording call site, and
+//! [`RequestInfo::params`]: it is fed exclusively through an allowlist
+//! of client-authored parameter keys at the recording call site, and
 //! data fetched from Bugzilla never passes through it. [`AuditError`]
 //! follows the same rule — it names the failed
 //! operation and carries the underlying I/O error, never the record that
@@ -72,6 +72,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 /// The audit record schema version stamped into every event (`v`).
 pub const SCHEMA_VERSION: u32 = 1;
@@ -101,8 +102,9 @@ pub enum FailMode {
     /// are lost to the record. Availability over accountability.
     Open,
     /// Reads the guard fully allows still proceed unaudited; write
-    /// operations and any call where the guard suppressed or denied
-    /// something are refused until their record can be persisted again.
+    /// operations and any call where the guard suppressed, denied, or
+    /// refused something are refused until their record can be persisted
+    /// again.
     ClosedWritesDenials,
     /// Every tool call is refused until its record can be persisted.
     /// Accountability over availability: an unmonitored full disk turns
@@ -388,11 +390,11 @@ pub struct RequestInfo {
     /// JSON-RPC request id, when the transport exposes one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    /// CLIENT-authored request parameters, passed through a per-tool
-    /// allowlist by the recording call site: identifiers, projections,
-    /// switches — parameters whose values the client chose. Bug content
-    /// fetched from Bugzilla must never be placed here; a tool result is
-    /// not a parameter.
+    /// CLIENT-authored request parameters, passed through an allowlist
+    /// by the recording call site: identifiers, projections, switches —
+    /// parameters whose values the client chose. Bug content fetched
+    /// from Bugzilla must never be placed here; a tool result is not a
+    /// parameter.
     pub params: BTreeMap<String, serde_json::Value>,
 }
 
@@ -838,9 +840,31 @@ impl AuditSink {
         }
     }
 
-    /// Test-only fault injection; see the `fail_writes` field.
+    /// Whether the sink is currently in failure: at least one record has
+    /// been dropped since the last successful write. The request path
+    /// consults this before dispatching a tool call, so a sink that is
+    /// already down can hold back further unaudited work under the closed
+    /// fail modes instead of discovering the outage one record at a time.
+    pub fn failing(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dropped
+            > 0
+    }
+
+    /// Whether records may carry suppressed bug ids
+    /// ([`AuditConfig::suppressed_ids`]); the recording call site enforces
+    /// the flag when building [`GuardInfo`].
+    pub fn suppressed_ids(&self) -> bool {
+        self.cfg.suppressed_ids
+    }
+
+    /// Test-only fault injection; see the `fail_writes` field. Crate
+    /// visibility: the request-path fail-mode tests in `server.rs` drive
+    /// a real sink into failure through this same hook.
     #[cfg(test)]
-    fn set_fail_writes(&self, fail: bool) {
+    pub(crate) fn set_fail_writes(&self, fail: bool) {
         self.fail_writes
             .store(fail, std::sync::atomic::Ordering::Relaxed);
     }
@@ -877,6 +901,226 @@ fn rotated_path(live: &Path, n: u32) -> PathBuf {
     let mut os = live.as_os_str().to_os_string();
     os.push(format!(".{n}"));
     PathBuf::from(os)
+}
+
+// ---------------------------------------------------------------------------
+// Request-path wiring
+// ---------------------------------------------------------------------------
+
+impl FailMode {
+    /// The fail mode in force: the operator's explicit choice when the
+    /// configuration sets one, else the transport-derived default.
+    pub fn resolve(explicit: Option<FailMode>, transport: TransportKind) -> FailMode {
+        explicit.unwrap_or_else(|| FailMode::default_for(transport))
+    }
+
+    /// The default fail mode for a transport, used when the audit
+    /// configuration leaves `fail_mode` unset: `stdio` (a local,
+    /// single-operator session) defaults to `open` — availability for a
+    /// single user; `http` (remote clients) defaults to `closed_all` —
+    /// accountability for a fleet.
+    pub fn default_for(transport: TransportKind) -> FailMode {
+        match transport {
+            TransportKind::Stdio => FailMode::Open,
+            TransportKind::Http => FailMode::ClosedAll,
+        }
+    }
+}
+
+/// Everything the request path needs to write audit records: the open
+/// sink, the resolved fail mode, and the startup-computed identifiers
+/// records carry. Built once at startup, shared behind an `Arc`.
+#[derive(Debug)]
+pub struct AuditState {
+    /// The open sink; every record goes through it.
+    pub sink: AuditSink,
+    /// What happens to tool calls while records cannot be persisted.
+    /// Already resolved ([`FailMode::resolve`]): the explicit configured
+    /// value, else the transport default.
+    pub fail_mode: FailMode,
+    /// `sha256:<hex>` digest of the policy file in force, stamped into
+    /// [`GuardInfo::policy_hash`]. `None` when the built-in default
+    /// policy applies (there is no file to hash).
+    pub policy_hash: Option<String>,
+    /// Session id stamped into stdio records. One process is one stdio
+    /// session, so `<pid>-<unix epoch secs at startup>` anchors those
+    /// records the way the `mcp-session-id` header anchors http ones.
+    pub stdio_session_id: String,
+}
+
+/// The `sha256:<hex>` digest of a policy document's bytes — the value
+/// [`AuditState::policy_hash`] holds and [`GuardInfo::policy_hash`]
+/// carries. The digest is over the raw file bytes, not any parsed form,
+/// so a record ties to the exact document the operator deployed.
+pub fn policy_hash_of(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+impl AuditState {
+    /// Assemble the request-path state around an open sink.
+    pub fn new(sink: AuditSink, fail_mode: FailMode, policy_hash: Option<String>) -> AuditState {
+        let epoch_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        AuditState {
+            sink,
+            fail_mode,
+            policy_hash,
+            stdio_session_id: format!("{}-{epoch_secs}", std::process::id()),
+        }
+    }
+}
+
+/// Severity of a verdict for the worst-wins merge:
+/// `Denied > Refused > ServedFiltered > Served`.
+fn verdict_rank(verdict: Verdict) -> u8 {
+    match verdict {
+        Verdict::Served => 0,
+        Verdict::ServedFiltered => 1,
+        Verdict::Refused => 2,
+        Verdict::Denied => 3,
+    }
+}
+
+#[derive(Debug, Default)]
+struct CellState {
+    verdict: Option<Verdict>,
+    rule: Option<String>,
+    suppressed_ids: std::collections::BTreeSet<u64>,
+    /// Suppressions that have no bug id (private comments or attachment
+    /// metadata filtered out): counted, never named.
+    suppressed_extra: u64,
+    redacted_fields: std::collections::BTreeSet<String>,
+    upstream: Option<UpstreamInfo>,
+}
+
+/// Per-request enrichment cell for one tool call's audit record.
+///
+/// The wrapper that owns the record inserts one cell into the request's
+/// extensions before dispatch; the guard call sites inside the tool note
+/// what was decided; the wrapper drains the cell into [`GuardInfo`] after
+/// the tool returns. A tool that never touches the cell (it performs no
+/// guard assessment) yields no `GuardInfo` at all. Multi-id calls note
+/// once per id and the cell merges: ONE record per call, worst verdict,
+/// with suppression carrying the per-id detail.
+///
+/// Interior mutability via a `Mutex` with the same poison posture as the
+/// sink: a panicked noter loses nothing worth dropping enrichment over.
+#[derive(Debug, Default)]
+pub struct AuditCell {
+    state: Mutex<CellState>,
+}
+
+impl AuditCell {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CellState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Worst-wins verdict merge. The rule follows the deciding verdict: a
+    /// strict upgrade replaces the stored rule with the new one (present
+    /// or not — a default-decided verdict has none), an equally severe
+    /// verdict may only fill an empty slot (first rule recorded wins),
+    /// and a less severe verdict changes nothing.
+    fn merge(&self, verdict: Verdict, rule: Option<&str>) {
+        let mut state = self.lock();
+        match state.verdict {
+            None => {
+                state.verdict = Some(verdict);
+                state.rule = rule.map(str::to_owned);
+            }
+            Some(current) if verdict_rank(verdict) > verdict_rank(current) => {
+                state.verdict = Some(verdict);
+                state.rule = rule.map(str::to_owned);
+            }
+            Some(current) if verdict_rank(verdict) == verdict_rank(current) => {
+                if state.rule.is_none() {
+                    state.rule = rule.map(str::to_owned);
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Note a verdict with no deciding rule (the policy default, or a
+    /// refusal that never consulted a rule).
+    pub fn note_verdict(&self, verdict: Verdict) {
+        self.merge(verdict, None);
+    }
+
+    /// Note a verdict together with the rule that decided it.
+    pub fn note_verdict_rule(&self, verdict: Verdict, rule: &str) {
+        self.merge(verdict, Some(rule));
+    }
+
+    /// Note bug ids the guard hid in this call (unions across notes).
+    /// Suppression implies at least a filtered serve, so the verdict is
+    /// upgraded to `ServedFiltered` through the worst-wins merge — a
+    /// record can never claim a clean `Served` while carrying
+    /// suppressions.
+    pub fn note_suppressed(&self, ids: impl IntoIterator<Item = u64>) {
+        self.merge(Verdict::ServedFiltered, None);
+        self.lock().suppressed_ids.extend(ids);
+    }
+
+    /// Note `n` suppressions that carry no bug id (private comments or
+    /// attachment metadata filtered out). Adds across notes; upgrades the
+    /// verdict exactly as [`AuditCell::note_suppressed`] does.
+    pub fn note_suppressed_count(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.merge(Verdict::ServedFiltered, None);
+        let mut state = self.lock();
+        state.suppressed_extra = state.suppressed_extra.saturating_add(n);
+    }
+
+    /// Note a field (or view marker) the guard redacted from served
+    /// bugs. Upgrades the verdict to `ServedFiltered`.
+    pub fn note_redacted(&self, field: &str) {
+        self.merge(Verdict::ServedFiltered, None);
+        self.lock().redacted_fields.insert(field.to_owned());
+    }
+
+    /// Note the Bugzilla side of the call, where the caller has it.
+    pub fn note_upstream(&self, upstream: UpstreamInfo) {
+        self.lock().upstream = Some(upstream);
+    }
+
+    /// Take the noted upstream info, if any.
+    pub fn take_upstream(&self) -> Option<UpstreamInfo> {
+        self.lock().upstream.take()
+    }
+
+    /// Drain the cell into the record's [`GuardInfo`]. `None` when no
+    /// verdict was ever noted — the tool performed no guard assessment.
+    /// When `suppressed_ids_cfg` is `false` the ids are dropped and only
+    /// the count ships ([`AuditConfig::suppressed_ids`]). The count is
+    /// the larger of the id set and the id-less counter, so it can only
+    /// ever under-name, never under-count.
+    pub fn into_guard_info(
+        &self,
+        policy_hash: Option<&str>,
+        suppressed_ids_cfg: bool,
+    ) -> Option<GuardInfo> {
+        let state = std::mem::take(&mut *self.lock());
+        let verdict = state.verdict?;
+        let suppressed_count = (state.suppressed_ids.len() as u64).max(state.suppressed_extra);
+        Some(GuardInfo {
+            verdict,
+            rule: state.rule,
+            policy_hash: policy_hash.map(str::to_owned),
+            suppressed_count,
+            suppressed_ids: if suppressed_ids_cfg {
+                state.suppressed_ids.into_iter().collect()
+            } else {
+                Vec::new()
+            },
+            redacted_fields: state.redacted_fields.into_iter().collect(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1575,6 +1819,154 @@ mod tests {
         assert!(
             !contents.contains(CANARY),
             "the API key canary leaked into the audit file"
+        );
+    }
+
+    // ---------- request-path wiring ----------
+
+    #[test]
+    fn fail_mode_transport_defaults_bind_the_documented_wording() {
+        // The documented derivation: stdio (a local, single-operator
+        // session) defaults to open — availability for a single user;
+        // http (remote clients) defaults to closed_all — accountability
+        // for a fleet.
+        assert_eq!(FailMode::default_for(TransportKind::Stdio), FailMode::Open);
+        assert_eq!(
+            FailMode::default_for(TransportKind::Http),
+            FailMode::ClosedAll
+        );
+        // An explicit configured value wins over both derivations.
+        for transport in [TransportKind::Stdio, TransportKind::Http] {
+            assert_eq!(
+                FailMode::resolve(Some(FailMode::ClosedWritesDenials), transport),
+                FailMode::ClosedWritesDenials
+            );
+        }
+        assert_eq!(
+            FailMode::resolve(None, TransportKind::Stdio),
+            FailMode::Open
+        );
+        assert_eq!(
+            FailMode::resolve(None, TransportKind::Http),
+            FailMode::ClosedAll
+        );
+    }
+
+    #[test]
+    fn audit_state_session_id_is_pid_dash_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = AuditSink::open(test_cfg(dir.path().join("audit.jsonl"))).unwrap();
+        let state = AuditState::new(sink, FailMode::Open, None);
+        let (pid, epoch) = state
+            .stdio_session_id
+            .split_once('-')
+            .expect("session id is <pid>-<epoch>");
+        assert_eq!(pid, std::process::id().to_string());
+        assert!(epoch.parse::<u64>().is_ok(), "epoch part is seconds");
+    }
+
+    #[test]
+    fn cell_verdict_merge_keeps_the_worst_and_its_rule() {
+        let cell = AuditCell::default();
+        cell.note_verdict_rule(Verdict::Served, "allow-most");
+        cell.note_verdict_rule(Verdict::Denied, "embargo");
+        // A lesser verdict after the worst changes nothing.
+        cell.note_verdict_rule(Verdict::ServedFiltered, "peek");
+        let info = cell.into_guard_info(None, true).expect("verdict noted");
+        assert_eq!(info.verdict, Verdict::Denied);
+        assert_eq!(info.rule.as_deref(), Some("embargo"));
+    }
+
+    #[test]
+    fn cell_upgrade_by_a_default_decision_clears_the_rule() {
+        // The rule names the DECIDING rule of the worst verdict: when a
+        // default-decided denial outranks a rule-decided serve, no rule
+        // may stay attached.
+        let cell = AuditCell::default();
+        cell.note_verdict_rule(Verdict::Served, "allow-most");
+        cell.note_verdict(Verdict::Denied);
+        let info = cell.into_guard_info(None, true).expect("verdict noted");
+        assert_eq!(info.verdict, Verdict::Denied);
+        assert_eq!(info.rule, None);
+    }
+
+    #[test]
+    fn cell_first_rule_wins_at_equal_severity() {
+        let cell = AuditCell::default();
+        cell.note_verdict(Verdict::Served);
+        cell.note_verdict_rule(Verdict::Served, "first");
+        cell.note_verdict_rule(Verdict::Served, "second");
+        let info = cell.into_guard_info(None, true).expect("verdict noted");
+        assert_eq!(info.rule.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn cell_suppression_implies_a_filtered_serve() {
+        let cell = AuditCell::default();
+        cell.note_verdict_rule(Verdict::Served, "allow-most");
+        cell.note_suppressed([1290040, 1290041, 1290040]);
+        let info = cell.into_guard_info(Some("sha256:ab"), true).unwrap();
+        assert_eq!(info.verdict, Verdict::ServedFiltered);
+        assert_eq!(info.suppressed_ids, vec![1290040, 1290041]);
+        assert_eq!(info.suppressed_count, 2);
+        assert_eq!(info.policy_hash.as_deref(), Some("sha256:ab"));
+    }
+
+    #[test]
+    fn cell_suppressed_count_is_max_of_ids_and_counter() {
+        let cell = AuditCell::default();
+        cell.note_suppressed([7]);
+        cell.note_suppressed_count(2);
+        cell.note_suppressed_count(1);
+        let info = cell.into_guard_info(None, true).unwrap();
+        assert_eq!(info.suppressed_count, 3, "id-less counter adds up");
+        assert_eq!(info.suppressed_ids, vec![7]);
+    }
+
+    #[test]
+    fn cell_suppressed_ids_config_ships_the_count_only() {
+        let cell = AuditCell::default();
+        cell.note_suppressed([40, 41]);
+        let info = cell.into_guard_info(None, false).unwrap();
+        assert!(info.suppressed_ids.is_empty(), "ids elided by config");
+        assert_eq!(info.suppressed_count, 2, "the count still ships");
+    }
+
+    #[test]
+    fn cell_untouched_yields_no_guard_info() {
+        let cell = AuditCell::default();
+        assert_eq!(cell.into_guard_info(Some("sha256:ab"), true), None);
+        // Upstream info alone is not a guard verdict. It is taken FIRST:
+        // into_guard_info drains the whole cell.
+        let cell = AuditCell::default();
+        cell.note_upstream(UpstreamInfo {
+            requests: 1,
+            status: Some(200),
+            latency_ms: 3,
+        });
+        assert!(cell.take_upstream().is_some());
+        assert_eq!(cell.into_guard_info(None, true), None);
+    }
+
+    #[test]
+    fn cell_redaction_is_recorded_and_upgrades_the_verdict() {
+        let cell = AuditCell::default();
+        cell.note_verdict(Verdict::Served);
+        cell.note_redacted("summary_view");
+        cell.note_redacted("summary_view");
+        let info = cell.into_guard_info(None, true).unwrap();
+        assert_eq!(info.verdict, Verdict::ServedFiltered);
+        assert_eq!(info.redacted_fields, vec!["summary_view".to_string()]);
+    }
+
+    #[test]
+    fn policy_hash_of_digests_the_given_bytes() {
+        // The FIPS 180-2 test vector for sha256("abc"), precomputed:
+        // recomputing the expectation with sha2 here would only prove the
+        // function calls sha2, not that it hashes the bytes it was given.
+        assert_eq!(
+            policy_hash_of(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
 }

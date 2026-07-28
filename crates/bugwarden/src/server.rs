@@ -8,20 +8,22 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use bugwarden_core::client::{BugzillaClient, CLASSIFY_FIELDS};
 use bugwarden_core::guard::{Guard, SearchRequest};
 use bugwarden_core::policy::{Access, Action, Capability};
 use chrono::{DateTime, Utc};
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
     model::*,
     schemars,
     service::RequestContext,
-    tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler,
+    tool, tool_router, ErrorData as McpError, RoleServer, ServerHandler,
 };
 use serde_json::{json, Value};
 
+use crate::audit::{self, AuditCell, AuditState, FailMode, TransportKind, Verdict};
 use crate::config::{Cli, Transport};
 
 /// Names of the tools that modify bug state. These routes are removed from
@@ -54,6 +56,204 @@ fn action_name(action: Action) -> &'static str {
         Action::Allow => "allow",
         Action::Deny => "deny",
         Action::Restrict => "restrict",
+    }
+}
+
+/// The name of the policy rule that decided an assessment; both variants
+/// carry one.
+fn access_rule(access: &Access) -> &str {
+    match access {
+        Access::Denied { rule } | Access::Granted { rule, .. } => rule,
+    }
+}
+
+/// The request's audit enrichment cell, when auditing is on. The audit
+/// wrapper inserts one before dispatch; with auditing off (or a caller
+/// outside the wrapper) there is none and every note is a no-op at the
+/// call site — enrichment can never change what a tool returns.
+fn audit_cell(ctx: &RequestContext<RoleServer>) -> Option<Arc<AuditCell>> {
+    ctx.extensions.get::<Arc<AuditCell>>().cloned()
+}
+
+/// Note a `Refused` verdict on the request's audit cell. Mechanical
+/// companion for the `return Ok(err_text(..))` refusal sites that answer
+/// from the request alone.
+fn note_refused(ctx: &RequestContext<RoleServer>) {
+    if let Some(cell) = audit_cell(ctx) {
+        cell.note_verdict(Verdict::Refused);
+    }
+}
+
+/// Whether the pre-dispatch audit gate holds `tool` back while the sink is
+/// already failing: `Open` never gates, `ClosedWritesDenials` gates the
+/// write tools only, `ClosedAll` gates everything.
+fn gate_applies(fail_mode: FailMode, tool: &str) -> bool {
+    match fail_mode {
+        FailMode::Open => false,
+        FailMode::ClosedWritesDenials => WRITE_TOOLS.contains(&tool),
+        FailMode::ClosedAll => true,
+    }
+}
+
+/// The refusal text for a tool call refused because its audit record
+/// cannot be persisted (the closed fail modes). One fixed text per TOOL —
+/// each tool's EXISTING generic failure wording, so an audit outage looks
+/// like the failure the client already knows and is not a new fingerprint;
+/// tools without a generic failure text get a pattern-consistent one. The
+/// text depends on the tool name alone, never on anything the guard
+/// decided. `None` only for names outside the tool surface — the map must
+/// be total over the full router (tested), and every routed tool must
+/// have its own entry here before it can ship.
+fn audit_refusal_text(tool: &str) -> Option<String> {
+    let text = match tool {
+        "bug_info" => "Failed to fetch bug information".to_string(),
+        "bug_history" => "Failed to fetch bug history".to_string(),
+        "bug_comments" => "Failed to fetch bug comments".to_string(),
+        "bugs_quicksearch" => "Search failed".to_string(),
+        "summarize_bug" => "Summarize Comments Failed".to_string(),
+        "list_attachments" => "Failed to fetch bug attachments".to_string(),
+        "download_attachment" => "Failed to fetch attachment".to_string(),
+        "bugzilla_server_info" => "Failed to fetch bugzilla server info".to_string(),
+        "quicksearch_syntax" => "Failed to fetch quicksearch documentation".to_string(),
+        "bug_url" => "Failed to compute the bug url".to_string(),
+        "mcp_server_info" => "Failed to compute server info".to_string(),
+        // Write tools: the first line of their existing failure text,
+        // without the upstream detail — truthfully so: nothing upstream
+        // happened when the gate refused before dispatch.
+        "add_comment" => "Failed to create a comment".to_string(),
+        "update_bug_status" => "Failed to update bug status".to_string(),
+        "assign_bug" => "Failed to assign bug".to_string(),
+        "update_bug_fields" => "Failed to update bug fields".to_string(),
+        "update_bug_dependencies" => "Failed to update bug dependencies".to_string(),
+        "add_cc_to_bug" => "Failed to add CC".to_string(),
+        "add_attachment" => "Failed to add attachment".to_string(),
+        "mark_as_duplicate" => "Failed to mark as duplicate".to_string(),
+        "create_bug" => Guard::create_denial(),
+        _ => return None,
+    };
+    Some(text)
+}
+
+/// The uniform fail-closed refusal for `tool`. Unknown names fall back to
+/// a generic text; unreachable for routed tools (see
+/// [`audit_refusal_text`]) — the fallback exists so the map is total.
+fn audit_refusal(tool: &str) -> CallToolResult {
+    err_text(audit_refusal_text(tool).unwrap_or_else(|| "Request failed".to_string()))
+}
+
+/// Keys of client-authored tool parameters whose VALUES may enter an audit
+/// record. The bar: identifiers, projections and routing/vocabulary fields
+/// yes; free text no. `comment`, `summary`, `description`, `data`
+/// (attachment bytes) and `custom_fields` (operator-defined values) never
+/// appear by value — a non-allowlisted key is recorded as
+/// `{"_len": <serialized byte length>}`, so presence and size are loggable
+/// while content is not. Allowlisted string values are truncated to 1024
+/// characters.
+const PARAM_ALLOWLIST: &[&str] = &[
+    "assignee",
+    "attachment_id",
+    "blocks_add",
+    "blocks_remove",
+    "bug_id",
+    "bug_ids",
+    "cc_email",
+    "component",
+    "content_type",
+    "depends_on_add",
+    "depends_on_remove",
+    "duplicate_of",
+    "file_name",
+    "groups",
+    "id",
+    "include_fields",
+    "include_private",
+    "is_patch",
+    "is_private",
+    "keywords",
+    "limit",
+    "new_since",
+    "offset",
+    "op_sys",
+    "platform",
+    "priority",
+    "product",
+    "query",
+    "resolution",
+    "severity",
+    "status",
+    "version",
+];
+
+/// Cap on recorded string values; see [`PARAM_ALLOWLIST`].
+const PARAM_VALUE_MAX_CHARS: usize = 1024;
+
+/// An allowlisted value with every string (top level or inside a list)
+/// truncated to [`PARAM_VALUE_MAX_CHARS`] characters. No marker is
+/// appended; the cap is documented at the allowlist.
+fn truncated(value: &Value) -> Value {
+    match value {
+        // A string of at most 1024 BYTES has at most 1024 chars; the
+        // cheap length check skips the char walk for the common case.
+        Value::String(s) if s.len() > PARAM_VALUE_MAX_CHARS => {
+            let capped: String = s.chars().take(PARAM_VALUE_MAX_CHARS).collect();
+            Value::String(capped)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(truncated).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Project a tool call's arguments through [`PARAM_ALLOWLIST`] into the
+/// audit record's `params` map.
+fn allowlisted(params: Option<&JsonObject>) -> BTreeMap<String, Value> {
+    let Some(params) = params else {
+        return BTreeMap::new();
+    };
+    params
+        .iter()
+        .map(|(key, value)| {
+            let recorded = if PARAM_ALLOWLIST.contains(&key.as_str()) {
+                truncated(value)
+            } else {
+                let len = serde_json::to_vec(value).map(|b| b.len()).unwrap_or(0);
+                json!({ "_len": len })
+            };
+            (key.clone(), recorded)
+        })
+        .collect()
+}
+
+/// The calling client as it introduced itself in the handshake, for an
+/// audit record. Self-declared, therefore untrusted; `principal` stays
+/// `None` (reserved for a future authenticated identity).
+fn client_of(ctx: &RequestContext<RoleServer>) -> audit::ClientInfo {
+    let peer = ctx.peer.peer_info();
+    audit::ClientInfo {
+        name: peer.as_ref().map(|p| p.client_info.name.clone()),
+        version: peer.as_ref().map(|p| p.client_info.version.clone()),
+        principal: None,
+    }
+}
+
+/// Total elapsed milliseconds since `started`, saturating.
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Persist one audit record without blocking the async worker: the sink
+/// is synchronous by design (that is what makes "persisted before the
+/// response is returned" a guarantee), so the write moves to the blocking
+/// pool and is awaited — the response still cannot overtake it. A
+/// panicked write counts as a failed one.
+async fn record_event(
+    audit: &Arc<AuditState>,
+    kind: audit::AuditEventKind,
+    session: audit::SessionInfo,
+) -> Result<u64, ()> {
+    let state = Arc::clone(audit);
+    match tokio::task::spawn_blocking(move || state.sink.record(kind, session)).await {
+        Ok(Ok(seq)) => Ok(seq),
+        Ok(Err(_)) | Err(_) => Err(()),
     }
 }
 
@@ -552,6 +752,8 @@ pub struct BugWarden {
     guard: Arc<Guard>,
     bz: Arc<BugzillaClient>,
     tool_router: ToolRouter<Self>,
+    /// Audit wiring; `None` runs the exact pre-audit request path.
+    audit: Option<Arc<AuditState>>,
 }
 
 impl BugWarden {
@@ -596,7 +798,51 @@ impl BugWarden {
             guard,
             bz,
             tool_router,
+            audit: None,
         })
+    }
+
+    /// Enable auditing. Separate from [`BugWarden::new`] so existing
+    /// construction sites (and the tests that rely on them) stay valid
+    /// with auditing off.
+    pub fn with_audit(mut self, audit: Arc<AuditState>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// The session an audit record belongs to. http: the server-assigned
+    /// `mcp-session-id` header and, when the listener was built with
+    /// connect-info, the remote peer address — both from the HTTP request
+    /// parts rmcp copies into the request extensions. stdio: the
+    /// process-scoped session id from [`AuditState`].
+    fn session_info(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        audit: &AuditState,
+    ) -> audit::SessionInfo {
+        match self.cfg.transport {
+            Transport::Stdio => audit::SessionInfo {
+                id: Some(audit.stdio_session_id.clone()),
+                transport: TransportKind::Stdio,
+                remote: None,
+            },
+            Transport::Http => {
+                let parts = ctx.extensions.get::<axum::http::request::Parts>();
+                audit::SessionInfo {
+                    id: parts
+                        .and_then(|p| p.headers.get("mcp-session-id"))
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned),
+                    transport: TransportKind::Http,
+                    remote: parts
+                        .and_then(|p| {
+                            p.extensions
+                                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                        })
+                        .map(|ci| ci.0.to_string()),
+                }
+            }
+        }
     }
 
     /// Resolve the Bugzilla API key for the current request.
@@ -642,12 +888,30 @@ impl BugWarden {
     }
 
     /// Assess a single bug id and require `cap`. Returns `Some(denial)` when
-    /// the operation must be refused; the denial text is uniform (I2).
-    async fn deny_unless(&self, key: &str, id: u64, cap: Capability) -> Option<CallToolResult> {
+    /// the operation must be refused; the denial text is uniform (I2). The
+    /// verdict — either way — and its deciding rule are noted on the
+    /// request's audit cell; noting changes nothing the client sees.
+    async fn deny_unless(
+        &self,
+        key: &str,
+        id: u64,
+        cap: Capability,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Option<CallToolResult> {
         let assessments = self.assess(key, &[id]).await;
-        let allowed = assessments
-            .get(&id)
-            .is_some_and(|(access, _)| access.allows(cap));
+        let entry = assessments.get(&id);
+        let allowed = entry.is_some_and(|(access, _)| access.allows(cap));
+        if let Some(cell) = audit_cell(ctx) {
+            let verdict = if allowed {
+                Verdict::Served
+            } else {
+                Verdict::Denied
+            };
+            match entry {
+                Some((access, _)) => cell.note_verdict_rule(verdict, access_rule(access)),
+                None => cell.note_verdict(verdict),
+            }
+        }
         if allowed {
             None
         } else {
@@ -680,9 +944,11 @@ impl BugWarden {
             .filter(|id| seen.insert(*id))
             .collect();
         if ids.is_empty() {
+            note_refused(&ctx);
             return Ok(err_text("At least one bug id must be provided"));
         }
         if let Some(refusal) = too_many_ids(&ids) {
+            note_refused(&ctx);
             return Ok(refusal);
         }
 
@@ -760,6 +1026,56 @@ impl BugWarden {
                 Guard::scrub_bug_links(bug, base_url, &allowed);
             }
         }
+        if let Some(cell) = audit_cell(&ctx) {
+            // One record for the whole call: per-id verdicts merge worst-
+            // wins. The envelope is the truth (a re-check flip lands a
+            // granted id under `restricted`); rules come from the
+            // assessments where the variant matches the outcome. A
+            // `restricted` entry is a Denied the client was told about;
+            // the suppressed set is the scrubbed LINK ids — the ones the
+            // client cannot see at all (I14).
+            if let Some(bugs) = envelope.get("bugs").and_then(Value::as_array) {
+                for bug in bugs {
+                    let redacted = bug.get("_redacted").is_some();
+                    let verdict = if redacted {
+                        Verdict::ServedFiltered
+                    } else {
+                        Verdict::Served
+                    };
+                    let rule = bug
+                        .get("id")
+                        .and_then(Value::as_u64)
+                        .and_then(|id| assessments.get(&id));
+                    match rule {
+                        Some((Access::Granted { rule, .. }, _)) => {
+                            cell.note_verdict_rule(verdict, rule);
+                        }
+                        _ => cell.note_verdict(verdict),
+                    }
+                    if redacted {
+                        cell.note_redacted("summary_view");
+                    }
+                }
+            }
+            if let Some(restricted) = envelope.get("restricted").and_then(Value::as_array) {
+                for entry in restricted {
+                    let rule = entry
+                        .get("id")
+                        .and_then(Value::as_u64)
+                        .and_then(|id| assessments.get(&id));
+                    match rule {
+                        Some((Access::Denied { rule }, _)) => {
+                            cell.note_verdict_rule(Verdict::Denied, rule);
+                        }
+                        _ => cell.note_verdict(Verdict::Denied),
+                    }
+                }
+            }
+            let hidden_links: Vec<u64> = named.difference(&allowed).copied().collect();
+            if !hidden_links.is_empty() {
+                cell.note_suppressed(hidden_links);
+            }
+        }
         Ok(ok_json(envelope))
     }
 
@@ -774,7 +1090,10 @@ impl BugWarden {
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(id = p.id, new_since = ?p.new_since, "tool: bug_history");
         let key = self.api_key(&ctx)?;
-        if let Some(denied) = self.deny_unless(&key, p.id, Capability::History).await {
+        if let Some(denied) = self
+            .deny_unless(&key, p.id, Capability::History, &ctx)
+            .await
+        {
             return Ok(denied);
         }
         match self.bz.bug_history(&key, p.id, p.new_since).await {
@@ -785,6 +1104,12 @@ impl BugWarden {
                 let base_url = self.bz.base_url();
                 let named = Guard::history_bug_ids(&history, base_url);
                 let disclosable = self.guard.disclosable(&self.bz, &key, &named).await;
+                if let Some(cell) = audit_cell(&ctx) {
+                    let hidden: Vec<u64> = named.difference(&disclosable).copied().collect();
+                    if !hidden.is_empty() {
+                        cell.note_suppressed(hidden);
+                    }
+                }
                 Ok(ok_json(Guard::scrub_history(
                     history,
                     base_url,
@@ -814,17 +1139,30 @@ impl BugWarden {
             "tool: bug_comments"
         );
         let key = self.api_key(&ctx)?;
-        if let Some(denied) = self.deny_unless(&key, p.id, Capability::Comments).await {
+        if let Some(denied) = self
+            .deny_unless(&key, p.id, Capability::Comments, &ctx)
+            .await
+        {
             return Ok(denied);
         }
         match self.bz.bug_comments(&key, p.id, p.new_since).await {
             Ok(comments) => {
+                let total = comments.len();
                 let filtered = self.guard.filter_comments(comments, p.include_private);
                 // Bugzilla writes "*** Bug N has been marked as a duplicate
                 // of this bug ***" itself, so a hidden bug can name itself in
                 // the comments of one the client may read (I2).
                 let named = Guard::duplicate_marker_ids(&filtered);
                 let disclosable = self.guard.disclosable(&self.bz, &key, &named).await;
+                if let Some(cell) = audit_cell(&ctx) {
+                    // Dropped private comments have no bug id: count only.
+                    // Scrubbed duplicate-marker ids are the hidden bugs.
+                    cell.note_suppressed_count((total - filtered.len()) as u64);
+                    let hidden: Vec<u64> = named.difference(&disclosable).copied().collect();
+                    if !hidden.is_empty() {
+                        cell.note_suppressed(hidden);
+                    }
+                }
                 let scrubbed = Guard::scrub_duplicate_markers(filtered, &disclosable);
                 Ok(ok_json(Value::Array(scrubbed)))
             }
@@ -913,6 +1251,22 @@ impl BugWarden {
         for bug in projected.iter_mut() {
             Guard::scrub_bug_links(bug, base_url, &allowed);
         }
+        if let Some(cell) = audit_cell(&ctx) {
+            // The window's own drops happen inside the guard scan and are
+            // not surfaced here; what this site sees is the served
+            // projection — redacted rows and the linked ids I14 scrubbed
+            // out of them.
+            cell.note_verdict(Verdict::Served);
+            for bug in &projected {
+                if bug.get("_redacted").is_some() {
+                    cell.note_redacted("summary_view");
+                }
+            }
+            let hidden: Vec<u64> = named.difference(&allowed).copied().collect();
+            if !hidden.is_empty() {
+                cell.note_suppressed(hidden);
+            }
+        }
 
         let mut envelope = json!({ "bugs": projected });
         // Steering only, computed from the request the client itself sent
@@ -992,7 +1346,12 @@ impl BugWarden {
         if !self.guard.may_create(&payload) {
             let _ = self.assess(&key, &[0]).await;
             tracing::info!(product = %p.product, "guard denied bug creation");
+            note_refused(&ctx);
             return Ok(err_text(Guard::create_denial()));
+        }
+        if let Some(cell) = audit_cell(&ctx) {
+            // may_create judges the request as a whole and names no rule.
+            cell.note_verdict(Verdict::Served);
         }
 
         match self.bz.create_bug(&key, payload).await {
@@ -1028,12 +1387,16 @@ impl BugWarden {
             "tool: add_attachment"
         );
         let key = self.api_key(&ctx)?;
-        if let Some(denied) = self.deny_unless(&key, p.bug_id, Capability::Attach).await {
+        if let Some(denied) = self
+            .deny_unless(&key, p.bug_id, Capability::Attach, &ctx)
+            .await
+        {
             return Ok(denied);
         }
 
         let cap = self.guard.policy.global.max_attachment_bytes;
         if let Some(refusal) = upload_size_refusal(cap, &p.data) {
+            note_refused(&ctx);
             return Ok(err_text(refusal));
         }
 
@@ -1083,7 +1446,10 @@ impl BugWarden {
             "tool: add_comment"
         );
         let key = self.api_key(&ctx)?;
-        if let Some(denied) = self.deny_unless(&key, p.bug_id, Capability::Comment).await {
+        if let Some(denied) = self
+            .deny_unless(&key, p.bug_id, Capability::Comment, &ctx)
+            .await
+        {
             return Ok(denied);
         }
         match self
@@ -1118,12 +1484,16 @@ impl BugWarden {
         );
         let has_resolution = p.resolution.as_deref().is_some_and(|r| !r.is_empty());
         if p.status == "CLOSED" && !has_resolution {
+            note_refused(&ctx);
             return Ok(err_text(
                 "Resolution is required when setting status to CLOSED (e.g., FIXED, WONTFIX, NOTABUG, DUPLICATE)",
             ));
         }
         let key = self.api_key(&ctx)?;
-        if let Some(denied) = self.deny_unless(&key, p.bug_id, Capability::Status).await {
+        if let Some(denied) = self
+            .deny_unless(&key, p.bug_id, Capability::Status, &ctx)
+            .await
+        {
             return Ok(denied);
         }
 
@@ -1163,7 +1533,10 @@ impl BugWarden {
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(bug_id = p.bug_id, assignee = %p.assignee, "tool: assign_bug");
         let key = self.api_key(&ctx)?;
-        if let Some(denied) = self.deny_unless(&key, p.bug_id, Capability::Assign).await {
+        if let Some(denied) = self
+            .deny_unless(&key, p.bug_id, Capability::Assign, &ctx)
+            .await
+        {
             return Ok(denied);
         }
         let mut payload = serde_json::Map::new();
@@ -1217,6 +1590,7 @@ impl BugWarden {
             // without calling Bugzilla otherwise.
             for k in custom_fields.keys() {
                 if !k.starts_with("cf_") {
+                    note_refused(&ctx);
                     return Ok(err_text(format!(
                         "Invalid custom field '{k}': custom field names must start with 'cf_'"
                     )));
@@ -1227,12 +1601,16 @@ impl BugWarden {
             }
         }
         if payload.is_empty() {
+            note_refused(&ctx);
             return Ok(err_text("At least one field must be specified"));
         }
         attach_comment(&mut payload, &p.comment);
 
         let key = self.api_key(&ctx)?;
-        if let Some(denied) = self.deny_unless(&key, p.bug_id, Capability::Fields).await {
+        if let Some(denied) = self
+            .deny_unless(&key, p.bug_id, Capability::Fields, &ctx)
+            .await
+        {
             return Ok(denied);
         }
         match self
@@ -1278,6 +1656,7 @@ impl BugWarden {
             payload.insert("depends_on".to_string(), depends_on);
         }
         if payload.is_empty() {
+            note_refused(&ctx);
             return Ok(err_text("At least one dependency change must be specified"));
         }
         attach_comment(&mut payload, &p.comment);
@@ -1304,16 +1683,27 @@ impl BugWarden {
         let mut seen = BTreeSet::new();
         ids.retain(|id| seen.insert(*id));
         if let Some(refusal) = too_many_ids(&ids) {
+            note_refused(&ctx);
             return Ok(refusal);
         }
 
         let key = self.api_key(&ctx)?;
+        let cell = audit_cell(&ctx);
         let assessments = self.assess(&key, &ids).await;
+        let note = |id: u64, verdict: Verdict| {
+            if let Some(cell) = &cell {
+                match assessments.get(&id) {
+                    Some((access, _)) => cell.note_verdict_rule(verdict, access_rule(access)),
+                    None => cell.note_verdict(verdict),
+                }
+            }
+        };
         let deps_ok = assessments
             .get(&p.bug_id)
             .is_some_and(|(access, _)| access.allows(Capability::Deps));
         if !deps_ok {
             tracing::info!(bug_id = p.bug_id, "guard denied operation");
+            note(p.bug_id, Verdict::Denied);
             return Ok(err_text(Guard::denial(p.bug_id)));
         }
         for &id in ids.iter().filter(|&&id| id != p.bug_id) {
@@ -1322,9 +1712,11 @@ impl BugWarden {
                 .is_some_and(|(access, _)| access.allows(Capability::Summary));
             if !target_ok {
                 tracing::info!(bug_id = id, "guard denied dependency target");
+                note(id, Verdict::Denied);
                 return Ok(err_text(Guard::denial(id)));
             }
         }
+        note(p.bug_id, Verdict::Served);
 
         match self
             .bz
@@ -1352,7 +1744,7 @@ impl BugWarden {
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(bug_id = p.bug_id, cc_email = %p.cc_email, "tool: add_cc_to_bug");
         let key = self.api_key(&ctx)?;
-        if let Some(denied) = self.deny_unless(&key, p.bug_id, Capability::Cc).await {
+        if let Some(denied) = self.deny_unless(&key, p.bug_id, Capability::Cc, &ctx).await {
             return Ok(denied);
         }
         let payload = json!({ "cc": { "add": [p.cc_email] } });
@@ -1389,19 +1781,31 @@ impl BugWarden {
         } else {
             vec![p.bug_id, p.duplicate_of]
         };
+        let cell = audit_cell(&ctx);
         let assessments = self.assess(&key, &ids).await;
+        let note = |id: u64, verdict: Verdict| {
+            if let Some(cell) = &cell {
+                match assessments.get(&id) {
+                    Some((access, _)) => cell.note_verdict_rule(verdict, access_rule(access)),
+                    None => cell.note_verdict(verdict),
+                }
+            }
+        };
         let status_ok = assessments
             .get(&p.bug_id)
             .is_some_and(|(access, _)| access.allows(Capability::Status));
         if !status_ok {
+            note(p.bug_id, Verdict::Denied);
             return Ok(err_text(Guard::denial(p.bug_id)));
         }
         let duplicate_ok = assessments
             .get(&p.duplicate_of)
             .is_some_and(|(access, _)| access.allows(Capability::Summary));
         if !duplicate_ok {
+            note(p.duplicate_of, Verdict::Denied);
             return Ok(err_text(Guard::denial(p.duplicate_of)));
         }
+        note(p.bug_id, Verdict::Served);
 
         let comment = if p.comment.is_empty() {
             format!("Marking as duplicate of bug {}", p.duplicate_of)
@@ -1440,7 +1844,7 @@ impl BugWarden {
         );
         let key = self.api_key(&ctx)?;
         if let Some(denied) = self
-            .deny_unless(&key, p.bug_id, Capability::Attachments)
+            .deny_unless(&key, p.bug_id, Capability::Attachments, &ctx)
             .await
         {
             return Ok(denied);
@@ -1456,7 +1860,13 @@ impl BugWarden {
                     // than passing unfiltered metadata through.
                     _ => Vec::new(),
                 };
+                let total = items.len();
                 let filtered = self.guard.filter_attachments(items, p.include_private);
+                if let Some(cell) = audit_cell(&ctx) {
+                    // Filtered private attachments have no bug id of
+                    // their own: count only.
+                    cell.note_suppressed_count((total - filtered.len()) as u64);
+                }
                 Ok(ok_json(Value::Array(filtered)))
             }
             Err(e) => Ok(err_text(format!(
@@ -1513,6 +1923,23 @@ impl BugWarden {
         let allowed = assessments
             .get(&assess_id)
             .is_some_and(|(access, _)| access.allows(Capability::Attachments));
+        if let Some(cell) = audit_cell(&ctx) {
+            // Every uniform-denial path below upgrades this to Denied;
+            // the padding assessment against bug id 0 decides nothing,
+            // so no rule is attached there.
+            match assessments.get(&assess_id) {
+                _ if assess_id == 0 => cell.note_verdict(Verdict::Denied),
+                Some((access, _)) => cell.note_verdict_rule(
+                    if allowed {
+                        Verdict::Served
+                    } else {
+                        Verdict::Denied
+                    },
+                    access_rule(access),
+                ),
+                None => cell.note_verdict(Verdict::Denied),
+            }
+        }
 
         let Some(meta) = meta.filter(|_| allowed && assess_id != 0) else {
             // Missing metadata, missing bug id, or a denied owning bug: one
@@ -1520,7 +1947,16 @@ impl BugWarden {
             // reused — it would confirm which bug owns the attachment.
             return Ok(err_text(Guard::attachment_denial(p.attachment_id)));
         };
+        // Withheld content after a granted assessment is still the guard
+        // deciding: every refusal below upgrades the noted verdict to
+        // Denied (the note changes no response byte).
+        let note_denied = || {
+            if let Some(cell) = audit_cell(&ctx) {
+                cell.note_verdict(Verdict::Denied);
+            }
+        };
         if let Some(refusal) = self.guard.attachment_gate(&meta, p.include_private) {
+            note_denied();
             return Ok(err_text(refusal));
         }
 
@@ -1529,13 +1965,17 @@ impl BugWarden {
             // A failed blob fetch gets the same uniform denial as an unknown
             // id: the upstream status and message would otherwise distinguish
             // the two and disclose server detail.
-            Ok(None) => return Ok(err_text(Guard::attachment_denial(p.attachment_id))),
+            Ok(None) => {
+                note_denied();
+                return Ok(err_text(Guard::attachment_denial(p.attachment_id)));
+            }
             Err(e) => {
                 tracing::debug!(
                     attachment_id = p.attachment_id,
                     error = %e,
                     "attachment data fetch failed"
                 );
+                note_denied();
                 return Ok(err_text(Guard::attachment_denial(p.attachment_id)));
             }
         };
@@ -1544,9 +1984,11 @@ impl BugWarden {
         // owning bug, so an attachment that turns private (or moves to another
         // bug) between the two calls cannot be served.
         if attachment.get("bug_id").and_then(Value::as_u64) != Some(assess_id) {
+            note_denied();
             return Ok(err_text(Guard::attachment_denial(p.attachment_id)));
         }
         if let Some(refusal) = self.guard.attachment_gate(&attachment, p.include_private) {
+            note_denied();
             return Ok(err_text(refusal));
         }
 
@@ -1555,6 +1997,7 @@ impl BugWarden {
             .and_then(Value::as_str)
             .map(str::to_owned)
         else {
+            note_refused(&ctx);
             return Ok(err_text("Attachment has no data"));
         };
         // Defense in depth: the size gate trusted the upstream-REPORTED size;
@@ -1564,6 +2007,7 @@ impl BugWarden {
         // so the cap stays inclusive, matching the metadata gate.
         let cap = self.guard.policy.global.max_attachment_bytes;
         if cap > 0 && decoded_len(&blob) > cap {
+            note_denied();
             return Ok(err_text(format!(
                 "Attachment {} exceeds the size limit of this server",
                 p.attachment_id
@@ -1689,7 +2133,10 @@ impl BugWarden {
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(id = p.id, "tool: summarize_bug");
         let key = self.api_key(&ctx)?;
-        if let Some(denied) = self.deny_unless(&key, p.id, Capability::Comments).await {
+        if let Some(denied) = self
+            .deny_unless(&key, p.id, Capability::Comments, &ctx)
+            .await
+        {
             return Ok(denied);
         }
         let comments = match self.bz.bug_comments(&key, p.id, None).await {
@@ -1698,11 +2145,19 @@ impl BugWarden {
                 return Ok(err_text(format!("Summarize Comments Failed\nReason: {e}")));
             }
         };
+        let total = comments.len();
         let comments = self.guard.filter_comments(comments, false);
         // Same scrub as bug_comments: otherwise a client that would be
         // scrubbed there just asks for a summary instead (I14).
         let named = Guard::duplicate_marker_ids(&comments);
         let disclosable = self.guard.disclosable(&self.bz, &key, &named).await;
+        if let Some(cell) = audit_cell(&ctx) {
+            cell.note_suppressed_count((total - comments.len()) as u64);
+            let hidden: Vec<u64> = named.difference(&disclosable).copied().collect();
+            if !hidden.is_empty() {
+                cell.note_suppressed(hidden);
+            }
+        }
         let comments = Guard::scrub_duplicate_markers(comments, &disclosable);
         let comments_json =
             serde_json::to_string_pretty(&comments).unwrap_or_else(|_| "[]".to_string());
@@ -1721,11 +2176,202 @@ impl BugWarden {
     }
 }
 
-// `router = self.tool_router` is load-bearing: the instance router has the
-// write tools / disabled tools removed (I13). The macro default,
-// `Self::tool_router()`, would rebuild an unpruned router.
-#[tool_handler(router = self.tool_router)]
+// Hand-written handler impl. `call_tool`, `list_tools` and `get_tool` keep
+// the exact semantics the `#[tool_handler]` macro would generate for them;
+// hand-writing exists so `call_tool` can own the audit record and
+// `initialize` the initialize record. Dispatch through `self.tool_router`
+// is load-bearing: the instance router has the write tools / disabled
+// tools removed (I13); the macro default, `Self::tool_router()`, would
+// rebuild an unpruned router. `list_tools` is not audited: no event kind
+// exists for a listing — deliberate for schema v1.
 impl ServerHandler for BugWarden {
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        // The default handler's peer bookkeeping, replicated: the
+        // handshake info is stored so later calls (and their audit
+        // records) can read it back through `peer_info`.
+        context.peer.set_peer_info(request.clone());
+        if let Some(audit) = &self.audit {
+            // Every session start is recorded, unconditionally — no
+            // configuration knob: a stream that could omit session
+            // starts could not anchor its tool records to a client.
+            let event = audit::AuditEventKind::Initialize(audit::InitializeEvent {
+                client: audit::ClientInfo {
+                    name: Some(request.client_info.name.clone()),
+                    version: Some(request.client_info.version.clone()),
+                    principal: None,
+                },
+                protocol_version: Some(request.protocol_version.as_str().to_string()),
+            });
+            let session = self.session_info(&context, audit);
+            if record_event(audit, event, session).await.is_err()
+                && audit.fail_mode == FailMode::ClosedAll
+            {
+                // Only ClosedAll refuses the handshake: initialize is
+                // neither a write nor a guard verdict, so the other two
+                // modes proceed and let the gap marker account for the
+                // loss.
+                return Err(McpError::internal_error("audit unavailable", None));
+            }
+        }
+        // The default handler's version negotiation, replicated: echo a
+        // client-requested version this SDK knows, keep the server
+        // default otherwise.
+        let mut info = self.get_info();
+        if ProtocolVersion::KNOWN_VERSIONS.contains(&request.protocol_version) {
+            info.protocol_version = request.protocol_version;
+        } else {
+            tracing::warn!(
+                client_requested = %request.protocol_version,
+                server_fallback = %info.protocol_version,
+                "client requested unsupported protocol version; falling back to server default"
+            );
+        }
+        Ok(info)
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        mut context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        // Auditing off: byte-identical to the macro-generated dispatch.
+        let Some(audit) = self.audit.clone() else {
+            return self
+                .tool_router
+                .call(ToolCallContext::new(self, request, context))
+                .await;
+        };
+        let started = Instant::now();
+        let tool = request.name.to_string();
+        let session = self.session_info(&context, &audit);
+        let client = client_of(&context);
+        let request_id = Some(context.id.to_string());
+        // Allowlist BEFORE dispatch: the record needs the params after
+        // the router has consumed the request, and allowlisting first
+        // avoids cloning free-text and blob values that would be reduced
+        // to a byte length anyway.
+        let params = allowlisted(request.arguments.as_ref());
+
+        // Pre-dispatch gate: a sink already in failure holds back further
+        // unaudited work, scoped by the fail mode. The refusal is
+        // recorded best-effort — succeed or not, the call is refused:
+        // the gate exists to stop unaudited work, not to retry its way
+        // open. The refusal depends on the tool name alone, never on
+        // anything the guard decided (the guard never ran).
+        if audit.sink.failing() && gate_applies(audit.fail_mode, &tool) {
+            let event = audit::AuditEventKind::ToolCall(Box::new(audit::ToolCallEvent {
+                client,
+                trace: None,
+                request: audit::RequestInfo {
+                    tool: tool.clone(),
+                    id: request_id,
+                    params,
+                },
+                guard: Some(audit::GuardInfo {
+                    verdict: Verdict::Refused,
+                    rule: None,
+                    policy_hash: audit.policy_hash.clone(),
+                    suppressed_count: 0,
+                    suppressed_ids: Vec::new(),
+                    redacted_fields: Vec::new(),
+                }),
+                upstream: None,
+                outcome: audit::OutcomeInfo {
+                    class: audit::OutcomeClass::Refused,
+                    duration_ms: elapsed_ms(started),
+                },
+            }));
+            let _ = record_event(&audit, event, session).await;
+            return Ok(audit_refusal(&tool));
+        }
+
+        let cell = Arc::new(AuditCell::default());
+        context.extensions.insert(Arc::clone(&cell));
+        let result = self
+            .tool_router
+            .call(ToolCallContext::new(self, request, context))
+            .await;
+
+        // Exactly one record per call, whatever `result` is — including
+        // an unknown tool or another protocol error from the router.
+        let upstream = cell.take_upstream();
+        let guard = cell.into_guard_info(audit.policy_hash.as_deref(), audit.sink.suppressed_ids());
+        let guard_verdict = guard.as_ref().map(|g| g.verdict);
+        let class = match &result {
+            // A guard denial is a well-formed response (the uniform
+            // denial text): its `is_error` marker classifies the
+            // content, not the call, so the outcome stays `ok` and the
+            // denial lives in guard.verdict.
+            Ok(r) if r.is_error == Some(true) && guard_verdict != Some(Verdict::Denied) => {
+                audit::OutcomeClass::Refused
+            }
+            Ok(_) => audit::OutcomeClass::Ok,
+            Err(_) => audit::OutcomeClass::Error,
+        };
+        let event = audit::AuditEventKind::ToolCall(Box::new(audit::ToolCallEvent {
+            client,
+            trace: None,
+            request: audit::RequestInfo {
+                tool: tool.clone(),
+                id: request_id,
+                params,
+            },
+            guard,
+            upstream,
+            outcome: audit::OutcomeInfo {
+                class,
+                duration_ms: elapsed_ms(started),
+            },
+        }));
+        match record_event(&audit, event, session).await {
+            // Persisted before the response is returned.
+            Ok(_) => result,
+            Err(()) => match (audit.fail_mode, &result) {
+                // A protocol error from the router stands under every
+                // mode: the record was attempted, an unknown tool is
+                // unknown with or without auditing, and swapping the
+                // error for a tool-level refusal would CREATE a
+                // distinguisher that exists only during an audit outage.
+                (_, Err(_)) => result,
+                // The sink has rate-limit-logged the failure; the gap
+                // marker accounts for the loss after recovery.
+                (FailMode::Open, _) => result,
+                (FailMode::ClosedWritesDenials, _)
+                    if WRITE_TOOLS.contains(&tool.as_str())
+                        || matches!(
+                            guard_verdict,
+                            Some(Verdict::Denied | Verdict::Refused | Verdict::ServedFiltered)
+                        ) =>
+                {
+                    Ok(audit_refusal(&tool))
+                }
+                // A read the guard fully allowed serves unaudited.
+                (FailMode::ClosedWritesDenials, _) => result,
+                (FailMode::ClosedAll, _) => Ok(audit_refusal(&tool)),
+            },
+        }
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult {
+            tools: self.tool_router.list_all(),
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tool_router.get(name).cloned()
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
@@ -2107,6 +2753,28 @@ mod tests {
     }
 
     #[test]
+    fn get_tool_serves_the_pruned_instance_router_i13() {
+        // The definition lookup must consult the INSTANCE router `new`
+        // pruned, not a freshly built default one: a stripped tool has no
+        // definition to serve, exactly as it has no route to call.
+        let (cfg, guard, bz) =
+            parts("[global]\nread_only = true\ndisabled_tools = [\"bug_history\"]\n");
+        let server = BugWarden::new(cfg, guard, bz).expect("server builds");
+        assert!(
+            server.get_tool("add_comment").is_none(),
+            "a write tool stripped by read-only mode has no definition (I13)"
+        );
+        assert!(
+            server.get_tool("bug_history").is_none(),
+            "a policy-disabled tool has no definition (I13)"
+        );
+        assert!(
+            server.get_tool("bug_info").is_some(),
+            "a live tool keeps its definition"
+        );
+    }
+
+    #[test]
     fn decoded_len_counts_decoded_bytes_exactly() {
         assert_eq!(decoded_len(""), 0);
         assert_eq!(decoded_len("YQ=="), 1); // "a"
@@ -2156,5 +2824,384 @@ mod tests {
         assert!(!is_inline_image("application/octet-stream"));
         assert!(!is_inline_image("image/"));
         assert!(!is_inline_image("imagexpng"));
+    }
+
+    // ---------- audit wiring ----------
+
+    #[test]
+    fn audit_refusal_map_covers_every_tool_in_the_full_router() {
+        // Iterated over the FULL (unpruned) router on purpose: a new tool
+        // must get its uniform refusal text before it can ship, or an
+        // audit outage would answer it with the generic fallback — a
+        // brand-new fingerprint.
+        let tools = BugWarden::tool_router().list_all();
+        assert!(!tools.is_empty(), "the full router lists the tool surface");
+        for tool in tools {
+            assert!(
+                audit_refusal_text(&tool.name).is_some(),
+                "tool {} has no audit refusal mapping — add its uniform \
+                 failure text to audit_refusal_text",
+                tool.name
+            );
+        }
+        assert_eq!(
+            audit_refusal_text("no_such_tool"),
+            None,
+            "unknown names take the generic fallback"
+        );
+    }
+
+    #[test]
+    fn allowlist_reduces_free_text_to_length_only() {
+        let args = json!({
+            "bug_id": 7,
+            "is_private": true,
+            "comment": "definitely secret text",
+            "custom_fields": { "cf_fixed_in": "also withheld" },
+        });
+        let Value::Object(obj) = args else {
+            unreachable!()
+        };
+        let params = allowlisted(Some(&obj));
+        assert_eq!(params["bug_id"], json!(7));
+        assert_eq!(params["is_private"], json!(true));
+        let comment_len = serde_json::to_vec(&json!("definitely secret text"))
+            .unwrap()
+            .len();
+        assert_eq!(params["comment"], json!({ "_len": comment_len }));
+        let flat = serde_json::to_string(&params).unwrap();
+        assert!(!flat.contains("secret"), "free text leaked: {flat}");
+        assert!(!flat.contains("withheld"), "custom field leaked: {flat}");
+    }
+
+    #[test]
+    fn allowlist_truncates_long_strings_at_1024_chars() {
+        let obj: JsonObject = serde_json::from_value(json!({ "query": "q".repeat(5000) })).unwrap();
+        let params = allowlisted(Some(&obj));
+        assert_eq!(params["query"].as_str().unwrap().chars().count(), 1024);
+        // Strings inside allowlisted lists are capped the same way.
+        let obj: JsonObject =
+            serde_json::from_value(json!({ "keywords": ["k".repeat(2000)] })).unwrap();
+        let params = allowlisted(Some(&obj));
+        assert_eq!(params["keywords"][0].as_str().unwrap().len(), 1024);
+        // A short value is passed through untouched.
+        let obj: JsonObject = serde_json::from_value(json!({ "query": "kernel" })).unwrap();
+        assert_eq!(allowlisted(Some(&obj))["query"], json!("kernel"));
+    }
+
+    // The fail-mode scope tests below drive a REAL sink into failure via
+    // its cfg(test) injection hook, which integration tests cannot reach;
+    // everything else is the production path: a real MCP session over an
+    // in-memory duplex transport against a wiremock Bugzilla.
+
+    use crate::audit::{AuditConfig, AuditEvent, AuditEventKind, AuditSink};
+    use rmcp::service::{RoleClient, RunningService};
+    use rmcp::ServiceExt as _;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn audit_state(
+        dir: &std::path::Path,
+        fail_mode: FailMode,
+    ) -> (Arc<AuditState>, std::path::PathBuf) {
+        let path = dir.join("audit.jsonl");
+        let sink = AuditSink::open(AuditConfig {
+            path: path.clone(),
+            fsync: false,
+            fail_mode: None,
+            rotate_max_bytes: 0,
+            rotate_keep: 8,
+            suppressed_ids: true,
+        })
+        .expect("audit sink must open");
+        (Arc::new(AuditState::new(sink, fail_mode, None)), path)
+    }
+
+    fn read_audit_events(path: &std::path::Path) -> Vec<AuditEvent> {
+        let s = std::fs::read_to_string(path).expect("audit file must be readable");
+        s.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).expect("every audit line must parse"))
+            .collect()
+    }
+
+    /// Serve a [`BugWarden`] against `mock` over an in-memory duplex
+    /// transport, optionally audited, and connect an MCP client.
+    async fn mcp_client(
+        policy: &str,
+        mock_uri: &str,
+        audit: Option<Arc<AuditState>>,
+    ) -> RunningService<RoleClient, ()> {
+        use clap::Parser as _;
+        let cfg = Arc::new(Cli::parse_from([
+            "bugwarden",
+            "--bugzilla-server",
+            mock_uri,
+            "--transport",
+            "stdio",
+            "--api-key",
+            "test-key",
+        ]));
+        let guard = Arc::new(Guard {
+            policy: Policy::from_toml_str(policy).expect("test policy must parse"),
+        });
+        let bz = Arc::new(BugzillaClient::new(mock_uri, false).expect("client must build"));
+        let mut server = BugWarden::new(cfg, guard, bz).expect("server must build");
+        if let Some(audit) = audit {
+            server = server.with_audit(audit);
+        }
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            if let Ok(running) = server.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        ().serve(client_io)
+            .await
+            .expect("MCP handshake must succeed")
+    }
+
+    async fn call(
+        client: &RunningService<RoleClient, ()>,
+        tool: &str,
+        args: Value,
+    ) -> CallToolResult {
+        let Value::Object(args) = args else {
+            panic!("tool arguments must be a JSON object");
+        };
+        client
+            .call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(args))
+            .await
+            .expect("tool call must not be a protocol error")
+    }
+
+    fn text_of(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .collect()
+    }
+
+    fn is_error(result: &CallToolResult) -> bool {
+        result.is_error == Some(true)
+    }
+
+    fn world_bug(id: u64) -> Value {
+        json!({
+            "id": id,
+            "summary": "a plain bug",
+            "product": "openSUSE",
+            "component": "Kernel",
+            "status": "NEW",
+            "severity": "normal",
+            "priority": "P3",
+            "keywords": [],
+            "groups": [],
+            "whiteboard": "",
+            "creation_time": "2020-01-01T00:00:00Z",
+        })
+    }
+
+    /// Classify/full fetches for bug 7, the empty id=0 padding fetch, an
+    /// empty history, and a comment thread with one private comment.
+    async fn mount_bug7(mock: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/rest/bug"))
+            .and(query_param("id", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+            .mount(mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/bug"))
+            .and(query_param("id", "7"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "bugs": [world_bug(7)] })),
+            )
+            .mount(mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/bug/7/history"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "bugs": [{ "history": [] }] })),
+            )
+            .mount(mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/bug/7/comment"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "bugs": { "7": { "comments": [
+                    { "id": 1, "bug_id": 7, "is_private": false, "text": "public" },
+                    { "id": 2, "bug_id": 7, "is_private": true, "text": "private" },
+                ] } }
+            })))
+            .mount(mock)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn closed_all_gates_pre_dispatch_once_the_sink_is_failing() {
+        let mock = MockServer::start().await;
+        mount_bug7(&mock).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::ClosedAll);
+        let client = mcp_client("", &mock.uri(), Some(Arc::clone(&audit))).await;
+
+        // Healthy sink: a granted read serves and is recorded.
+        let served = call(&client, "bug_history", json!({ "id": 7 })).await;
+        assert!(!is_error(&served), "healthy sink must serve");
+
+        audit.sink.set_fail_writes(true);
+        // The outage is discovered ON the response path: the tool ran
+        // (upstream was contacted), the record failed, and the response
+        // became the mapped refusal — the write sits on the response path.
+        let discovered = call(&client, "bug_history", json!({ "id": 7 })).await;
+        assert!(is_error(&discovered));
+        assert_eq!(text_of(&discovered), "Failed to fetch bug history");
+        let after_discovery = mock.received_requests().await.unwrap().len();
+
+        // From now on the gate closes BEFORE dispatch: no new upstream
+        // request, same refusal text.
+        let gated = call(&client, "bug_history", json!({ "id": 7 })).await;
+        assert!(is_error(&gated));
+        assert_eq!(text_of(&gated), "Failed to fetch bug history");
+        assert_eq!(
+            mock.received_requests().await.unwrap().len(),
+            after_discovery,
+            "the pre-dispatch gate must not contact upstream"
+        );
+
+        // On disk: only the healthy-phase records made it.
+        let events = read_audit_events(&audit_path);
+        assert_eq!(events.len(), 2, "initialize + the served call");
+    }
+
+    #[tokio::test]
+    async fn closed_writes_denials_scopes_refusal_to_writes_and_non_clean_reads() {
+        let mock = MockServer::start().await;
+        mount_bug7(&mock).await;
+        Mock::given(method("POST"))
+            .and(path("/rest/bug/7/comment"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 11 })))
+            .expect(0)
+            .mount(&mock)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::ClosedWritesDenials);
+        // Failing from the very start; the initialize record is lost but
+        // the handshake proceeds (only closed_all refuses it).
+        audit.sink.set_fail_writes(true);
+        let client = mcp_client("", &mock.uri(), Some(Arc::clone(&audit))).await;
+
+        // A read the guard fully allows serves unaudited.
+        let served = call(&client, "bug_history", json!({ "id": 7 })).await;
+        assert!(!is_error(&served), "a clean read must serve unaudited");
+
+        // A write refuses BEFORE any upstream request (the sink is
+        // already failing, so the gate closes pre-dispatch: no classify,
+        // no POST).
+        let before_write = mock.received_requests().await.unwrap().len();
+        let write = call(
+            &client,
+            "add_comment",
+            json!({ "bug_id": 7, "comment": "hi" }),
+        )
+        .await;
+        assert!(is_error(&write));
+        assert_eq!(text_of(&write), "Failed to create a comment");
+        assert_eq!(
+            mock.received_requests().await.unwrap().len(),
+            before_write,
+            "a gated write must not contact upstream at all"
+        );
+
+        // A read whose guard suppressed something (a private comment
+        // filtered out) refuses.
+        let filtered = call(&client, "bug_comments", json!({ "id": 7 })).await;
+        assert!(is_error(&filtered));
+        assert_eq!(text_of(&filtered), "Failed to fetch bug comments");
+
+        // Recovery: the unaudited work shows up as the gap marker's drop
+        // count — initialize, the served read, the gated write's refusal
+        // record, and the filtered read.
+        audit.sink.set_fail_writes(false);
+        let again = call(&client, "bug_history", json!({ "id": 7 })).await;
+        assert!(!is_error(&again));
+        let events = read_audit_events(&audit_path);
+        assert_eq!(events.len(), 2, "gap marker + the recovered call");
+        match &events[0].kind {
+            AuditEventKind::AuditGap(gap) => assert_eq!(gap.dropped, 4),
+            other => panic!("expected audit_gap first after recovery, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_byte_identical_with_audit_off_on_and_failing_open() {
+        // The same call sequence — a denial, a filtered read, a write —
+        // against one upstream, through three servers: audit off, audit
+        // on, audit failing under fail_mode = open. The client-visible
+        // results must serialize byte-identically (I15).
+        let policy = concat!(
+            "[[rule]]\nname = \"hide-secret\"\naction = \"deny\"\n",
+            "[rule.match]\nproducts = [\"Secret*\"]\n",
+        );
+        let mock = MockServer::start().await;
+        mount_bug7(&mock).await;
+        let mut secret = world_bug(99);
+        secret["product"] = json!("SecretSauce");
+        Mock::given(method("GET"))
+            .and(path("/rest/bug"))
+            .and(query_param("id", "99"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [secret] })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/rest/bug/7/comment"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 11 })))
+            .mount(&mock)
+            .await;
+
+        let client_off = mcp_client(policy, &mock.uri(), None).await;
+        let dir_on = tempfile::tempdir().unwrap();
+        let (audit_on, _) = audit_state(dir_on.path(), FailMode::Open);
+        let client_on = mcp_client(policy, &mock.uri(), Some(audit_on)).await;
+        let dir_fail = tempfile::tempdir().unwrap();
+        let (audit_fail, fail_path) = audit_state(dir_fail.path(), FailMode::Open);
+        audit_fail.sink.set_fail_writes(true);
+        let client_fail = mcp_client(policy, &mock.uri(), Some(Arc::clone(&audit_fail))).await;
+
+        let sequence = [
+            ("bug_info", json!({ "bug_ids": [7, 99] })),
+            ("bug_comments", json!({ "id": 7 })),
+            ("add_comment", json!({ "bug_id": 7, "comment": "hello" })),
+        ];
+        for (tool, args) in sequence {
+            let off = call(&client_off, tool, args.clone()).await;
+            let on = call(&client_on, tool, args.clone()).await;
+            let failing = call(&client_fail, tool, args).await;
+            let off = serde_json::to_string(&off).unwrap();
+            assert_eq!(
+                off,
+                serde_json::to_string(&on).unwrap(),
+                "auditing on must not change {tool}"
+            );
+            assert_eq!(
+                off,
+                serde_json::to_string(&failing).unwrap(),
+                "a failing-open sink must not change {tool}"
+            );
+        }
+
+        // fail-open accounts for the outage in the stream itself.
+        audit_fail.sink.set_fail_writes(false);
+        let _ = call(&client_fail, "bug_comments", json!({ "id": 7 })).await;
+        let events = read_audit_events(&fail_path);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.kind, AuditEventKind::AuditGap(_))),
+            "a gap marker must follow recovery"
+        );
     }
 }

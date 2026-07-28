@@ -71,4 +71,10 @@ pub struct Cli {
     /// policy is used.
     #[arg(long, env = "BUGWARDEN_POLICY")]
     pub policy: Option<PathBuf>,
+
+    /// Path to the audit configuration TOML file (see examples/audit.toml).
+    /// Environment variable BUGWARDEN_AUDIT_CONFIG can also be used.
+    /// Without it no audit stream is written.
+    #[arg(long, env = "BUGWARDEN_AUDIT_CONFIG")]
+    pub audit_config: Option<PathBuf>,
 }
