@@ -688,6 +688,59 @@ impl Guard {
             .collect()
     }
 
+    /// Whether a bug MAY BE FILED as described.
+    ///
+    /// There is no bug to classify yet, so the bug as requested is
+    /// classified instead: the same rules that decide whether an existing bug
+    /// may be seen decide whether one may be created looking like that. A
+    /// policy that hides a product by NAME therefore also refuses to let
+    /// bugs be filed into it, without needing a second vocabulary.
+    ///
+    /// The request is only evidence for fields Bugzilla will take verbatim.
+    /// For product, component, summary, version, severity, priority,
+    /// keywords and the rest, the created bug either carries exactly the
+    /// requested value or creation fails upstream — so the claim is sound to
+    /// classify on. `groups` is different in kind: Bugzilla UNIONS the
+    /// product's mandatory groups into whatever the request named, so the
+    /// created bug can belong to groups the request never mentioned (the
+    /// canonical `security-*` embargo setup works exactly this way). A
+    /// client-claimed group list must therefore never decide the verdict —
+    /// claiming `groups: []` would otherwise defeat a group deny rule that
+    /// omitting `groups` correctly trips. The group list of a prospective
+    /// bug is forced to UNKNOWN, whatever the payload said, and unknown
+    /// fails closed (I4). Consequence, deliberate: a policy whose applicable
+    /// rules consult `groups` or `group_restricted` refuses ALL creation,
+    /// because the answer cannot be known before the bug exists.
+    ///
+    /// The prospective bug is dated NOW, so an age rule (`younger_than_days`,
+    /// `min_bug_age_days`) refuses creation wherever it would immediately
+    /// hide the result. Filing a bug nobody may then read is not a service.
+    pub fn may_create(&self, requested: &Value) -> bool {
+        let mut meta = BugMeta::from_json(requested);
+        meta.creation_time = Some(Utc::now());
+        // Bugzilla augments the group list server-side on creation; the
+        // request's claim about it is not knowledge (see above).
+        meta.groups = None;
+        // Every other field the request does not mention is unknown, not
+        // empty, and classification fails closed on it (I4).
+        self.policy
+            .classify(&meta, Utc::now())
+            .allows(Capability::Create)
+    }
+
+    /// The refusal for a bug that was not filed.
+    ///
+    /// Says only that the server did not do it: which rule tripped — or
+    /// whether it was Bugzilla, not the policy, that refused — stays
+    /// server-side (I1/I2). Callers must return this SAME text for a policy
+    /// refusal and for an upstream failure: two texts would let a client
+    /// send an always-invalid request (a bogus `version`, say) and read the
+    /// policy off which refusal came back, creating nothing and paying
+    /// nothing.
+    pub fn create_denial() -> String {
+        "Filing this bug is not permitted through this server".to_string()
+    }
+
     /// Project a bug object down to [`SUMMARY_FIELDS`] and add a
     /// `"_redacted": true` marker so clients (and tests) can tell a summary
     /// view from a full bug. Fields absent from the input are simply omitted.
@@ -1490,6 +1543,164 @@ products = ["NoView*"]
                 .global
                 .max_attachment_bytes,
             2 * 1024 * 1024
+        );
+    }
+
+    // ---------- may_create ----------
+
+    /// A minimal well-formed create request, as `create_bug` builds one.
+    fn create_request(product: &str) -> Value {
+        json!({
+            "product": product,
+            "component": "core",
+            "summary": "crash on start",
+            "version": "1.0",
+        })
+    }
+
+    #[test]
+    fn may_create_refuses_the_products_the_policy_hides() {
+        // The same rule that hides a product refuses filing into it.
+        let g = Guard {
+            policy: policy(concat!(
+                "[[rule]]\nname = \"hide-security\"\naction = \"deny\"\n",
+                "[rule.match]\nproducts = [\"Security*\"]\n",
+            )),
+        };
+        assert!(!g.may_create(&create_request("Security Response")));
+        assert!(g.may_create(&create_request("openSUSE")));
+    }
+
+    #[test]
+    fn may_create_never_lets_the_claimed_group_list_decide() {
+        // Bugzilla UNIONS the product's mandatory groups into whatever the
+        // request named, so the created bug can be in groups the request
+        // never mentioned. A group deny rule therefore refuses creation
+        // whatever the payload claims: omitting `groups`, claiming `[]`, and
+        // claiming a non-matching list must all be refused alike — if
+        // `groups: []` were taken as fact it would be strictly MORE
+        // permissive than omitting the field, and the canonical security-*
+        // embargo pattern would be filed straight through.
+        let g = Guard {
+            policy: policy(concat!(
+                "[[rule]]\nname = \"embargo\"\naction = \"deny\"\n",
+                "[rule.match]\ngroups = [\"embargo*\"]\n",
+            )),
+        };
+        let mut req = create_request("openSUSE");
+        assert!(!g.may_create(&req), "absent groups must fail closed");
+        req["groups"] = json!([]);
+        assert!(
+            !g.may_create(&req),
+            "a claimed empty group list is not knowledge: Bugzilla adds \
+             mandatory groups the request cannot disclaim"
+        );
+        req["groups"] = json!(["harmless"]);
+        assert!(!g.may_create(&req), "a non-matching claim decides nothing");
+        req["groups"] = json!(["embargo-security"]);
+        assert!(!g.may_create(&req));
+    }
+
+    #[test]
+    fn may_create_group_restricted_policies_refuse_all_creation() {
+        // The example policy's first rule: deny anything group-restricted.
+        // Whether the created bug will be group-restricted cannot be known
+        // in advance, so every create request is refused (I4) — including
+        // one that claims to be world-readable.
+        let g = Guard {
+            policy: policy(concat!(
+                "[[rule]]\nname = \"group-restricted\"\naction = \"deny\"\n",
+                "[rule.match]\ngroup_restricted = true\n",
+            )),
+        };
+        let mut req = create_request("openSUSE");
+        assert!(!g.may_create(&req));
+        req["groups"] = json!([]);
+        assert!(!g.may_create(&req));
+    }
+
+    #[test]
+    fn shipped_example_policy_parses_and_refuses_all_creation() {
+        // examples/policy.toml documents, in its header, that filing bugs is
+        // impossible under it: its first rule consults the group list, which
+        // is unknowable for a not-yet-created bug. Pin that the shipped file
+        // parses and behaves as its own comments claim. Read at runtime (not
+        // include_str!) so the core crate stays packageable without the file.
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/policy.toml");
+        let toml = std::fs::read_to_string(path).expect("example policy must exist in-repo");
+        let g = Guard {
+            policy: policy(&toml),
+        };
+        let mut req = create_request("openSUSE");
+        assert!(!g.may_create(&req), "omitted groups: refused");
+        req["groups"] = json!([]);
+        assert!(!g.may_create(&req), "claimed empty groups: refused");
+        req["groups"] = json!(["security-team"]);
+        assert!(!g.may_create(&req), "claimed groups: refused");
+    }
+
+    #[test]
+    fn may_create_group_rules_ruled_out_by_other_criteria_do_not_block() {
+        // Forcing groups to unknown must not turn every group-consulting
+        // rule into a blanket refusal: a rule some OTHER criterion already
+        // ruled out (definitive No) cannot apply either way, and evaluation
+        // moves on.
+        let g = Guard {
+            policy: policy(concat!(
+                "[[rule]]\nname = \"secret-embargo\"\naction = \"deny\"\n",
+                "[rule.match]\nproducts = [\"Secret*\"]\ngroups = [\"embargo*\"]\n",
+            )),
+        };
+        assert!(g.may_create(&create_request("openSUSE")));
+        assert!(!g.may_create(&create_request("SecretSauce")));
+    }
+
+    #[test]
+    fn may_create_dates_the_request_now() {
+        // An age gate that would immediately hide the new bug refuses its
+        // creation — and a creation_time CLAIMED by the payload must not
+        // defeat that: the prospective bug is dated NOW, whatever the
+        // request says.
+        let g = Guard {
+            policy: policy("[global]\nmin_bug_age_days = 1\n"),
+        };
+        let mut req = create_request("openSUSE");
+        assert!(!g.may_create(&req));
+        req["creation_time"] = json!("2000-01-01T00:00:00Z");
+        assert!(!g.may_create(&req));
+    }
+
+    #[test]
+    fn may_create_restrict_grants_only_the_named_products() {
+        // Pins the operator-facing TOML spelling "create" along the way.
+        let g = Guard {
+            policy: policy(concat!(
+                "default_action = \"deny\"\n",
+                "[[rule]]\nname = \"filers\"\naction = \"restrict\"\n",
+                "capabilities = [\"create\"]\n",
+                "[rule.match]\nproducts = [\"openSUSE*\"]\n",
+            )),
+        };
+        assert!(g.may_create(&create_request("openSUSE Tumbleweed")));
+        assert!(!g.may_create(&create_request("Internal Tools")));
+    }
+
+    #[test]
+    fn may_create_refuses_everything_in_read_only() {
+        let g = Guard {
+            policy: policy("[global]\nread_only = true\n"),
+        };
+        assert!(!g.may_create(&create_request("openSUSE")));
+    }
+
+    #[test]
+    fn create_denial_is_uniform_and_names_nothing() {
+        // One fixed text whatever tripped the refusal: no rule name, no
+        // criterion, no product (I1).
+        assert_eq!(
+            Guard::create_denial(),
+            "Filing this bug is not permitted through this server"
         );
     }
 }

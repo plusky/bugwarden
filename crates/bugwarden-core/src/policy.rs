@@ -78,11 +78,26 @@ pub enum Capability {
     Cc,
     /// Write: change blocks/depends_on.
     Deps,
+    /// Write: file a NEW bug.
+    ///
+    /// Judged against the bug as REQUESTED — product, component, summary and
+    /// so on are classified exactly as an existing bug's would be, so a rule
+    /// that hides a product by name also refuses to let bugs be filed into
+    /// it. The one exception is `groups`: Bugzilla augments the group list
+    /// server-side on creation, so the request's claim about it is ignored
+    /// and a policy consulting groups refuses creation outright (see
+    /// `Guard::may_create`).
+    Create,
+    /// Write: upload a new attachment to a bug.
+    ///
+    /// Distinct from [`Capability::Attachments`], which is the read side
+    /// (listing metadata and downloading content).
+    Attach,
 }
 
 impl Capability {
     /// Every capability, in declaration order. Used to expand `allow` grants.
-    pub const ALL: [Capability; 11] = [
+    pub const ALL: [Capability; 13] = [
         Capability::Read,
         Capability::Summary,
         Capability::Comments,
@@ -94,6 +109,8 @@ impl Capability {
         Capability::Assign,
         Capability::Cc,
         Capability::Deps,
+        Capability::Create,
+        Capability::Attach,
     ];
 
     /// Whether this capability permits mutating Bugzilla state.
@@ -110,6 +127,8 @@ impl Capability {
                 | Capability::Assign
                 | Capability::Cc
                 | Capability::Deps
+                | Capability::Create
+                | Capability::Attach
         )
     }
 }
@@ -899,10 +918,10 @@ mod tests {
     // ---------- Capability ----------
 
     #[test]
-    fn capability_all_lists_eleven_unique() {
-        assert_eq!(Capability::ALL.len(), 11);
+    fn capability_all_lists_thirteen_unique() {
+        assert_eq!(Capability::ALL.len(), 13);
         let set: BTreeSet<_> = Capability::ALL.iter().copied().collect();
-        assert_eq!(set.len(), 11);
+        assert_eq!(set.len(), 13);
     }
 
     #[test]
@@ -921,6 +940,8 @@ mod tests {
                 Capability::Assign,
                 Capability::Cc,
                 Capability::Deps,
+                Capability::Create,
+                Capability::Attach,
             ]
         );
         for c in [
@@ -1536,7 +1557,7 @@ products = ["SUSE*"]
         match &access {
             Access::Granted { caps, rule } => {
                 assert_eq!(rule, "default");
-                assert_eq!(caps.len(), 11);
+                assert_eq!(caps.len(), 13);
             }
             other => panic!("expected grant, got {other:?}"),
         }
@@ -1804,6 +1825,54 @@ capabilities = ["summary", "comment", "status"]
             Access::Granted { caps, .. } => assert_eq!(caps.len(), 1),
             other => panic!("expected grant, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn read_only_strips_create_and_attach() {
+        // Named explicitly (not via is_write) so a miscategorised capability
+        // cannot make this vacuously true: filing bugs and uploading
+        // attachments are writes, and read-only must strip them.
+        let p = Policy::from_toml_str("[global]\nread_only = true\n").unwrap();
+        let access = p.classify(&meta(), now());
+        assert!(!access.allows(Capability::Create));
+        assert!(!access.allows(Capability::Attach));
+        // Their read-side counterpart survives.
+        assert!(access.allows(Capability::Attachments));
+    }
+
+    #[test]
+    fn restrict_comment_grants_neither_create_nor_attach() {
+        // Commenting on existing bugs is not filing new ones and not
+        // uploading files: no implication exists between any of these.
+        let s = r#"
+[[rule]]
+name = "comment-only"
+action = "restrict"
+capabilities = ["comment"]
+"#;
+        let p = Policy::from_toml_str(s).unwrap();
+        let access = p.classify(&meta(), now());
+        assert!(access.allows(Capability::Comment));
+        assert!(!access.allows(Capability::Create));
+        assert!(!access.allows(Capability::Attach));
+        assert!(!access.allows(Capability::Attachments));
+    }
+
+    #[test]
+    fn restrict_can_grant_create_and_attach_by_name() {
+        // Pins the operator-facing TOML spelling of the two capabilities.
+        let s = r#"
+[[rule]]
+name = "filers"
+action = "restrict"
+capabilities = ["summary", "create", "attach"]
+"#;
+        let p = Policy::from_toml_str(s).unwrap();
+        let access = p.classify(&meta(), now());
+        assert!(access.allows(Capability::Create));
+        assert!(access.allows(Capability::Attach));
+        assert!(!access.allows(Capability::Read));
+        assert!(!access.allows(Capability::Attachments));
     }
 
     #[test]

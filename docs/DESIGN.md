@@ -12,7 +12,14 @@ Cargo workspace, two crates:
 - `crates/bugwarden-core` — guard policy engine + async Bugzilla REST client.
   MUST NOT depend on rmcp, axum, clap, or any MCP/transport crate.
 - `crates/bugwarden` — the binary: clap CLI, rmcp 2.2 MCP server, stdio and
-  streamable-HTTP transports. Depends on `bugwarden-core`.
+  streamable-HTTP transports. Depends on `bugwarden-core`. The crate also
+  has a lib target (`lib.rs` re-exporting `config` and `server`) consumed by
+  `main.rs` and by the integration tests under `crates/bugwarden/tests/`,
+  which drive the MCP tools end to end; a binary-only crate would leave the
+  tool gates untestable (a mutation deleting a guard call from a tool body
+  survived every test while only the pure helpers were covered). The
+  supported product remains the binary; the lib API carries no stability
+  promise.
 
 Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
 
@@ -108,11 +115,32 @@ pub enum Capability {
     Assign,      // write: assignee
     Cc,          // write: CC list
     Deps,        // write: blocks/depends_on
+    Create,      // write: file a NEW bug (judged against the bug AS REQUESTED)
+    Attach,      // write: upload an attachment (read side is Attachments)
 }
 impl Capability {
-    pub const ALL: [Capability; 11];
-    pub fn is_write(self) -> bool; // Comment|Status|Fields|Assign|Cc|Deps
+    pub const ALL: [Capability; 13];
+    pub fn is_write(self) -> bool; // Comment|Status|Fields|Assign|Cc|Deps|Create|Attach
 }
+```
+
+**Upgrade hazard — Capability::ALL grew from 11 to 13.** `create` and
+`attach` joined `ALL`, and every `allow` rule and `default_action = "allow"`
+grants ALL: an existing deployment that upgrades WITHOUT touching its policy
+file silently starts permitting bug filing (`create_bug`) and attachment
+upload (`add_attachment`) wherever it previously granted `allow`. An
+operator who wants the pre-upgrade surface must either add
+`disabled_tools = ["create_bug", "add_attachment"]` under `[global]`
+(removes the tools from the listing outright, I13), or replace `allow`
+grants with `restrict` rules enumerating exactly the old eleven
+capabilities. `read_only` deployments are unaffected — both new
+capabilities are writes and stay stripped. This trade (new capabilities
+join `allow` automatically) is deliberate — `allow` means "everything this
+server can do", and a frozen enumeration would silently exclude every
+future capability instead — but it must be called out in release notes
+whenever ALL grows.
+
+```rust
 
 /// Case-insensitive glob; '*' matches any (possibly empty) substring.
 pub fn glob_match(pattern: &str, value: &str) -> bool;
@@ -314,6 +342,34 @@ impl Guard {
     /// max_attachment_bytes is not I1-disclosable). Returns
     /// Some(refusal_text) when blocked.
     pub fn attachment_gate(&self, attachment: &serde_json::Value, include_private: bool) -> Option<String>;
+
+    /// Create gate: classify the bug AS REQUESTED (BugMeta::from_json over
+    /// the create payload) and require Capability::Create. There is no bug
+    /// to fetch yet, so the request is what is judged — the same rules that
+    /// hide a product BY NAME refuse filing into it, with no second
+    /// vocabulary. A field the request does not carry is unknown, not
+    /// empty, and fails closed (I4). The request is evidence only for
+    /// fields Bugzilla takes verbatim (the created bug matches the claim or
+    /// creation fails upstream); `groups` is NOT one of them — Bugzilla
+    /// UNIONS the product's mandatory groups into whatever was claimed, so
+    /// the claimed group list is forced to unknown (None) whatever the
+    /// payload said. Taking `groups: []` as fact would make claiming a
+    /// field strictly MORE permissive than omitting it and file straight
+    /// past a group deny rule into a security-* embargo product.
+    /// Consequence, deliberate and documented: a policy whose applicable
+    /// rules consult `groups` or `group_restricted` refuses ALL creation —
+    /// the answer cannot be known before the bug exists. creation_time is
+    /// forced to NOW, whatever the payload claims, so an age rule refuses
+    /// creation wherever it would immediately hide the result.
+    pub fn may_create(&self, requested: &Value) -> bool;
+
+    /// Uniform refusal for a bug that was not filed: one fixed text, naming
+    /// no rule and no criterion (I1), whatever tripped it. Callers MUST
+    /// return this same text for a policy refusal AND an upstream failure —
+    /// two texts would let a client pair a guaranteed-invalid field with a
+    /// probe payload and read the policy off which refusal came back, free
+    /// and silent (see the create_bug tool row).
+    pub fn create_denial() -> String; // "Filing this bug is not permitted through this server"
 }
 ```
 
@@ -333,6 +389,8 @@ impl BugzillaClient {
     pub async fn bug_history(&self, key: &str, id: u64, new_since: Option<chrono::DateTime<chrono::Utc>>) -> anyhow::Result<serde_json::Value>;
     pub async fn bug_comments(&self, key: &str, id: u64, new_since: Option<chrono::DateTime<chrono::Utc>>) -> anyhow::Result<Vec<serde_json::Value>>;
     pub async fn add_comment(&self, key: &str, id: u64, comment: &str, is_private: bool) -> anyhow::Result<serde_json::Value>;
+    pub async fn create_bug(&self, key: &str, payload: serde_json::Value) -> anyhow::Result<serde_json::Value>;
+    pub async fn add_attachment(&self, key: &str, id: u64, payload: serde_json::Value) -> anyhow::Result<serde_json::Value>;
     pub async fn quicksearch(&self, key: &str, query: &str, status: &str, include_fields: &str, limit: u32, offset: u32) -> anyhow::Result<serde_json::Value>;
     pub async fn update_bug(&self, key: &str, id: u64, payload: serde_json::Value) -> anyhow::Result<serde_json::Value>;
     pub async fn attachments(&self, key: &str, id: u64) -> anyhow::Result<serde_json::Value>;
@@ -352,6 +410,8 @@ Endpoint mapping:
 | bug_history | GET /rest/bug/{id}/history[?new_since=%Y-%m-%dT%H:%M:%SZ] | `bugs[0].history` array as Value |
 | bug_comments | GET /rest/bug/{id}/comment[?new_since=..] | `bugs.{id}.comments` as Vec<Value> |
 | add_comment | POST /rest/bug/{id}/comment `{comment, is_private}` | envelope |
+| create_bug | POST /rest/bug with caller-built payload | envelope (`{"id": N}`) |
+| add_attachment | POST /rest/bug/{id}/attachment with caller-built payload (`ids` names the bug) | envelope (`{"ids": [..]}`) |
 | quicksearch | GET /rest/bug?quicksearch={status}+" "+{query}&include_fields=..&limit=..&offset=..&order=relevance | envelope |
 | update_bug | PUT /rest/bug/{id} with caller-built payload (caller adds `"comment": {"body": ..}` when set) | envelope |
 | attachments | GET /rest/bug/{id}/attachment?exclude_fields=data | `envelope.bugs.{id}` array as Value |
@@ -382,6 +442,8 @@ constraints the model must know.
 | bug_history | id, new_since?: DateTime<Utc> | history | |
 | bug_comments | id, include_private: bool = false, new_since? | comments | filter_comments applied (I5) |
 | bugs_quicksearch | query, status: String = "ALL", include_fields: String = "id,product,component,assigned_to,status,resolution,summary,last_change_time", limit: u32 = 50, offset: u32 = 0 | post-filter | fetch include_fields = requested ∪ CLASSIFY_FIELDS; after filter, project kept bugs to requested fields (keep `_redacted` marker); envelope `{"bugs":[..]}` only (I3) | **limit/offset address the bugs the client may SEE, not upstream rows** (Guard::quicksearch_window): filtering an already-paginated page left a hole exactly where a hidden bug sat — a short page the next offset contradicted — and since quicksearch matches summary text that hole was a probe for the hidden title, one word at a time. The guard now scans upstream from row 0 in 200-row chunks, classifies each, and fills the window from the survivors; rows are deduped on the server-reported id (relevance order is not stable between calls) and an id-less row is dropped (I4). Bounds: MAX_SEARCH_WINDOW=1000 addressable, 2000 rows scanned (<=10 sequential requests); hitting either truncates, which looks exactly like the end of results. The objects returned are the ones classified. The scan target is quantised to whole chunks so the stopping point does not track the client's `limit`; without that, `limit` could be binary-searched against the clock to recover each block's exact hidden count. Residual, accepted: filling a window of VISIBLE bugs needs more rows when bugs are hidden, so a stopwatch still learns one bit per scanned block ("not entirely visible"). Removing that would mean scanning the worst case on every search, or letting pages go short again. Search failure returns a bare "Search failed"; the upstream text is logged server-side only (it can name a bug and say whether it exists) |
+| create_bug | product, component, summary, version, description = "", severity?, priority?, op_sys?, platform?, keywords?: Vec<String>, groups?: Vec<String> | create (write), judged on the bug AS REQUESTED (Guard::may_create) | there is no bug id to assess, so the request itself is classified BEFORE any upstream call (I8): the rules that hide a product by name refuse filing into it, a field the request omits fails closed (I4), and a client-claimed `groups` list is never trusted — Bugzilla unions the product's mandatory groups in server-side, so may_create forces groups to unknown, which means a policy whose applicable rules consult groups/group_restricted refuses ALL creation. **Both refusals are one refusal**: a policy refusal and an upstream failure return the same fixed create_denial text after the same single upstream request — the refused path burns one classify call against bug id 0 (never a valid id, creates nothing; download_attachment's padding precedent) instead of the POST. Two texts, or 0 vs 1 requests, would be a free policy-enumeration oracle: send a guaranteed-invalid `version` plus a probe product and read the policy off which refusal (or which latency) comes back, with nothing created. Residual, accepted: a SUCCESSFUL create still confirms the product is allowed — that is the tool doing its job, and it costs a real, attributable bug; and the padding equalizes request count, not the upstream handler's exact latency (GET classify vs rejected POST). Bugzilla's failure message is logged server-side only (it can say whether a product/component exists) |
+| add_attachment | bug_id, data (base64), file_name, summary, content_type, comment = "", is_private = false, is_patch = false | attach (write) on bug_id | guard assessment before the upload (I8), uniform denial (I2); then global.max_attachment_bytes caps the DECODED size of `data` (0 = no cap) — the ceiling the operator set on downloads binds uploads through the same server too, measured after base64 expansion is stripped so encoding overhead cannot shrink it. The refusal names neither the payload's size nor the cap value (max_attachment_bytes is not I1-disclosable, exactly as on the download path). `comment` travels as a PLAIN string — Bug.add_attachment documents it so; the `{"comment": {"body": ..}}` shape belongs to Bug.update only |
 | add_comment | bug_id, comment, is_private: bool = false | comment (write) | |
 | update_bug_status | bug_id, status, resolution?, comment: String = "" | status (write) | CLOSED requires resolution (error otherwise); when reopening (status not CLOSED/VERIFIED and no resolution given) set `"resolution": ""` |
 | assign_bug | bug_id, assignee (email), comment = "" | assign (write) | payload `{"assigned_to": ..}` |
@@ -430,7 +492,8 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
 - `BugWarden::new` builds `Self::tool_router()` then `remove_route` for write
   tools when read-only and for every `global.disabled_tools` entry (I13).
   Write tool names: add_comment, update_bug_status, assign_bug,
-  update_bug_fields, update_bug_dependencies, add_cc_to_bug, mark_as_duplicate.
+  update_bug_fields, update_bug_dependencies, add_cc_to_bug, mark_as_duplicate,
+  create_bug, add_attachment.
 - API key resolution: stdio => `cfg.api_key`; http => `ctx.extensions.get::<axum::http::request::Parts>()`, then `parts.headers.get(lowercased_header_name)`.
 - HTTP serving: `StreamableHttpService::new(move || Ok(server.clone()), LocalSessionManager::default().into(), StreamableHttpServerConfig::default())`, `axum::Router::new().nest_service("/mcp", service)`, `tokio::net::TcpListener::bind`, graceful shutdown on ctrl_c.
 - Tracing to stderr always (stdout belongs to the stdio transport).
@@ -440,13 +503,24 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
 - Unit tests (#[cfg(test)] in policy.rs/guard.rs): glob matching; first-match
   ordering; embargo group deny; min_bug_age_days incl. missing creation_time
   (fail closed); younger_than_days matcher; restrict caps; read-implies-summary;
-  read_only strips write caps; default deny; summary redaction; comment
-  filtering; validation errors (unknown TOML keys, restrict without caps).
+  read_only strips write caps — create and attach named explicitly, and a
+  restrict grant of comment grants neither; default deny; summary redaction;
+  comment filtering; validation errors (unknown TOML keys, restrict without
+  caps); may_create — a hidden product refuses filing, an omitted field the
+  policy consults fails closed (I4), a claimed group list NEVER decides a
+  group rule (omitted, `[]`, and non-matching claims are all refused alike;
+  a group_restricted policy refuses all creation; a group rule ruled out by
+  another criterion does not block), a creation_time claimed by the payload
+  is ignored in favour of NOW, restrict must name "create", and the
+  create_denial text is fixed.
 - Unit tests (#[cfg(test)] in crates/bugwarden/src/server.rs): assemble_bug_info
   re-classification — a body embargoed after the verdict is refused, a body
   that now earns only summary is downgraded, a body granting neither read nor
   summary is refused, and refused/absent/up-front-denied ids yield byte-
-  identical restricted entries; the distinct-id bound.
+  identical restricted entries; the distinct-id bound; read-only delists
+  create_bug and add_attachment (I13); the upload size gate measures decoded
+  (never base64-encoded) bytes, is disabled at 0, and its refusal names no
+  number.
 - Integration tests (crates/bugwarden-core/tests/guard_wiremock.rs, wiremock):
   quicksearch_window — pages stay full while visible bugs remain (no hole),
   consecutive pages tile the visible sequence disjointly (against a stable
@@ -460,6 +534,20 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   id whatever the answer (nonexistent vs withheld cost the same), repeated
   ids fetched once, no batch to poison; per-id
   fallback fail closed; comment privacy; error mapping; API key absent from
-  error text (I12).
+  error text (I12); create_bug and add_attachment endpoint mapping (payload
+  travels untouched to POST /rest/bug and /rest/bug/{id}/attachment).
+- Integration tests (crates/bugwarden/tests/tools_wiremock.rs, wiremock +
+  rmcp client over an in-memory duplex transport): the tools are CALLED
+  through a real MCP session, so a tool that stops calling its guard fails
+  a test rather than only a helper suite. Minimum bar: create_bug policy
+  refusal and upstream refusal are byte-identical and each cost exactly one
+  upstream request (nothing POSTed on the refused path, which instead burns
+  a classify call against bug id 0); a claimed `groups` list never defeats
+  a group deny rule and a group_restricted policy refuses all creation;
+  an allowed create reaches POST /rest/bug; add_attachment refuses on a
+  grant carrying `attachments` (read) without `attach` (write) and uploads
+  on `attach`; the upload size cap refuses before anything is POSTed; and
+  the attachment `comment` travels as a plain string (Bug.add_attachment
+  API shape), pinned by a wiremock body matcher.
 - CI: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace --locked`, `cargo deny check`.

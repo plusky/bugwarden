@@ -435,6 +435,50 @@ async fn auth_header_mode_sends_bearer_and_no_query_key() {
 }
 
 #[tokio::test]
+async fn client_create_bug_posts_the_payload_to_rest_bug() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rest/bug"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 42 })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let bz = client(&server);
+    let payload = json!({
+        "product": "openSUSE",
+        "component": "Kernel",
+        "summary": "boom",
+        "version": "1.0",
+    });
+    let v = bz.create_bug(KEY, payload.clone()).await.unwrap();
+    assert_eq!(v["id"], json!(42));
+
+    // The payload travels as the POST body, untouched.
+    let reqs = server.received_requests().await.expect("recording enabled");
+    let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).expect("json body");
+    assert_eq!(body, payload);
+}
+
+#[tokio::test]
+async fn client_add_attachment_posts_to_the_bug_attachment_path() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rest/bug/7/attachment"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ids": [9] })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let bz = client(&server);
+    let v = bz
+        .add_attachment(KEY, 7, json!({ "ids": [7], "data": "Zm9v" }))
+        .await
+        .unwrap();
+    assert_eq!(v["ids"], json!([9]));
+}
+
+#[tokio::test]
 async fn summary_view_strips_sensitive_fields_after_fetch() {
     let server = MockServer::start().await;
     // A bug loaded with everything the redacted view must strip.

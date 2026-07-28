@@ -1,12 +1,14 @@
 //! bugwarden — Rust MCP server for Bugzilla with operator-controlled
 //! security guards.
-
-mod config;
-mod server;
+//!
+//! The binary is a thin transport wrapper; the CLI and the MCP tool surface
+//! live in the `bugwarden` library crate (`config`, `server`) so integration
+//! tests can drive the tools without a process boundary.
 
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
+use bugwarden::{config, server};
 use bugwarden_core::{client::BugzillaClient, guard::Guard, policy::Policy};
 use clap::Parser;
 use rmcp::{
@@ -20,7 +22,7 @@ use rmcp::{
 };
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{Cli, Transport};
+use config::{Cli, Transport};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

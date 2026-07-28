@@ -23,11 +23,12 @@ touched or data is returned.
 
 - **Complete Bugzilla tool surface**: bug details, history, comments,
   attachment metadata and content, quicksearch, comment/status/field/
-  assignee/CC/dependency updates, duplicate marking, server info, quicksearch
-  syntax docs, and a bug-summarization prompt tool.
+  assignee/CC/dependency updates, duplicate marking, bug filing, attachment
+  upload, server info, quicksearch syntax docs, and a bug-summarization
+  prompt tool.
 - **Guard policy engine**: per-bug `allow` / `deny` / `restrict` decisions
   matched on product, component, group, keyword, status, severity, priority,
-  whiteboard, and bug age — with a fine-grained 11-capability vocabulary for
+  whiteboard, and bug age — with a fine-grained 13-capability vocabulary for
   `restrict`.
 - **No existence oracle**: a policy-denied bug is indistinguishable from a
   nonexistent one.
@@ -289,7 +290,19 @@ metacharacters. Examples: `embargo*`, `*security*`, `SUSE *`.
 
 #### Capabilities
 
-Eleven capabilities exist. `read` implies `summary`; nothing else is implied.
+Thirteen capabilities exist. `read` implies `summary`; nothing else is
+implied.
+
+> **Upgrading from a version without `create`/`attach`:** the capability set
+> grew from eleven to thirteen, and `allow` (rules and
+> `default_action = "allow"` alike) always grants the **full** set. A policy
+> written before these capabilities existed therefore starts permitting bug
+> filing and attachment upload the moment the server is upgraded, with no
+> change to the policy file. To keep the old behaviour, either add
+> `disabled_tools = ["create_bug", "add_attachment"]` under `[global]`, or
+> replace `allow` grants with `restrict` rules listing exactly the
+> capabilities you mean. Read-only deployments are unaffected (both new
+> capabilities are writes).
 
 | Capability | Kind | Grants |
 |------------|------|--------|
@@ -304,9 +317,11 @@ Eleven capabilities exist. `read` implies `summary`; nothing else is implied.
 | `assign` | write | changing the assignee |
 | `cc` | write | modifying the CC list |
 | `deps` | write | changing blocks/depends_on |
+| `create` | write | filing a new bug — judged against the bug *as requested*, so a rule that hides a product by name also refuses filing into it. The request's `groups` claim is never trusted (Bugzilla adds mandatory groups server-side), so **a policy whose rules consult `groups` or `group_restricted` refuses all bug filing** |
+| `attach` | write | uploading an attachment to a bug |
 
-When the server is read-only (policy or CLI), the six write capabilities are
-stripped from every grant, including from `allow` rules and the default
+When the server is read-only (policy or CLI), the eight write capabilities
+are stripped from every grant, including from `allow` rules and the default
 action.
 
 ## Tool reference
@@ -327,6 +342,8 @@ action.
 | `update_bug_dependencies` | Add/remove blocks and depends_on entries | `deps` |
 | `add_cc_to_bug` | Add an email to the CC list | `cc` |
 | `mark_as_duplicate` | Close a bug as DUPLICATE of another | `status` on the bug **and** at least `summary` on the duplicate target |
+| `create_bug` | File a new bug; the request is policy-checked *as described* before anything is created. A policy refusal and a Bugzilla-side failure return the same refusal text at the same cost, so a failed create never says which of the two refused, or why | `create` on the bug as requested |
+| `add_attachment` | Upload a base64-encoded attachment to a bug, capped by `max_attachment_bytes` (decoded size) | `attach` on the target bug |
 | `bug_url` | Compute `{server}/show_bug.cgi?id={id}` locally | none (contacts nothing) |
 | `bugzilla_server_info` | Bugzilla version, extensions, timezone, time, parameters | none |
 | `quicksearch_syntax` | Bugzilla's quicksearch syntax documentation (HTML) | none |

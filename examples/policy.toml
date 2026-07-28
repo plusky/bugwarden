@@ -8,7 +8,10 @@
 #     deliberately broader than "security" and can be narrowed;
 #   * bugs labelled "security" are invisible while they are fresher than
 #     5 days (the window in which details are typically still unreviewed);
-#   * every other bug is shown to the user in full.
+#   * every other bug is shown to the user in full;
+#   * filing new bugs is refused entirely: rule 1 depends on the group
+#     list, and a not-yet-created bug's groups cannot be known — see the
+#     note before the commented-out "reporters" rule below.
 #
 # The policy is read once at server startup (--policy / BUGWARDEN_POLICY) and
 # is never visible to the MCP client. Parsing is strict: unknown keys anywhere
@@ -59,7 +62,8 @@ read_only = false
 
 # Largest attachment (decoded bytes) download_attachment may return; the
 # content is embedded base64 in the tool result and consumes model context.
-# 0 removes the cap. Default: 2 MiB.
+# The same ceiling caps what add_attachment may UPLOAD, also measured on the
+# decoded bytes. 0 removes the cap. Default: 2 MiB.
 #max_attachment_bytes = 2097152
 
 # ---------------------------------------------------------------------------
@@ -161,9 +165,48 @@ younger_than_days = 5
 ## allow/deny rules. Full vocabulary, for reference:
 ##   read summary comments history attachments   (read capabilities)
 ##   comment status fields assign cc deps        (write capabilities)
+##   create attach                               (write: file new bugs, upload attachments)
 #capabilities = ["summary", "comment"]
 #[rule.match]
 #products = ["Security*"]
+
+# Filing new bugs ("create") and uploading attachments ("attach") are
+# capabilities like any other. A create request has no bug id yet, so the
+# policy judges the bug AS DESCRIBED by the request — the deny rules above
+# therefore also refuse filing into anything they hide by name, with no
+# extra configuration. A request that omits a field a rule asks about is
+# refused (unknown, not empty), and the request's OWN claim about `groups`
+# is never trusted: Bugzilla unions the product's mandatory groups into
+# whatever was claimed, so what groups the created bug would end up in
+# cannot be known before it exists.
+#
+# BE AWARE: under THIS policy, filing bugs is impossible — deliberately.
+# Rule 1 ("group-restricted") consults the group list, the group list of a
+# not-yet-created bug is unknowable (see above), and unknown fails closed.
+# Every create request is therefore refused before Bugzilla is contacted,
+# and a rule granting "create" placed BELOW rule 1 — like the example
+# below — can never be reached by a create request. The same holds for any
+# policy whose applicable rules use `groups` or `group_restricted`.
+#
+# To actually accept new bugs, a create-granting rule must come BEFORE
+# every group-consulting rule and match on fields the request does carry
+# (products, components, summary, keywords, ...). First match wins, so
+# such a rule then also decides access to EXISTING bugs it matches —
+# grant it "create" alone (as below) and matched existing bugs stay
+# unreadable; add read capabilities to it and you have re-opened the
+# group-restricted bugs of those products, which is exactly what rule 1
+# exists to prevent. Weigh that trade before moving it up.
+#
+# "attach" is judged against the target bug like every other write (the
+# bug exists, so its real group list is fetched and rule 1 applies
+# normally), and the upload is capped by max_attachment_bytes above.
+#[[rule]]
+#name = "reporters"
+#description = "Desktop products accept new bug reports"
+#action = "restrict"
+#capabilities = ["create"]
+#[rule.match]
+#products = ["GNOME*", "KDE*"]
 
 # Every remaining match criterion, in one rule.
 #[[rule]]

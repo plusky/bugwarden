@@ -255,6 +255,21 @@ impl BugzillaClient {
         self.get_json(key, "/bug", &params).await
     }
 
+    /// POST `/rest/bug` — file a new bug, returning the response envelope
+    /// (`{"id": N}` on success).
+    pub async fn create_bug(&self, key: &str, payload: Value) -> Result<Value> {
+        self.send_json_body(reqwest::Method::POST, key, "/bug", &payload)
+            .await
+    }
+
+    /// POST `/rest/bug/{id}/attachment` — upload an attachment, returning the
+    /// response envelope (`{"ids": [N]}` on success).
+    pub async fn add_attachment(&self, key: &str, id: u64, payload: Value) -> Result<Value> {
+        let path = format!("/bug/{id}/attachment");
+        self.send_json_body(reqwest::Method::POST, key, &path, &payload)
+            .await
+    }
+
     /// PUT `/rest/bug/{id}` with a caller-built payload (the caller adds
     /// `"comment": {"body": ..}` when a comment is wanted) — returns the
     /// response envelope.

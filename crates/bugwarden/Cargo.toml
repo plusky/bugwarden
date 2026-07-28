@@ -37,3 +37,10 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# The integration tests drive the tools through a real MCP session over an
+# in-memory duplex transport, so the client half of rmcp is needed here.
+rmcp = { version = "2.2", features = ["client"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util"] }
+wiremock = "0.6"

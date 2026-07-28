@@ -34,6 +34,8 @@ pub const WRITE_TOOLS: &[&str] = &[
     "update_bug_dependencies",
     "add_cc_to_bug",
     "mark_as_duplicate",
+    "create_bug",
+    "add_attachment",
 ];
 
 /// Success result: ONE text block containing pretty-printed JSON.
@@ -147,7 +149,9 @@ fn project_fields(bug: &Value, fields: &BTreeSet<String>) -> Value {
     Value::Object(out)
 }
 
-/// Add `"comment": {"body": ...}` to an update payload when a comment is set.
+/// Add `"comment": {"body": ...}` to a `Bug.update` payload when a comment is
+/// set. This is the UPDATE shape only — `Bug.add_attachment` takes `comment`
+/// as a plain string and must not use this helper.
 fn attach_comment(payload: &mut serde_json::Map<String, Value>, comment: &str) {
     if !comment.is_empty() {
         payload.insert("comment".to_string(), json!({ "body": comment }));
@@ -189,6 +193,20 @@ fn decoded_len(blob: &str) -> u64 {
     let full = chars / 4 * 3;
     let tail = (chars % 4).saturating_sub(1);
     (full + tail).saturating_sub(padding)
+}
+
+/// Upload-side size gate: `Some(refusal)` when the DECODED size of a base64
+/// payload exceeds a non-zero cap.
+///
+/// The same ceiling `download_attachment` enforces, applied to what comes IN:
+/// an operator who capped what may leave has not agreed to unbounded uploads
+/// through the same server. Measured on the decoded size, so base64 expansion
+/// cannot shrink the cap by a third. The refusal says the payload is too big
+/// but not by how much: `max_attachment_bytes` is not I1-disclosable, on this
+/// path exactly as on the download path.
+fn upload_size_refusal(cap: u64, data: &str) -> Option<String> {
+    (cap > 0 && decoded_len(data) > cap)
+        .then(|| "Attachment exceeds the size limit of this server".to_string())
 }
 
 /// Whether attachment content of this media type may be returned as MCP
@@ -267,6 +285,62 @@ pub struct QuicksearchParams {
     /// Offset into the result list (for pagination).
     #[serde(default)]
     pub offset: u32,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CreateBugParams {
+    /// Product to file against.
+    pub product: String,
+    /// Component within the product.
+    pub component: String,
+    /// One-line summary.
+    pub summary: String,
+    /// Version of the product the bug is against.
+    pub version: String,
+    /// Longer description; becomes the first comment.
+    #[serde(default)]
+    pub description: String,
+    /// Severity (instance-specific vocabulary, e.g. "normal").
+    #[serde(default)]
+    pub severity: Option<String>,
+    /// Priority (instance-specific vocabulary, e.g. "P3").
+    #[serde(default)]
+    pub priority: Option<String>,
+    /// Operating system the bug applies to.
+    #[serde(default)]
+    pub op_sys: Option<String>,
+    /// Platform/architecture the bug applies to.
+    #[serde(default)]
+    pub platform: Option<String>,
+    /// Keywords to set on the new bug.
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    /// Groups to restrict the new bug to.
+    #[serde(default)]
+    pub groups: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct AddAttachmentParams {
+    /// Bug id to attach to.
+    pub bug_id: u64,
+    /// Attachment content, base64-encoded.
+    pub data: String,
+    /// File name shown in Bugzilla.
+    pub file_name: String,
+    /// Short description of the attachment.
+    pub summary: String,
+    /// MIME type, e.g. "text/plain".
+    pub content_type: String,
+    /// Comment to add alongside the attachment.
+    #[serde(default)]
+    pub comment: String,
+    /// Mark the attachment private.
+    #[serde(default)]
+    pub is_private: bool,
+    /// Mark the attachment as a patch.
+    #[serde(default)]
+    pub is_patch: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -398,6 +472,9 @@ pub struct SummarizeBugParams {
     pub id: u64,
 }
 
+/// The MCP server: guard policy, Bugzilla client, and the pruned tool
+/// router (I13). Construct with [`BugWarden::new`]; serve over any rmcp
+/// transport.
 #[derive(Clone)]
 pub struct BugWarden {
     cfg: Arc<Cli>,
@@ -767,6 +844,144 @@ impl BugWarden {
         }
 
         Ok(ok_json(json!({ "bugs": projected })))
+    }
+
+    #[tool(
+        description = "File a new bug. The bug is checked against server policy AS DESCRIBED before it is created, so a product or component the policy withholds cannot be filed into either. Returns the new bug id on success.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn create_bug(
+        &self,
+        Parameters(p): Parameters<CreateBugParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        tracing::info!(
+            product = %p.product,
+            component = %p.component,
+            "tool: create_bug"
+        );
+        let key = self.api_key(&ctx)?;
+
+        let mut payload = serde_json::Map::new();
+        payload.insert("product".to_string(), json!(p.product));
+        payload.insert("component".to_string(), json!(p.component));
+        payload.insert("summary".to_string(), json!(p.summary));
+        payload.insert("version".to_string(), json!(p.version));
+        if !p.description.is_empty() {
+            payload.insert("description".to_string(), json!(p.description));
+        }
+        for (field, value) in [
+            ("severity", p.severity),
+            ("priority", p.priority),
+            ("op_sys", p.op_sys),
+            ("platform", p.platform),
+        ] {
+            if let Some(v) = value {
+                payload.insert(field.to_string(), json!(v));
+            }
+        }
+        if !p.keywords.is_empty() {
+            payload.insert("keywords".to_string(), json!(p.keywords));
+        }
+        if !p.groups.is_empty() {
+            payload.insert("groups".to_string(), json!(p.groups));
+        }
+        let payload = Value::Object(payload);
+
+        // No bug exists yet, so the bug AS REQUESTED is what the policy
+        // judges: the rules that decide what may be seen decide what may be
+        // filed. The refusal names no rule (I1) and — crucially — is the
+        // SAME text, after the SAME single upstream request, whether the
+        // policy or Bugzilla refused. Two distinguishable refusals would be
+        // a free policy oracle: send a request Bugzilla is guaranteed to
+        // reject (an invalid `version`, say) and read the policy off which
+        // refusal comes back, with nothing created and nothing logged
+        // upstream. So the refused path burns one classification call
+        // against bug id 0 — which never exists and creates nothing —
+        // exactly as download_attachment pads its metadata-miss path, so
+        // both failure paths cost one upstream request. Honestly residual:
+        // a SUCCESSFUL create is still distinguishable (it returns the new
+        // bug id — that is the tool working), so a client willing to file a
+        // real, attributable bug in an allowed product can still confirm
+        // that product is allowed; and the padding equalizes the request
+        // COUNT, not the upstream handler's exact latency (a GET classify
+        // vs a rejected POST), the same residual the download path accepts.
+        if !self.guard.may_create(&payload) {
+            let _ = self.assess(&key, &[0]).await;
+            tracing::info!(product = %p.product, "guard denied bug creation");
+            return Ok(err_text(Guard::create_denial()));
+        }
+
+        match self.bz.create_bug(&key, payload).await {
+            Ok(v) => Ok(ok_json(v)),
+            Err(e) => {
+                // Uniform with the policy refusal above (see that comment);
+                // Bugzilla's message is logged server-side only — it can say
+                // whether a product or component exists.
+                tracing::warn!(error = %e, "create_bug: upstream refused");
+                Ok(err_text(Guard::create_denial()))
+            }
+        }
+    }
+
+    #[tool(
+        description = "Attach a file to a bug. Content must be base64-encoded. Subject to server policy on the target bug and to the server's attachment size limit.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn add_attachment(
+        &self,
+        Parameters(p): Parameters<AddAttachmentParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        tracing::info!(
+            bug_id = p.bug_id,
+            file_name = %p.file_name,
+            is_private = p.is_private,
+            "tool: add_attachment"
+        );
+        let key = self.api_key(&ctx)?;
+        if let Some(denied) = self.deny_unless(&key, p.bug_id, Capability::Attach).await {
+            return Ok(denied);
+        }
+
+        let cap = self.guard.policy.global.max_attachment_bytes;
+        if let Some(refusal) = upload_size_refusal(cap, &p.data) {
+            return Ok(err_text(refusal));
+        }
+
+        let mut payload = serde_json::Map::new();
+        payload.insert("ids".to_string(), json!([p.bug_id]));
+        payload.insert("data".to_string(), json!(p.data));
+        payload.insert("file_name".to_string(), json!(p.file_name));
+        payload.insert("summary".to_string(), json!(p.summary));
+        payload.insert("content_type".to_string(), json!(p.content_type));
+        payload.insert("is_patch".to_string(), json!(p.is_patch));
+        payload.insert("is_private".to_string(), json!(p.is_private));
+        // Bug.add_attachment takes `comment` as a PLAIN string — unlike
+        // Bug.update's `{"comment": {"body": ...}}` shape, so the update
+        // helper (attach_comment) must not be reused here.
+        if !p.comment.is_empty() {
+            payload.insert("comment".to_string(), json!(p.comment));
+        }
+        let payload = Value::Object(payload);
+
+        match self.bz.add_attachment(&key, p.bug_id, payload).await {
+            Ok(v) => Ok(ok_json(v)),
+            Err(e) => {
+                tracing::warn!(bug_id = p.bug_id, error = %e, "add_attachment: upstream refused");
+                Ok(err_text("Failed to add attachment"))
+            }
+        }
     }
 
     #[tool(
@@ -1741,6 +1956,59 @@ mod tests {
             );
         }
         assert!(server.tool_router.has_route("bug_info"));
+    }
+
+    #[test]
+    fn read_only_delists_create_bug_and_add_attachment_i13() {
+        // The filing tools are writes: read-only mode must remove them from
+        // the LISTING — call-time capability stripping alone is not I13.
+        let (cfg, guard, bz) = parts("[global]\nread_only = true\n");
+        let server = BugWarden::new(cfg, guard, bz).expect("server builds");
+        assert!(!server.tool_router.has_route("create_bug"));
+        assert!(!server.tool_router.has_route("add_attachment"));
+        // A default build serves both.
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz).expect("server builds");
+        assert!(server.tool_router.has_route("create_bug"));
+        assert!(server.tool_router.has_route("add_attachment"));
+    }
+
+    #[test]
+    fn decoded_len_counts_decoded_bytes_exactly() {
+        assert_eq!(decoded_len(""), 0);
+        assert_eq!(decoded_len("YQ=="), 1); // "a"
+        assert_eq!(decoded_len("YWI="), 2); // "ab"
+        assert_eq!(decoded_len("YWJj"), 3); // "abc"
+        assert_eq!(decoded_len("YWJjZA"), 4); // "abcd", unpadded tail
+        assert_eq!(decoded_len("YWJj\nZGVm"), 6); // wrapped lines do not inflate
+    }
+
+    #[test]
+    fn upload_size_cap_measures_decoded_not_encoded_bytes() {
+        // 100 decoded bytes encode to 136 base64 chars: the cap must judge
+        // the former, or encoding overhead would shrink every operator cap
+        // by a third.
+        let data = "AAAA".repeat(33) + "AA==";
+        assert_eq!(data.len(), 136);
+        assert_eq!(decoded_len(&data), 100);
+        assert!(
+            upload_size_refusal(100, &data).is_none(),
+            "136 encoded chars must not count against a 100-byte cap"
+        );
+        assert!(upload_size_refusal(99, &data).is_some());
+    }
+
+    #[test]
+    fn upload_size_cap_zero_disables_and_refusal_names_no_number() {
+        let data = "AAAA".repeat(33) + "AA==";
+        assert!(upload_size_refusal(0, &data).is_none(), "0 removes the cap");
+        // The refusal must not disclose the configured cap or the payload's
+        // size — max_attachment_bytes is not I1-disclosable.
+        let refusal = upload_size_refusal(99, &data).expect("over the cap");
+        assert!(
+            !refusal.contains(|c: char| c.is_ascii_digit()),
+            "refusal leaks a number: {refusal}"
+        );
     }
 
     #[test]
