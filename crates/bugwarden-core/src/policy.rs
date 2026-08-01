@@ -37,6 +37,13 @@
 //!
 //! Rules are evaluated in file order, first match wins; unmatched bugs fall
 //! through to `default_action`.
+//!
+//! A rule may additionally carry `operations = [...]` to scope itself to a
+//! subset of evaluation kinds: `"create"` (the create gate judging a
+//! prospective bug) and/or `"access"` (every classification of an existing
+//! bug). The scope is checked BEFORE the rule's matcher, so a scoped rule is
+//! fully invisible — including its fail-closed path — to the operations it
+//! does not cover. A rule without the key applies to every operation.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -406,6 +413,28 @@ pub enum Action {
     Restrict,
 }
 
+/// The kind of evaluation a classification is performed for.
+///
+/// Every call to [`Policy::classify`] names the operation it is deciding,
+/// and a rule carrying an `operations` list is consulted only for the
+/// operations it names. The scope check runs BEFORE the rule's matcher, so
+/// a rule scoped away from the operation at hand is fully invisible to it —
+/// it can neither match nor fail closed on unreadable metadata. This is
+/// what lets a rule grant `create` for a product without becoming the
+/// first-match rule for that product's EXISTING bugs (issue #26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Operation {
+    /// Classification of a PROSPECTIVE bug: the create gate
+    /// (`Guard::may_create`) judging a `create_bug` request before anything
+    /// is filed.
+    Create,
+    /// Every classification of an EXISTING bug: retrieval, search-result
+    /// filtering, comments, history, attachments, link disclosure, and all
+    /// updates to the bug.
+    Access,
+}
+
 /// One policy rule: matching criteria plus the action to take.
 ///
 /// Rule names exist for operator-side logging only; they are never exposed
@@ -427,6 +456,42 @@ pub struct Rule {
     /// `allow`/`deny` and non-empty for `restrict` (validated).
     #[serde(default)]
     pub capabilities: Vec<Capability>,
+    /// Operations this rule is consulted for; leaving the key out means the
+    /// rule applies to every operation (the behaviour of every rule before
+    /// this field existed).
+    ///
+    /// A rule scoped away from an operation is invisible to it: the scope is
+    /// checked BEFORE the matcher (see [`Rule::applies_to`]), so a
+    /// create-scoped rule can never deny a read — not even through the
+    /// fail-closed path for unreadable metadata (I4), because for reads it
+    /// is not consulted at all. An explicitly empty list is rejected at
+    /// validation: a rule applying to no operation is dead configuration
+    /// masking operator intent.
+    #[serde(default)]
+    pub operations: Option<Vec<Operation>>,
+}
+
+impl Rule {
+    /// Whether this rule is consulted when classifying for `op`.
+    ///
+    /// An absent `operations` field applies to every operation; a written
+    /// list applies to exactly the operations it names. An explicitly empty
+    /// list is rejected by [`Policy::from_toml_str`] validation; should one
+    /// appear in a hand-constructed [`Policy`], it is treated as unscoped —
+    /// exactly as if the field were absent. No fallback for that invalid
+    /// state is uniformly fail-closed: honouring "applies to no operation"
+    /// would silently skip a deny rule everywhere (fail open), and would
+    /// just as silently skip a restrict rule under an allowing default
+    /// (also fail open — matched bugs would fall through to the full
+    /// default grant). The unscoped reading is canonical because it never
+    /// SKIPS a rule the author wrote; rejecting the state outright is
+    /// validation's job, not this method's.
+    pub fn applies_to(&self, op: Operation) -> bool {
+        match &self.operations {
+            None => true,
+            Some(ops) => ops.is_empty() || ops.contains(&op),
+        }
+    }
 }
 
 /// Policy-wide guards applied on top of (and before) the rule list.
@@ -521,7 +586,21 @@ impl Policy {
     /// - `restrict` rules carry at least one capability;
     /// - `allow`/`deny` rules carry no capabilities (a capability list on
     ///   them would be dead configuration masking operator intent);
-    /// - `default_action` is not `restrict`.
+    /// - `default_action` is not `restrict`;
+    /// - `operations`, when written, is non-empty (`operations = []` would
+    ///   apply the rule to no operation at all);
+    /// - a `restrict` rule scoped to ONLY the `create` operation grants
+    ///   exactly the `create` capability — without it the rule could never
+    ///   grant anything, and any other capability it named would be
+    ///   unreachable (the create gate consults only `create`);
+    /// - a `restrict` rule scoped away from `create` does not grant the
+    ///   `create` capability (nothing outside the create gate consults it,
+    ///   so the grant would be dead — and an operator who typoed the scope
+    ///   would silently lose both the filing they meant to permit and the
+    ///   reads the capability list withholds).
+    ///
+    /// Unknown operation names, like every other unknown name or key, are
+    /// rejected by strict deserialization.
     pub fn from_toml_str(s: &str) -> anyhow::Result<Policy> {
         let policy: Policy = toml::from_str(s).context("failed to parse guard policy TOML")?;
         policy.validate()?;
@@ -578,23 +657,80 @@ impl Policy {
                 }
                 _ => {}
             }
+            if let Some(ops) = &rule.operations {
+                if ops.is_empty() {
+                    anyhow::bail!(
+                        "rule \"{}\": operations = [] would apply the rule to no operation; \
+                         omit the key to apply the rule to every operation",
+                        rule.name
+                    );
+                }
+                // The create gate consults exactly one capability
+                // (`create`), and nothing outside the create gate consults
+                // it. A restrict rule whose scope and capability list
+                // disagree about that is dead configuration masking
+                // operator intent — the same startup-error class as a
+                // capability list on an allow/deny rule.
+                if rule.action == Action::Restrict {
+                    let covers_create = ops.contains(&Operation::Create);
+                    let covers_access = ops.contains(&Operation::Access);
+                    let grants_create = rule.capabilities.contains(&Capability::Create);
+                    if covers_create && !covers_access {
+                        if !grants_create {
+                            anyhow::bail!(
+                                "rule \"{}\": scoped to operations = [\"create\"] but its \
+                                 capabilities do not include \"create\", so it could never \
+                                 grant anything reachable",
+                                rule.name
+                            );
+                        }
+                        if rule.capabilities.iter().any(|&c| c != Capability::Create) {
+                            anyhow::bail!(
+                                "rule \"{}\": scoped to operations = [\"create\"] but grants \
+                                 capabilities besides \"create\"; the create gate consults \
+                                 only \"create\", so the others could never be granted \
+                                 anywhere — drop them or widen the scope",
+                                rule.name
+                            );
+                        }
+                    }
+                    if covers_access && !covers_create && grants_create {
+                        anyhow::bail!(
+                            "rule \"{}\": scoped to operations = [\"access\"] but grants \
+                             \"create\", which only the create gate consults; the grant \
+                             is dead — drop the capability or add \"create\" to operations",
+                            rule.name
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
 
-    /// Classify one bug into an [`Access`] decision.
+    /// Classify one bug into an [`Access`] decision, for operation `op`.
+    ///
+    /// `op` names what the classification is FOR: [`Operation::Access`] for
+    /// every evaluation of an existing bug, [`Operation::Create`] for the
+    /// create gate judging a prospective one.
     ///
     /// Evaluation order (normative):
     ///
     /// 1. `global.min_bug_age_days` — a bug younger than the minimum age is
     ///    Denied before any rule runs. A missing/unparsable `creation_time`
-    ///    while this gate is active is also Denied (fail closed, I4).
-    /// 2. Rules in file order, first match wins.
+    ///    while this gate is active is also Denied (fail closed, I4). This
+    ///    gate is global, never operation-scoped: the create gate dates a
+    ///    prospective bug NOW, so an active age gate deliberately refuses
+    ///    all creation.
+    /// 2. Rules in file order, first match wins — consulting only the rules
+    ///    whose `operations` cover `op`. The scope check precedes matcher
+    ///    evaluation, so a rule scoped away from `op` can neither match nor
+    ///    fail closed on unreadable metadata for this classification.
     /// 3. `default_action`.
     ///
     /// Every grant — from a rule or from the default — has write capabilities
     /// stripped when `global.read_only` is set.
-    pub fn classify(&self, bug: &BugMeta, now: DateTime<Utc>) -> Access {
+    pub fn classify(&self, bug: &BugMeta, now: DateTime<Utc>, op: Operation) -> Access {
         if self.global.min_bug_age_days > 0 {
             let too_young = match (
                 bug.creation_time,
@@ -613,6 +749,14 @@ impl Policy {
             }
         }
         for rule in &self.rules {
+            // Operation scoping is decided BEFORE the matcher runs: a rule
+            // scoped away from `op` is fully invisible to this
+            // classification, including the Unknown fail-closed arm below —
+            // a create-only rule must never deny a read over unreadable
+            // metadata, because for reads it is not consulted at all.
+            if !rule.applies_to(op) {
+                continue;
+            }
             match rule.matcher.evaluate(bug, now) {
                 // The rule definitively does not apply; try the next one.
                 MatchOutcome::No => continue,
@@ -1516,6 +1660,169 @@ products = ["SUSE*"]
         assert!(msg.contains("default_action"), "unexpected error: {msg}");
     }
 
+    // ---------- operations (rule scoping) ----------
+
+    #[test]
+    fn operations_toml_spellings_pinned() {
+        // Pins the operator-facing TOML spellings "create" and "access", and
+        // that an absent key parses as None (unscoped).
+        let s = concat!(
+            "[[rule]]\nname = \"scoped\"\naction = \"deny\"\n",
+            "operations = [\"create\", \"access\"]\n",
+            "[[rule]]\nname = \"unscoped\"\naction = \"deny\"\n",
+        );
+        let p = Policy::from_toml_str(s).unwrap();
+        assert_eq!(
+            p.rules[0].operations,
+            Some(vec![Operation::Create, Operation::Access])
+        );
+        assert_eq!(p.rules[1].operations, None);
+    }
+
+    #[test]
+    fn reject_unknown_operation_name() {
+        let s = "[[rule]]\nname = \"r\"\naction = \"deny\"\noperations = [\"delete\"]\n";
+        assert!(Policy::from_toml_str(s).is_err());
+    }
+
+    #[test]
+    fn reject_explicitly_empty_operations() {
+        // A rule applying to no operation is dead weight / operator error.
+        let s = "[[rule]]\nname = \"r\"\naction = \"deny\"\noperations = []\n";
+        let err = Policy::from_toml_str(s).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no operation"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn reject_create_only_restrict_that_cannot_grant_create() {
+        // Scoped to the create operation, the capability list is consulted
+        // only by the create gate; without "create" in it the rule could
+        // never grant anything reachable.
+        let s = concat!(
+            "[[rule]]\nname = \"r\"\naction = \"restrict\"\n",
+            "capabilities = [\"read\"]\noperations = [\"create\"]\n",
+        );
+        let err = Policy::from_toml_str(s).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("create"), "unexpected error: {msg}");
+
+        // With "create" granted the same shape is valid...
+        let ok = concat!(
+            "[[rule]]\nname = \"r\"\naction = \"restrict\"\n",
+            "capabilities = [\"create\"]\noperations = [\"create\"]\n",
+        );
+        assert!(Policy::from_toml_str(ok).is_ok());
+        // ...and so is a read-granting rule that also covers access.
+        let ok = concat!(
+            "[[rule]]\nname = \"r\"\naction = \"restrict\"\n",
+            "capabilities = [\"read\"]\noperations = [\"create\", \"access\"]\n",
+        );
+        assert!(Policy::from_toml_str(ok).is_ok());
+        // A rule covering BOTH operations may mix create and access
+        // capabilities freely: each is reachable under one of its scopes.
+        let ok = concat!(
+            "[[rule]]\nname = \"r\"\naction = \"restrict\"\n",
+            "capabilities = [\"read\", \"create\"]\noperations = [\"access\", \"create\"]\n",
+        );
+        assert!(Policy::from_toml_str(ok).is_ok());
+    }
+
+    #[test]
+    fn reject_create_only_restrict_with_unreachable_extra_capabilities() {
+        // The create gate consults only the `create` capability, so a
+        // create-only rule granting anything else is dead configuration:
+        // the operator named a capability the rule can never hand out.
+        let s = concat!(
+            "[[rule]]\nname = \"r\"\naction = \"restrict\"\n",
+            "capabilities = [\"create\", \"read\"]\noperations = [\"create\"]\n",
+        );
+        let err = Policy::from_toml_str(s).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("besides \"create\""),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_access_scoped_restrict_granting_create() {
+        // Mirror image: `create` in an access-only rule is never consulted
+        // (may_create classifies with Operation::Create, which skips the
+        // rule). Accepting it would let a typoed scope silently drop both
+        // the intended filing grant AND every read the capability list
+        // withholds — a fail-closed outage with no startup diagnostic.
+        let s = concat!(
+            "[[rule]]\nname = \"r\"\naction = \"restrict\"\n",
+            "capabilities = [\"create\"]\noperations = [\"access\"]\n",
+        );
+        let err = Policy::from_toml_str(s).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("dead"), "unexpected error: {msg}");
+
+        // Also rejected when `create` rides along other, reachable caps.
+        let s = concat!(
+            "[[rule]]\nname = \"r\"\naction = \"restrict\"\n",
+            "capabilities = [\"read\", \"create\"]\noperations = [\"access\"]\n",
+        );
+        assert!(Policy::from_toml_str(s).is_err());
+    }
+
+    #[test]
+    fn hand_constructed_empty_operations_list_is_unscoped() {
+        // `operations = []` never survives from_toml_str, but every Rule
+        // field is pub, so a hand-built Policy can carry Some(vec![]). Pin
+        // the documented fallback: the empty list behaves exactly like the
+        // absent field — the rule stays consulted for EVERY operation.
+        // Honouring "applies nowhere" would silently skip a deny rule
+        // everywhere (fail open), and would skip a restrict rule under an
+        // allowing default just the same; the unscoped reading is the one
+        // that never skips a rule the author wrote.
+        let rule = Rule {
+            name: "hand-built".to_string(),
+            description: String::new(),
+            matcher: Matcher::default(),
+            action: Action::Deny,
+            capabilities: Vec::new(),
+            operations: Some(Vec::new()),
+        };
+        assert!(rule.applies_to(Operation::Access));
+        assert!(rule.applies_to(Operation::Create));
+
+        // End to end: a deny rule carrying the empty list still denies for
+        // both operations instead of being skipped into the allowing
+        // default.
+        let p = Policy {
+            default_action: Action::Allow,
+            global: GlobalGuards::default(),
+            rules: vec![rule],
+        };
+        for op in [Operation::Access, Operation::Create] {
+            match p.classify(&meta(), now(), op) {
+                Access::Denied { rule } => assert_eq!(rule, "hand-built"),
+                other => {
+                    panic!("empty-list deny rule must stay consulted for {op:?}, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rule_applies_to_semantics() {
+        let p = Policy::from_toml_str(concat!(
+            "[[rule]]\nname = \"unscoped\"\naction = \"deny\"\n",
+            "[[rule]]\nname = \"create-only\"\naction = \"deny\"\noperations = [\"create\"]\n",
+            "[[rule]]\nname = \"access-only\"\naction = \"deny\"\noperations = [\"access\"]\n",
+        ))
+        .unwrap();
+        assert!(p.rules[0].applies_to(Operation::Create));
+        assert!(p.rules[0].applies_to(Operation::Access));
+        assert!(p.rules[1].applies_to(Operation::Create));
+        assert!(!p.rules[1].applies_to(Operation::Access));
+        assert!(!p.rules[2].applies_to(Operation::Create));
+        assert!(p.rules[2].applies_to(Operation::Access));
+    }
+
     // ---------- Policy::load ----------
 
     #[test]
@@ -1553,7 +1860,7 @@ products = ["SUSE*"]
     #[test]
     fn classify_default_allow_grants_everything() {
         let p = Policy::default();
-        let access = p.classify(&meta(), now());
+        let access = p.classify(&meta(), now(), Operation::Access);
         match &access {
             Access::Granted { caps, rule } => {
                 assert_eq!(rule, "default");
@@ -1569,7 +1876,7 @@ products = ["SUSE*"]
     #[test]
     fn classify_default_deny_denies_everything() {
         let p = Policy::from_toml_str("default_action = \"deny\"").unwrap();
-        let access = p.classify(&meta(), now());
+        let access = p.classify(&meta(), now(), Operation::Access);
         match &access {
             Access::Denied { rule } => assert_eq!(rule, "default"),
             other => panic!("expected denial, got {other:?}"),
@@ -1595,14 +1902,14 @@ action = "allow"
 products = ["*"]
 "#;
         let p = Policy::from_toml_str(s).unwrap();
-        match p.classify(&meta(), now()) {
+        match p.classify(&meta(), now(), Operation::Access) {
             Access::Denied { rule } => assert_eq!(rule, "first"),
             other => panic!("first matching rule must win, got {other:?}"),
         }
         // A bug the first rule does not match falls through to the second.
         let mut other_bug = meta();
         other_bug.product = Some("GNOME".into());
-        match p.classify(&other_bug, now()) {
+        match p.classify(&other_bug, now(), Operation::Access) {
             Access::Granted { rule, .. } => assert_eq!(rule, "second"),
             other => panic!("expected grant from catch-all, got {other:?}"),
         }
@@ -1622,12 +1929,14 @@ groups = ["*security*", "*embargo*"]
         let p = Policy::from_toml_str(s).unwrap();
         let mut bug = meta();
         bug.groups = Some(vec!["suse-security-internal".into()]);
-        match p.classify(&bug, now()) {
+        match p.classify(&bug, now(), Operation::Access) {
             Access::Denied { rule } => assert_eq!(rule, "embargo"),
             other => panic!("embargoed bug must be denied, got {other:?}"),
         }
         // Without the group the default allows.
-        assert!(p.classify(&meta(), now()).allows(Capability::Read));
+        assert!(p
+            .classify(&meta(), now(), Operation::Access)
+            .allows(Capability::Read));
     }
 
     #[test]
@@ -1635,12 +1944,14 @@ groups = ["*security*", "*embargo*"]
         let p = Policy::from_toml_str("[global]\nmin_bug_age_days = 30\n").unwrap();
         let mut bug = meta();
         bug.creation_time = Some(t("2026-01-14T00:00:00Z")); // 1 day old
-        match p.classify(&bug, now()) {
+        match p.classify(&bug, now(), Operation::Access) {
             Access::Denied { rule } => assert_eq!(rule, "min_bug_age_days"),
             other => panic!("young bug must be denied, got {other:?}"),
         }
         bug.creation_time = Some(t("2025-01-01T00:00:00Z")); // over a year old
-        assert!(p.classify(&bug, now()).allows(Capability::Read));
+        assert!(p
+            .classify(&bug, now(), Operation::Access)
+            .allows(Capability::Read));
     }
 
     #[test]
@@ -1648,13 +1959,13 @@ groups = ["*security*", "*embargo*"]
         let p = Policy::from_toml_str("[global]\nmin_bug_age_days = 30\n").unwrap();
         let mut bug = meta();
         bug.creation_time = None;
-        match p.classify(&bug, now()) {
+        match p.classify(&bug, now(), Operation::Access) {
             Access::Denied { rule } => assert_eq!(rule, "min_bug_age_days"),
             other => panic!("unknown age must be denied under an age gate (I4), got {other:?}"),
         }
         // With the gate disabled a missing creation_time is fine.
         assert!(Policy::default()
-            .classify(&bug, now())
+            .classify(&bug, now(), Operation::Access)
             .allows(Capability::Read));
     }
 
@@ -1664,10 +1975,15 @@ groups = ["*security*", "*embargo*"]
         let mut bug = meta();
         // Exactly 7 days old => age requirement met => allowed.
         bug.creation_time = Some(t("2026-01-08T12:00:00Z"));
-        assert!(p.classify(&bug, now()).allows(Capability::Read));
+        assert!(p
+            .classify(&bug, now(), Operation::Access)
+            .allows(Capability::Read));
         // One second younger => denied.
         bug.creation_time = Some(t("2026-01-08T12:00:01Z"));
-        assert!(matches!(p.classify(&bug, now()), Access::Denied { .. }));
+        assert!(matches!(
+            p.classify(&bug, now(), Operation::Access),
+            Access::Denied { .. }
+        ));
     }
 
     #[test]
@@ -1683,7 +1999,7 @@ action = "allow"
         let p = Policy::from_toml_str(s).unwrap();
         let mut bug = meta();
         bug.creation_time = Some(t("2026-01-14T00:00:00Z"));
-        match p.classify(&bug, now()) {
+        match p.classify(&bug, now(), Operation::Access) {
             Access::Denied { rule } => assert_eq!(rule, "min_bug_age_days"),
             other => panic!("global age gate must precede rules, got {other:?}"),
         }
@@ -1698,7 +2014,7 @@ action = "restrict"
 capabilities = ["summary", "comments"]
 "#;
         let p = Policy::from_toml_str(s).unwrap();
-        let access = p.classify(&meta(), now());
+        let access = p.classify(&meta(), now(), Operation::Access);
         assert!(access.allows(Capability::Summary));
         assert!(access.allows(Capability::Comments));
         assert!(!access.allows(Capability::Read));
@@ -1721,15 +2037,19 @@ younger_than_days = 14
         let p = Policy::from_toml_str(s).unwrap();
         let mut bug = meta();
         bug.creation_time = Some(t("2026-01-10T00:00:00Z")); // 5 days old
-        let access = p.classify(&bug, now());
+        let access = p.classify(&bug, now(), Operation::Access);
         assert!(access.allows(Capability::Summary));
         assert!(!access.allows(Capability::Read));
         // Old bug falls through to default allow.
         bug.creation_time = Some(t("2025-06-01T00:00:00Z"));
-        assert!(p.classify(&bug, now()).allows(Capability::Read));
+        assert!(p
+            .classify(&bug, now(), Operation::Access)
+            .allows(Capability::Read));
         // Unknown age is treated as young (fail closed).
         bug.creation_time = None;
-        assert!(!p.classify(&bug, now()).allows(Capability::Read));
+        assert!(!p
+            .classify(&bug, now(), Operation::Access)
+            .allows(Capability::Read));
     }
 
     #[test]
@@ -1771,7 +2091,7 @@ younger_than_days = 14
     #[test]
     fn read_only_strips_write_caps_from_default_grant() {
         let p = Policy::from_toml_str("[global]\nread_only = true\n").unwrap();
-        let access = p.classify(&meta(), now());
+        let access = p.classify(&meta(), now(), Operation::Access);
         for c in Capability::ALL {
             if c.is_write() {
                 assert!(!access.allows(c), "{c:?} must be stripped in read-only");
@@ -1792,7 +2112,7 @@ name = "allow-all"
 action = "allow"
 "#;
         let p = Policy::from_toml_str(s).unwrap();
-        let access = p.classify(&meta(), now());
+        let access = p.classify(&meta(), now(), Operation::Access);
         assert!(access.allows(Capability::Read));
         assert!(!access.allows(Capability::Comment));
         assert!(!access.allows(Capability::Status));
@@ -1817,7 +2137,7 @@ action = "restrict"
 capabilities = ["summary", "comment", "status"]
 "#;
         let p = Policy::from_toml_str(s).unwrap();
-        let access = p.classify(&meta(), now());
+        let access = p.classify(&meta(), now(), Operation::Access);
         assert!(access.allows(Capability::Summary));
         assert!(!access.allows(Capability::Comment));
         assert!(!access.allows(Capability::Status));
@@ -1833,7 +2153,7 @@ capabilities = ["summary", "comment", "status"]
         // cannot make this vacuously true: filing bugs and uploading
         // attachments are writes, and read-only must strip them.
         let p = Policy::from_toml_str("[global]\nread_only = true\n").unwrap();
-        let access = p.classify(&meta(), now());
+        let access = p.classify(&meta(), now(), Operation::Access);
         assert!(!access.allows(Capability::Create));
         assert!(!access.allows(Capability::Attach));
         // Their read-side counterpart survives.
@@ -1851,7 +2171,7 @@ action = "restrict"
 capabilities = ["comment"]
 "#;
         let p = Policy::from_toml_str(s).unwrap();
-        let access = p.classify(&meta(), now());
+        let access = p.classify(&meta(), now(), Operation::Access);
         assert!(access.allows(Capability::Comment));
         assert!(!access.allows(Capability::Create));
         assert!(!access.allows(Capability::Attach));
@@ -1868,7 +2188,7 @@ action = "restrict"
 capabilities = ["summary", "create", "attach"]
 "#;
         let p = Policy::from_toml_str(s).unwrap();
-        let access = p.classify(&meta(), now());
+        let access = p.classify(&meta(), now(), Operation::Access);
         assert!(access.allows(Capability::Create));
         assert!(access.allows(Capability::Attach));
         assert!(!access.allows(Capability::Read));
@@ -1897,11 +2217,11 @@ capabilities = ["summary", "create", "attach"]
         ))
         .unwrap();
         assert!(matches!(
-            allow_rule.classify(&unreadable, now()),
+            allow_rule.classify(&unreadable, now(), Operation::Access),
             Access::Denied { .. }
         ));
         assert!(allow_rule
-            .classify(&known_fresh, now())
+            .classify(&known_fresh, now(), Operation::Access)
             .allows(Capability::Read));
 
         // The case a permissive default would hide: under `deny`, a restrict
@@ -1914,11 +2234,11 @@ capabilities = ["summary", "create", "attach"]
         ))
         .unwrap();
         assert!(matches!(
-            restrict_rule.classify(&unreadable, now()),
+            restrict_rule.classify(&unreadable, now(), Operation::Access),
             Access::Denied { .. }
         ));
         assert!(restrict_rule
-            .classify(&known_fresh, now())
+            .classify(&known_fresh, now(), Operation::Access)
             .allows(Capability::Summary));
     }
 
@@ -1943,7 +2263,7 @@ capabilities = ["summary", "create", "attach"]
             ..meta()
         };
         assert!(matches!(
-            p.classify(&readable, now()),
+            p.classify(&readable, now(), Operation::Access),
             Access::Denied { .. }
         ));
         // The same bug with neither field readable must not do better.
@@ -1953,7 +2273,7 @@ capabilities = ["summary", "create", "attach"]
             ..meta()
         };
         assert!(matches!(
-            p.classify(&unreadable, now()),
+            p.classify(&unreadable, now(), Operation::Access),
             Access::Denied { .. }
         ));
     }
@@ -1973,7 +2293,9 @@ capabilities = ["summary", "create", "attach"]
             whiteboard: None,
             ..meta()
         };
-        assert!(p.classify(&no_whiteboard, now()).allows(Capability::Read));
+        assert!(p
+            .classify(&no_whiteboard, now(), Operation::Access)
+            .allows(Capability::Read));
     }
 
     #[test]
@@ -1985,7 +2307,90 @@ capabilities = ["summary", "create", "attach"]
             global: GlobalGuards::default(),
             rules: Vec::new(),
         };
-        assert!(matches!(p.classify(&meta(), now()), Access::Denied { .. }));
+        assert!(matches!(
+            p.classify(&meta(), now(), Operation::Access),
+            Access::Denied { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_create_scoped_rule_is_skipped_before_its_matcher_runs() {
+        // The crux of operation scoping (issue #26): a create-scoped rule is
+        // fully invisible to access classification, INCLUDING the fail-closed
+        // path for unreadable metadata. This bug's group list is unreadable,
+        // so the rule's matcher would return Unknown — but the rule must not
+        // be consulted at all, and the bug falls through to the default.
+        let unreadable_groups = BugMeta {
+            groups: None,
+            ..meta()
+        };
+        let scoped = Policy::from_toml_str(concat!(
+            "default_action = \"allow\"\n",
+            "[[rule]]\nname = \"filers\"\naction = \"restrict\"\n",
+            "capabilities = [\"create\"]\noperations = [\"create\"]\n",
+            "[rule.match]\ngroup_restricted = false\n",
+        ))
+        .unwrap();
+        match scoped.classify(&unreadable_groups, now(), Operation::Access) {
+            Access::Granted { rule, .. } => assert_eq!(rule, "default"),
+            other => panic!("create-scoped rule must be invisible to access, got {other:?}"),
+        }
+
+        // The SAME rule without `operations` keeps the pre-scoping
+        // behaviour: consulted, undecidable, and fail closed (I4) unchanged.
+        let unscoped = Policy::from_toml_str(concat!(
+            "default_action = \"allow\"\n",
+            "[[rule]]\nname = \"filers\"\naction = \"restrict\"\n",
+            "capabilities = [\"create\"]\n",
+            "[rule.match]\ngroup_restricted = false\n",
+        ))
+        .unwrap();
+        assert!(matches!(
+            unscoped.classify(&unreadable_groups, now(), Operation::Access),
+            Access::Denied { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_access_scoped_rule_is_invisible_to_create() {
+        // The mirror image: a rule scoped to access decides nothing for the
+        // create operation, even when its matcher would match.
+        let p = Policy::from_toml_str(concat!(
+            "default_action = \"deny\"\n",
+            "[[rule]]\nname = \"readers\"\naction = \"restrict\"\n",
+            "capabilities = [\"read\"]\noperations = [\"access\"]\n",
+            "[rule.match]\nproducts = [\"openSUSE*\"]\n",
+        ))
+        .unwrap();
+        // For access the rule matches and grants read.
+        assert!(p
+            .classify(&meta(), now(), Operation::Access)
+            .allows(Capability::Read));
+        // For create it is skipped and the denying default decides.
+        match p.classify(&meta(), now(), Operation::Create) {
+            Access::Denied { rule } => assert_eq!(rule, "default"),
+            other => panic!("access-scoped rule must be invisible to create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_min_bug_age_gate_is_not_operation_scoped() {
+        // The global age gate stays global: it runs for every operation,
+        // whatever any rule's `operations` says.
+        let p = Policy::from_toml_str(concat!(
+            "[global]\nmin_bug_age_days = 30\n",
+            "[[rule]]\nname = \"filers\"\naction = \"restrict\"\n",
+            "capabilities = [\"create\"]\noperations = [\"create\"]\n",
+        ))
+        .unwrap();
+        let mut young = meta();
+        young.creation_time = Some(t("2026-01-14T00:00:00Z"));
+        for op in [Operation::Access, Operation::Create] {
+            match p.classify(&young, now(), op) {
+                Access::Denied { rule } => assert_eq!(rule, "min_bug_age_days"),
+                other => panic!("age gate must precede scoped rules for {op:?}, got {other:?}"),
+            }
+        }
     }
 
     // ---------- BugMeta::from_json ----------

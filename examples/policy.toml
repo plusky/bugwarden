@@ -12,23 +12,38 @@
 #   * bugs labelled "security" are invisible while they are fresher than
 #     5 days (the window in which details are typically still unreviewed);
 #   * every other bug is shown to the user in full;
-#   * filing new bugs is refused entirely: rule 1 depends on the group
-#     list, and a not-yet-created bug's groups cannot be known — see the
-#     note before the commented-out "reporters" rule below.
+#   * new bug reports are accepted into the desktop products ONLY — see the
+#     "reporters" rule in section 0, whose `operations = ["create"]` scope
+#     grants filing without touching what may be read — except that a title
+#     carrying the embargo marker may not be filed anywhere
+#     ("no-embargo-filings"). Everywhere else filing is refused: the first
+#     deny rule the create gate reaches ("group-restricted") consults the
+#     group list, a not-yet-created bug's groups cannot be known, and
+#     unknown fails closed.
 #
 # The policy is read once at server startup (--policy / BUGWARDEN_POLICY) and
 # is never visible to the MCP client. Parsing is strict: unknown keys anywhere
 # are a startup error, so typos cannot silently disable a guard.
 #
 # Rule evaluation order:
-#   1. global.min_bug_age_days (a too-young bug is invisible, no rule runs)
-#   2. [[rule]] entries top to bottom — FIRST MATCH WINS
+#   1. global.min_bug_age_days (a too-young bug is invisible, no rule runs;
+#      this gate is global — it is never operation-scoped, and it refuses
+#      creation too, since a just-created bug would be immediately hidden)
+#   2. [[rule]] entries top to bottom — FIRST MATCH WINS. A rule carrying
+#      `operations = [...]` is consulted only for the operations it names
+#      ("create" = the create gate judging a prospective bug, "access" =
+#      every classification of an existing bug); the scope is checked
+#      BEFORE the rule's match criteria, so a scoped rule is completely
+#      invisible to the operations it does not cover.
 #   3. default_action for bugs no rule matched
 #
 # Unreadable metadata: if a bug object does not carry a field some rule asks
 # about — absent, null, wrongly typed, or a list with an unreadable element —
 # that rule cannot be decided and the bug is DENIED, whatever the rule's
-# action. This holds for every criterion below, so none of them repeats it.
+# action. This holds for every criterion of every rule CONSULTED for the
+# operation at hand — an operation-scoped rule (section 0) is skipped before
+# its criteria are read, so it can make nothing undecidable for the
+# operations it does not cover — and none of the rules below repeats it.
 # A field that is present but empty ("" or []) is knowledge, not ignorance,
 # and matches normally.
 #
@@ -68,6 +83,66 @@ read_only = false
 # The same ceiling caps what add_attachment may UPLOAD, also measured on the
 # decoded bytes. 0 removes the cap. Default: 2 MiB.
 #max_attachment_bytes = 2097152
+
+# ---------------------------------------------------------------------------
+# 0. New bug reports: accepted into the desktop products, and only there.
+#
+# Filing must be decided before the bug exists, so the policy judges the bug
+# AS DESCRIBED by the create request. The first deny rule below
+# ("group-restricted") consults the group list, the group list of a
+# not-yet-created bug is unknowable (Bugzilla unions the product's mandatory
+# groups into whatever the request claims), and unknown fails closed — so
+# every create request that reaches it is refused, and no rule after it is
+# ever consulted for creation. A rule granting "create" must therefore come
+# BEFORE it.
+#
+# What makes that placement safe is `operations = ["create"]`: the rule is
+# consulted ONLY by the create gate and is invisible to every classification
+# of an EXISTING bug, including the fail-closed handling of unreadable
+# metadata. Without the scoping, this rule would also be the first match for
+# every existing bug in these products — and a restrict rule's
+# `capabilities` list is the COMPLETE grant for all operations the rule
+# covers, not an addition to what other rules or the default would allow, so
+# `capabilities = ["create"]` alone would silently make those bugs
+# unreadable (gone from searches, "not accessible" from bug_info). With the
+# scoping, filing works and reads are untouched: existing GNOME*/KDE* bugs
+# fall through to the rules below and default_action exactly as if this
+# rule did not exist.
+#
+# Granting creation ahead of the deny rules also takes their OTHER screens
+# out of the create path, so the title screen is restated create-side:
+# "no-embargo-filings" refuses a filing whose title carries the embargo
+# marker, which "reporters" would otherwise accept and "undisclosed-marker"
+# would then instantly hide (a bug created and never readable serves
+# nobody). The keyword screen ("embargo-keyword") deliberately has no
+# create-side twin: a create request may omit `keywords`, an omitted field
+# is unknown, and unknown fails closed — a keyword rule ahead of the grant
+# would refuse every keywordless filing. Residual, accepted: a desktop
+# filing that CLAIMS an embargo keyword is created and then immediately
+# hidden by "embargo-keyword".
+#
+# NOTE: bugwarden versions without operation support REJECT a policy using
+# `operations` at startup — parsing is strict, so the whole file fails
+# closed instead of the rule being silently misread as unscoped.
+
+[[rule]]
+name = "no-embargo-filings"
+description = "Embargo-marked titles may not be filed anywhere"
+action = "deny"
+operations = ["create"]
+[rule.match]
+# Same criterion as "undisclosed-marker" below; scoped to the create gate so
+# it screens filings without duplicating that rule's job for reads.
+summary_contains = ["embargo"]
+
+[[rule]]
+name = "reporters"
+description = "Desktop products accept new bug reports"
+action = "restrict"
+capabilities = ["create"]
+operations = ["create"]
+[rule.match]
+products = ["GNOME*", "KDE*"]
 
 # ---------------------------------------------------------------------------
 # 1. Undisclosed security bugs: fully invisible, at any age.
@@ -202,41 +277,23 @@ younger_than_days = 5
 
 # Filing new bugs ("create") and uploading attachments ("attach") are
 # capabilities like any other. A create request has no bug id yet, so the
-# policy judges the bug AS DESCRIBED by the request — the deny rules above
-# therefore also refuse filing into anything they hide by name, with no
-# extra configuration. A request that omits a field a rule asks about is
-# refused (unknown, not empty), and the request's OWN claim about `groups`
-# is never trusted: Bugzilla unions the product's mandatory groups into
-# whatever was claimed, so what groups the created bug would end up in
-# cannot be known before it exists.
-#
-# BE AWARE: under THIS policy, filing bugs is impossible — deliberately.
-# Rule 1 ("group-restricted") consults the group list, the group list of a
-# not-yet-created bug is unknowable (see above), and unknown fails closed.
-# Every create request is therefore refused before Bugzilla is contacted,
-# and a rule granting "create" placed BELOW rule 1 — like the example
-# below — can never be reached by a create request. The same holds for any
-# policy whose applicable rules use `groups` or `group_restricted`.
-#
-# To actually accept new bugs, a create-granting rule must come BEFORE
-# every group-consulting rule and match on fields the request does carry
-# (products, components, summary, keywords, ...). First match wins, so
-# such a rule then also decides access to EXISTING bugs it matches —
-# grant it "create" alone (as below) and matched existing bugs stay
-# unreadable; add read capabilities to it and you have re-opened the
-# group-restricted bugs of those products, which is exactly what rule 1
-# exists to prevent. Weigh that trade before moving it up.
+# policy judges the bug AS DESCRIBED by the request — a deny rule above
+# therefore also refuses filing into anything it hides by name, with no
+# extra configuration, for every create request that REACHES it (a grant
+# matched earlier, like "reporters", decides first). A request that omits a
+# field a rule asks about is refused (unknown, not empty), and the request's
+# OWN claim about `groups` is never trusted: Bugzilla unions the product's
+# mandatory groups into whatever was claimed, so what groups the created bug
+# would end up in cannot be known before it exists. That is why accepting
+# new bugs takes a rule scoped with `operations = ["create"]`, placed before
+# every group-consulting rule and matching on fields the request does carry
+# (products, components, summary, keywords, ...) — see the "reporters" rule
+# in section 0 at the top of this file and its comment for the full
+# reasoning.
 #
 # "attach" is judged against the target bug like every other write (the
 # bug exists, so its real group list is fetched and rule 1 applies
 # normally), and the upload is capped by max_attachment_bytes above.
-#[[rule]]
-#name = "reporters"
-#description = "Desktop products accept new bug reports"
-#action = "restrict"
-#capabilities = ["create"]
-#[rule.match]
-#products = ["GNOME*", "KDE*"]
 
 # Every remaining match criterion, in one rule.
 #[[rule]]

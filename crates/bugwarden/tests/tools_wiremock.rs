@@ -302,6 +302,77 @@ async fn create_bug_group_restricted_policy_refuses_all_creation() {
     assert_eq!(text_of(&result), CREATE_DENIAL);
 }
 
+#[tokio::test]
+async fn create_scoped_rule_files_bugs_without_hiding_reads_issue_26() {
+    // Issue #26, fixed: a create-scoped grant placed ahead of the
+    // group-consulting deny rule lets filing work while existing bugs in the
+    // matched products stay searchable — the pre-fix shape made them vanish
+    // from quicksearch entirely.
+    let mock = MockServer::start().await;
+    let mut bug = world_readable_bug(7);
+    bug["product"] = json!("SUSE Linux Enterprise Server 15");
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("quicksearch", "ALL product:Enterprise"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [bug] })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/rest/bug"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 4242 })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let client = client_for(
+        concat!(
+            "[[rule]]\nname = \"file-new-bugs\"\naction = \"restrict\"\n",
+            "capabilities = [\"create\"]\noperations = [\"create\"]\n",
+            "[rule.match]\nproducts = [\"SUSE Linux Enterprise*\"]\n",
+            "[[rule]]\nname = \"group-restricted\"\naction = \"deny\"\n",
+            "[rule.match]\ngroup_restricted = true\n",
+        ),
+        &mock,
+    )
+    .await;
+
+    // The read the pre-fix shape silently revoked: the existing
+    // world-readable bug stays in search results, because the create-scoped
+    // rule is invisible to access classification.
+    let search = call(
+        &client,
+        "bugs_quicksearch",
+        json!({ "query": "product:Enterprise" }),
+    )
+    .await;
+    assert!(
+        !is_error(&search),
+        "search must succeed: {}",
+        text_of(&search)
+    );
+    assert!(
+        text_of(&search).contains("\"id\": 7"),
+        "the existing bug must not vanish from search: {}",
+        text_of(&search)
+    );
+
+    // Filing into the matched product reaches Bugzilla: the scoped rule is
+    // first match for the create operation and grants `create` before the
+    // group rule can fail closed on the unknowable group list.
+    let created = call(
+        &client,
+        "create_bug",
+        create_args("SUSE Linux Enterprise Server 15"),
+    )
+    .await;
+    assert!(
+        !is_error(&created),
+        "create must be permitted: {}",
+        text_of(&created)
+    );
+    assert!(text_of(&created).contains("4242"));
+}
+
 // ---------- add_attachment (HIGH-3 mutations a and c, LOW-2) ----------
 
 #[tokio::test]

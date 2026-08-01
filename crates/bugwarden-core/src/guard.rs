@@ -21,7 +21,7 @@ use chrono::Utc;
 use serde_json::{Map, Value};
 
 use crate::client::{BugzillaClient, CLASSIFY_FIELDS};
-use crate::policy::{Access, BugMeta, Capability, Policy};
+use crate::policy::{Access, BugMeta, Capability, Operation, Policy};
 
 /// Fields kept by the redacted summary-only projection of a bug
 /// ([`Guard::summary_view`]). Everything else — assignee, CC, groups,
@@ -177,7 +177,10 @@ impl Guard {
             let entry = match fetched.get(&id) {
                 Some(bug) => {
                     let meta = BugMeta::from_json(bug);
-                    (self.policy.classify(&meta, now), bug.clone())
+                    (
+                        self.policy.classify(&meta, now, Operation::Access),
+                        bug.clone(),
+                    )
                 }
                 // Absent from the response: nonexistent, server-side denied,
                 // or fetch failure — all fail closed identically (I4).
@@ -397,7 +400,11 @@ impl Guard {
                     continue;
                 }
                 let meta = BugMeta::from_json(bug);
-                if self.policy.classify(&meta, now).allows(Capability::Summary) {
+                if self
+                    .policy
+                    .classify(&meta, now, Operation::Access)
+                    .allows(Capability::Summary)
+                {
                     out.insert(id);
                 }
             }
@@ -708,9 +715,19 @@ impl Guard {
     /// claiming `groups: []` would otherwise defeat a group deny rule that
     /// omitting `groups` correctly trips. The group list of a prospective
     /// bug is forced to UNKNOWN, whatever the payload said, and unknown
-    /// fails closed (I4). Consequence, deliberate: a policy whose applicable
-    /// rules consult `groups` or `group_restricted` refuses ALL creation,
-    /// because the answer cannot be known before the bug exists.
+    /// fails closed (I4). Consequence, deliberate: a rule consulting
+    /// `groups` or `group_restricted` refuses every create request that
+    /// REACHES it, because the answer cannot be known before the bug
+    /// exists — so creation is possible only where an earlier rule covering
+    /// the create operation grants `create` first, and a policy with no
+    /// such earlier grant refuses all creation.
+    ///
+    /// The request is classified for [`Operation::Create`]: a rule scoped to
+    /// `operations = ["access"]` is not consulted here, and a rule scoped to
+    /// `operations = ["create"]` exists ONLY here — which is what lets an
+    /// operator grant filing into a product ahead of the group-consulting
+    /// rules without that grant shadowing reads of the product's existing
+    /// bugs (issue #26).
     ///
     /// The prospective bug is dated NOW, so an age rule (`younger_than_days`,
     /// `min_bug_age_days`) refuses creation wherever it would immediately
@@ -724,7 +741,7 @@ impl Guard {
         // Every other field the request does not mention is unknown, not
         // empty, and classification fails closed on it (I4).
         self.policy
-            .classify(&meta, Utc::now())
+            .classify(&meta, Utc::now(), Operation::Create)
             .allows(Capability::Create)
     }
 
@@ -774,7 +791,7 @@ impl Guard {
         let mut dropped = 0usize;
         for bug in bugs {
             let meta = BugMeta::from_json(&bug);
-            let access = self.policy.classify(&meta, now);
+            let access = self.policy.classify(&meta, now, Operation::Access);
             if access.allows(Capability::Read) {
                 kept.push(bug);
             } else if access.allows(Capability::Summary) {
@@ -1620,24 +1637,93 @@ products = ["NoView*"]
     }
 
     #[test]
-    fn shipped_example_policy_parses_and_refuses_all_creation() {
-        // examples/policy.toml documents, in its header, that filing bugs is
-        // impossible under it: its first rule consults the group list, which
-        // is unknowable for a not-yet-created bug. Pin that the shipped file
-        // parses and behaves as its own comments claim. Read at runtime (not
-        // include_str!) so the core crate stays packageable without the file.
+    fn shipped_example_policy_files_into_desktop_products_only_and_keeps_reads() {
+        // examples/policy.toml promises, in its header: new bug reports are
+        // accepted into the desktop products ONLY (the create-scoped
+        // "reporters" rule), except that an embargo-marked title may not be
+        // filed anywhere; everywhere else filing is refused because the
+        // first deny rule the create gate reaches consults the unknowable
+        // group list. Pin the whole shipped contract — the accept half, the
+        // refuse half, and that the create grant stays invisible to reads
+        // of existing desktop bugs (the silent-vanishing regression of
+        // issue #26). Read at runtime (not include_str!) so the core crate
+        // stays packageable without the file.
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/policy.toml");
         let toml = std::fs::read_to_string(path).expect("example policy must exist in-repo");
         let g = Guard {
             policy: policy(&toml),
         };
+
+        // Accept half: the desktop products take new bug reports.
+        assert!(
+            g.may_create(&create_request("GNOME Shell")),
+            "the example's headline: desktop products accept filings"
+        );
+        assert!(g.may_create(&create_request("KDE Frameworks")));
+
+        // ...but never with the embargo marker in the title: the
+        // create-scoped screen refuses what "undisclosed-marker" would
+        // instantly hide (no create-then-vanish).
+        let mut marked = create_request("GNOME Shell");
+        marked["summary"] = json!("EMBARGO: heap overflow in the shell");
+        assert!(
+            !g.may_create(&marked),
+            "an embargo-marked title must not be filed anywhere"
+        );
+
+        // Refuse half: everywhere else the group-consulting deny rule fails
+        // closed on the unknowable group list, whatever the request claims.
         let mut req = create_request("openSUSE");
         assert!(!g.may_create(&req), "omitted groups: refused");
         req["groups"] = json!([]);
         assert!(!g.may_create(&req), "claimed empty groups: refused");
         req["groups"] = json!(["security-team"]);
         assert!(!g.may_create(&req), "claimed groups: refused");
+
+        // Issue #26: the create grant is scoped away from access, so an
+        // existing world-readable desktop bug keeps its FULL read — under
+        // the pre-fix policy shape the same rule was first match for reads
+        // and silently revoked everything but `create`.
+        let public = BugMeta::from_json(&json!({
+            "id": 500,
+            "summary": "totem crashes when seeking in a webm file",
+            "product": "GNOME Multimedia",
+            "component": "totem",
+            "groups": [],
+            "keywords": [],
+            "whiteboard": "",
+            "status": "NEW",
+            "creation_time": "2020-01-01T00:00:00Z",
+        }));
+        assert!(
+            g.policy
+                .classify(&public, Utc::now(), Operation::Access)
+                .allows(Capability::Read),
+            "existing desktop bugs must stay fully readable"
+        );
+
+        // ...while a group-restricted desktop bug stays denied: the grant
+        // does not shadow the deny rules for reads either.
+        let restricted = BugMeta::from_json(&json!({
+            "id": 501,
+            "summary": "totem crashes when seeking in a webm file",
+            "product": "GNOME Multimedia",
+            "component": "totem",
+            "groups": ["secteam"],
+            "keywords": [],
+            "whiteboard": "",
+            "status": "NEW",
+            "creation_time": "2020-01-01T00:00:00Z",
+        }));
+        assert!(
+            matches!(
+                g.policy
+                    .classify(&restricted, Utc::now(), Operation::Access),
+                Access::Denied { .. }
+            ),
+            "group-restricted desktop bugs must stay denied"
+        );
     }
 
     #[test]
@@ -1670,7 +1756,10 @@ products = ["NoView*"]
         // The shipped file as-is: denied (the broad rule reaches it first).
         let full = policy(&toml);
         assert!(
-            matches!(full.classify(&bug, Utc::now()), Access::Denied { .. }),
+            matches!(
+                full.classify(&bug, Utc::now(), Operation::Access),
+                Access::Denied { .. }
+            ),
             "shipped policy must deny a security-group bug"
         );
 
@@ -1686,7 +1775,7 @@ products = ["NoView*"]
                 .find("[[rule]]")
                 .expect("a rule must follow the broad rule");
         let narrowed = policy(&format!("{}{}", &toml[..start], &toml[end..]));
-        match narrowed.classify(&bug, Utc::now()) {
+        match narrowed.classify(&bug, Utc::now(), Operation::Access) {
             Access::Denied { rule } => assert_eq!(
                 rule, "security-groups",
                 "the named-group rule itself must be the one denying"
@@ -1713,12 +1802,15 @@ products = ["NoView*"]
             "creation_time": "2020-01-01T00:00:00Z",
         }));
         assert!(
-            matches!(full.classify(&partner, Utc::now()), Access::Denied { .. }),
+            matches!(
+                full.classify(&partner, Utc::now(), Operation::Access),
+                Access::Denied { .. }
+            ),
             "shipped policy hides every restricted bug"
         );
         assert!(
             matches!(
-                narrowed.classify(&partner, Utc::now()),
+                narrowed.classify(&partner, Utc::now(), Operation::Access),
                 Access::Granted { .. }
             ),
             "narrowing is meant to expose non-security restricted bugs"
@@ -1783,6 +1875,125 @@ products = ["NoView*"]
     fn may_create_refuses_everything_in_read_only() {
         let g = Guard {
             policy: policy("[global]\nread_only = true\n"),
+        };
+        assert!(!g.may_create(&create_request("openSUSE")));
+    }
+
+    // ---------- operation-scoped rules (issue #26) ----------
+
+    /// The policy shape from the issue #26 reproduction, fixed: a
+    /// create-scoped grant placed ahead of the group-consulting deny rule.
+    const ISSUE_26_POLICY: &str = r#"
+default_action = "allow"
+
+[[rule]]
+name = "file-new-bugs"
+action = "restrict"
+capabilities = ["create"]
+operations = ["create"]
+[rule.match]
+products = ["SUSE Linux Enterprise*"]
+
+[[rule]]
+name = "group-restricted"
+action = "deny"
+[rule.match]
+group_restricted = true
+"#;
+
+    #[test]
+    fn create_scoped_rule_no_longer_shadows_reads_issue_26() {
+        let g = Guard {
+            policy: policy(ISSUE_26_POLICY),
+        };
+
+        // An existing, world-readable bug in a matched product: the
+        // create-scoped rule is invisible to access classification, so the
+        // bug falls through the deny rule to the allowing default — this is
+        // the read the pre-fix policy shape silently revoked.
+        let public = BugMeta::from_json(&json!({
+            "id": 100,
+            "summary": "boot hangs after update",
+            "product": "SUSE Linux Enterprise Server 15",
+            "component": "Kernel",
+            "groups": [],
+            "creation_time": "2020-01-01T00:00:00Z",
+        }));
+        match g.policy.classify(&public, Utc::now(), Operation::Access) {
+            Access::Granted { rule, .. } => assert_eq!(rule, "default"),
+            other => panic!("non-restricted bug must stay readable, got {other:?}"),
+        }
+
+        // A group-restricted bug in the same product stays denied: the
+        // create grant does not shadow the deny rule for reads.
+        let restricted = BugMeta::from_json(&json!({
+            "id": 101,
+            "summary": "boot hangs after update",
+            "product": "SUSE Linux Enterprise Server 15",
+            "component": "Kernel",
+            "groups": ["secteam"],
+            "creation_time": "2020-01-01T00:00:00Z",
+        }));
+        match g
+            .policy
+            .classify(&restricted, Utc::now(), Operation::Access)
+        {
+            Access::Denied { rule } => assert_eq!(rule, "group-restricted"),
+            other => panic!("group-restricted bug must stay denied, got {other:?}"),
+        }
+
+        // Filing into the matched product works: for the create operation
+        // the scoped rule is first match and grants `create` before the
+        // group-consulting rule can fail closed on the unknowable groups.
+        assert!(g.may_create(&create_request("SUSE Linux Enterprise Server 15")));
+        // Elsewhere creation still fails closed on the group rule.
+        assert!(!g.may_create(&create_request("openSUSE")));
+    }
+
+    #[test]
+    fn create_scoped_grant_does_not_defeat_a_preceding_name_deny() {
+        // A deny rule placed ABOVE the create-scoped grant still wins for
+        // creation: scoping changes which rules are consulted, never the
+        // first-match order among those that are.
+        let g = Guard {
+            policy: policy(concat!(
+                "[[rule]]\nname = \"hide-sle\"\naction = \"deny\"\n",
+                "[rule.match]\nproducts = [\"SUSE Linux Enterprise*\"]\n",
+                "[[rule]]\nname = \"file-new-bugs\"\naction = \"restrict\"\n",
+                "capabilities = [\"create\"]\noperations = [\"create\"]\n",
+                "[rule.match]\nproducts = [\"SUSE Linux Enterprise*\"]\n",
+            )),
+        };
+        assert!(!g.may_create(&create_request("SUSE Linux Enterprise Server 15")));
+    }
+
+    #[test]
+    fn access_scoped_rule_is_invisible_to_may_create() {
+        // A rule scoped to `operations = ["access"]` decides nothing for the
+        // create gate: creation falls through to the denying default.
+        let g = Guard {
+            policy: policy(concat!(
+                "default_action = \"deny\"\n",
+                "[[rule]]\nname = \"readers\"\naction = \"restrict\"\n",
+                "capabilities = [\"read\"]\noperations = [\"access\"]\n",
+                "[rule.match]\nproducts = [\"openSUSE*\"]\n",
+            )),
+        };
+        assert!(!g.may_create(&create_request("openSUSE")));
+    }
+
+    #[test]
+    fn may_create_read_only_strips_a_create_scoped_grant() {
+        // I9: read_only strips write capabilities from EVERY grant, a
+        // create-scoped one included — the scoping must not open a side door
+        // around read-only mode.
+        let g = Guard {
+            policy: policy(concat!(
+                "[global]\nread_only = true\n",
+                "[[rule]]\nname = \"file-new-bugs\"\naction = \"restrict\"\n",
+                "capabilities = [\"create\"]\noperations = [\"create\"]\n",
+                "[rule.match]\nproducts = [\"openSUSE*\"]\n",
+            )),
         };
         assert!(!g.may_create(&create_request("openSUSE")));
     }

@@ -69,9 +69,11 @@ is `bug_url`, which computes a URL string locally and contacts nothing.
   filtering happened at all. (Server-side debug logs do record it for the
   operator.)
 - **Fail closed.** If the classification fetch fails, if a bug is absent from
-  the response, or if a rule cannot be decided because the bug object did not
-  carry a field that rule asks about, the bug is treated as denied — never as
-  allowed.
+  the response, or if a rule consulted for the operation being decided cannot
+  be decided because the bug object did not carry a field that rule asks
+  about, the bug is treated as denied — never as allowed. (A rule scoped away
+  from the operation via `operations` is not consulted at all — scoping
+  changes which rules run, never how a consulted rule resolves.)
 - **Private-comment gate.** Private comments are returned only when the policy
   sets `allow_private_comments = true` **and** the individual call opts in
   with `include_private = true`. Either alone is not enough.
@@ -239,6 +241,13 @@ applies. Put your most specific (usually most restrictive) rules first.
 | `match` | table | `{}` (matches every bug) | Match criteria, see below |
 | `action` | `"allow"` \| `"deny"` \| `"restrict"` | *required* | `allow` grants all capabilities, `deny` grants none, `restrict` grants exactly `capabilities` |
 | `capabilities` | array of capability strings | `[]` | Only for `action = "restrict"`, where at least one is required. Must be empty/absent for `allow` and `deny` |
+| `operations` | array of `"create"` \| `"access"` | absent (rule applies to every operation) | Scopes the rule to the named operations: `create` is the create gate judging a prospective `create_bug` request, `access` is every classification of an existing bug (retrieval, search filtering, comments, history, attachments, updates). The scope is checked **before** the matcher, so a scoped rule is completely invisible to the operations it does not cover — a create-scoped rule can never hide an existing bug. An explicitly empty list is a startup error, as is a `restrict` rule whose scope and `capabilities` disagree about `create`: a rule scoped to only `create` must grant exactly the `create` capability (the create gate consults nothing else), and a rule scoped away from `create` must not grant it (nothing else consults it). Older bugwarden versions reject a policy using this key at startup (strict parsing — the file fails closed rather than being misread) |
+
+Note that a `restrict` rule's `capabilities` list is the **complete grant**
+for every operation the rule covers, not an addition to what other rules or
+`default_action` would have granted — that is why a rule granting only
+`create` should carry `operations = ["create"]`, so it decides filing without
+becoming the first-match rule for reads of the bugs it matches.
 
 #### `match` criteria
 
@@ -279,6 +288,9 @@ Two things this deliberately does *not* do. A criterion that already failed
 definitively wins over an unknown one, so a rule ruled out by another criterion
 stays ruled out. And only the fields a rule actually consults matter — a
 missing whiteboard is irrelevant to a rule that never mentions the whiteboard.
+Likewise, only the rules actually consulted matter: a rule scoped away from
+the operation being decided (`operations`) is skipped before its matcher runs,
+so its criteria cannot make anything undecidable for that operation.
 A field that is present but empty (`""`, `[]`) is knowledge, not ignorance, and
 is matched normally.
 
@@ -317,7 +329,7 @@ implied.
 | `assign` | write | changing the assignee |
 | `cc` | write | modifying the CC list |
 | `deps` | write | changing blocks/depends_on |
-| `create` | write | filing a new bug — judged against the bug *as requested*, so a rule that hides a product by name also refuses filing into it. The request's `groups` claim is never trusted (Bugzilla adds mandatory groups server-side), so **a policy whose rules consult `groups` or `group_restricted` refuses all bug filing** |
+| `create` | write | filing a new bug — judged against the bug *as requested*, so a rule that hides a product by name also refuses filing into it. The request's `groups` claim is never trusted (Bugzilla adds mandatory groups server-side), so **a rule consulting `groups` or `group_restricted` refuses every create request that reaches it** — to accept new bugs under such a policy, grant `create` in a rule scoped with `operations = ["create"]` placed before the group-consulting rules; being create-scoped, the grant leaves reads of existing bugs untouched, and without such a grant the policy refuses all bug filing |
 | `attach` | write | uploading an attachment to a bug |
 
 When the server is read-only (policy or CLI), the eight write capabilities

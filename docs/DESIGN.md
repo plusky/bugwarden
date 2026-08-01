@@ -35,12 +35,16 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
 - **I3** Search filtering is silent: counts of dropped/filtered results are
   never returned to the client (server-side debug logging is fine).
 - **I4** Fail closed: classification-fetch failure, bug absent from the
-  response, or a rule that cannot be decided because the bug object did not
-  carry a field that rule asks about (absent, null, wrongly typed, or only
-  partially recoverable — including an unparsable `creation_time`) => Denied.
-  Unreadable metadata never yields more access than readable metadata would:
-  it satisfies no granting rule, and it does not let a bug slip past a rule
-  that would otherwise have caught it.
+  response, or a CONSULTED rule that cannot be decided because the bug object
+  did not carry a field that rule asks about (absent, null, wrongly typed, or
+  only partially recoverable — including an unparsable `creation_time`) =>
+  Denied. The consulted rules are those whose `operations` cover the
+  operation being classified (see classify): a rule scoped away from the
+  operation is skipped before its matcher runs and can neither grant nor
+  deny there — scoping changes which rules are consulted, never how a
+  consulted rule resolves. Unreadable metadata never yields more access than
+  readable metadata would: it satisfies no granting rule, and it does not let
+  a bug slip past a consulted rule that would otherwise have caught it.
 - **I14** A bug id the policy would deny must not appear inside something the
   client IS shown: dependency/duplicate/see_also fields of a served bug,
   history changes naming other bugs, or Bugzilla's auto-generated duplicate
@@ -186,6 +190,14 @@ impl Matcher {
 #[serde(rename_all = "snake_case")]
 pub enum Action { Allow, Deny, Restrict }
 
+// TOML spellings "create" / "access". `create` is the classification of a
+// PROSPECTIVE bug performed by Guard::may_create; `access` is every
+// classification of an EXISTING bug (retrieval, list filtering, comments,
+// history, attachments, link disclosure, updates).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Operation { Create, Access }
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
@@ -194,6 +206,21 @@ pub struct Rule {
     #[serde(rename = "match", default)] pub matcher: Matcher,
     pub action: Action,
     #[serde(default)] pub capabilities: Vec<Capability>, // only for action = "restrict"
+    // Operations this rule is consulted for; an ABSENT key means every
+    // operation (the behaviour of every pre-existing policy, unchanged).
+    // An explicitly written empty list is a validation error.
+    #[serde(default)] pub operations: Option<Vec<Operation>>,
+}
+impl Rule {
+    // Absent list, or a list containing `op`. (A hand-constructed empty
+    // list — unreachable via from_toml_str, which rejects it — counts as
+    // unscoped, exactly like the absent field. No fallback for that invalid
+    // state is uniformly fail-closed: honouring "applies nowhere" silently
+    // skips a deny rule everywhere AND skips a restrict rule under an
+    // allowing default — both fail open. The unscoped reading is canonical
+    // because it never skips a rule the author wrote; rejection is
+    // validation's job.)
+    pub fn applies_to(&self, op: Operation) -> bool;
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -222,10 +249,28 @@ impl Policy {
     pub fn from_toml_str(s: &str) -> anyhow::Result<Policy>; // strict parse + validate
     pub fn load(path: &std::path::Path) -> anyhow::Result<Policy>; // read + from_toml_str; on unix warn (tracing::warn) if file is group/other-writable
     // validate: Restrict rules need >=1 capability; Allow/Deny rules must have
-    // empty capabilities; default_action must not be Restrict.
-    pub fn classify(&self, bug: &BugMeta, now: chrono::DateTime<chrono::Utc>) -> Access;
-    // order: global min_bug_age_days first (missing creation_time => Denied, I4),
-    // then rules first-match-wins, then default_action.
+    // empty capabilities; default_action must not be Restrict; a written
+    // `operations = []` is an error (a rule applying to no operation is dead
+    // configuration); a Restrict rule scoped to ONLY `create` must grant
+    // exactly the `create` capability (without it the rule could grant
+    // nothing reachable, and any other capability it named would be dead —
+    // the create gate consults only `create`); a Restrict rule scoped away
+    // from `create` must not grant `create` (nothing outside the create
+    // gate consults it, so a typoed scope would otherwise silently lose
+    // both the intended filing grant and the reads the capability list
+    // withholds). Unknown operation names are rejected by serde.
+    pub fn classify(&self, bug: &BugMeta, now: chrono::DateTime<chrono::Utc>, op: Operation) -> Access;
+    // order: global min_bug_age_days first (missing creation_time => Denied, I4;
+    // the gate is global, never operation-scoped — it deliberately refuses
+    // creation too, since may_create dates the prospective bug NOW), then
+    // rules first-match-wins CONSULTING ONLY the rules whose `operations`
+    // cover `op`, then default_action. The operation scope is checked BEFORE
+    // the rule's matcher is evaluated: a rule scoped away from `op` is fully
+    // invisible to that classification — it can neither match nor fail
+    // closed through the MatchOutcome::Unknown path (a create-only rule must
+    // never deny a read over unreadable metadata; it is not consulted at
+    // all). For the rules that ARE consulted, the Unknown => Denied
+    // resolution (I4) is unchanged.
     // Every grant (rule or default) strips write caps when global.read_only.
 }
 
@@ -363,9 +408,17 @@ impl Guard {
     /// payload said. Taking `groups: []` as fact would make claiming a
     /// field strictly MORE permissive than omitting it and file straight
     /// past a group deny rule into a security-* embargo product.
-    /// Consequence, deliberate and documented: a policy whose applicable
-    /// rules consult `groups` or `group_restricted` refuses ALL creation —
-    /// the answer cannot be known before the bug exists. creation_time is
+    /// Consequence, deliberate and documented: a rule consulting `groups`
+    /// or `group_restricted` refuses every create request that REACHES it —
+    /// the answer cannot be known before the bug exists — so creation is
+    /// possible only where an earlier rule covering the create operation
+    /// grants `create` first, and a policy with no such earlier grant
+    /// refuses all creation. The request is classified with Operation::Create: rules
+    /// scoped to `operations = ["access"]` are not consulted here, and a
+    /// rule scoped to `operations = ["create"]` exists only here, which is
+    /// how an operator grants filing into a product ahead of the
+    /// group-consulting rules WITHOUT that grant becoming the first-match
+    /// rule for the product's existing bugs (issue #26). creation_time is
     /// forced to NOW, whatever the payload claims, so an age rule refuses
     /// creation wherever it would immediately hide the result.
     pub fn may_create(&self, requested: &Value) -> bool;
@@ -449,7 +502,7 @@ constraints the model must know.
 | bug_history | id, new_since?: DateTime<Utc> | history | |
 | bug_comments | id, include_private: bool = false, new_since? | comments | filter_comments applied (I5) |
 | bugs_quicksearch | query, status: String = "ALL", include_fields: String = "id,product,component,assigned_to,status,resolution,summary,last_change_time", limit: u32 = 50, offset: u32 = 0 | post-filter | fetch include_fields = requested ∪ CLASSIFY_FIELDS; after filter, project kept bugs to requested fields (keep `_redacted` marker); envelope `{"bugs":[..]}` only (I3), except an advisory `note` when the query is nothing but bug ids (comma/whitespace-separated, optional `#` per id) steering exact id sets to bug_info — the note is a pure function of the CLIENT'S REQUEST (the query and status strings), never of results, verdicts, or anything upstream said (no new oracle), and the `bugs` array is byte-identical with or without it (the query is still searched, never rerouted); its wording tracks the request: a non-empty status is prefixed to the query so upstream content-matches the whole expression, while an empty status sends the query bare and Bugzilla routes a bare all-number query to an exact id lookup (bug_id + anyexact) — on that path the note drops the content-matching claim — and a query naming more distinct ids than MAX_ASSESS_IDS steers to batched bug_info calls (the cap is already public in the too_many_ids refusal text) instead of straight into that refusal | **limit/offset address the bugs the client may SEE, not upstream rows** (Guard::quicksearch_window): filtering an already-paginated page left a hole exactly where a hidden bug sat — a short page the next offset contradicted — and since quicksearch matches summary text that hole was a probe for the hidden title, one word at a time. The guard now scans upstream from row 0 in 200-row chunks, classifies each, and fills the window from the survivors; rows are deduped on the server-reported id (relevance order is not stable between calls) and an id-less row is dropped (I4). Bounds: MAX_SEARCH_WINDOW=1000 addressable, 2000 rows scanned (<=10 sequential requests); hitting either truncates, which looks exactly like the end of results. The objects returned are the ones classified. The scan target is quantised to whole chunks so the stopping point does not track the client's `limit`; without that, `limit` could be binary-searched against the clock to recover each block's exact hidden count. Residual, accepted: filling a window of VISIBLE bugs needs more rows when bugs are hidden, so a stopwatch still learns one bit per scanned block ("not entirely visible"). Removing that would mean scanning the worst case on every search, or letting pages go short again. Search failure returns a bare "Search failed"; the upstream text is logged server-side only (it can name a bug and say whether it exists) |
-| create_bug | product, component, summary, version, description = "", severity?, priority?, op_sys?, platform?, keywords?: Vec<String>, groups?: Vec<String> | create (write), judged on the bug AS REQUESTED (Guard::may_create) | there is no bug id to assess, so the request itself is classified BEFORE any upstream call (I8): the rules that hide a product by name refuse filing into it, a field the request omits fails closed (I4), and a client-claimed `groups` list is never trusted — Bugzilla unions the product's mandatory groups in server-side, so may_create forces groups to unknown, which means a policy whose applicable rules consult groups/group_restricted refuses ALL creation. **Both refusals are one refusal**: a policy refusal and an upstream failure return the same fixed create_denial text after the same single upstream request — the refused path burns one classify call against bug id 0 (never a valid id, creates nothing; download_attachment's padding precedent) instead of the POST. Two texts, or 0 vs 1 requests, would be a free policy-enumeration oracle: send a guaranteed-invalid `version` plus a probe product and read the policy off which refusal (or which latency) comes back, with nothing created. Residual, accepted: a SUCCESSFUL create still confirms the product is allowed — that is the tool doing its job, and it costs a real, attributable bug; and the padding equalizes request count, not the upstream handler's exact latency (GET classify vs rejected POST). Bugzilla's failure message is logged server-side only (it can say whether a product/component exists) |
+| create_bug | product, component, summary, version, description = "", severity?, priority?, op_sys?, platform?, keywords?: Vec<String>, groups?: Vec<String> | create (write), judged on the bug AS REQUESTED (Guard::may_create) | there is no bug id to assess, so the request itself is classified BEFORE any upstream call (I8): the rules that hide a product by name refuse filing into it, a field the request omits fails closed (I4), and a client-claimed `groups` list is never trusted — Bugzilla unions the product's mandatory groups in server-side, so may_create forces groups to unknown, which means a group-consulting rule refuses every create request that REACHES it — creation is possible only where an earlier rule covering the create operation grants it (a rule carrying `operations = ["create"]`, placed ahead of the group-consulting rules, is how an operator permits filing without that grant shadowing reads of existing bugs — issue #26), and a policy with no such grant refuses all creation. **Both refusals are one refusal**: a policy refusal and an upstream failure return the same fixed create_denial text after the same single upstream request — the refused path burns one classify call against bug id 0 (never a valid id, creates nothing; download_attachment's padding precedent) instead of the POST. Two texts, or 0 vs 1 requests, would be a free policy-enumeration oracle: send a guaranteed-invalid `version` plus a probe product and read the policy off which refusal (or which latency) comes back, with nothing created. Residual, accepted: a SUCCESSFUL create still confirms the product is allowed — that is the tool doing its job, and it costs a real, attributable bug; and the padding equalizes request count, not the upstream handler's exact latency (GET classify vs rejected POST). Bugzilla's failure message is logged server-side only (it can say whether a product/component exists) |
 | add_attachment | bug_id, data (base64), file_name, summary, content_type, comment = "", is_private = false, is_patch = false | attach (write) on bug_id | guard assessment before the upload (I8), uniform denial (I2); then global.max_attachment_bytes caps the DECODED size of `data` (0 = no cap) — the ceiling the operator set on downloads binds uploads through the same server too, measured after base64 expansion is stripped so encoding overhead cannot shrink it. The refusal names neither the payload's size nor the cap value (max_attachment_bytes is not I1-disclosable, exactly as on the download path). `comment` travels as a PLAIN string — Bug.add_attachment documents it so; the `{"comment": {"body": ..}}` shape belongs to Bug.update only |
 | add_comment | bug_id, comment, is_private: bool = false | comment (write) | |
 | update_bug_status | bug_id, status, resolution?, comment: String = "" | status (write) | CLOSED requires resolution (error otherwise); when reopening (status not CLOSED/VERIFIED and no resolution given) set `"resolution": ""` |
@@ -562,7 +615,31 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   a group_restricted policy refuses all creation; a group rule ruled out by
   another criterion does not block), a creation_time claimed by the payload
   is ignored in favour of NOW, restrict must name "create", and the
-  create_denial text is fixed.
+  create_denial text is fixed; operation scoping — the issue-#26
+  reproduction fixed (a create-scoped restrict rule ahead of a
+  group-restricted deny rule under an allowing default: existing
+  non-restricted bugs in matched products fall through to a full grant,
+  group-restricted bugs stay denied, may_create succeeds for the matched
+  product and still fails closed elsewhere, and a preceding name-deny rule
+  still refuses creation), a create-scoped rule is skipped BEFORE its
+  matcher runs so it never denies access classification through the
+  Unknown fail-closed path while the same rule without `operations` still
+  does (I4 unchanged), an access-scoped rule is invisible to may_create,
+  the global age gate is not operation-scoped, read_only strips a
+  create-scoped grant so may_create refuses (I9), the TOML spellings
+  "create"/"access" are pinned, a hand-constructed `operations` list that
+  is EMPTY (unreachable via from_toml_str) is pinned unscoped for both
+  operations — a deny rule carrying it still denies instead of being
+  skipped into an allowing default — and validation rejects
+  `operations = []`, unknown operation names, a restrict rule scoped to
+  only `create` whose capabilities are not exactly `create`, and a
+  restrict rule scoped away from `create` that grants `create`; the
+  shipped examples/policy.toml is pinned end to end against its own
+  header: it parses, accepts filing into the desktop products, refuses an
+  embargo-marked title everywhere, refuses filing elsewhere (omitted and
+  claimed group lists alike), keeps existing world-readable desktop bugs
+  fully readable (the issue-#26 regression surface), and keeps
+  group-restricted desktop bugs denied.
 - Unit tests (#[cfg(test)] in crates/bugwarden/src/server.rs): assemble_bug_info
   re-classification — a body embargoed after the verdict is refused, a body
   that now earns only summary is downgraded, a body granting neither read nor
@@ -594,7 +671,10 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   upstream request (nothing POSTed on the refused path, which instead burns
   a classify call against bug id 0); a claimed `groups` list never defeats
   a group deny rule and a group_restricted policy refuses all creation;
-  an allowed create reaches POST /rest/bug; add_attachment refuses on a
+  an allowed create reaches POST /rest/bug; a create-scoped rule placed
+  ahead of a group-restricted deny rule both files into its products (the
+  POST is reached) and leaves existing bugs in them searchable
+  (issue #26); add_attachment refuses on a
   grant carrying `attachments` (read) without `attach` (write) and uploads
   on `attach`; the upload size cap refuses before anything is POSTed; and
   the attachment `comment` travels as a plain string (Bug.add_attachment
