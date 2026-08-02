@@ -96,7 +96,40 @@ is `bug_url`, which computes a URL string locally and contacts nothing.
 - **`update_bug_fields` custom fields are restricted** to `cf_*` keys as
   described above.
 
-## Installation / build
+## Installation
+
+### openSUSE (zypper)
+
+bugwarden is packaged in openSUSE Tumbleweed:
+
+```bash
+sudo zypper install bugwarden
+```
+
+For other openSUSE distributions (Leap 16.x, Slowroll), packages are built in
+the [`devel:tools`](https://build.opensuse.org/package/show/devel:tools/bugwarden)
+project on the openSUSE Build Service.
+
+The package installs worked-example configuration files —
+`/etc/bugwarden/policy.toml` (guard policy) and `/etc/bugwarden/audit.toml`
+(audit stream) — marked `%config(noreplace)`, so local edits survive package
+upgrades. Neither is loaded implicitly: the server reads a policy only when
+one is named via `--policy` / `BUGWARDEN_POLICY`, and an audit configuration
+only via `--audit-config` / `BUGWARDEN_AUDIT_CONFIG`, so installing the
+package does not by itself activate anything.
+
+### crates.io (cargo)
+
+```bash
+cargo install bugwarden
+```
+
+This installs the `bugwarden` binary into `~/.cargo/bin`. Unlike the openSUSE
+package it ships no configuration files — copy
+[`examples/policy.toml`](examples/policy.toml) somewhere and name it via
+`--policy`.
+
+### From source
 
 ```bash
 git clone https://github.com/plusky/bugwarden
@@ -201,6 +234,7 @@ Command-line arguments take precedence over environment variables.
 | `--use-auth-header` | — | `false` | Authenticate to Bugzilla with `Authorization: Bearer <key>` instead of the `api_key` query parameter |
 | `--read-only` | `MCP_READ_ONLY` | `false` | Disable all write tools. Tighten-only: ORed with the policy's `global.read_only`; cannot re-enable writes a policy forbids |
 | `--policy <PATH>` | `BUGWARDEN_POLICY` | — | Path to the guard policy TOML. Without it, an allow-all policy applies (with private comments off) |
+| `--audit-config <PATH>` | `BUGWARDEN_AUDIT_CONFIG` | — | Path to the audit stream configuration TOML (worked example in [`examples/audit.toml`](examples/audit.toml)). Without it, no audit stream is written |
 
 ## Policy file reference
 
@@ -360,10 +394,6 @@ action.
 | `bugzilla_server_info` | Bugzilla version, extensions, timezone, time, parameters | none |
 | `quicksearch_syntax` | Bugzilla's quicksearch syntax documentation (HTML) | none |
 | `mcp_server_info` | bugwarden version, Bugzilla URL, transport, coarse policy summary | none |
-
-## Roadmap
-
-- **OBS / openSUSE packaging** for installation via zypper.
 
 ## License
 
