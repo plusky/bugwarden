@@ -453,7 +453,12 @@ impl Guard {
 
     /// The bug id a `see_also` entry points at, when it points at THIS
     /// Bugzilla. Entries for other trackers are somebody else's to disclose.
-    fn see_also_local_id(entry: &str, base_url: &str) -> Option<u64> {
+    ///
+    /// Public because the write side needs the same parse the read side
+    /// uses: `update_bug_fields` must assess the local targets of
+    /// `see_also_add`/`see_also_remove` before writing the link (I8/I14),
+    /// exactly as the read paths scrub such links out of served bugs.
+    pub fn see_also_local_id(entry: &str, base_url: &str) -> Option<u64> {
         // Compare host-and-path only, case-insensitively: Bugzilla stores
         // see_also with the host as the user typed it, so scheme and case
         // vary freely for the same instance. An instance reachable under a

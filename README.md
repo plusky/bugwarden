@@ -372,7 +372,7 @@ implied.
 | `attachments` | read | listing attachment metadata and downloading attachment content |
 | `comment` | write | adding a comment |
 | `status` | write | changing status/resolution, marking duplicates |
-| `fields` | write | changing priority, severity, resolution, `cf_*` custom fields |
+| `fields` | write | changing priority, severity, resolution, summary, URL, whiteboard, version, target milestone, keywords, see-also links, `cf_*` custom fields |
 | `assign` | write | changing the assignee |
 | `cc` | write | modifying the CC list |
 | `deps` | write | changing blocks/depends_on |
@@ -397,7 +397,7 @@ action.
 | `add_comment` | Add a comment to a bug | `comment` |
 | `update_bug_status` | Change status/resolution (CLOSED requires a resolution) | `status` |
 | `assign_bug` | Set the assignee | `assign` |
-| `update_bug_fields` | Update priority/severity/resolution and `cf_*` custom fields | `fields` |
+| `update_bug_fields` | Update priority/severity/resolution, summary, URL, whiteboard, version, target milestone, keywords and see-also links (both add/remove, never replace-all), and `cf_*` custom fields | `fields` on the bug **and** at least `summary` on every see-also target on this instance |
 | `update_bug_dependencies` | Add/remove blocks and depends_on entries | `deps` |
 | `add_cc_to_bug` | Add an email to the CC list | `cc` |
 | `mark_as_duplicate` | Close a bug as DUPLICATE of another | `status` on the bug **and** at least `summary` on the duplicate target |

@@ -143,9 +143,10 @@ fn audit_refusal(tool: &str) -> CallToolResult {
 
 /// Keys of client-authored tool parameters whose VALUES may enter an audit
 /// record. The bar: identifiers, projections and routing/vocabulary fields
-/// yes; free text no. `comment`, `summary`, `description`, `data`
-/// (attachment bytes) and `custom_fields` (operator-defined values) never
-/// appear by value — a non-allowlisted key is recorded as
+/// yes; free text no. `comment`, `summary`, `description`, `url`,
+/// `whiteboard`, `data` (attachment bytes), `custom_fields`
+/// (operator-defined values) and the `see_also_add`/`see_also_remove` URL
+/// lists never appear by value — a non-allowlisted key is recorded as
 /// `{"_len": <serialized byte length>}`, so presence and size are loggable
 /// while content is not. Allowlisted string values are truncated to 1024
 /// characters.
@@ -170,6 +171,8 @@ const PARAM_ALLOWLIST: &[&str] = &[
     "is_patch",
     "is_private",
     "keywords",
+    "keywords_add",
+    "keywords_remove",
     "limit",
     "new_since",
     "offset",
@@ -181,6 +184,7 @@ const PARAM_ALLOWLIST: &[&str] = &[
     "resolution",
     "severity",
     "status",
+    "target_milestone",
     "version",
 ];
 
@@ -444,6 +448,36 @@ fn dep_change(add: Option<&Vec<u64>>, remove: Option<&Vec<u64>>) -> Option<Value
     }
 }
 
+/// [`dep_change`] for string lists (`keywords`, `see_also`): build an
+/// `{"add": [..], "remove": [..]}` change object; `None` when there is no
+/// change. Empty strings are dropped like the scalar params drop them, and
+/// a side that is absent, empty, or becomes empty is omitted. The
+/// replace-all `set` variant is never produced — a stale view of the list
+/// would silently wipe entries added since it was read.
+fn list_change(add: Option<&Vec<String>>, remove: Option<&Vec<String>>) -> Option<Value> {
+    fn clean(list: Option<&Vec<String>>) -> Vec<&str> {
+        list.into_iter()
+            .flatten()
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+    let mut obj = serde_json::Map::new();
+    let add = clean(add);
+    if !add.is_empty() {
+        obj.insert("add".to_string(), json!(add));
+    }
+    let remove = clean(remove);
+    if !remove.is_empty() {
+        obj.insert("remove".to_string(), json!(remove));
+    }
+    if obj.is_empty() {
+        None
+    } else {
+        Some(Value::Object(obj))
+    }
+}
+
 /// Decoded byte length of a base64 payload, counting the `=` padding out.
 ///
 /// Used to re-check an attachment against the size cap without decoding the
@@ -670,6 +704,34 @@ pub struct UpdateBugFieldsParams {
     /// closed bugs.
     #[serde(default)]
     pub resolution: Option<String>,
+    /// New one-line summary (retitles the bug).
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// URL the bug relates to (the bug's "URL" field).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Status whiteboard text.
+    #[serde(default)]
+    pub whiteboard: Option<String>,
+    /// Version of the product the bug is against (instance-specific
+    /// vocabulary).
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Target milestone (instance-specific vocabulary).
+    #[serde(default)]
+    pub target_milestone: Option<String>,
+    /// Keywords to add.
+    #[serde(default)]
+    pub keywords_add: Option<Vec<String>>,
+    /// Keywords to remove.
+    #[serde(default)]
+    pub keywords_remove: Option<Vec<String>>,
+    /// See Also entries to add; each value is a bug URL.
+    #[serde(default)]
+    pub see_also_add: Option<Vec<String>>,
+    /// See Also entries to remove; each value is a bug URL.
+    #[serde(default)]
+    pub see_also_remove: Option<Vec<String>>,
     /// Custom fields, e.g. {"cf_fixed_in": "1.2.3"}. Keys must start with
     /// 'cf_'.
     #[serde(default)]
@@ -1598,7 +1660,7 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Update various bug fields. All fields are optional, but at least one must be specified. Custom field names must start with 'cf_' (e.g. {\"cf_fixed_in\": \"1.2.3\"}).",
+        description = "Update bug fields: priority, severity, resolution, summary, url, whiteboard, version, target_milestone, keywords (add/remove), see_also (add/remove; values are bug URLs), and custom 'cf_*' fields. All fields are optional, but at least one must be specified. Empty strings and empty lists are ignored; clearing a field is not supported. Custom field names must start with 'cf_' (e.g. {\"cf_fixed_in\": \"1.2.3\"}).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1611,24 +1673,49 @@ impl BugWarden {
         Parameters(p): Parameters<UpdateBugFieldsParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        // priority/severity/resolution are benign instance vocabulary and
+        // stay value-logged; every other param is logged as presence or
+        // count only — summaries, whiteboards and URLs can carry embargoed
+        // content, and the server log must not become a content sink (the
+        // audit stream's boundary rule, applied to tracing).
         tracing::info!(
             bug_id = p.bug_id,
             priority = ?p.priority,
             severity = ?p.severity,
             resolution = ?p.resolution,
+            summary = p.summary.is_some(),
+            url = p.url.is_some(),
+            whiteboard = p.whiteboard.is_some(),
+            version = p.version.is_some(),
+            target_milestone = p.target_milestone.is_some(),
+            keywords_add = p.keywords_add.as_ref().map_or(0, Vec::len),
+            keywords_remove = p.keywords_remove.as_ref().map_or(0, Vec::len),
+            see_also_add = p.see_also_add.as_ref().map_or(0, Vec::len),
+            see_also_remove = p.see_also_remove.as_ref().map_or(0, Vec::len),
             custom_field_count = p.custom_fields.as_ref().map_or(0, |cf| cf.len()),
             "tool: update_bug_fields"
         );
 
         let mut payload = serde_json::Map::new();
-        if let Some(priority) = p.priority.as_deref().filter(|s| !s.is_empty()) {
-            payload.insert("priority".to_string(), json!(priority));
+        for (field, value) in [
+            ("priority", &p.priority),
+            ("severity", &p.severity),
+            ("resolution", &p.resolution),
+            ("summary", &p.summary),
+            ("url", &p.url),
+            ("whiteboard", &p.whiteboard),
+            ("version", &p.version),
+            ("target_milestone", &p.target_milestone),
+        ] {
+            if let Some(v) = value.as_deref().filter(|s| !s.is_empty()) {
+                payload.insert(field.to_string(), json!(v));
+            }
         }
-        if let Some(severity) = p.severity.as_deref().filter(|s| !s.is_empty()) {
-            payload.insert("severity".to_string(), json!(severity));
+        if let Some(keywords) = list_change(p.keywords_add.as_ref(), p.keywords_remove.as_ref()) {
+            payload.insert("keywords".to_string(), keywords);
         }
-        if let Some(resolution) = p.resolution.as_deref().filter(|s| !s.is_empty()) {
-            payload.insert("resolution".to_string(), json!(resolution));
+        if let Some(see_also) = list_change(p.see_also_add.as_ref(), p.see_also_remove.as_ref()) {
+            payload.insert("see_also".to_string(), see_also);
         }
         if let Some(custom_fields) = &p.custom_fields {
             // I7: only cf_* keys may pass through the generic updater. Error
@@ -1651,14 +1738,63 @@ impl BugWarden {
         }
         attach_comment(&mut payload, &p.comment);
 
+        // I8/I14: a see_also entry that points at THIS Bugzilla is a bug-id
+        // link, so writing one is judged like the other link-writing paths
+        // (update_bug_dependencies, mark_as_duplicate/I11): the bug being
+        // updated needs `fields`, and every LOCAL see_also target must allow
+        // at least `summary` before the PUT. Without this, a see_also change
+        // would write links into policy-denied bugs — Bugzilla records the
+        // reciprocal entry on the target — and leak their existence through
+        // the difference between its success and "does not exist" responses
+        // (I2). Entries for other trackers carry no local bug id and are
+        // somebody else's to disclose; they pass through unassessed.
+        let base_url = self.bz.base_url();
+        let mut ids: Vec<u64> = vec![p.bug_id];
+        for list in [&p.see_also_add, &p.see_also_remove].into_iter().flatten() {
+            ids.extend(
+                list.iter()
+                    .filter_map(|entry| Guard::see_also_local_id(entry, base_url)),
+            );
+        }
+        let mut seen = BTreeSet::new();
+        ids.retain(|id| seen.insert(*id));
+        if let Some(refusal) = too_many_ids(&ids) {
+            note_refused(&ctx);
+            return Ok(refusal);
+        }
+
         let key = self.api_key(&ctx)?;
         let caller = self.guard.resolve_caller(&self.bz, &key).await;
-        if let Some(denied) = self
-            .deny_unless(&key, p.bug_id, Capability::Fields, caller.as_deref(), &ctx)
-            .await
-        {
-            return Ok(denied);
+        let cell = audit_cell(&ctx);
+        let assessments = self.assess(&key, &ids, caller.as_deref()).await;
+        let note = |id: u64, verdict: Verdict| {
+            if let Some(cell) = &cell {
+                match assessments.get(&id) {
+                    Some((access, _)) => cell.note_verdict_rule(verdict, access_rule(access)),
+                    None => cell.note_verdict(verdict),
+                }
+            }
+        };
+        let fields_ok = assessments
+            .get(&p.bug_id)
+            .is_some_and(|(access, _)| access.allows(Capability::Fields));
+        if !fields_ok {
+            tracing::info!(bug_id = p.bug_id, "guard denied operation");
+            note(p.bug_id, Verdict::Denied);
+            return Ok(err_text(Guard::denial(p.bug_id)));
         }
+        for &id in ids.iter().filter(|&&id| id != p.bug_id) {
+            let target_ok = assessments
+                .get(&id)
+                .is_some_and(|(access, _)| access.allows(Capability::Summary));
+            if !target_ok {
+                tracing::info!(bug_id = id, "guard denied see_also target");
+                note(id, Verdict::Denied);
+                return Ok(err_text(Guard::denial(id)));
+            }
+        }
+        note(p.bug_id, Verdict::Served);
+
         match self
             .bz
             .update_bug(&key, p.bug_id, Value::Object(payload))

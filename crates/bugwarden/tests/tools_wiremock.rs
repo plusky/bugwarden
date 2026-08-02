@@ -12,6 +12,8 @@
 //!   add_attachment gate;
 //! - deleting the `may_create` call from create_bug;
 //! - deleting the upload size-cap call from add_attachment;
+//! - dropping the local see_also targets from update_bug_fields' assessed
+//!   id set (or lowering their Capability::Summary bar to nothing);
 //! - attaching the quicksearch id-list advisory only when the served `bugs`
 //!   array is non-empty;
 //! - suppressing the quicksearch id-list advisory when I14 link scrubbing
@@ -742,6 +744,296 @@ async fn add_attachment_comment_travels_as_a_plain_string() {
     let result = call(&client, "add_attachment", args).await;
     assert!(!is_error(&result), "result: {}", text_of(&result));
     assert!(text_of(&result).contains("55"));
+}
+
+// ---------- update_bug_fields: the widened field surface (issue #38) ----------
+
+/// Mount a successful `PUT /rest/bug/7` whose body must carry `body`,
+/// expected exactly once.
+async fn mount_update_put(mock: &MockServer, body: Value) {
+    Mock::given(method("PUT"))
+        .and(path("/rest/bug/7"))
+        .and(body_partial_json(body))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [{ "id": 7 }] })))
+        .expect(1)
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn update_fields_sends_see_also_add_and_remove() {
+    // see_also travels as the {"add": [..], "remove": [..]} object — the
+    // shape update_bug_dependencies already pinned for blocks/depends_on —
+    // with BOTH sides present when both were given, never a flat array.
+    // The entries name bugs on ANOTHER tracker (bugzilla.example.org, not
+    // this mock), so they are somebody else's to disclose and must NOT be
+    // guard-assessed: the classify mock for bug 7 is the only one mounted,
+    // and its expect(1) fails the test if a foreign URL draws a lookup.
+    let mock = MockServer::start().await;
+    mount_classify(&mock, world_readable_bug(7)).await;
+    mount_update_put(
+        &mock,
+        json!({
+            "see_also": {
+                "add": ["https://bugzilla.example.org/show_bug.cgi?id=101"],
+                "remove": ["https://bugzilla.example.org/show_bug.cgi?id=102"],
+            }
+        }),
+    )
+    .await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "update_bug_fields",
+        json!({
+            "bug_id": 7,
+            "see_also_add": ["https://bugzilla.example.org/show_bug.cgi?id=101"],
+            "see_also_remove": ["https://bugzilla.example.org/show_bug.cgi?id=102"],
+        }),
+    )
+    .await;
+    assert!(!is_error(&result), "result: {}", text_of(&result));
+}
+
+#[tokio::test]
+async fn update_fields_sends_keywords_as_add_remove_never_set() {
+    // The add/remove-vs-set distinction is the point: `set` replaces the
+    // WHOLE keyword list, so a stale view would silently wipe concurrent
+    // additions. The specific mock accepts only the add shape; the
+    // catch-all behind it answers any other PUT body (a `set`-shaped one
+    // included) and fails the test through its expect(0) when hit.
+    let mock = MockServer::start().await;
+    mount_classify(&mock, world_readable_bug(7)).await;
+    mount_update_put(&mock, json!({ "keywords": { "add": ["regression"] } })).await;
+    Mock::given(method("PUT"))
+        .and(path("/rest/bug/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [{ "id": 7 }] })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "update_bug_fields",
+        json!({ "bug_id": 7, "keywords_add": ["regression"] }),
+    )
+    .await;
+    assert!(!is_error(&result), "result: {}", text_of(&result));
+}
+
+#[tokio::test]
+async fn update_fields_sets_scalar_fields() {
+    // All five scalar fields land in one PUT body, and the optional
+    // comment still rides along in the Bug.update shape.
+    let mock = MockServer::start().await;
+    mount_classify(&mock, world_readable_bug(7)).await;
+    mount_update_put(
+        &mock,
+        json!({
+            "summary": "clearer title",
+            "url": "https://example.org/crash-report",
+            "whiteboard": "triaged",
+            "version": "15.6",
+            "target_milestone": "Beta1",
+            "comment": { "body": "retitled after triage" },
+        }),
+    )
+    .await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "update_bug_fields",
+        json!({
+            "bug_id": 7,
+            "summary": "clearer title",
+            "url": "https://example.org/crash-report",
+            "whiteboard": "triaged",
+            "version": "15.6",
+            "target_milestone": "Beta1",
+            "comment": "retitled after triage",
+        }),
+    )
+    .await;
+    assert!(!is_error(&result), "result: {}", text_of(&result));
+}
+
+#[tokio::test]
+async fn update_fields_ignores_empty_strings_and_empty_lists() {
+    // Empty values mean "not this field", exactly like the pre-existing
+    // params: the body must carry ONLY the real field. The trap mock is
+    // mounted first, so a body still carrying "summary" is routed to it
+    // and fails its expect(0); the emptied keyword list is checked against
+    // the recorded request body directly.
+    let mock = MockServer::start().await;
+    mount_classify(&mock, world_readable_bug(7)).await;
+    Mock::given(method("PUT"))
+        .and(path("/rest/bug/7"))
+        .and(body_partial_json(json!({ "summary": "" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [{ "id": 7 }] })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    mount_update_put(&mock, json!({ "priority": "P2" })).await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "update_bug_fields",
+        json!({ "bug_id": 7, "summary": "", "keywords_add": [], "priority": "P2" }),
+    )
+    .await;
+    assert!(!is_error(&result), "result: {}", text_of(&result));
+    let put_body: Value = mock
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .find(|r| r.method == wiremock::http::Method::PUT)
+        .map(|r| serde_json::from_slice(&r.body).expect("PUT body is JSON"))
+        .expect("one PUT reached the mock");
+    assert_eq!(
+        put_body,
+        json!({ "priority": "P2" }),
+        "empty strings and empty lists must not reach the wire"
+    );
+}
+
+#[tokio::test]
+async fn update_fields_new_fields_respect_the_guard() {
+    // A call touching only the newer fields still goes through deny_unless:
+    // a policy-denied bug takes the uniform denial (I2) and nothing is PUT.
+    let mock = MockServer::start().await;
+    let mut secret = world_readable_bug(7);
+    secret["product"] = json!("SecretSauce");
+    mount_classify(&mock, secret).await;
+    Mock::given(method("PUT"))
+        .and(path("/rest/bug/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [{ "id": 7 }] })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let client = client_for(
+        concat!(
+            "[[rule]]\nname = \"hide-secret\"\naction = \"deny\"\n",
+            "[rule.match]\nproducts = [\"Secret*\"]\n",
+        ),
+        &mock,
+    )
+    .await;
+    let result = call(
+        &client,
+        "update_bug_fields",
+        json!({ "bug_id": 7, "summary": "probe", "keywords_add": ["regression"] }),
+    )
+    .await;
+    assert!(is_error(&result));
+    assert_eq!(
+        text_of(&result),
+        "Bug 7 is not accessible through this server",
+        "a denied bug takes the uniform denial for new fields too (I2)"
+    );
+}
+
+#[tokio::test]
+async fn update_fields_see_also_targets_respect_the_guard() {
+    // A see_also entry naming a bug on THIS instance is a bug-id link, so
+    // its target takes the same Capability::Summary bar as dependency
+    // targets and duplicate_of (I8/I14): a policy-denied target draws the
+    // uniform denial (I2) and nothing is PUT. Otherwise the difference
+    // between Bugzilla's success and "does not exist" answers would
+    // enumerate every hidden id, and a successful PUT would even write the
+    // reciprocal see_also entry onto the denied bug itself.
+    let mock = MockServer::start().await;
+    mount_classify(&mock, world_readable_bug(7)).await;
+    let mut secret = world_readable_bug(999);
+    secret["product"] = json!("SecretSauce");
+    mount_classify(&mock, secret).await;
+    Mock::given(method("PUT"))
+        .and(path("/rest/bug/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [{ "id": 7 }] })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let client = client_for(
+        concat!(
+            "[[rule]]\nname = \"hide-secret\"\naction = \"deny\"\n",
+            "[rule.match]\nproducts = [\"Secret*\"]\n",
+        ),
+        &mock,
+    )
+    .await;
+    let result = call(
+        &client,
+        "update_bug_fields",
+        json!({
+            "bug_id": 7,
+            "see_also_add": [format!("{}/show_bug.cgi?id=999", mock.uri())],
+        }),
+    )
+    .await;
+    assert!(is_error(&result));
+    assert_eq!(
+        text_of(&result),
+        "Bug 999 is not accessible through this server",
+        "a policy-denied see_also target takes the uniform denial (I2), no PUT"
+    );
+}
+
+#[tokio::test]
+async fn update_fields_still_rejects_non_cf_custom_keys() {
+    // I7 unchanged by the widening: `see_also` has a named param now, and
+    // as a custom_fields key it still errors before Bugzilla is contacted —
+    // the named params did not open a smuggling path through the generic
+    // updater.
+    let mock = MockServer::start().await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "update_bug_fields",
+        json!({
+            "bug_id": 7,
+            "custom_fields": {
+                "see_also": ["https://bugzilla.example.org/show_bug.cgi?id=101"],
+            },
+        }),
+    )
+    .await;
+    assert!(is_error(&result));
+    assert_eq!(
+        text_of(&result),
+        "Invalid custom field 'see_also': custom field names must start with 'cf_'"
+    );
+    assert!(
+        mock.received_requests().await.unwrap().is_empty(),
+        "the cf_ gate must refuse before any upstream request (I7)"
+    );
+}
+
+#[tokio::test]
+async fn update_fields_all_empty_call_errors_without_calling_bugzilla() {
+    // Nothing but empty strings and empty lists is an empty call: the
+    // at-least-one-field check counts the new params AFTER the emptiness
+    // filtering, and refuses before anything upstream happens.
+    let mock = MockServer::start().await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "update_bug_fields",
+        json!({
+            "bug_id": 7,
+            "summary": "",
+            "url": "",
+            "whiteboard": "",
+            "keywords_add": [],
+            "see_also_remove": [],
+        }),
+    )
+    .await;
+    assert!(is_error(&result));
+    assert_eq!(text_of(&result), "At least one field must be specified");
+    assert!(
+        mock.received_requests().await.unwrap().is_empty(),
+        "an all-empty call must not contact Bugzilla"
+    );
 }
 
 /// Tool names a client sees when it lists the server's tools — a real

@@ -349,6 +349,22 @@ younger_than_days = 5
 #capabilities = ["summary", "comment"]
 #[rule.match]
 #products = ["Security*"]
+#
+# CAUTION — self-defeating grants: do not grant `fields` (or `status`) in a
+# restrict rule whose match criteria are fields those capabilities can
+# write. `fields` writes summary, whiteboard, keywords, severity and
+# priority; `status` writes the status. A rule matching on
+# summary_contains / whiteboard_contains / keywords / severities /
+# priorities (or statuses, for a `status` grant) while granting the
+# matching capability lets one write rewrite the very field the rule
+# matches on — nothing is cached, so the next call reclassifies the bug
+# past this rule to a later rule or default_action, opening everything the
+# rule withheld. Matching on product/component/groups/created_by_me/age is
+# safe: no capability this server grants can write those. (Deny rules are
+# not affected — a denied bug cannot be written at all. The flip side is
+# permanent: a write CAN add e.g. an embargo keyword and push a bug INTO a
+# deny rule, after which no client of this server — the writer included —
+# can see or revert it; only direct Bugzilla access can.)
 
 # Filing new bugs ("create") and uploading attachments ("attach") are
 # capabilities like any other. A create request has no bug id yet, so the

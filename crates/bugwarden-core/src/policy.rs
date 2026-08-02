@@ -77,7 +77,9 @@ pub enum Capability {
     Comment,
     /// Write: change status/resolution/mark as duplicate.
     Status,
-    /// Write: change priority/severity/resolution/custom `cf_*` fields.
+    /// Write: change priority/severity/resolution, summary, url,
+    /// whiteboard, version, target milestone, keywords, see_also links,
+    /// and custom `cf_*` fields.
     Fields,
     /// Write: change the assignee.
     Assign,

@@ -53,8 +53,10 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
   client IS shown: dependency/duplicate/see_also fields of a served bug,
   history changes naming other bugs, or Bugzilla's auto-generated duplicate
   marker comments. The bar is `Capability::Summary` — the same one the write
-  paths apply before CREATING such a link (I8/I11), since a link read out and
-  a link written in disclose the same fact. Candidate ids come from Bugzilla,
+  paths apply before CREATING such a link (I8/I11: dependency targets,
+  `duplicate_of`, and the local-instance targets of `update_bug_fields`'
+  `see_also_add`/`see_also_remove`), since a link read out and a link
+  written in disclose the same fact. Candidate ids come from Bugzilla,
   not the client, so they are assessed in ONE batched request (Guard::
   disclosable) rather than per id; a failed fetch scrubs everything (I4).
   Applies to bug_info, bugs_quicksearch (the client picks the projection, so
@@ -377,6 +379,7 @@ impl Guard {
     pub async fn disclosable(&self, bz: &BugzillaClient, key: &str,
         ids: &BTreeSet<u64>, caller: Option<&str>) -> BTreeSet<u64>;
     pub fn linked_bug_ids(bug: &Value, base_url: &str) -> BTreeSet<u64>;
+    pub fn see_also_local_id(entry: &str, base_url: &str) -> Option<u64>; // write side reuses the read side's parse
     pub fn scrub_bug_links(bug: &mut Value, base_url: &str, ok: &BTreeSet<u64>);
     pub fn history_bug_ids(history: &Value, base_url: &str) -> BTreeSet<u64>;
     pub fn scrub_history(history: Value, base_url: &str, ok: &BTreeSet<u64>) -> Value;
@@ -611,7 +614,7 @@ constraints the model must know.
 | add_comment | bug_id, comment, is_private: bool = false | comment (write) | |
 | update_bug_status | bug_id, status, resolution?, comment: String = "" | status (write) | CLOSED requires resolution (error otherwise); when reopening (status not CLOSED/VERIFIED and no resolution given) set `"resolution": ""` |
 | assign_bug | bug_id, assignee (email), comment = "" | assign (write) | payload `{"assigned_to": ..}` |
-| update_bug_fields | bug_id, priority?, severity?, resolution?, custom_fields?: JsonObject, comment = "" | fields (write) | at least one field required; custom_fields keys must start with `cf_` (I7) |
+| update_bug_fields | bug_id, priority?, severity?, resolution?, summary?, url?, whiteboard?, version?, target_milestone?, keywords_add?/keywords_remove?: Vec<String>, see_also_add?/see_also_remove?: Vec<String> (bug URLs), custom_fields?: JsonObject, comment = "" | fields (write) on bug_id + summary on every LOCAL see_also target (I8/I14) | at least one field required — the named params all count, so a call touching only the newer fields is valid, and a call carrying nothing but empty strings/lists still errors without contacting Bugzilla; empty strings and empty lists are ignored (clearing a field is unsupported); keywords and see_also travel as `{"add": [..], "remove": [..]}`, NEVER the replace-all `set` variant; a see_also entry that points at THIS instance is a bug-id link, so its target is assessed like a dependency target — at least `summary`, uniform denial (I2), no PUT on refusal — while entries for other trackers carry no local id and pass through unassessed; custom_fields keys must start with `cf_` (I7) — `see_also` and `keywords` are named params now, and as custom_fields keys they still error before Bugzilla is contacted; free-text values (summary/whiteboard/url) never enter the server log — only which fields a call touched (see "Update-field surface") |
 | update_bug_dependencies | bug_id, blocks_add?/blocks_remove?/depends_on_add?/depends_on_remove?: Vec<u64>, comment = "" | deps (write) | at least one change required; payload uses `{"blocks": {"add": [..], "remove": [..]}}` shape |
 | add_cc_to_bug | bug_id, cc_email | cc (write) | payload `{"cc": {"add": [email]}}` |
 | mark_as_duplicate | bug_id, duplicate_of, comment = "" | status on bug_id + summary on duplicate_of (I11) | default comment "Marking as duplicate of bug {duplicate_of}"; payload status CLOSED, resolution DUPLICATE, dupe_of |
@@ -622,6 +625,87 @@ constraints the model must know.
 | quicksearch_syntax | — | none | HTML doc page |
 | mcp_server_info | — | none | version (CARGO_PKG_VERSION), bugzilla server url, transport, and policy summary per I1 |
 | summarize_bug | id | comments | fetches comments (private filtered with include_private=false), returns the summarization prompt text (fixed prompt template) |
+
+### Update-field surface (issue #38)
+
+The full audit of Bugzilla's `PUT /rest/bug/<id>` parameter surface against
+the guard model. The split is deliberate and permanent record: every REST
+update parameter is either exposed through a named tool/param below or
+withheld for the stated reason — nothing is exposed by accident, and
+nothing may be smuggled through `custom_fields` (I7).
+
+Exposed:
+
+| REST param | tool / param | capability |
+|---|---|---|
+| `priority`, `severity`, `resolution`, `cf_*` | `update_bug_fields` | `fields` |
+| `summary` | `update_bug_fields.summary` | `fields` |
+| `url` | `update_bug_fields.url` | `fields` |
+| `whiteboard` | `update_bug_fields.whiteboard` | `fields` |
+| `version` | `update_bug_fields.version` (product-scoped vocabulary; Bugzilla validates the value) | `fields` |
+| `target_milestone` | `update_bug_fields.target_milestone` (product-scoped vocabulary; Bugzilla validates the value) | `fields` |
+| `keywords` (add/remove) | `update_bug_fields.keywords_add` / `keywords_remove` — parity with `create_bug`, which can already set them; the replace-all `set` variant stays withheld as a footgun | `fields` |
+| `see_also` (add/remove) | `update_bug_fields.see_also_add` / `see_also_remove` (bug URLs) | `fields`, plus at least `summary` on every target the URL resolves to on THIS instance (I8/I14 — the same bar as dependency targets; foreign-tracker entries are unassessed) |
+| `status` + `resolution` | `update_bug_status` | `status` |
+| `dupe_of` | `mark_as_duplicate` | `status` |
+| `assigned_to` | `assign_bug` | `assign` |
+| `cc.add` | `add_cc_to_bug` | `cc` |
+| `blocks` / `depends_on` (add/remove) | `update_bug_dependencies` | `deps` |
+| `comment` | `add_comment`, plus the optional comment on the write tools that take one (update_bug_status, assign_bug, update_bug_fields, update_bug_dependencies, mark_as_duplicate, add_attachment — add_cc_to_bug does not) | `comment` (write tools: their own capability) |
+
+Withheld, deliberately:
+
+| REST param | why |
+|---|---|
+| `product`, `component` | the reclassification levers: they change which guard rules match *and* which Bugzilla groups apply server-side. If ever exposed, that wants its own design (and probably its own capability) — a follow-up issue, not this surface. |
+| `groups` (add/remove) | directly edits the confidentiality boundary the guard exists to respect. |
+| `is_cc_accessible`, `is_creator_accessible`, `comment_is_private` | confidentiality toggles, same reasoning. |
+| `flags` | instance-specific approval workflows with high blast radius; own design if ever needed. |
+| `alias` | global namespace, niche. |
+| `deadline`, `estimated_time`, `remaining_time`, `work_time` | time tracking; no agent use case. |
+| `qa_contact`, `reset_qa_contact`, `reset_assigned_to` | not requested; assignee handling stays with `assign_bug`. |
+| `cc.remove` | not requested; CC handling stays additive via `add_cc_to_bug`. |
+| `op_sys`, `platform` | not requested; trivially addable under `fields` later. |
+| new-comment privacy (`comment.is_private` inside the `comment` object) | already handled (and pinned by tests) by `add_comment`'s `is_private` param; the privacy of EXISTING comments is the `comment_is_private` confidentiality toggle withheld above. |
+| `ids` (batch update) | one bug per call, so the guard verdict stays exactly per-bug. |
+| `keywords`/`see_also` `set` variant | replace-all from a possibly stale view silently wipes concurrent additions. |
+
+On policy relevance: `keywords`, `summary` and `whiteboard` are
+matcher-visible (rules can match on them), so writing them lets a caller
+move a bug along matcher axes. That is not a new property — `severity`,
+`priority` and `status` are matcher-visible and writable today. The bound,
+stated precisely: it takes a `fields` grant on the bug's *current*
+classification to touch it, so a write can never lift a bug out of a
+`deny` — a deny grants nothing, and a denied bug cannot be written at
+all. A `restrict` rule that grants `fields` is NOT bounded this way: if
+its match criteria include a field `fields` can write
+(`summary_contains`, `whiteboard_contains`, `keywords`, `severities`,
+`priorities` — or `statuses` under a `status` grant), the rule is
+self-defeating — one write rewrites the very field the rule matches on,
+classification is never cached, and on the next call the bug falls
+through to a later, more permissive rule or to `default_action`, opening
+the capabilities the rule withheld. Operators must not grant `fields` in
+a restrict rule whose match criteria are fields `fields` can write (the
+warning is restated at the restrict examples in `examples/policy.toml`).
+The opposite direction is reachable too, and one-way: a write CAN move a
+bug INTO a rule that denies it (adding an embargo keyword under the
+example policy, say), and because a denied bug is unwritable, that change
+cannot be reverted through this server — only an operator with direct
+Bugzilla access can undo it. Both directions are the price of `fields`
+under a policy whose rules key on writable fields; grant it accordingly.
+
+Semantics kept deliberately narrow: add/remove only, never replace-all;
+empty strings are ignored, as for the pre-existing params — clearing a
+field (e.g. blanking the whiteboard) stays unsupported until someone needs
+it; one bug per call. The free-text values (`summary`, `whiteboard`,
+`url`) never appear in the server log — only which fields a call touched
+(presence/counts in the tool-entry trace; the audit stream's params
+allowlist records them, and the see_also URL lists, as `_len`).
+`keywords_add`/`keywords_remove` and `target_milestone` are closed
+instance vocabulary — the same class as the already-allowlisted
+`keywords` and `version` — and are audit-recorded by value, so the
+keyword that hid a bug is recoverable from the audit stream no matter
+which tool wrote it.
 
 ## CLI (crates/bugwarden/src/config.rs)
 
@@ -809,7 +893,22 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   grant carrying `attachments` (read) without `attach` (write) and uploads
   on `attach`; the upload size cap refuses before anything is POSTed; the
   attachment `comment` travels as a plain string (Bug.add_attachment
-  API shape), pinned by a wiremock body matcher; and identity end to end —
+  API shape), pinned by a wiremock body matcher; the update-field surface
+  (issue #38) — see_also travels as the `{"add": [..], "remove": [..]}`
+  object with both sides present, keywords travel as add/remove and NEVER
+  as the replace-all `set` (a catch-all PUT mock fails the test if any
+  other body shape reaches Bugzilla), the five scalar fields
+  (summary/url/whiteboard/version/target_milestone) land in one PUT body
+  together with the attached comment, empty strings and empty lists are
+  ignored (an expect(0) trap mock proves the ignored field never reaches
+  the wire), a new-fields-only call against a policy-denied bug takes the
+  uniform denial with zero PUTs, a see_also entry naming a policy-denied
+  bug on THIS instance draws that bug's uniform denial with zero PUTs
+  (I8/I14) while foreign-tracker entries are never assessed (the bug-7-only
+  classify mock's expect(1) proves it), `see_also` inside `custom_fields` still
+  errors on the `cf_` gate (I7) with zero upstream requests, and an
+  all-empty call errors "At least one field must be specified" without
+  contacting Bugzilla; and identity end to end —
   issue #33's exact scenario (a my-own-reports restrict rule above a
   group_restricted deny: with whoami answering the caller, a
   group-restricted bug the caller authored is readable through bug_info
