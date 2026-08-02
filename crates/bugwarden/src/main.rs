@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use bugwarden::audit::{
     policy_hash_of, AuditConfig, AuditSink, AuditState, FailMode, TransportKind,
 };
@@ -50,31 +50,18 @@ async fn main() -> anyhow::Result<()> {
     // CLI/env can only tighten policy (I9).
     policy.global.read_only |= cli.read_only;
 
-    match cli.transport {
-        Transport::Stdio => {
-            if cli.api_key.as_deref().is_none_or(str::is_empty) {
-                bail!(
-                    "--transport stdio requires --api-key or the BUGZILLA_API_KEY environment variable"
-                );
-            }
-        }
-        Transport::Http => {
-            if cli.api_key.is_some() {
-                tracing::warn!(
-                    "--api-key / BUGZILLA_API_KEY is set but ignored with --transport http \
-                     (clients send the key per-request via the API key header). \
-                     Unset it to clean the config."
-                );
-            }
-        }
-    }
-
+    // API key custody (stdio-without-key bail, http --api-key warn, key
+    // file handling) is resolved inside BugWarden::new — before the audit
+    // sink below, so a key misconfiguration aborts startup without first
+    // creating or rotating an audit file.
     let bz = Arc::new(
         BugzillaClient::new(&cli.bugzilla_server, cli.use_auth_header)
             .context("failed to build Bugzilla client")?,
     );
     let guard = Arc::new(Guard { policy });
     let cfg = Arc::new(cli);
+    let server =
+        server::BugWarden::new(cfg.clone(), guard, bz).context("failed to build the MCP server")?;
 
     // Audit stream, when configured. The fail mode falls back to the
     // transport-derived default; the policy digest ties every record to
@@ -117,8 +104,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let server = server::BugWarden::new(cfg.clone(), guard, bz)
-        .context("failed to build the MCP server from the guard policy")?;
     let server = match audit {
         Some(audit) => server.with_audit(audit),
         None => server,

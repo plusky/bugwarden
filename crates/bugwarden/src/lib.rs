@@ -12,3 +12,6 @@
 pub mod audit;
 pub mod config;
 pub mod server;
+
+#[cfg(test)]
+mod testlog;

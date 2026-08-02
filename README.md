@@ -39,8 +39,9 @@ touched or data is returned.
   (the ones most likely to contain not-yet-triaged sensitive data) invisible.
 - **Read-only mode and tool disabling** remove write tools from the MCP tool
   listing entirely — clients never see them, rather than seeing them error.
-- **Two transports**: streamable HTTP (per-request API key header, suitable for
-  shared deployments) and stdio (subprocess launch by a desktop MCP client).
+- **Two transports**: streamable HTTP (per-request API key header, or a
+  server-held key via `--api-key-file` for fleet deployments) and stdio
+  (subprocess launch by a desktop MCP client).
 - Single static binary, async throughout (tokio + [rmcp](https://crates.io/crates/rmcp)).
 
 ## Security model
@@ -187,12 +188,44 @@ instances that reject the `api_key` query parameter and require
 this affects only server-to-Bugzilla authentication, not the client-facing
 header.
 
+#### Server-held key mode (fleet deployments)
+
+With `--api-key-file` the Bugzilla API key belongs to the *server*: every
+request is served with the key read from that file, clients present no
+credential at all, and the per-request header is not consulted — a request
+that does carry one is served with the server's key, and the header value is
+never read. There is **no fallback between the two modes in either
+direction** (handing clients the real key would let them bypass the guard by
+talking to Bugzilla directly). This fits deployments where the key is
+provisioned as a container secret or a systemd credential
+(`LoadCredential=bugzilla-key:/etc/bugwarden/bugzilla-key` plus
+`--api-key-file ${CREDENTIALS_DIRECTORY}/bugzilla-key`):
+
+```bash
+bugwarden \
+  --bugzilla-server https://bugzilla.opensuse.org \
+  --policy /etc/bugwarden/policy.toml \
+  --api-key-file /run/secrets/bugzilla-key \
+  --host 127.0.0.1 --port 8000
+```
+
+The file's content is trimmed, so a trailing newline is fine; an empty or
+unreadable file is a startup error naming the path (never its contents). The
+file is read exactly once, at startup — rotating the key requires a restart.
+Keep it mode 0600: bugwarden warns when group or others can access it.
+
+One policy consequence to know: in this mode every client authenticates to
+Bugzilla — and resolves identity — as the service account that owns the key,
+so a policy rule matching on `created_by_me` describes that one account's
+bug reports for *all* clients, not each caller's own. bugwarden warns at
+startup when server-held mode meets such a policy.
+
 ### stdio transport
 
 For MCP clients that launch the server as a subprocess and speak over
 stdin/stdout. There are no per-request HTTP headers here, so the API key must
-be provided up front via `--api-key` or `BUGZILLA_API_KEY` (starting without
-one is an error):
+be provided up front via `--api-key` / `BUGZILLA_API_KEY` or `--api-key-file`
+(starting without one is an error):
 
 ```bash
 BUGZILLA_API_KEY=your_api_key \
@@ -233,7 +266,8 @@ Command-line arguments take precedence over environment variables.
 | `--host <ADDRESS>` | `MCP_HOST` | `127.0.0.1` | Listen address (http transport only) |
 | `--port <PORT>` | `MCP_PORT` | `8000` | Listen port (http transport only) |
 | `--api-key-header <NAME>` | `MCP_API_KEY_HEADER` | `ApiKey` | HTTP header name in which clients send the Bugzilla API key (http transport only) |
-| `--api-key <KEY>` | `BUGZILLA_API_KEY` | — | Bugzilla API key. **Required** for `--transport stdio`; with `http` it is ignored with a warning (clients send the key per request) |
+| `--api-key <KEY>` | `BUGZILLA_API_KEY` | — | Bugzilla API key. **Required** for `--transport stdio` unless `--api-key-file` provides it; with `http` it is ignored with a warning (clients send the key per request — use `--api-key-file` for a server-held key) |
+| `--api-key-file <PATH>` | `BUGZILLA_API_KEY_FILE` | — | Path to a file holding the Bugzilla API key (container secret, systemd `LoadCredential` path). Mutually exclusive with `--api-key`; an empty value counts as unset. Over `http` this selects server-held key mode: every request is served with this key and the per-request header is not consulted |
 | `--use-auth-header` | — | `false` | Authenticate to Bugzilla with `Authorization: Bearer <key>` instead of the `api_key` query parameter |
 | `--read-only` | `MCP_READ_ONLY` | `false` | Disable all write tools. Tighten-only: ORed with the policy's `global.read_only`; cannot re-enable writes a policy forbids |
 | `--policy <PATH>` | `BUGWARDEN_POLICY` | — | Path to the guard policy TOML. Without it, an allow-all policy applies (with private comments off) |

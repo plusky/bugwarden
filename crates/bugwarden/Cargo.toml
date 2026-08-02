@@ -42,9 +42,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-# The integration tests drive the tools through a real MCP session over an
-# in-memory duplex transport, so the client half of rmcp is needed here.
-rmcp = { version = "2.2", features = ["client"] }
+# The integration tests drive the tools through a real MCP session — over an
+# in-memory duplex transport (tools_wiremock) and over real streamable HTTP
+# (http_transport_wiremock) — so the client half of rmcp is needed here. The
+# rmcp `reqwest` feature selects rustls, matching the rustls-only workspace.
+rmcp = { version = "2.2", features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util"] }
 wiremock = "0.6"

@@ -39,7 +39,7 @@ const CREATE_DENIAL: &str = "Filing this bug is not permitted through this serve
 /// Serve a [`BugWarden`] built from `policy` against `mock`, and connect an
 /// MCP client to it over an in-memory duplex transport.
 async fn client_for(policy: &str, mock: &MockServer) -> RunningService<RoleClient, ()> {
-    let cfg = Arc::new(Cli::parse_from([
+    let mut cli = Cli::parse_from([
         "bugwarden",
         "--bugzilla-server",
         &mock.uri(),
@@ -47,7 +47,11 @@ async fn client_for(policy: &str, mock: &MockServer) -> RunningService<RoleClien
         "stdio",
         "--api-key",
         "test-key",
-    ]));
+    ]);
+    // The ambient environment (BUGZILLA_API_KEY_FILE) must not leak into
+    // what these tests resolve.
+    cli.api_key_file = None;
+    let cfg = Arc::new(cli);
     let guard = Arc::new(Guard {
         policy: Policy::from_toml_str(policy).expect("test policy must parse"),
     });
@@ -1146,7 +1150,7 @@ async fn whoami_transport_error_does_not_leak_the_api_key_i12() {
     let addr = listener.local_addr().expect("addr");
     drop(listener); // free the port so every connection is refused
 
-    let cfg = Arc::new(Cli::parse_from([
+    let mut cli = Cli::parse_from([
         "bugwarden",
         "--bugzilla-server",
         &format!("http://{addr}"),
@@ -1154,7 +1158,9 @@ async fn whoami_transport_error_does_not_leak_the_api_key_i12() {
         "stdio",
         "--api-key",
         "SUPERSECRETKEY123",
-    ]));
+    ]);
+    cli.api_key_file = None; // the ambient environment must not leak in
+    let cfg = Arc::new(cli);
     let guard = Arc::new(Guard {
         policy: Policy::from_toml_str(IDENTITY_POLICY).expect("test policy must parse"),
     });

@@ -24,7 +24,7 @@ use rmcp::{
 use serde_json::{json, Value};
 
 use crate::audit::{self, AuditCell, AuditState, FailMode, TransportKind, Verdict};
-use crate::config::{Cli, Transport};
+use crate::config::{Cli, KeyCustody, Transport};
 
 /// Names of the tools that modify bug state. These routes are removed from
 /// the router in read-only mode (I13).
@@ -758,6 +758,10 @@ pub struct BugWarden {
     guard: Arc<Guard>,
     bz: Arc<BugzillaClient>,
     tool_router: ToolRouter<Self>,
+    /// Who holds the Bugzilla API key — resolved exactly once, at
+    /// construction. In `Server` custody the running server owns the key
+    /// `String`; it is never re-read from disk per request.
+    key_custody: KeyCustody,
     /// Audit wiring; `None` runs the exact pre-audit request path.
     audit: Option<Arc<AuditState>>,
 }
@@ -770,7 +774,28 @@ impl BugWarden {
     /// would otherwise leave the tool exposed while the operator believes it
     /// disabled — the policy format's "typos are hard startup errors, never
     /// silent fail-open" rule applies here too.
+    ///
+    /// Also resolves API key custody ([`Cli::resolve_key_custody`]) — here,
+    /// on every construction path, so a missing or unreadable key fails at
+    /// startup rather than at the first request.
     pub fn new(cfg: Arc<Cli>, guard: Arc<Guard>, bz: Arc<BugzillaClient>) -> anyhow::Result<Self> {
+        let key_custody = cfg.resolve_key_custody()?;
+        // Identity collapses under server-held http custody: every client
+        // authenticates — and therefore whoamis — as the server's service
+        // account. A policy written for per-request custody, where
+        // `created_by_me` meant each caller's own reports, silently changes
+        // meaning, so say it out loud at startup.
+        if cfg.transport == Transport::Http
+            && matches!(key_custody, KeyCustody::Server(_))
+            && guard.policy.needs_identity()
+        {
+            tracing::warn!(
+                "the policy consults created_by_me, but in server-held key mode every \
+                 client resolves to the service account that owns the key: \
+                 created_by_me describes that one account's bug reports for ALL \
+                 clients, never an individual caller's"
+            );
+        }
         let mut tool_router = Self::tool_router();
         // Validate disabled_tools against the FULL router, before any route
         // removal: a write-tool name stays a valid entry even when read-only
@@ -804,6 +829,7 @@ impl BugWarden {
             guard,
             bz,
             tool_router,
+            key_custody,
             audit: None,
         })
     }
@@ -853,24 +879,16 @@ impl BugWarden {
 
     /// Resolve the Bugzilla API key for the current request.
     ///
-    /// stdio: from the startup configuration. http: from the configured
-    /// (lowercased) header of the underlying HTTP request. A missing key is a
+    /// Server custody (stdio, or http server-held mode): the key resolved at
+    /// startup — the per-request header is never consulted, so a request that
+    /// carries one is served with the server's key and the header value is
+    /// never read. Per-request custody (http): from the configured
+    /// (lowercased) header of the underlying HTTP request; a missing key is a
     /// protocol error (`McpError::invalid_request`), not a tool error.
     fn api_key(&self, ctx: &RequestContext<RoleServer>) -> Result<String, McpError> {
-        match self.cfg.transport {
-            Transport::Stdio => self
-                .cfg
-                .api_key
-                .as_deref()
-                .filter(|k| !k.is_empty())
-                .map(str::to_owned)
-                .ok_or_else(|| {
-                    McpError::invalid_request(
-                        "stdio transport requires --api-key or BUGZILLA_API_KEY env var",
-                        None,
-                    )
-                }),
-            Transport::Http => {
+        match &self.key_custody {
+            KeyCustody::Server(key) => Ok(key.clone()),
+            KeyCustody::PerRequest => {
                 let header_name = self.cfg.api_key_header.to_lowercase();
                 ctx.extensions
                     .get::<axum::http::request::Parts>()
@@ -2747,7 +2765,7 @@ mod tests {
 
     fn parts(policy: &str) -> (Arc<Cli>, Arc<Guard>, Arc<BugzillaClient>) {
         use clap::Parser as _;
-        let cfg = Arc::new(Cli::parse_from([
+        let mut cli = Cli::parse_from([
             "bugwarden",
             "--bugzilla-server",
             "https://bugzilla.example.com",
@@ -2755,7 +2773,11 @@ mod tests {
             "stdio",
             "--api-key",
             "test-key",
-        ]));
+        ]);
+        // The ambient environment (BUGZILLA_API_KEY_FILE) must not leak into
+        // what these tests resolve.
+        cli.api_key_file = None;
+        let cfg = Arc::new(cli);
         let guard = Arc::new(Guard {
             policy: Policy::from_toml_str(policy).expect("test policy must parse"),
         });
@@ -2777,6 +2799,78 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("no_such_tool"), "unexpected error: {msg}");
         assert!(msg.contains("unknown tool"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn new_fails_at_construction_for_stdio_without_a_key() {
+        // Key custody is resolved by BugWarden::new on every construction
+        // path: stdio without any key source must fail at startup, never at
+        // the first request. main.rs no longer duplicates this bail.
+        use clap::Parser as _;
+        let mut cli = Cli::parse_from([
+            "bugwarden",
+            "--bugzilla-server",
+            "https://bugzilla.example.com",
+            "--transport",
+            "stdio",
+        ]);
+        // The ambient environment must not decide this test.
+        cli.api_key = None;
+        cli.api_key_file = None;
+        let guard = Arc::new(Guard {
+            policy: Policy::from_toml_str("").expect("empty policy parses"),
+        });
+        let bz = Arc::new(
+            BugzillaClient::new("https://bugzilla.example.com", false).expect("client must build"),
+        );
+        let err = match BugWarden::new(Arc::new(cli), guard, bz) {
+            Err(e) => e,
+            Ok(_) => panic!("stdio without a key must fail at construction"),
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--transport stdio requires"), "{msg}");
+    }
+
+    #[test]
+    fn server_held_custody_with_identity_policy_warns_at_startup() {
+        // Under server-held http custody every client whoamis as the service
+        // account that owns the key, so a created_by_me policy written for
+        // per-request custody silently changes meaning — construction must
+        // say so. A policy that never consults identity stays quiet.
+        use clap::Parser as _;
+        use std::io::Write as _;
+        let mut file = tempfile::NamedTempFile::new().expect("temp key file");
+        file.write_all(b"srv-key\n").expect("write key file");
+        let identity_policy = concat!(
+            "[[rule]]\nname = \"own-reports\"\naction = \"allow\"\n",
+            "[rule.match]\ncreated_by_me = true\n",
+        );
+        for (policy, expect_warn) in [(identity_policy, true), ("", false)] {
+            let mut cli = Cli::parse_from([
+                "bugwarden",
+                "--bugzilla-server",
+                "https://bugzilla.example.com",
+                "--transport",
+                "http",
+            ]);
+            cli.api_key = None;
+            cli.api_key_file = Some(file.path().to_path_buf());
+            let guard = Arc::new(Guard {
+                policy: Policy::from_toml_str(policy).expect("test policy must parse"),
+            });
+            let bz = Arc::new(
+                BugzillaClient::new("https://bugzilla.example.com", false)
+                    .expect("client must build"),
+            );
+            let (server, logs) =
+                crate::testlog::capture_logs(|| BugWarden::new(Arc::new(cli), guard, bz));
+            drop(server.expect("server must build"));
+            assert_eq!(
+                logs.contains("created_by_me describes that one account"),
+                expect_warn,
+                "startup logs: {logs}"
+            );
+        }
     }
 
     #[test]
@@ -3000,7 +3094,7 @@ mod tests {
         audit: Option<Arc<AuditState>>,
     ) -> RunningService<RoleClient, ()> {
         use clap::Parser as _;
-        let cfg = Arc::new(Cli::parse_from([
+        let mut cli = Cli::parse_from([
             "bugwarden",
             "--bugzilla-server",
             mock_uri,
@@ -3008,7 +3102,10 @@ mod tests {
             "stdio",
             "--api-key",
             "test-key",
-        ]));
+        ]);
+        // The ambient environment (BUGZILLA_API_KEY_FILE) must not leak in.
+        cli.api_key_file = None;
+        let cfg = Arc::new(cli);
         let guard = Arc::new(Guard {
             policy: Policy::from_toml_str(policy).expect("test policy must parse"),
         });

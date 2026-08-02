@@ -542,7 +542,12 @@ where every other criterion describes bug content. Decisions, all deliberate:
   call (I12). It is compared case-insensitively (`to_lowercase`, the same
   normalization the glob matcher applies) against the bug's `creator`
   field, which joined `CLASSIFY_FIELDS` for this purpose. A non-string
-  `creator` leaves the relationship unknown.
+  `creator` leaves the relationship unknown. "The requesting account" is
+  whatever key custody says authenticates: per-request http custody gives
+  each caller their own identity, while `Server` custody (stdio, or http
+  server-held mode — see "Key custody") resolves EVERY caller to the one
+  account that owns the server's key; under server-held http custody the
+  collapse is warned about at startup.
 - **Laziness.** `Policy::needs_identity()` = some rule whose `operations`
   cover `Operation::Access` carries a `created_by_me` criterion. When it is
   false, `Guard::resolve_caller` returns `None` without any HTTP request —
@@ -595,7 +600,60 @@ Result convention: success => `CallToolResult::success` with ONE text block of
 pretty-printed JSON. The sole exception is `download_attachment`, which
 returns a JSON summary text block PLUS one image or blob-resource block. Guard refusals and input-validation failures =>
 `CallToolResult::error` with a text block (NOT a protocol error). Protocol
-issues (missing API key header) => `McpError::invalid_request`.
+issues (missing API key header in per-request custody) =>
+`McpError::invalid_request`.
+
+### Key custody
+
+Who authenticates to Bugzilla is resolved exactly ONCE, at startup
+(`Cli::resolve_key_custody` => `KeyCustody`, stored on the server; called
+inside `BugWarden::new` so EVERY construction path fails at startup, never
+at first request). The whole table:
+
+| transport | `--api-key` | `--api-key-file` | custody |
+|---|---|---|---|
+| any | set | set | startup error — mutually exclusive, names both flags |
+| stdio | set | — | `Server(key)` |
+| stdio | — | set | `Server(key from file)` |
+| stdio | — | — | startup error |
+| http | — | set | `Server(key from file)` — server-held mode |
+| http | set | — | `tracing::warn` + ignored => `PerRequest` |
+| http | — | — | `PerRequest` |
+
+An empty `--api-key` counts as absent; so does an empty `--api-key-file`
+path (`BUGZILLA_API_KEY_FILE=` is the set-but-empty "unset" idiom of systemd
+units and container specs). Decisions, all deliberate:
+
+- **`Server` custody** (stdio, or http server-held mode): the running
+  server owns the one key `String`; every request is served with it and the
+  per-request key header is NEVER consulted — a request that carries one is
+  SERVED (with the server's key), not rejected, and the header value is
+  never read. The key file is read once at startup; rotation requires a
+  restart (no per-request re-read, no SIGHUP reload).
+- **Identity collapses under server-held http custody.** Every client
+  authenticates — and therefore resolves identity — as the service account
+  that owns the key, so `created_by_me` describes that ONE account's bug
+  reports for all clients, never an individual caller's (see "Identity
+  resolution"). A policy written for per-request custody changes meaning
+  when redeployed with `--api-key-file`, so `BugWarden::new` emits a
+  `tracing::warn` when server-held http custody meets a policy that
+  consults identity (`Policy::needs_identity`).
+- **`PerRequest` custody** (http without a key file): each request must
+  carry the key header; a missing key is `McpError::invalid_request`.
+- **No fallback between custodies, in either direction.** Server-held mode
+  exists so fleet clients can hold NOTHING — a client holding the real key
+  could bypass the guard by talking to Bugzilla directly — so falling back
+  to a client-supplied header would defeat the mode's point. And http with
+  `--api-key` alone stays per-request (warn + ignore, never a silent
+  upgrade): `BUGZILLA_API_KEY` is a generic env name other Bugzilla tooling
+  sets, and flipping it to server-held would change deployed custody
+  semantics.
+- **Key file handling**: `read_to_string` then `trim`; empty after trim or
+  unreadable => startup error naming the PATH only, never file contents
+  (I12). On unix, a file accessible by group or others draws a
+  `tracing::warn` recommending 0600 (the read-bit analogue of the policy
+  file's write-bit warning). The startup log line states mode and source
+  only — never key material (I12).
 
 Tool descriptions: concise and action-oriented; state the defaults and
 constraints the model must know.
@@ -634,15 +692,20 @@ clap derive `Cli`, with env fallbacks:
 | --host | MCP_HOST | 127.0.0.1 | http only |
 | --port | MCP_PORT | 8000 | http only |
 | --api-key-header | MCP_API_KEY_HEADER | ApiKey | http per-request key header |
-| --api-key | BUGZILLA_API_KEY | — | required for stdio; warn-and-ignore for http |
+| --api-key | BUGZILLA_API_KEY | — | required for stdio unless --api-key-file provides it; warn-and-ignore for http (never a silent upgrade to server-held) |
+| --api-key-file | BUGZILLA_API_KEY_FILE | — | file holding the key (container secret / systemd LoadCredential path); mutually exclusive with --api-key; over http selects server-held key mode (see Key custody) |
 | --use-auth-header | — | false | Bearer to Bugzilla instead of api_key query param |
 | --read-only | MCP_READ_ONLY | false | tighten-only (I9) |
 | --policy | BUGWARDEN_POLICY | — | path to guard policy TOML |
 | --audit-config | BUGWARDEN_AUDIT_CONFIG | — | path to audit configuration TOML; without it no audit stream is written |
 
-Startup validation: stdio without api_key => exit with error; http with
-api_key => tracing::warn (ignored); http without audit_config =>
-tracing::warn (remote tool calls leave no audit record).
+Startup validation: key custody is resolved by `Cli::resolve_key_custody`
+inside `BugWarden::new` (see Key custody) — --api-key together with
+--api-key-file, stdio without any key source, and an empty or unreadable
+key file all exit with an error (the key-file errors name the path only,
+I12); http with api_key => tracing::warn (ignored). main.rs adds: http
+without audit_config => tracing::warn (remote tool calls leave no audit
+record).
 
 ## Audit stream (crates/bugwarden/src/audit.rs + the server.rs wrapper)
 
@@ -695,13 +758,13 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
 - `rmcp = { version = "2.2", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }`
 - axum MUST be 0.8 (rmcp's version — extension extraction breaks otherwise);
   schemars 1.x with feature `chrono04`; tokio 1; tokio-util 0.7.
-- Server struct: `#[derive(Clone)] pub struct BugWarden { cfg: Arc<Cli>, guard: Arc<Guard>, bz: Arc<BugzillaClient>, tool_router: ToolRouter<Self> }`
+- Server struct: `#[derive(Clone)] pub struct BugWarden { cfg: Arc<Cli>, guard: Arc<Guard>, bz: Arc<BugzillaClient>, tool_router: ToolRouter<Self>, key_custody: KeyCustody, audit: Option<Arc<AuditState>> }`
 - `BugWarden::new` builds `Self::tool_router()` then `remove_route` for write
   tools when read-only and for every `global.disabled_tools` entry (I13).
   Write tool names: add_comment, update_bug_status, assign_bug,
   update_bug_fields, update_bug_dependencies, add_cc_to_bug, mark_as_duplicate,
   create_bug, add_attachment.
-- API key resolution: stdio => `cfg.api_key`; http => `ctx.extensions.get::<axum::http::request::Parts>()`, then `parts.headers.get(lowercased_header_name)`.
+- API key resolution: a match on `key_custody` (resolved once at startup, see Key custody — never re-read per request): `Server(key)` => the server's key, without touching the request at all; `PerRequest` => `ctx.extensions.get::<axum::http::request::Parts>()`, then `parts.headers.get(lowercased_header_name)`.
 - HTTP serving: `StreamableHttpService::new(move || Ok(server.clone()), LocalSessionManager::default().into(), StreamableHttpServerConfig::default())`, `axum::Router::new().nest_service("/mcp", service)`, `tokio::net::TcpListener::bind`, graceful shutdown on ctrl_c.
 - Tracing to stderr always (stdout belongs to the stdio transport).
 
@@ -770,7 +833,21 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   identical restricted entries; the distinct-id bound; read-only delists
   create_bug and add_attachment (I13); the upload size gate measures decoded
   (never base64-encoded) bytes, is disabled at 0, and its refusal names no
-  number.
+  number; and stdio without any key source fails at `BugWarden::new`
+  construction, never at first request.
+- Unit tests (#[cfg(test)] in crates/bugwarden/src/config.rs): the key
+  custody table — the mutual-exclusion error names both flags (each pinned
+  with its env var, since `--api-key` is a substring of `--api-key-file`);
+  empty, whitespace-only, and unreadable key files error naming the path;
+  the file's content is trimmed (`"the-key\n"` => `Server("the-key")`);
+  stdio resolves the key from the file as well as from --api-key; http with
+  --api-key alone stays `PerRequest` (warn-and-ignore pinned against a
+  silent upgrade to server-held custody); an empty --api-key-file value
+  counts as absent; the startup log line states mode and source, never key
+  material (I12); `Cli`'s Debug redacts the startup key (I12); and
+  server-held http custody under an identity-consulting policy warns at
+  construction (crates/bugwarden/src/server.rs) that created_by_me now
+  describes the service account for every client.
 - Integration tests (crates/bugwarden-core/tests/guard_wiremock.rs, wiremock):
   quicksearch_window — pages stay full while visible bugs remain (no hole),
   consecutive pages tile the visible sequence disjointly (against a stable
@@ -827,6 +904,21 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   own reports POSTs the comment for the caller's bug and refuses a
   foreign one with nothing POSTed), and a whoami transport error leaking
   no API key into any client-visible text (I12).
+- Integration tests (crates/bugwarden/tests/http_transport_wiremock.rs,
+  wiremock + rmcp client over REAL streamable HTTP — the only harness in
+  which the per-request key header physically exists; the wiremock upstream
+  proves WHICH key served a request through an `api_key` query-param
+  matcher): server-held mode serves a client presenting no credential at
+  all, with the key file's trailing newline trimmed end to end; a
+  client-sent key header in server-held mode is SERVED with the server's
+  key — never rejected, never read, and nothing authenticating with the
+  header's value reaches Bugzilla (expect(0) on that key); per-request mode
+  still authenticates with the client's header; a missing header in
+  per-request mode is a protocol-level invalid_request costing zero
+  upstream requests; the key is resolved once at startup (rewriting the key
+  file mid-flight changes nothing — the old key keeps serving); and the
+  guard's uniform denial text is byte-identical over http (I2 transport
+  parity).
 - Audit tests (crates/bugwarden/tests/audit_wiremock.rs + #[cfg(test)] in
   server.rs and audit.rs): one record per call for EVERY routed tool,
   refusal paths and protocol errors included; the refusal map is total

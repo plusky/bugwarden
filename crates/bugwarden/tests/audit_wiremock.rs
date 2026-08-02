@@ -69,7 +69,7 @@ async fn audited_client_with(
         Some("sha256:policy-under-test".to_string()),
     ));
 
-    let cfg = Arc::new(Cli::parse_from([
+    let mut cli = Cli::parse_from([
         "bugwarden",
         "--bugzilla-server",
         &mock.uri(),
@@ -77,7 +77,10 @@ async fn audited_client_with(
         "stdio",
         "--api-key",
         api_key,
-    ]));
+    ]);
+    // The ambient environment (BUGZILLA_API_KEY_FILE) must not leak in.
+    cli.api_key_file = None;
+    let cfg = Arc::new(cli);
     let guard = Arc::new(Guard {
         policy: Policy::from_toml_str(policy).expect("test policy must parse"),
     });
@@ -102,7 +105,7 @@ async fn audited_client_with(
 
 /// An un-audited server over the same transport, for comparisons.
 async fn plain_client_for(policy: &str, mock: &MockServer) -> RunningService<RoleClient, ()> {
-    let cfg = Arc::new(Cli::parse_from([
+    let mut cli = Cli::parse_from([
         "bugwarden",
         "--bugzilla-server",
         &mock.uri(),
@@ -110,7 +113,10 @@ async fn plain_client_for(policy: &str, mock: &MockServer) -> RunningService<Rol
         "stdio",
         "--api-key",
         "test-key",
-    ]));
+    ]);
+    // The ambient environment (BUGZILLA_API_KEY_FILE) must not leak in.
+    cli.api_key_file = None;
+    let cfg = Arc::new(cli);
     let guard = Arc::new(Guard {
         policy: Policy::from_toml_str(policy).expect("test policy must parse"),
     });
