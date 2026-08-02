@@ -271,7 +271,7 @@ Command-line arguments take precedence over environment variables.
 | `--use-auth-header` | — | `false` | Authenticate to Bugzilla with `Authorization: Bearer <key>` instead of the `api_key` query parameter |
 | `--read-only` | `MCP_READ_ONLY` | `false` | Disable all write tools. Tighten-only: ORed with the policy's `global.read_only`; cannot re-enable writes a policy forbids |
 | `--policy <PATH>` | `BUGWARDEN_POLICY` | — | Path to the guard policy TOML. Without it, an allow-all policy applies (with private comments off) |
-| `--audit-config <PATH>` | `BUGWARDEN_AUDIT_CONFIG` | — | Path to the audit stream configuration TOML (worked example in [`examples/audit.toml`](examples/audit.toml)). Without it, no audit stream is written |
+| `--audit-config <PATH>` | `BUGWARDEN_AUDIT_CONFIG` | — | Path to the audit stream configuration TOML (worked example in [`examples/audit.toml`](examples/audit.toml)). Without it, no audit stream is written. Records carry W3C trace ids when the client sends a `traceparent` in the request's `_meta`, enabling correlation with client-side traces |
 
 ## Policy file reference
 

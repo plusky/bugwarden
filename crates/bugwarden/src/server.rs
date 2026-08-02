@@ -2476,6 +2476,25 @@ impl ServerHandler for BugWarden {
         // avoids cloning free-text and blob values that would be reduced
         // to a byte length anyway.
         let params = allowlisted(request.arguments.as_ref());
+        // Trace enrichment (issue #28), extracted BEFORE the router
+        // consumes `request`. The rmcp 2.2 trap: over every serialized
+        // transport the wire `params._meta` (SEP-414) does NOT arrive in
+        // `CallToolRequestParams.meta` — the SDK's custom `Request`
+        // deserializer strips `_meta` out of the params before the
+        // params struct sees it, parks it in the request extensions, and
+        // the serve loop hands it to the handler as `context.meta`. The
+        // params-struct field is populated only by in-process callers
+        // that never serialize. Read both, params struct first, so the
+        // value is found wherever the SDK put it. Strictly validated,
+        // fail-to-absent, never logged; the value enriches the record
+        // only — it must never influence the guard, the refusal
+        // decision, or the response (I15).
+        let trace = request
+            .meta
+            .as_ref()
+            .and_then(|m| m.get_traceparent())
+            .or_else(|| context.meta.get_traceparent())
+            .and_then(audit::TraceContext::from_traceparent);
 
         // Pre-dispatch gate: a sink already in failure holds back further
         // unaudited work, scoped by the fail mode. The refusal is
@@ -2486,7 +2505,7 @@ impl ServerHandler for BugWarden {
         if audit.sink.failing() && gate_applies(audit.fail_mode, &tool) {
             let event = audit::AuditEventKind::ToolCall(Box::new(audit::ToolCallEvent {
                 client,
-                trace: None,
+                trace: trace.clone(),
                 request: audit::RequestInfo {
                     tool: tool.clone(),
                     id: request_id,
@@ -2535,7 +2554,7 @@ impl ServerHandler for BugWarden {
         };
         let event = audit::AuditEventKind::ToolCall(Box::new(audit::ToolCallEvent {
             client,
-            trace: None,
+            trace,
             request: audit::RequestInfo {
                 tool: tool.clone(),
                 id: request_id,
@@ -3503,5 +3522,262 @@ mod tests {
                 .any(|e| matches!(e.kind, AuditEventKind::AuditGap(_))),
             "a gap marker must follow recovery"
         );
+    }
+
+    // ---------- trace enrichment (issue #28) ----------
+
+    /// The canonical W3C `traceparent` example; its ids.
+    const TRACEPARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+    const TRACE_ID: &str = "0af7651916cd43dd8448eb211c80319c";
+    const SPAN_ID: &str = "b7ad6b7169203331";
+
+    /// Like [`call`], but with `traceparent` in the request's `_meta`.
+    /// The duplex transport serde-roundtrips the bytes, so this exercises
+    /// the wire `params._meta` shape, not an in-process shortcut.
+    async fn call_with_traceparent(
+        client: &RunningService<RoleClient, ()>,
+        tool: &str,
+        args: Value,
+        traceparent: &str,
+    ) -> CallToolResult {
+        let Value::Object(args) = args else {
+            panic!("tool arguments must be a JSON object");
+        };
+        let mut params = CallToolRequestParams::new(tool.to_string()).with_arguments(args);
+        let mut meta = rmcp::model::Meta::new();
+        meta.set_traceparent(traceparent);
+        params.meta = Some(meta);
+        client
+            .call_tool(params)
+            .await
+            .expect("tool call must not be a protocol error")
+    }
+
+    /// The `tool_call` payloads of `events`, in file order.
+    fn tool_calls(events: &[AuditEvent]) -> Vec<&audit::ToolCallEvent> {
+        events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                AuditEventKind::ToolCall(ev) => Some(ev.as_ref()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_trace_is_canonical(trace: Option<&audit::TraceContext>) {
+        let trace = trace.expect("the record must carry the sent trace ids");
+        assert_eq!(trace.trace_id, TRACE_ID);
+        assert_eq!(trace.span_id, SPAN_ID);
+    }
+
+    #[tokio::test]
+    async fn traceparent_in_meta_lands_in_the_tool_record() {
+        let mock = MockServer::start().await;
+        mount_bug7(&mock).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
+        let client = mcp_client("", &mock.uri(), Some(audit)).await;
+
+        let plain = call(&client, "bug_history", json!({ "id": 7 })).await;
+        let traced =
+            call_with_traceparent(&client, "bug_history", json!({ "id": 7 }), TRACEPARENT).await;
+        // Record enrichment only (I15): the response must not change.
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            serde_json::to_string(&traced).unwrap(),
+            "a traceparent must not change the response"
+        );
+
+        let events = read_audit_events(&audit_path);
+        let calls = tool_calls(&events);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].trace, None, "no meta means no trace field");
+        assert_trace_is_canonical(calls[1].trace.as_ref());
+    }
+
+    #[tokio::test]
+    async fn malformed_traceparent_leaves_the_record_without_trace() {
+        let mock = MockServer::start().await;
+        mount_bug7(&mock).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
+        let client = mcp_client("", &mock.uri(), Some(audit)).await;
+
+        let plain = call(&client, "bug_history", json!({ "id": 7 })).await;
+        // Uppercase hex is invalid per W3C; the strict parser records
+        // nothing rather than a value it could not fully validate.
+        let upper = "00-0AF7651916CD43DD8448EB211C80319C-B7AD6B7169203331-01";
+        let traced = call_with_traceparent(&client, "bug_history", json!({ "id": 7 }), upper).await;
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            serde_json::to_string(&traced).unwrap(),
+            "a malformed traceparent must not change the response"
+        );
+
+        // Absent means absent bytes: no serialized line carries a trace
+        // key at all — and none echoes the rejected value anywhere.
+        let raw = std::fs::read_to_string(&audit_path).expect("audit file must be readable");
+        assert!(
+            !raw.contains("\"trace\""),
+            "a malformed traceparent must leave no trace field: {raw}"
+        );
+        assert!(
+            !raw.contains("0AF76519"),
+            "the rejected value must never reach the file: {raw}"
+        );
+        assert_eq!(tool_calls(&read_audit_events(&audit_path)).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn traceparent_on_a_denied_call_enriches_but_never_influences() {
+        // Correlation matters most on denials — and the trace ids must
+        // never leak into the denial itself.
+        let policy = concat!(
+            "[[rule]]\nname = \"hide-secret\"\naction = \"deny\"\n",
+            "[rule.match]\nproducts = [\"Secret*\"]\n",
+        );
+        let mock = MockServer::start().await;
+        mount_bug7(&mock).await;
+        let mut secret = world_bug(99);
+        secret["product"] = json!("SecretSauce");
+        Mock::given(method("GET"))
+            .and(path("/rest/bug"))
+            .and(query_param("id", "99"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [secret] })))
+            .mount(&mock)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
+        let client = mcp_client(policy, &mock.uri(), Some(audit)).await;
+
+        let denied =
+            call_with_traceparent(&client, "bug_comments", json!({ "id": 99 }), TRACEPARENT).await;
+        assert!(is_error(&denied), "the hidden bug must be denied");
+        assert_eq!(
+            text_of(&denied),
+            "Bug 99 is not accessible through this server",
+            "the denial must be the uniform text (I2), traceparent or not"
+        );
+
+        let calls_events = read_audit_events(&audit_path);
+        let calls = tool_calls(&calls_events);
+        assert_eq!(calls.len(), 1);
+        let guard = calls[0].guard.as_ref().expect("a denial has a guard");
+        assert_eq!(guard.verdict, Verdict::Denied);
+        assert_trace_is_canonical(calls[0].trace.as_ref());
+    }
+
+    #[tokio::test]
+    async fn failing_sink_gate_record_carries_the_trace() {
+        // The pre-dispatch fail-closed gate builds its own record; it
+        // must carry the trace too, not only the post-dispatch site.
+        let mock = MockServer::start().await;
+        mount_bug7(&mock).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::ClosedAll);
+        let client = mcp_client("", &mock.uri(), Some(Arc::clone(&audit))).await;
+
+        // Discover the outage on the response path, then lift the
+        // injected fault: the sink still counts as failing (records were
+        // dropped), so the next call takes the pre-dispatch gate — and
+        // its best-effort record now persists.
+        audit.sink.set_fail_writes(true);
+        let discovered = call(&client, "bug_history", json!({ "id": 7 })).await;
+        assert!(is_error(&discovered));
+        audit.sink.set_fail_writes(false);
+        let before_gated = mock.received_requests().await.unwrap().len();
+
+        let gated =
+            call_with_traceparent(&client, "bug_history", json!({ "id": 7 }), TRACEPARENT).await;
+        assert!(is_error(&gated));
+        assert_eq!(text_of(&gated), "Failed to fetch bug history");
+        assert_eq!(
+            mock.received_requests().await.unwrap().len(),
+            before_gated,
+            "the gated call must not contact upstream"
+        );
+
+        let events = read_audit_events(&audit_path);
+        let calls = tool_calls(&events);
+        assert_eq!(calls.len(), 1, "only the gate record reached the file");
+        let guard = calls[0].guard.as_ref().expect("the gate records a guard");
+        assert_eq!(guard.verdict, Verdict::Refused);
+        assert_trace_is_canonical(calls[0].trace.as_ref());
+    }
+
+    #[tokio::test]
+    async fn in_process_params_meta_traceparent_enriches_the_record() {
+        // The params-struct arm of the trace extraction (`request.meta`,
+        // consulted before the `context.meta` fallback) is reachable ONLY
+        // by an in-process caller: over every serialized transport rmcp
+        // strips the wire `_meta` into the request extensions before the
+        // params struct is built, so `CallToolRequestParams.meta` is
+        // always `None` there and the duplex and streamable-http tests
+        // all pin the `context.meta` fallback instead. This test invokes
+        // `ServerHandler::call_tool` directly, with the traceparent in
+        // the params-struct meta and a hand-built `RequestContext` whose
+        // meta is empty — killing a mutant that reads only `context.meta`
+        // (behavior-preserving over every serialized transport, so no
+        // other test can).
+        use clap::Parser as _;
+        let mock = MockServer::start().await;
+        mount_bug7(&mock).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
+
+        let mut cli = Cli::parse_from([
+            "bugwarden",
+            "--bugzilla-server",
+            &mock.uri(),
+            "--transport",
+            "stdio",
+            "--api-key",
+            "test-key",
+        ]);
+        cli.api_key_file = None;
+        let guard = Arc::new(Guard {
+            policy: Policy::from_toml_str("").expect("test policy must parse"),
+        });
+        let bz = Arc::new(BugzillaClient::new(&mock.uri(), false).expect("client must build"));
+        let server = BugWarden::new(Arc::new(cli), guard, bz)
+            .expect("server must build")
+            .with_audit(Arc::clone(&audit));
+
+        // A genuine `Peer<RoleServer>` for the hand-built context, minted
+        // by serving a clone over a duplex (the SDK exposes no other
+        // constructor); no tool call flows through that session, so the
+        // direct call below writes the only tool_call record.
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let serving = server.clone();
+        let server_task = tokio::spawn(async move { serving.serve(server_io).await });
+        let _client = ().serve(client_io).await.expect("MCP handshake must succeed");
+        let running = server_task
+            .await
+            .expect("serve task must not panic")
+            .expect("server must serve");
+        let peer = running.peer().clone();
+
+        let Value::Object(args) = json!({ "id": 7 }) else {
+            panic!("tool arguments must be a JSON object");
+        };
+        let mut params = CallToolRequestParams::new("bug_history".to_string()).with_arguments(args);
+        let mut meta = rmcp::model::Meta::new();
+        meta.set_traceparent(TRACEPARENT);
+        params.meta = Some(meta);
+        let context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer);
+        assert!(
+            context.meta.get_traceparent().is_none(),
+            "the hand-built context must carry no meta — the params struct is the only source"
+        );
+
+        let result = ServerHandler::call_tool(&server, params, context)
+            .await
+            .expect("the in-process call must not be a protocol error");
+        assert!(!is_error(&result), "bug_history must succeed");
+
+        let events = read_audit_events(&audit_path);
+        let calls = tool_calls(&events);
+        assert_eq!(calls.len(), 1, "exactly the direct call is recorded");
+        assert_trace_is_canonical(calls[0].trace.as_ref());
     }
 }

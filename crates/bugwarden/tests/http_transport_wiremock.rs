@@ -13,12 +13,21 @@
 //! - `api_key()` re-reading the key file per request instead of once at
 //!   startup;
 //! - server-held mode rejecting requests that carry the header;
-//! - dropping the trim of the key file's content.
+//! - dropping the trim of the key file's content;
+//! - audit trace enrichment reading only the params-struct
+//!   `CallToolRequestParams.meta` — always `None` over a serialized
+//!   transport, because rmcp strips the wire `_meta` into the request
+//!   extensions and hands it to the handler as `RequestContext.meta` —
+//!   instead of falling back to `context.meta` (the inverse mutant,
+//!   reading only `context.meta`, is behavior-preserving over every
+//!   serialized transport and is killed by the direct in-process call
+//!   test in server.rs instead).
 
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use bugwarden::audit::{AuditConfig, AuditEvent, AuditEventKind, AuditSink, AuditState, FailMode};
 use bugwarden::config::Cli;
 use bugwarden::server::BugWarden;
 use bugwarden_core::client::BugzillaClient;
@@ -57,13 +66,22 @@ fn http_cli(mock: &MockServer, key_file: Option<&std::path::Path>) -> Arc<Cli> {
 }
 
 /// Serve a [`BugWarden`] built from `cli` and `policy` over a real TCP
-/// listener; returns the bound address.
-async fn serve_http(cli: Arc<Cli>, policy: &str, mock: &MockServer) -> SocketAddr {
+/// listener, with the audit sink wired in when a test needs the record
+/// stream; returns the bound address.
+async fn serve_http(
+    cli: Arc<Cli>,
+    policy: &str,
+    mock: &MockServer,
+    audit: Option<Arc<AuditState>>,
+) -> SocketAddr {
     let guard = Arc::new(Guard {
         policy: Policy::from_toml_str(policy).expect("test policy must parse"),
     });
     let bz = Arc::new(BugzillaClient::new(&mock.uri(), false).expect("client must build"));
-    let server = BugWarden::new(cli, guard, bz).expect("server must build");
+    let mut server = BugWarden::new(cli, guard, bz).expect("server must build");
+    if let Some(audit) = audit {
+        server = server.with_audit(audit);
+    }
 
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
@@ -208,7 +226,7 @@ async fn server_held_serves_clients_with_no_credential() {
 
     let file = key_file("srv-key\n");
     let cli = http_cli(&mock, Some(file.path()));
-    let addr = serve_http(cli, "", &mock).await;
+    let addr = serve_http(cli, "", &mock, None).await;
     let client = connect(addr, None).await;
 
     assert_bug_7_served(&client).await;
@@ -227,7 +245,7 @@ async fn server_held_never_reads_the_client_header() {
 
     let file = key_file("srv-key");
     let cli = http_cli(&mock, Some(file.path()));
-    let addr = serve_http(cli, "", &mock).await;
+    let addr = serve_http(cli, "", &mock, None).await;
     let client = connect(addr, Some("attacker-key")).await;
 
     assert_bug_7_served(&client).await;
@@ -241,7 +259,7 @@ async fn per_request_header_still_authenticates_over_http() {
     mount_bug_for_key(&mock, world_readable_bug(7), "client-key").await;
 
     let cli = http_cli(&mock, None);
-    let addr = serve_http(cli, "", &mock).await;
+    let addr = serve_http(cli, "", &mock, None).await;
     let client = connect(addr, Some("client-key")).await;
 
     assert_bug_7_served(&client).await;
@@ -260,7 +278,7 @@ async fn per_request_missing_header_is_a_protocol_error() {
         .await;
 
     let cli = http_cli(&mock, None);
-    let addr = serve_http(cli, "", &mock).await;
+    let addr = serve_http(cli, "", &mock, None).await;
     let client = connect(addr, None).await;
 
     let err = try_call(&client, "bug_info", json!({ "bug_ids": [7] }))
@@ -285,7 +303,7 @@ async fn server_held_key_is_resolved_once_at_startup() {
 
     let file = key_file("srv-key\n");
     let cli = http_cli(&mock, Some(file.path()));
-    let addr = serve_http(cli, "", &mock).await;
+    let addr = serve_http(cli, "", &mock, None).await;
     let client = connect(addr, None).await;
 
     assert_bug_7_served(&client).await;
@@ -326,6 +344,7 @@ async fn guard_denies_uniformly_over_http() {
             "[rule.match]\nproducts = [\"Secret*\"]\n",
         ),
         &mock,
+        None,
     )
     .await;
     let client = connect(addr, None).await;
@@ -343,4 +362,81 @@ async fn guard_denies_uniformly_over_http() {
         "Bug 7 is not accessible through this server",
         "the denial must be the uniform text (I2)"
     );
+}
+
+#[tokio::test]
+async fn traceparent_over_http_lands_in_the_audit_record() {
+    // End-to-end over REAL streamable http: the client's `params._meta`
+    // traceparent survives serialization, transport, and deserialization
+    // into the audit record. Over every real transport the SDK strips the
+    // wire `_meta` out of the params before the params struct is built —
+    // `CallToolRequestParams.meta` arrives `None` here — and delivers it
+    // to the handler as the extensions-backed `RequestContext.meta`, so
+    // this test pins the `context.meta` fallback that every serialized
+    // transport depends on (see the rmcp 2.2 usage notes in DESIGN.md).
+    let mock = MockServer::start().await;
+    mount_bug_for_key(&mock, world_readable_bug(7), "srv-key").await;
+
+    let dir = tempfile::tempdir().expect("audit temp dir");
+    let audit_path = dir.path().join("audit.jsonl");
+    let sink = AuditSink::open(AuditConfig {
+        path: audit_path.clone(),
+        fsync: false,
+        fail_mode: None,
+        rotate_max_bytes: 0,
+        rotate_keep: 8,
+        suppressed_ids: true,
+    })
+    .expect("audit sink must open");
+    let audit = Arc::new(AuditState::new(sink, FailMode::Open, None));
+
+    let file = key_file("srv-key\n");
+    let cli = http_cli(&mock, Some(file.path()));
+    let addr = serve_http(cli, "", &mock, Some(audit)).await;
+    let client = connect(addr, None).await;
+
+    let plain = try_call(&client, "bug_info", json!({ "bug_ids": [7] }))
+        .await
+        .expect("bug_info must not be a protocol error");
+    let traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+    let Value::Object(args) = json!({ "bug_ids": [7] }) else {
+        panic!("tool arguments must be a JSON object");
+    };
+    let mut params = CallToolRequestParams::new("bug_info".to_string()).with_arguments(args);
+    let mut meta = rmcp::model::Meta::new();
+    meta.set_traceparent(traceparent);
+    params.meta = Some(meta);
+    let traced = client
+        .call_tool(params)
+        .await
+        .expect("a traced bug_info must not be a protocol error");
+
+    // Record enrichment only: the served response is unaffected.
+    assert_eq!(
+        serde_json::to_string(&plain).expect("serialize"),
+        serde_json::to_string(&traced).expect("serialize"),
+        "a traceparent must not change the response over http"
+    );
+
+    let raw = std::fs::read_to_string(&audit_path).expect("audit file must be readable");
+    let events: Vec<AuditEvent> = raw
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("every audit line must parse"))
+        .collect();
+    let calls: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            AuditEventKind::ToolCall(ev) => Some(ev.as_ref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 2, "both calls must be recorded");
+    assert_eq!(calls[0].trace, None, "no meta means no trace field");
+    let trace = calls[1]
+        .trace
+        .as_ref()
+        .expect("the traced call's record must carry the sent ids");
+    assert_eq!(trace.trace_id, "0af7651916cd43dd8448eb211c80319c");
+    assert_eq!(trace.span_id, "b7ad6b7169203331");
 }

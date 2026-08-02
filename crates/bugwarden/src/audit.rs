@@ -381,6 +381,69 @@ pub struct TraceContext {
     pub span_id: String,
 }
 
+impl TraceContext {
+    /// Parse a W3C `traceparent` header value (version 00 only) into
+    /// trace ids.
+    ///
+    /// Strict by design: anything not exactly
+    /// `00-<32 lowercase hex>-<16 lowercase hex>-<2 lowercase hex>`
+    /// (55 bytes) with non-zero trace and span ids is `None`. In
+    /// particular:
+    ///
+    /// - The length check comes FIRST, on bytes — a cheap rejection of
+    ///   oversized input, and no later step slices a string, so
+    ///   multibyte unicode can never panic the parser.
+    /// - The version must be exactly `00`. That rejects `ff` (forbidden
+    ///   by W3C) AND every future version: W3C allows lenient forward
+    ///   parsing, but this parser refuses to store ids from a format
+    ///   revision it cannot fully validate.
+    /// - Hex means ASCII lowercase `[0-9a-f]` only; uppercase is invalid
+    ///   per W3C.
+    /// - An all-zero trace id or span id is invalid per W3C.
+    /// - The flags byte pair is validated as hex but not stored — the
+    ///   schema has no field for it.
+    ///
+    /// The input is client-controlled bytes headed for operator logs, so
+    /// it is never logged here, valid or not: rejection is silent
+    /// (I12-adjacent hygiene).
+    pub(crate) fn from_traceparent(value: &str) -> Option<TraceContext> {
+        fn lower_hex(bytes: &[u8]) -> bool {
+            bytes
+                .iter()
+                .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+        }
+        let bytes = value.as_bytes();
+        if bytes.len() != 55 {
+            return None;
+        }
+        // Fixed layout: bytes 0-1 version, byte 2 `-`, bytes 3-34
+        // trace-id, byte 35 `-`, bytes 36-51 span-id, byte 52 `-`,
+        // bytes 53-54 flags.
+        if &bytes[0..2] != b"00" {
+            return None;
+        }
+        if bytes[2] != b'-' || bytes[35] != b'-' || bytes[52] != b'-' {
+            return None;
+        }
+        let trace_id = &bytes[3..35];
+        let span_id = &bytes[36..52];
+        let flags = &bytes[53..55];
+        if !lower_hex(trace_id) || !lower_hex(span_id) || !lower_hex(flags) {
+            return None;
+        }
+        if trace_id.iter().all(|&b| b == b'0') || span_id.iter().all(|&b| b == b'0') {
+            return None;
+        }
+        // Both ranges are validated ASCII hex, so the conversions cannot
+        // fail; going through `from_utf8` keeps the parser panic-free by
+        // construction.
+        Some(TraceContext {
+            trace_id: std::str::from_utf8(trace_id).ok()?.to_owned(),
+            span_id: std::str::from_utf8(span_id).ok()?.to_owned(),
+        })
+    }
+}
+
 /// The request as the client made it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1317,6 +1380,146 @@ mod tests {
             let back: AuditEvent = serde_json::from_str(&s).unwrap();
             assert_eq!(back, event);
         }
+    }
+
+    // ---------- traceparent parsing ----------
+
+    /// The canonical W3C example, 55 bytes; the ids are the same as the
+    /// golden serialization fixture's.
+    const CANONICAL_TRACEPARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+    #[test]
+    fn traceparent_canonical_value_parses_into_its_ids() {
+        let trace = TraceContext::from_traceparent(CANONICAL_TRACEPARENT)
+            .expect("the canonical W3C example must parse");
+        assert_eq!(trace.trace_id, "0af7651916cd43dd8448eb211c80319c");
+        assert_eq!(trace.span_id, "b7ad6b7169203331");
+    }
+
+    #[test]
+    fn traceparent_flags_00_parses_and_flags_are_not_stored() {
+        // The flags value is irrelevant (validated as hex, never stored):
+        // an unsampled request correlates the same as a sampled one.
+        let unsampled = CANONICAL_TRACEPARENT.replace("-01", "-00");
+        let trace = TraceContext::from_traceparent(&unsampled).expect("flags 00 must parse");
+        assert_eq!(trace.trace_id, "0af7651916cd43dd8448eb211c80319c");
+        assert_eq!(trace.span_id, "b7ad6b7169203331");
+    }
+
+    #[test]
+    fn traceparent_rejects_wrong_lengths() {
+        assert_eq!(TraceContext::from_traceparent(""), None);
+        // 54 bytes: the canonical value minus its last byte.
+        let short = &CANONICAL_TRACEPARENT[..54];
+        assert_eq!(TraceContext::from_traceparent(short), None);
+        // 56 bytes: the canonical value plus one hex byte. A truncating
+        // `>= 55` length check would parse this — the exact-length check
+        // must not.
+        let long = format!("{CANONICAL_TRACEPARENT}0");
+        assert_eq!(TraceContext::from_traceparent(&long), None);
+        // Oversized input is rejected on length alone (~1 MiB).
+        let huge = "a".repeat(1 << 20);
+        assert_eq!(TraceContext::from_traceparent(&huge), None);
+    }
+
+    #[test]
+    fn traceparent_rejects_uppercase_hex() {
+        // Uppercase in the trace-id: invalid per W3C.
+        let upper_trace = "00-0AF7651916CD43DD8448EB211C80319C-b7ad6b7169203331-01";
+        assert_eq!(TraceContext::from_traceparent(upper_trace), None);
+        // Uppercase in the span-id.
+        let upper_span = "00-0af7651916cd43dd8448eb211c80319c-B7AD6B7169203331-01";
+        assert_eq!(TraceContext::from_traceparent(upper_span), None);
+        // Uppercase hex in the version position.
+        let upper_version = "0A-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        assert_eq!(TraceContext::from_traceparent(upper_version), None);
+    }
+
+    #[test]
+    fn traceparent_rejects_versions_other_than_00() {
+        // `ff` is forbidden by W3C.
+        let ff = "ff-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        assert_eq!(TraceContext::from_traceparent(ff), None);
+        // A future version is rejected even when it happens to be 55
+        // bytes of version-00 shape: strict, no forward parsing.
+        let v01 = "01-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        assert_eq!(TraceContext::from_traceparent(v01), None);
+        // The forward-format case W3C would allow lenient parsers to
+        // accept: a future version with trailing data. Deliberately None.
+        let forward = "01-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01-extra";
+        assert_eq!(TraceContext::from_traceparent(forward), None);
+    }
+
+    #[test]
+    fn traceparent_rejects_all_zero_ids() {
+        let zero_trace = "00-00000000000000000000000000000000-b7ad6b7169203331-01";
+        assert_eq!(TraceContext::from_traceparent(zero_trace), None);
+        let zero_span = "00-0af7651916cd43dd8448eb211c80319c-0000000000000000-01";
+        assert_eq!(TraceContext::from_traceparent(zero_span), None);
+    }
+
+    #[test]
+    fn traceparent_rejects_non_hex_in_every_field() {
+        for bad in [
+            // `g` in the version, trace-id, span-id, and flags.
+            "g0-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            "00-gaf7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            "00-0af7651916cd43dd8448eb211c80319c-g7ad6b7169203331-01",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-g1",
+            // A space in each field.
+            " 0-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            "00- af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            "00-0af7651916cd43dd8448eb211c80319c- 7ad6b7169203331-01",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331- 1",
+        ] {
+            assert_eq!(
+                TraceContext::from_traceparent(bad),
+                None,
+                "must reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn traceparent_rejects_misplaced_separators() {
+        // Still 55 bytes each, but a `-` is off its fixed position.
+        for bad in [
+            // The trace-id/span-id separator shifted right by one.
+            "00-0af7651916cd43dd8448eb211c80319cb-7ad6b7169203331-01",
+            // The version separator replaced (two ids run together).
+            "0000af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            // The flags separator replaced by a hex byte.
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331001",
+        ] {
+            assert_eq!(bad.len(), 55, "fixture must stay 55 bytes");
+            assert_eq!(
+                TraceContext::from_traceparent(bad),
+                None,
+                "must reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn traceparent_rejects_surrounding_whitespace() {
+        // No trimming anywhere: whitespace is rejected, either by the
+        // hex/layout checks (55 bytes) or by the length check (56).
+        let lead_55 = format!(" {}", &CANONICAL_TRACEPARENT[..54]);
+        assert_eq!(TraceContext::from_traceparent(&lead_55), None);
+        let lead_56 = format!(" {CANONICAL_TRACEPARENT}");
+        assert_eq!(TraceContext::from_traceparent(&lead_56), None);
+        let trail_56 = format!("{CANONICAL_TRACEPARENT}\n");
+        assert_eq!(TraceContext::from_traceparent(&trail_56), None);
+    }
+
+    #[test]
+    fn traceparent_multibyte_unicode_returns_none_without_panicking() {
+        // 53 ASCII bytes of the canonical value plus one 2-byte char:
+        // exactly 55 bytes, so it passes the length check and must fall
+        // out of the layout checks — never panic.
+        let multibyte = format!("{}\u{e9}", &CANONICAL_TRACEPARENT[..53]);
+        assert_eq!(multibyte.len(), 55, "fixture must be 55 bytes");
+        assert_eq!(TraceContext::from_traceparent(&multibyte), None);
     }
 
     #[test]

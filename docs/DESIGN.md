@@ -831,6 +831,27 @@ Decisions, all deliberate:
   anchored by `<pid>-<startup epoch>`; http sessions by the
   `mcp-session-id` header, with the remote address when the listener
   provides connect-info.
+- **Trace enrichment (issue #28).** When a tool call's `params._meta`
+  carries a `traceparent` (SEP-414), its trace and span ids are copied
+  into the record's `trace` field — the pre-dispatch fail-closed gate
+  record included. Validation is strict: exactly the W3C version-00
+  layout (55 bytes, `00-<32 lowercase hex>-<16 lowercase hex>-<2
+  lowercase hex>`) with non-zero trace and span ids; `ff` and every
+  future version are rejected (no lenient forward parsing — ids from a
+  format revision the parser cannot fully validate are not stored), and
+  anything malformed records nothing rather than something wrong. The
+  value is client-controlled bytes headed for operator logs, so it is
+  never logged anywhere, valid or not, and it never influences a guard
+  decision or a response (I15) — enrichment is unconditional when
+  auditing is on, with no configuration knob. The stored ids are
+  unauthenticated client claims: any client can stamp any call with any
+  well-formed ids — its own probes with an innocent service's ids, or
+  unrelated calls with an id an operator is pivoting on — so they are
+  correlation hints, never evidence; attribution rests on the record's
+  session and client anchoring, not on `trace`. `tracestate` and `baggage`
+  are deliberately not stored: the schema has no field for either,
+  `tracestate` is client free text, and `baggage` is unbounded client
+  key/values — revisit under #34.
 
 ## rmcp 2.2 usage notes
 
@@ -850,6 +871,22 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   create_bug, add_attachment.
 - API key resolution: a match on `key_custody` (resolved once at startup, see Key custody — never re-read per request): `Server(key)` => the server's key, without touching the request at all; `PerRequest` => `ctx.extensions.get::<axum::http::request::Parts>()`, then `parts.headers.get(lowercased_header_name)`.
 - HTTP serving: `StreamableHttpService::new(move || Ok(server.clone()), LocalSessionManager::default().into(), StreamableHttpServerConfig::default())`, `axum::Router::new().nest_service("/mcp", service)`, `tokio::net::TcpListener::bind`, graceful shutdown on ctrl_c.
+- Request `_meta` (SEP-414, e.g. `traceparent`): over every serialized
+  transport the wire `params._meta` does NOT arrive in the params struct
+  (`CallToolRequestParams.meta` stays `None`) — the SDK's custom
+  `Deserialize for Request` (model/serde_impl.rs) strips `_meta` out of
+  the params into the request's extensions typemap, and the serve loop
+  (service.rs) moves that into `RequestContext.meta`. So read
+  `context.meta`; the params-struct `meta` field is populated only by
+  in-process callers that never serialize (`call_tool` consults it
+  first, then falls back to `context.meta`). Reading only the params
+  field compiles fine and is silently empty over every real transport —
+  pinned by the streamable-http traceparent test. The inverse mutant
+  (reading only `context.meta`) is behavior-preserving over every
+  serialized transport, so no transport-level test can kill it; the
+  params-struct arm is pinned by a direct in-process
+  `ServerHandler::call_tool` test with a hand-built `RequestContext`
+  (the only caller shape that populates the field).
 - Tracing to stderr always (stdout belongs to the stdio transport).
 
 ## Testing
@@ -1015,9 +1052,13 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   still authenticates with the client's header; a missing header in
   per-request mode is a protocol-level invalid_request costing zero
   upstream requests; the key is resolved once at startup (rewriting the key
-  file mid-flight changes nothing — the old key keeps serving); and the
+  file mid-flight changes nothing — the old key keeps serving); the
   guard's uniform denial text is byte-identical over http (I2 transport
-  parity).
+  parity); and a `params._meta` traceparent sent over real streamable
+  http lands its ids in the audit record with the response unchanged —
+  the end-to-end proof that the wire `_meta` is read from where the SDK
+  delivers it (`RequestContext.meta`), not from the params-struct field
+  that stays empty over serialized transports.
 - Audit tests (crates/bugwarden/tests/audit_wiremock.rs + #[cfg(test)] in
   server.rs and audit.rs): one record per call for EVERY routed tool,
   refusal paths and protocol errors included; the refusal map is total
@@ -1027,6 +1068,23 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   fail-closed scopes (pre-dispatch gate proven by upstream request
   counts) via the sink's cfg(test) fault injection; the transport-derived
   fail-mode defaults bound to their documented wording; the params
-  allowlist (free text to `_len`, 1024-char truncation).
+  allowlist (free text to `_len`, 1024-char truncation); and trace
+  enrichment (issue #28) — the strict traceparent parser (the canonical
+  W3C value and its flags-00 variant parse into their ids; empty,
+  54-byte, 56-byte, and ~1 MiB values, uppercase hex, versions other
+  than `00` including `ff` and the W3C forward-format, all-zero trace
+  or span ids, non-hex bytes and spaces in every field, misplaced
+  separators, surrounding whitespace, and a 55-byte multibyte-unicode
+  value are all `None`, without panicking), a well-formed traceparent
+  in `_meta` lands its ids in the tool record over the duplex transport
+  with the response byte-identical to the meta-less call, a malformed
+  one leaves the record without any `trace` bytes (and the rejected
+  value never reaches the file), a guard-denied call keeps the uniform
+  denial text while its record carries verdict and ids, the
+  failing-sink pre-dispatch gate record carries the ids too, and a
+  direct in-process `ServerHandler::call_tool` invocation with the
+  traceparent in the params-struct meta and an empty `context.meta`
+  pins the `CallToolRequestParams.meta` arm that no serialized
+  transport can exercise.
 - CI: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace --locked`, `cargo deny check`.
