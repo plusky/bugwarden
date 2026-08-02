@@ -622,7 +622,8 @@ async fn quicksearch_window_pages_have_no_holes_when_bugs_are_hidden() {
         let got = g
             .quicksearch_window(&bz, KEY, &search("q", 5, page * 5), None)
             .await
-            .expect("search succeeds");
+            .expect("search succeeds")
+            .bugs;
         assert_eq!(
             got.len(),
             5,
@@ -658,13 +659,15 @@ async fn quicksearch_window_pages_are_disjoint_and_gapless() {
         let got = g
             .quicksearch_window(&bz, KEY, &search("q", 4, page * 4), None)
             .await
-            .expect("search succeeds");
+            .expect("search succeeds")
+            .bugs;
         paged.extend(ids_of(&got));
     }
     let whole = g
         .quicksearch_window(&bz, KEY, &search("q", 32, 0), None)
         .await
-        .expect("search succeeds");
+        .expect("search succeeds")
+        .bugs;
     assert_eq!(
         paged,
         ids_of(&whole),
@@ -690,11 +693,13 @@ async fn quicksearch_window_page_is_identical_whether_or_not_bugs_are_hidden() {
     let clean = g
         .quicksearch_window(&client(&server_clean), KEY, &search("q", 4, 2), None)
         .await
-        .expect("search succeeds");
+        .expect("search succeeds")
+        .bugs;
     let mixed = g
         .quicksearch_window(&client(&server_mixed), KEY, &search("q", 4, 2), None)
         .await
-        .expect("search succeeds");
+        .expect("search succeeds")
+        .bugs;
     // Clean: visible are 1..12, so offset 2 limit 4 => 3,4,5,6.
     assert_eq!(ids_of(&clean), vec![3, 4, 5, 6]);
     // Mixed: visible are 1,3,5,6,8,9,10,11,12 => offset 2 limit 4 => 5,6,8,9.
@@ -721,12 +726,14 @@ async fn quicksearch_window_runs_out_like_a_normal_end_of_results() {
     let tail = g
         .quicksearch_window(&bz, KEY, &search("q", 10, 4), None)
         .await
-        .expect("search succeeds");
+        .expect("search succeeds")
+        .bugs;
     assert_eq!(ids_of(&tail), vec![6, 7]);
     let past = g
         .quicksearch_window(&bz, KEY, &search("q", 10, 50), None)
         .await
-        .expect("search succeeds");
+        .expect("search succeeds")
+        .bugs;
     assert!(past.is_empty());
 }
 
@@ -743,7 +750,8 @@ async fn quicksearch_window_scan_is_bounded() {
     let got = g
         .quicksearch_window(&client(&server), KEY, &search("q", 50, 0), None)
         .await
-        .expect("search succeeds");
+        .expect("search succeeds")
+        .bugs;
     assert!(got.is_empty(), "everything was hidden");
     assert_eq!(
         requests_to(&server).await,
@@ -767,7 +775,8 @@ async fn quicksearch_window_deep_offset_is_empty_whether_or_not_bugs_are_hidden(
             let got = g
                 .quicksearch_window(&client(&server), KEY, &search("q", 1, offset), None)
                 .await
-                .expect("a deep offset is not an error");
+                .expect("a deep offset is not an error")
+                .bugs;
             assert!(
                 got.is_empty(),
                 "offset {offset} with hidden={hidden:?} must be an empty page"
@@ -793,7 +802,8 @@ async fn quicksearch_window_scan_target_does_not_track_the_requested_limit() {
         let _ = g
             .quicksearch_window(&client(&server), KEY, &search("q", limit, 0), None)
             .await
-            .expect("search succeeds");
+            .expect("search succeeds")
+            .bugs;
         counts.push(requests_to(&server).await);
     }
     assert!(
@@ -823,7 +833,8 @@ async fn quicksearch_window_drops_rows_without_a_readable_id() {
     let got = g
         .quicksearch_window(&client(&server), KEY, &search("q", 10, 0), None)
         .await
-        .expect("search succeeds");
+        .expect("search succeeds")
+        .bugs;
     assert_eq!(ids_of(&got), vec![1, 2]);
 }
 
@@ -844,7 +855,8 @@ async fn quicksearch_window_dedupes_rows_repeated_across_chunks() {
     let got = g
         .quicksearch_window(&client(&server), KEY, &search("q", 400, 0), None)
         .await
-        .expect("search succeeds");
+        .expect("search succeeds")
+        .bugs;
     let ids = ids_of(&got);
     let unique: std::collections::BTreeSet<_> = ids.iter().collect();
     assert_eq!(unique.len(), ids.len(), "a bug was served twice: {ids:?}");
@@ -856,11 +868,14 @@ async fn quicksearch_window_zero_limit_touches_nothing() {
     let server = MockServer::start().await;
     // No mock is mounted: any upstream request would fail the call.
     let g = guard(EMBARGO_POLICY);
-    let got = g
+    let window = g
         .quicksearch_window(&client(&server), KEY, &search("q", 0, 0), None)
         .await
         .expect("zero limit is not an error");
-    assert!(got.is_empty());
+    assert!(window.bugs.is_empty());
+    // Nothing was fetched, so there is nothing to account for either.
+    assert_eq!(window.scanned, 0);
+    assert!(window.dropped.is_empty());
 }
 
 #[tokio::test]
@@ -873,9 +888,103 @@ async fn quicksearch_window_returns_the_classified_objects() {
     let got = g
         .quicksearch_window(&client(&server), KEY, &search("q", 10, 0), None)
         .await
-        .expect("search succeeds");
+        .expect("search succeeds")
+        .bugs;
     assert_eq!(ids_of(&got), vec![1, 3]);
     assert_eq!(got[0]["summary"], json!("test bug"), "full object returned");
+}
+
+#[tokio::test]
+async fn quicksearch_window_accounts_for_scanned_rows_and_dropped_ids() {
+    // The accounting exists for the audit record (issue #29): `scanned` is
+    // every upstream row the scan examined, `dropped` is exactly the ids
+    // the verdict withheld — in scan order, nothing more.
+    let server = MockServer::start().await;
+    corpus(&server, 30, &[2, 3, 11]).await;
+    let g = guard(EMBARGO_POLICY);
+    let window = g
+        .quicksearch_window(&client(&server), KEY, &search("q", 5, 0), None)
+        .await
+        .expect("search succeeds");
+    assert_eq!(ids_of(&window.bugs), vec![1, 4, 5, 6, 7]);
+    assert_eq!(window.scanned, 30, "every upstream row was examined");
+    assert_eq!(window.dropped, vec![2, 3, 11]);
+}
+
+#[tokio::test]
+async fn quicksearch_window_accounts_for_overshoot_denials() {
+    // The scan is quantised to whole chunks, so it classifies rows far
+    // past the requested window. A denial out there IS part of what this
+    // scan withheld while filling this window, and the accounting says so:
+    // hidden bug 120 sits well past the 5-bug window but inside the first
+    // 200-row chunk.
+    let server = MockServer::start().await;
+    corpus(&server, 150, &[120]).await;
+    let g = guard(EMBARGO_POLICY);
+    let window = g
+        .quicksearch_window(&client(&server), KEY, &search("q", 5, 0), None)
+        .await
+        .expect("search succeeds");
+    assert_eq!(ids_of(&window.bugs), vec![1, 2, 3, 4, 5]);
+    assert_eq!(window.dropped, vec![120], "overshoot denials are counted");
+    assert_eq!(window.scanned, 150);
+}
+
+#[tokio::test]
+async fn quicksearch_window_accounting_skips_idless_rows_and_repeats() {
+    // Neither an id-less row nor a deduped repeat reaches the verdict, so
+    // neither may appear in the drop accounting (they were never
+    // classified, and a non-verdict is not a drop) — but both were fetched
+    // and examined, so both count as scanned rows.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": [
+                bug(1, &[], OLD),
+                bug(2, &["embargo-security"], OLD),
+                json!({ "summary": "no id here", "groups": [] }),
+                bug(1, &[], OLD), // repeated inside the chunk
+                bug(3, &[], OLD),
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let g = guard(EMBARGO_POLICY);
+    let window = g
+        .quicksearch_window(&client(&server), KEY, &search("q", 10, 0), None)
+        .await
+        .expect("search succeeds");
+    assert_eq!(ids_of(&window.bugs), vec![1, 3]);
+    assert_eq!(window.dropped, vec![2], "only the classified denial");
+    assert_eq!(window.scanned, 5, "every row upstream served was examined");
+}
+
+#[tokio::test]
+async fn quicksearch_window_accounting_accumulates_across_chunks() {
+    // The accounting is accumulated per chunk (`dropped.extend`,
+    // `scanned +=`); a regression that reset either counter each
+    // iteration would pass every single-chunk fixture. 250 rows force a
+    // second chunk (target 400 for limit 201), with one hidden id in each
+    // chunk: 10 in the first (rows 1..=200), 230 in the second
+    // (rows 201..=250).
+    let server = MockServer::start().await;
+    corpus(&server, 250, &[10, 230]).await;
+    let g = guard(EMBARGO_POLICY);
+    let window = g
+        .quicksearch_window(&client(&server), KEY, &search("q", 201, 0), None)
+        .await
+        .expect("search succeeds");
+    assert_eq!(window.scanned, 250, "both chunks' rows are counted");
+    assert_eq!(
+        window.dropped,
+        vec![10, 230],
+        "drops from every chunk survive, in scan order"
+    );
+    let ids = ids_of(&window.bugs);
+    assert_eq!(ids.len(), 201, "the window itself is unaffected");
+    assert!(!ids.contains(&10) && !ids.contains(&230));
 }
 
 // ---------------------------------------------------------------------------

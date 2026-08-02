@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bugwarden_core::client::{BugzillaClient, CLASSIFY_FIELDS};
-use bugwarden_core::guard::{Guard, SearchRequest};
+use bugwarden_core::guard::{Guard, SearchRequest, SearchWindow};
 use bugwarden_core::policy::{Access, Action, Capability};
 use chrono::{DateTime, Utc};
 use rmcp::{
@@ -302,7 +302,7 @@ fn assemble_bug_info(
                 // Absent from the body response => fail closed (I4).
                 .and_then(|body| {
                     let (kept, dropped) = guard.filter_bug_list(vec![body.clone()], caller);
-                    if dropped > 0 {
+                    if !dropped.is_empty() {
                         // The verdict flipped between the two fetches — the
                         // anomaly this re-check exists for. Server-side only
                         // (I3): the client just sees the uniform denial.
@@ -1321,7 +1321,14 @@ impl BugWarden {
         // limit/offset address the bugs the client may see; the guard scans
         // and filters upstream rows to fill that window (I2/I3).
         let caller = self.guard.resolve_caller(&self.bz, &key).await;
-        let kept = match self
+        // `scanned`/`dropped` are the scan's accounting for the audit
+        // record only (issue #29); the response is built from `kept`
+        // alone, so it stays byte-identical whatever they hold (I3).
+        let SearchWindow {
+            bugs: kept,
+            scanned,
+            dropped,
+        } = match self
             .guard
             .quicksearch_window(
                 &self.bz,
@@ -1337,7 +1344,7 @@ impl BugWarden {
             )
             .await
         {
-            Ok(kept) => kept,
+            Ok(window) => window,
             // Uniform: a failing search never says which bug or why (I2).
             Err(e) => {
                 tracing::warn!(error = %e, "bugs_quicksearch: upstream search failed");
@@ -1369,11 +1376,19 @@ impl BugWarden {
             Guard::scrub_bug_links(bug, base_url, &allowed);
         }
         if let Some(cell) = audit_cell(&ctx) {
-            // The window's own drops happen inside the guard scan and are
-            // not surfaced here; what this site sees is the served
-            // projection — redacted rows and the linked ids I14 scrubbed
-            // out of them.
             cell.note_verdict(Verdict::Served);
+            // The window scan's own accounting (issue #29): rows examined
+            // and rows dropped by verdict. A dropping scan upgrades the
+            // verdict to served_filtered inside note_scan; the dropped
+            // ids ride the existing suppressed-ids machinery below —
+            // config gate, suppressed_count, and the BTreeSet union with
+            // the I14-scrubbed link ids (overlap dedupes, a feature).
+            cell.note_scan(u64::from(scanned), dropped.len() as u64);
+            if !dropped.is_empty() {
+                cell.note_suppressed(dropped.iter().copied());
+            }
+            // What this site itself sees is the served projection —
+            // redacted rows and the linked ids I14 scrubbed out of them.
             for bug in &projected {
                 if bug.get("_redacted").is_some() {
                     cell.note_redacted("summary_view");
@@ -2518,6 +2533,8 @@ impl ServerHandler for BugWarden {
                     suppressed_count: 0,
                     suppressed_ids: Vec::new(),
                     redacted_fields: Vec::new(),
+                    // The guard never ran, so no window scan did either.
+                    scan: None,
                 }),
                 upstream: None,
                 outcome: audit::OutcomeInfo {

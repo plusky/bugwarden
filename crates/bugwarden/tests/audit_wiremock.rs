@@ -610,6 +610,178 @@ async fn suppressed_ids_off_records_the_count_never_the_ids() {
     );
 }
 
+/// Serve a quicksearch corpus (issue #29 tests): search requests are paged
+/// by limit/offset the way Bugzilla pages them, and the I14 link-disclosure
+/// classify fetch — which addresses bugs by id, not by query — gets an
+/// empty answer (the corpus rows carry no link fields to disclose).
+async fn mount_search_corpus(mock: &MockServer, rows: Vec<Value>) {
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .respond_with(move |req: &wiremock::Request| {
+            let q: std::collections::HashMap<_, _> = req.url.query_pairs().collect();
+            if !q.contains_key("quicksearch") {
+                return ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] }));
+            }
+            let get = |k: &str| q.get(k).and_then(|v| v.parse::<usize>().ok());
+            let offset = get("offset").unwrap_or(0);
+            let limit = get("limit").unwrap_or(rows.len());
+            let page: Vec<_> = rows.iter().skip(offset).take(limit).cloned().collect();
+            ResponseTemplate::new(200).set_body_json(json!({ "bugs": page }))
+        })
+        .mount(mock)
+        .await;
+}
+
+/// A [`world_bug`] in the `Secret*` product the [`HIDE_SECRET_POLICY`]
+/// denies.
+fn secret_bug(id: u64) -> Value {
+    let mut bug = world_bug(id);
+    bug["product"] = json!("SecretSauce");
+    bug
+}
+
+#[tokio::test]
+async fn quicksearch_scan_accounting_reaches_the_record_never_the_envelope() {
+    // Five upstream rows, two of them hidden: the record must say the scan
+    // examined 5 and dropped 2 — and which two, through the existing
+    // suppressed-ids machinery — while the envelope shows three bugs and
+    // not a hint of accounting (I3).
+    let mock = MockServer::start().await;
+    mount_search_corpus(
+        &mock,
+        vec![
+            world_bug(1),
+            secret_bug(2),
+            world_bug(3),
+            secret_bug(4),
+            world_bug(5),
+        ],
+    )
+    .await;
+    let audited = audited_client_for(HIDE_SECRET_POLICY, &mock, "test-key").await;
+
+    let result = call(&audited.client, "bugs_quicksearch", json!({ "query": "q" })).await;
+    assert_ne!(result.is_error, Some(true), "the search is served");
+    let envelope = serde_json::to_string(&result).unwrap();
+    for leak in ["scanned", "dropped", "\"scan\""] {
+        assert!(
+            !envelope.contains(leak),
+            "scan accounting leaked into the envelope: {envelope}"
+        );
+    }
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    let guard = tc.guard.as_ref().expect("guard info recorded");
+    let scan = guard.scan.expect("a search records its scan");
+    assert_eq!(scan.scanned, 5, "every upstream row was examined");
+    assert_eq!(scan.dropped, 2, "the two hidden rows were dropped");
+    assert_eq!(guard.verdict, Verdict::ServedFiltered);
+    assert_eq!(
+        guard.suppressed_ids,
+        vec![2, 4],
+        "the dropped ids ride the suppressed-ids machinery"
+    );
+    assert_eq!(guard.suppressed_count, 2);
+}
+
+#[tokio::test]
+async fn quicksearch_response_is_byte_identical_whether_or_not_rows_were_dropped() {
+    // Acceptance (b) of issue #29, at the tool level with auditing ON: a
+    // window that dropped hidden rows serializes byte-identically to the
+    // same window over an upstream where those rows simply do not exist.
+    let visible: Vec<u64> = vec![1, 3, 5, 6, 8, 9, 10, 11, 12];
+    let mock_mixed = MockServer::start().await;
+    mount_search_corpus(
+        &mock_mixed,
+        (1..=12)
+            .map(|id| {
+                if [2, 4, 7].contains(&id) {
+                    secret_bug(id)
+                } else {
+                    world_bug(id)
+                }
+            })
+            .collect(),
+    )
+    .await;
+    let mock_clean = MockServer::start().await;
+    mount_search_corpus(
+        &mock_clean,
+        visible.iter().map(|&id| world_bug(id)).collect(),
+    )
+    .await;
+
+    let mixed = audited_client_for(HIDE_SECRET_POLICY, &mock_mixed, "test-key").await;
+    let clean = audited_client_for(HIDE_SECRET_POLICY, &mock_clean, "test-key").await;
+    let args = json!({ "query": "q", "limit": 4, "offset": 2 });
+    let from_mixed = call(&mixed.client, "bugs_quicksearch", args.clone()).await;
+    let from_clean = call(&clean.client, "bugs_quicksearch", args).await;
+    assert_eq!(
+        serde_json::to_string(&from_mixed).unwrap(),
+        serde_json::to_string(&from_clean).unwrap(),
+        "dropped rows must not change a single response byte (I3)"
+    );
+
+    // The difference lives in the records alone: the mixed scan dropped,
+    // the clean scan did not.
+    let mixed_events = read_events(&mixed.audit_path);
+    let mixed_guard = last_tool_call(&mixed_events).guard.as_ref().unwrap();
+    assert!(mixed_guard.scan.expect("scan recorded").dropped > 0);
+    let clean_events = read_events(&clean.audit_path);
+    let clean_guard = last_tool_call(&clean_events).guard.as_ref().unwrap();
+    assert_eq!(clean_guard.scan.expect("scan recorded").dropped, 0);
+}
+
+#[tokio::test]
+async fn quicksearch_drop_count_survives_the_suppressed_ids_knob() {
+    // Acceptance (c) of issue #29: with `suppressed_ids = false` the
+    // record still counts what the scan dropped — it just names no id.
+    let mock = MockServer::start().await;
+    mount_search_corpus(&mock, vec![world_bug(1), secret_bug(2), world_bug(3)]).await;
+    let audited = audited_client_with(HIDE_SECRET_POLICY, &mock, "test-key", false).await;
+
+    let result = call(&audited.client, "bugs_quicksearch", json!({ "query": "q" })).await;
+    assert_ne!(result.is_error, Some(true), "the search is served");
+
+    let events = read_events(&audited.audit_path);
+    let guard = last_tool_call(&events).guard.as_ref().unwrap();
+    let scan = guard.scan.expect("a search records its scan");
+    assert_eq!(scan.dropped, 1, "the count survives the elision");
+    assert_eq!(scan.scanned, 3);
+    assert!(guard.suppressed_count >= 1, "so does suppressed_count");
+    assert!(
+        guard.suppressed_ids.is_empty(),
+        "ids are elided when the knob is off: {:?}",
+        guard.suppressed_ids
+    );
+}
+
+#[tokio::test]
+async fn quicksearch_clean_scan_records_zero_drops_and_stays_served() {
+    // A search that hid nothing still accounts for its scan — dropped = 0
+    // is a statement, not an omission — and keeps the clean verdict.
+    let mock = MockServer::start().await;
+    mount_search_corpus(&mock, vec![world_bug(1), world_bug(2), world_bug(3)]).await;
+    let audited = audited_client_for(HIDE_SECRET_POLICY, &mock, "test-key").await;
+
+    let result = call(&audited.client, "bugs_quicksearch", json!({ "query": "q" })).await;
+    assert_ne!(result.is_error, Some(true), "the search is served");
+
+    let events = read_events(&audited.audit_path);
+    let guard = last_tool_call(&events).guard.as_ref().unwrap();
+    assert_eq!(
+        guard.scan,
+        Some(bugwarden::audit::ScanInfo {
+            scanned: 3,
+            dropped: 0
+        })
+    );
+    assert_eq!(guard.verdict, Verdict::Served, "a clean scan stays served");
+    assert!(guard.suppressed_ids.is_empty());
+    assert_eq!(guard.suppressed_count, 0);
+}
+
 #[tokio::test]
 async fn canary_content_never_reaches_the_audit_file() {
     const KEY_CANARY: &str = "canary-api-key-5c9e02";

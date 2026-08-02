@@ -6,9 +6,10 @@
 //!
 //! - **I2** — uniform denial: [`Guard::denial`] produces the exact same text
 //!   for a policy-denied and a nonexistent bug.
-//! - **I3** — silent filtering: [`Guard::filter_bug_list`] returns the count
-//!   of dropped bugs for server-side logging only; callers must never send
-//!   it to the MCP client.
+//! - **I3** — silent filtering: [`Guard::filter_bug_list`] returns the ids
+//!   of dropped bugs for server-side logging and audit accounting only;
+//!   callers must never send them — or anything derived from them — to the
+//!   MCP client.
 //! - **I4** — fail closed: [`Guard::assess`] maps every id whose
 //!   classification data cannot be fetched to `Denied`.
 //! - **I5** — private comments require BOTH the policy opt-in and the
@@ -64,6 +65,30 @@ pub struct SearchRequest<'a> {
     pub limit: u32,
     /// How many visible bugs to skip.
     pub offset: u32,
+}
+
+/// What one [`Guard::quicksearch_window`] scan produced: the window the
+/// client may see, plus the accounting the audit record needs (issue #29).
+///
+/// The accounting is server-side only (I3): callers may log it or place it
+/// in the audit record, but nothing derived from it — a count, an envelope
+/// field, a timing difference — may reach the MCP client, whose response
+/// is built from `bugs` alone.
+#[derive(Debug, Clone, Default)]
+pub struct SearchWindow {
+    /// The visible window: the bugs the client may see, in upstream order.
+    pub bugs: Vec<Value>,
+    /// Upstream rows the scan examined — duplicate rows and id-less rows
+    /// included, because each one was fetched and looked at.
+    pub scanned: u32,
+    /// Ids of the rows the scan dropped by verdict, in scan order (unique
+    /// by construction: rows are deduped on the server-reported id before
+    /// classification). Pinned semantics: denials in the overshoot region
+    /// past the requested window ARE included — deliberately, they are
+    /// what this scan classified while filling this window — while
+    /// id-less rows and deduped repeats are never classified, so they
+    /// appear neither here nor in any drop count.
+    pub dropped: Vec<u64>,
 }
 
 impl Guard {
@@ -256,13 +281,19 @@ impl Guard {
     /// binary-search `limit` and recover the exact hidden count of every
     /// block, which is why it is there. A long way from reconstructing a
     /// title, which is what this replaces.
+    ///
+    /// Returns a [`SearchWindow`]: the window itself plus the scan's
+    /// accounting (rows examined, ids dropped by verdict) so the caller can
+    /// put the numbers in the audit record (issue #29). The accounting is
+    /// server-side only (I3) — the client response is built from
+    /// [`SearchWindow::bugs`] alone.
     pub async fn quicksearch_window(
         &self,
         bz: &BugzillaClient,
         key: &str,
         req: &SearchRequest<'_>,
         caller: Option<&str>,
-    ) -> anyhow::Result<Vec<Value>> {
+    ) -> anyhow::Result<SearchWindow> {
         let SearchRequest {
             query,
             status,
@@ -272,7 +303,7 @@ impl Guard {
         } = *req;
         let needed = offset.saturating_add(limit).min(Self::MAX_SEARCH_WINDOW);
         if limit == 0 || needed == 0 {
-            return Ok(Vec::new());
+            return Ok(SearchWindow::default());
         }
 
         // Scan for a whole number of chunks' worth of visible bugs rather
@@ -291,7 +322,7 @@ impl Guard {
         let mut visible: Vec<Value> = Vec::new();
         let mut seen: BTreeSet<u64> = BTreeSet::new();
         let mut scanned: u32 = 0;
-        let mut dropped_total = 0usize;
+        let mut dropped: Vec<u64> = Vec::new();
 
         while (visible.len() as u32) < target && scanned < Self::SEARCH_SCAN_MAX {
             let chunk = Self::SEARCH_SCAN_CHUNK.min(Self::SEARCH_SCAN_MAX - scanned);
@@ -316,8 +347,8 @@ impl Guard {
                         .is_some_and(|id| seen.insert(id))
                 })
                 .collect();
-            let (kept, dropped) = self.filter_bug_list(fresh, caller);
-            dropped_total += dropped;
+            let (kept, chunk_dropped) = self.filter_bug_list(fresh, caller);
+            dropped.extend(chunk_dropped);
             visible.extend(kept);
             scanned += returned;
 
@@ -326,10 +357,10 @@ impl Guard {
             }
         }
 
-        if dropped_total > 0 {
+        if !dropped.is_empty() {
             // Server-side only, never a count to the client (I3).
             tracing::debug!(
-                dropped = dropped_total,
+                dropped = dropped.len(),
                 scanned,
                 "quicksearch: withheld policy-denied bugs"
             );
@@ -344,7 +375,11 @@ impl Guard {
         // session down with it).
         let end = (needed as usize).min(visible.len());
         let start = (offset as usize).min(end);
-        Ok(visible[start..end].to_vec())
+        Ok(SearchWindow {
+            bugs: visible[start..end].to_vec(),
+            scanned,
+            dropped,
+        })
     }
 
     /// Bug fields that carry references to OTHER bugs, as id lists.
@@ -835,9 +870,14 @@ impl Guard {
     ///
     /// Per bug: a `read` grant keeps the object as-is, a `summary`-only
     /// grant replaces it with [`Guard::summary_view`], anything else drops
-    /// it. Returns `(kept, dropped_count)`; the count exists for server-side
-    /// logging ONLY and must never be sent to the MCP client (I3) — from the
-    /// client's perspective filtered results simply never existed.
+    /// it. Returns `(kept, dropped_ids)`; the ids — and any count derived
+    /// from them — exist for server-side logging and audit accounting ONLY
+    /// and must never be sent to the MCP client (I3): from the client's
+    /// perspective filtered results simply never existed. A dropped row
+    /// without a readable u64 id contributes no entry, so `dropped.len()`
+    /// equals the drop count for every caller that feeds server-labelled
+    /// rows (which all of them do — [`Guard::quicksearch_window`] excludes
+    /// id-less rows before classification, I4).
     ///
     /// The input objects must include the classification fields (callers
     /// fetch `requested ∪ CLASSIFY_FIELDS`), otherwise bugs may be
@@ -847,10 +887,14 @@ impl Guard {
     /// ([`Guard::resolve_caller`]); under an identity-consulting policy a
     /// caller of `None` denies every bug the identity rules are consulted
     /// for (I4).
-    pub fn filter_bug_list(&self, bugs: Vec<Value>, caller: Option<&str>) -> (Vec<Value>, usize) {
+    pub fn filter_bug_list(
+        &self,
+        bugs: Vec<Value>,
+        caller: Option<&str>,
+    ) -> (Vec<Value>, Vec<u64>) {
         let now = Utc::now();
         let mut kept = Vec::new();
-        let mut dropped = 0usize;
+        let mut dropped = Vec::new();
         for bug in bugs {
             let meta = BugMeta::from_json(&bug, caller);
             let access = self.policy.classify(&meta, now, Operation::Access);
@@ -859,7 +903,7 @@ impl Guard {
             } else if access.allows(Capability::Summary) {
                 kept.push(Self::summary_view(&bug));
             } else {
-                dropped += 1;
+                dropped.extend(bug.get("id").and_then(Value::as_u64));
             }
         }
         (kept, dropped)
@@ -1424,7 +1468,7 @@ products = ["NoView*"]
             json!({"id": 4, "product": "NoViewer", "summary": "also hidden"}),
         ];
         let (kept, dropped) = g.filter_bug_list(bugs, None);
-        assert_eq!(dropped, 2, "denied and view-less bugs are dropped");
+        assert_eq!(dropped, vec![2, 4], "denied and view-less bugs are dropped");
         assert_eq!(kept.len(), 2);
         // Full-read bug passes through unmodified — extra fields intact, no
         // redaction marker.
@@ -1465,7 +1509,11 @@ products = ["NoView*"]
             json!({"id": 6, "groups": []}),
         ];
         let (kept, dropped) = g.filter_bug_list(bugs, None);
-        assert_eq!(dropped, 5, "only the plain, world-readable bug survives");
+        assert_eq!(
+            dropped,
+            vec![2, 3, 4, 5, 6],
+            "only the plain, world-readable bug survives"
+        );
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0]["id"], json!(1));
     }
@@ -1479,7 +1527,7 @@ products = ["NoView*"]
         };
         let (kept, dropped) =
             g.filter_bug_list(vec![json!({"id": 9, "product": "x", "cc": ["a@b"]})], None);
-        assert_eq!(dropped, 0);
+        assert!(dropped.is_empty());
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0]["cc"], json!(["a@b"]));
         assert!(kept[0].get("_redacted").is_none());
@@ -1492,7 +1540,7 @@ products = ["NoView*"]
         };
         let (kept, dropped) = g.filter_bug_list(vec![json!({"id": 1}), json!({"id": 2})], None);
         assert_eq!(kept.len(), 2);
-        assert_eq!(dropped, 0);
+        assert!(dropped.is_empty());
     }
 
     #[test]
@@ -1502,7 +1550,7 @@ products = ["NoView*"]
         };
         let (kept, dropped) = g.filter_bug_list(vec![json!({"id": 1}), json!({"id": 2})], None);
         assert!(kept.is_empty());
-        assert_eq!(dropped, 2);
+        assert_eq!(dropped, vec![1, 2]);
     }
 
     #[test]
@@ -1512,7 +1560,7 @@ products = ["NoView*"]
         };
         let (kept, dropped) = g.filter_bug_list(Vec::new(), None);
         assert!(kept.is_empty());
-        assert_eq!(dropped, 0);
+        assert!(dropped.is_empty());
     }
 
     #[test]
@@ -1527,7 +1575,7 @@ products = ["NoView*"]
             json!({"id": 2, "product": "P", "groups": []}),
         ];
         let (kept, dropped) = g.filter_bug_list(bugs, None);
-        assert_eq!(dropped, 1);
+        assert_eq!(dropped, vec![1]);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0]["id"], json!(2));
     }

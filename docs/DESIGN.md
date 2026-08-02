@@ -367,8 +367,12 @@ impl Guard {
     // limit/offset address VISIBLE bugs: scan upstream from row 0 in chunks,
     // classify, fill the window from survivors. Bounded by MAX_SEARCH_WINDOW
     // (1000 addressable) and 2000 scanned rows; truncation looks like the end
-    // of results. Returns the classified objects themselves.
+    // of results. Returns the classified objects themselves, wrapped in a
+    // SearchWindow together with the scan's accounting (issue #29) —
+    // server-side only (I3), for the audit record; the client response is
+    // built from `bugs` alone.
     pub struct SearchRequest<'a> { query, status, include_fields: &'a str, limit, offset: u32 }
+    pub struct SearchWindow { bugs: Vec<serde_json::Value>, scanned: u32, dropped: Vec<u64> }
     pub const MAX_SEARCH_WINDOW: u32;
 
     // I14 link scrubbing. Candidate ids come from Bugzilla, not the client,
@@ -387,7 +391,7 @@ impl Guard {
     pub fn duplicate_marker_ids(comments: &[Value]) -> BTreeSet<u64>;
     pub fn scrub_duplicate_markers(comments: Vec<Value>, ok: &BTreeSet<u64>) -> Vec<Value>;
     pub async fn quicksearch_window(&self, bz: &BugzillaClient, key: &str,
-        req: &SearchRequest<'_>, caller: Option<&str>) -> anyhow::Result<Vec<serde_json::Value>>;
+        req: &SearchRequest<'_>, caller: Option<&str>) -> anyhow::Result<SearchWindow>;
 
     // The `caller` parameter on assess/quicksearch_window/disclosable/
     // filter_bug_list is the identity resolved ONCE per tool call by
@@ -408,9 +412,10 @@ impl Guard {
     pub fn summary_view(bug: &serde_json::Value) -> serde_json::Value;
 
     /// Classify each bug: full read kept as-is, summary-only replaced by
-    /// summary_view, denied dropped. Returns (kept, dropped_count) — the count
-    /// is for server-side logging ONLY, never sent to the client (I3).
-    pub fn filter_bug_list(&self, bugs: Vec<serde_json::Value>, caller: Option<&str>) -> (Vec<serde_json::Value>, usize);
+    /// summary_view, denied dropped. Returns (kept, dropped_ids) — the ids
+    /// are for server-side logging and audit accounting ONLY, never sent to
+    /// the client (I3).
+    pub fn filter_bug_list(&self, bugs: Vec<serde_json::Value>, caller: Option<&str>) -> (Vec<serde_json::Value>, Vec<u64>);
 
     /// Drops is_private comments unless include_private && policy allows (I5).
     pub fn filter_comments(&self, comments: Vec<serde_json::Value>, include_private: bool) -> Vec<serde_json::Value>;
@@ -666,7 +671,7 @@ constraints the model must know.
 | bug_info | bug_ids: Vec<u64> | per-id: Read => full, else Summary => redacted, else restricted entry | envelope `{"bugs":[..], "restricted":[{"id":N,"note":denial(N)}]}`; full fetch only for Read-granted ids. Every fetched body is RE-CLASSIFIED before it is served (assemble_bug_info): the verdict came from the classification fetch and the body from a later request, so a bug embargoed in between must not be served on the stale verdict (TOCTOU; same reason download_attachment re-checks). Costs no request — the body is a superset of CLASSIFY_FIELDS — and a body that now earns only summary is served as the summary view, one that earns nothing becomes the uniform restricted entry. A failed body fetch is logged server-side ONLY and leaves those ids restricted: Bugzilla's message names the bug and says whether it exists, so forwarding it would undo I2 |
 | bug_history | id, new_since?: DateTime<Utc> | history | |
 | bug_comments | id, include_private: bool = false, new_since? | comments | filter_comments applied (I5) |
-| bugs_quicksearch | query, status: String = "ALL", include_fields: String = "id,product,component,assigned_to,status,resolution,summary,last_change_time", limit: u32 = 50, offset: u32 = 0 | post-filter | fetch include_fields = requested ∪ CLASSIFY_FIELDS; after filter, project kept bugs to requested fields (keep `_redacted` marker); envelope `{"bugs":[..]}` only (I3), except an advisory `note` when the query is nothing but bug ids (comma/whitespace-separated, optional `#` per id) steering exact id sets to bug_info — the note is a pure function of the CLIENT'S REQUEST (the query and status strings), never of results, verdicts, or anything upstream said (no new oracle), and the `bugs` array is byte-identical with or without it (the query is still searched, never rerouted); its wording tracks the request: a non-empty status is prefixed to the query so upstream content-matches the whole expression, while an empty status sends the query bare and Bugzilla routes a bare all-number query to an exact id lookup (bug_id + anyexact) — on that path the note drops the content-matching claim — and a query naming more distinct ids than MAX_ASSESS_IDS steers to batched bug_info calls (the cap is already public in the too_many_ids refusal text) instead of straight into that refusal | **limit/offset address the bugs the client may SEE, not upstream rows** (Guard::quicksearch_window): filtering an already-paginated page left a hole exactly where a hidden bug sat — a short page the next offset contradicted — and since quicksearch matches summary text that hole was a probe for the hidden title, one word at a time. The guard now scans upstream from row 0 in 200-row chunks, classifies each, and fills the window from the survivors; rows are deduped on the server-reported id (relevance order is not stable between calls) and an id-less row is dropped (I4). Bounds: MAX_SEARCH_WINDOW=1000 addressable, 2000 rows scanned (<=10 sequential requests); hitting either truncates, which looks exactly like the end of results. The objects returned are the ones classified. The scan target is quantised to whole chunks so the stopping point does not track the client's `limit`; without that, `limit` could be binary-searched against the clock to recover each block's exact hidden count. Residual, accepted: filling a window of VISIBLE bugs needs more rows when bugs are hidden, so a stopwatch still learns one bit per scanned block ("not entirely visible"). Removing that would mean scanning the worst case on every search, or letting pages go short again. Search failure returns a bare "Search failed"; the upstream text is logged server-side only (it can name a bug and say whether it exists) |
+| bugs_quicksearch | query, status: String = "ALL", include_fields: String = "id,product,component,assigned_to,status,resolution,summary,last_change_time", limit: u32 = 50, offset: u32 = 0 | post-filter | fetch include_fields = requested ∪ CLASSIFY_FIELDS; after filter, project kept bugs to requested fields (keep `_redacted` marker); envelope `{"bugs":[..]}` only (I3), except an advisory `note` when the query is nothing but bug ids (comma/whitespace-separated, optional `#` per id) steering exact id sets to bug_info — the note is a pure function of the CLIENT'S REQUEST (the query and status strings), never of results, verdicts, or anything upstream said (no new oracle), and the `bugs` array is byte-identical with or without it (the query is still searched, never rerouted); its wording tracks the request: a non-empty status is prefixed to the query so upstream content-matches the whole expression, while an empty status sends the query bare and Bugzilla routes a bare all-number query to an exact id lookup (bug_id + anyexact) — on that path the note drops the content-matching claim — and a query naming more distinct ids than MAX_ASSESS_IDS steers to batched bug_info calls (the cap is already public in the too_many_ids refusal text) instead of straight into that refusal | **limit/offset address the bugs the client may SEE, not upstream rows** (Guard::quicksearch_window): filtering an already-paginated page left a hole exactly where a hidden bug sat — a short page the next offset contradicted — and since quicksearch matches summary text that hole was a probe for the hidden title, one word at a time. The guard now scans upstream from row 0 in 200-row chunks, classifies each, and fills the window from the survivors; rows are deduped on the server-reported id (relevance order is not stable between calls) and an id-less row is dropped (I4). Bounds: MAX_SEARCH_WINDOW=1000 addressable, 2000 rows scanned (<=10 sequential requests); hitting either truncates, which looks exactly like the end of results. The objects returned are the ones classified. The scan target is quantised to whole chunks so the stopping point does not track the client's `limit`; without that, `limit` could be binary-searched against the clock to recover each block's exact hidden count. Residual, accepted: filling a window of VISIBLE bugs needs more rows when bugs are hidden, so a stopwatch still learns one bit per scanned block ("not entirely visible"). Removing that would mean scanning the worst case on every search, or letting pages go short again. Search failure returns a bare "Search failed"; the upstream text is logged server-side only (it can name a bug and say whether it exists). The scan's accounting — rows examined, verdict-dropped ids — goes to the audit record only (`guard.scan` plus the suppressed-ids machinery, issue #29); the response is byte-identical with or without drops |
 | create_bug | product, component, summary, version, description = "", severity?, priority?, op_sys?, platform?, keywords?: Vec<String>, groups?: Vec<String> | create (write), judged on the bug AS REQUESTED (Guard::may_create) | there is no bug id to assess, so the request itself is classified BEFORE any upstream call (I8): the rules that hide a product by name refuse filing into it, a field the request omits fails closed (I4), and a client-claimed `groups` list is never trusted — Bugzilla unions the product's mandatory groups in server-side, so may_create forces groups to unknown, which means a group-consulting rule refuses every create request that REACHES it — creation is possible only where an earlier rule covering the create operation grants it (a rule carrying `operations = ["create"]`, placed ahead of the group-consulting rules, is how an operator permits filing without that grant shadowing reads of existing bugs — issue #26), and a policy with no such grant refuses all creation. **Both refusals are one refusal**: a policy refusal and an upstream failure return the same fixed create_denial text after the same single upstream request — the refused path burns one classify call against bug id 0 (never a valid id, creates nothing; download_attachment's padding precedent) instead of the POST. Two texts, or 0 vs 1 requests, would be a free policy-enumeration oracle: send a guaranteed-invalid `version` plus a probe product and read the policy off which refusal (or which latency) comes back, with nothing created. Residual, accepted: a SUCCESSFUL create still confirms the product is allowed — that is the tool doing its job, and it costs a real, attributable bug; and the padding equalizes request count, not the upstream handler's exact latency (GET classify vs rejected POST). Bugzilla's failure message is logged server-side only (it can say whether a product/component exists) |
 | add_attachment | bug_id, data (base64), file_name, summary, content_type, comment = "", is_private = false, is_patch = false | attach (write) on bug_id | guard assessment before the upload (I8), uniform denial (I2); then global.max_attachment_bytes caps the DECODED size of `data` (0 = no cap) — the ceiling the operator set on downloads binds uploads through the same server too, measured after base64 expansion is stripped so encoding overhead cannot shrink it. The refusal names neither the payload's size nor the cap value (max_attachment_bytes is not I1-disclosable, exactly as on the download path). `comment` travels as a PLAIN string — Bug.add_attachment documents it so; the `{"comment": {"body": ..}}` shape belongs to Bug.update only |
 | add_comment | bug_id, comment, is_private: bool = false | comment (write) | |
@@ -852,6 +857,29 @@ Decisions, all deliberate:
   are deliberately not stored: the schema has no field for either,
   `tracestate` is client free text, and `baggage` is unbounded client
   key/values — revisit under #34.
+- **Search-window drop accounting (issue #29).** A `bugs_quicksearch`
+  record carries `guard.scan = {scanned, dropped}`: how many upstream rows
+  the window scan examined and how many it dropped by verdict — without
+  it, a search that silently withheld many denied rows is
+  indistinguishable in the stream from one that withheld none. Pinned
+  semantics follow what the scan actually classified: overshoot-region
+  denials (past the requested window but inside the quantised chunk) are
+  counted, deduped repeats and id-less rows are not (they never reach a
+  verdict). The field is present on every served `bugs_quicksearch`
+  call — a zero-limit call touches no upstream rows and records
+  `{scanned: 0, dropped: 0}`, and a failed search records no scan (the
+  error discards its partial accounting along with the window) — so on
+  a served search, `dropped: 0` is a statement, not an omission;
+  records from before the field existed deserialize with no scan
+  (optional field, schema still v1). The dropped IDS ride the existing suppressed-ids machinery —
+  unioned into `guard.suppressed_ids` under the same `suppressed_ids`
+  config switch, no second knob — while the counts in `scan` are recorded
+  regardless of that switch. DELIBERATE verdict change: a search whose
+  scan dropped rows now records `served_filtered` (through the worst-wins
+  merge; previously such a call recorded `served`), because a search that
+  withheld rows IS a filtered serve; a clean scan leaves the verdict
+  untouched. Client-invisible by construction (I3): the response is built
+  from the window's bugs alone, byte-identical with or without drops.
 
 ## rmcp 2.2 usage notes
 
@@ -977,7 +1005,12 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   an empty page whether or not bugs were hidden, the scan bound is counted in
   requests, the scan target does not track `limit`, id-less rows are dropped,
   rows repeated across chunks are served once, exhaustion and scan truncation look alike, zero limit
-  touches nothing, and the returned objects are the classified ones;
+  touches nothing (and accounts for nothing), the returned objects are the
+  classified ones, and the scan accounting (issue #29) — `scanned` counts
+  every upstream row examined and `dropped` is exactly the verdict-dropped
+  ids, overshoot-region denials included, id-less rows and deduped repeats
+  excluded, and both accumulate across chunks (a multi-chunk corpus with a
+  drop in each chunk pins the per-chunk `extend`/`+=`);
   assess() deny for embargoed group; min-age deny; one request per distinct
   id whatever the answer (nonexistent vs withheld cost the same), repeated
   ids fetched once, no batch to poison; per-id
@@ -1085,6 +1118,16 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   direct in-process `ServerHandler::call_tool` invocation with the
   traceparent in the params-struct meta and an empty `context.meta`
   pins the `CallToolRequestParams.meta` arm that no serialized
-  transport can exercise.
+  transport can exercise; and search-window drop accounting (issue #29)
+  — a search over hidden rows records `guard.scan` with the exact
+  scanned/dropped counts, the dropped ids in `suppressed_ids`, and
+  verdict `served_filtered`, while the served envelope carries not a
+  byte of accounting and is byte-identical to the same window over an
+  upstream where the hidden rows do not exist; with `suppressed_ids =
+  false` the scan counts and `suppressed_count` survive while the ids
+  are elided; a clean search records `scan.dropped == 0` under verdict
+  `served`; and a pre-#29 record line without `guard.scan`
+  deserializes with the scan absent (plus the cell-level note_scan
+  merge tests and the updated schema golden in audit.rs).
 - CI: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace --locked`, `cargo deny check`.

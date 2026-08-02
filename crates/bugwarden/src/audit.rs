@@ -490,6 +490,30 @@ pub struct GuardInfo {
     /// Names of fields the guard redacted from served bugs (field names
     /// only, never their values).
     pub redacted_fields: Vec<String>,
+    /// Search-window scan accounting, present only on calls that ran a
+    /// window scan (`bugs_quicksearch`). Recorded regardless of
+    /// [`AuditConfig::suppressed_ids`] — that switch elides ids, never
+    /// counts. Records written before this field existed deserialize to
+    /// `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan: Option<ScanInfo>,
+}
+
+/// What the search-window scan behind one call examined and withheld
+/// (issue #29). These numbers are exactly what I3 keeps out of the
+/// response: without them a search that silently dropped many denied rows
+/// is indistinguishable in the stream from one that dropped none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanInfo {
+    /// Upstream rows the scan examined — duplicate and id-less rows
+    /// included, because each one was fetched and looked at.
+    pub scanned: u64,
+    /// Rows the scan dropped by verdict. Authoritative on its own, like
+    /// [`GuardInfo::suppressed_count`]: the dropped ids ride
+    /// [`GuardInfo::suppressed_ids`] and may be elided by configuration,
+    /// so consumers must never infer this count from that list.
+    pub dropped: u64,
 }
 
 /// The guard's overall verdict for one tool call.
@@ -1055,6 +1079,8 @@ struct CellState {
     /// metadata filtered out): counted, never named.
     suppressed_extra: u64,
     redacted_fields: std::collections::BTreeSet<String>,
+    /// Search-window scan accounting ([`AuditCell::note_scan`]).
+    scan: Option<ScanInfo>,
     upstream: Option<UpstreamInfo>,
 }
 
@@ -1140,6 +1166,22 @@ impl AuditCell {
         state.suppressed_extra = state.suppressed_extra.saturating_add(n);
     }
 
+    /// Note the search-window scan's accounting (issue #29): how many
+    /// upstream rows it examined and how many it dropped by verdict. One
+    /// scan per call by construction; if noted twice, the last note wins.
+    /// A scan that dropped rows IS a filtered serve, so `dropped > 0`
+    /// upgrades the verdict exactly as [`AuditCell::note_suppressed`]
+    /// does; a clean scan records its numbers without touching the
+    /// verdict at all. The dropped IDS are not this method's business —
+    /// the call site feeds them to [`AuditCell::note_suppressed`], where
+    /// the existing `suppressed_ids` config switch governs them.
+    pub fn note_scan(&self, scanned: u64, dropped: u64) {
+        if dropped > 0 {
+            self.merge(Verdict::ServedFiltered, None);
+        }
+        self.lock().scan = Some(ScanInfo { scanned, dropped });
+    }
+
     /// Note a field (or view marker) the guard redacted from served
     /// bugs. Upgrades the verdict to `ServedFiltered`.
     pub fn note_redacted(&self, field: &str) {
@@ -1182,6 +1224,8 @@ impl AuditCell {
                 Vec::new()
             },
             redacted_fields: state.redacted_fields.into_iter().collect(),
+            // Counts, not ids: the suppressed_ids switch never touches it.
+            scan: state.scan,
         })
     }
 }
@@ -1238,6 +1282,10 @@ mod tests {
                 suppressed_count: 2,
                 suppressed_ids: vec![1290040, 1290041],
                 redacted_fields: vec!["cc".into(), "flags".into()],
+                scan: Some(ScanInfo {
+                    scanned: 200,
+                    dropped: 2,
+                }),
             }),
             upstream: Some(UpstreamInfo {
                 requests: 1,
@@ -1324,10 +1372,32 @@ mod tests {
     // ---------- schema goldens (v1 stability gate) ----------
     //
     // These strings ARE the wire format. A failure here means the schema
-    // changed; that requires a version bump and a deliberate decision,
-    // not an updated constant.
+    // changed; that requires a deliberate decision, not an updated
+    // constant. One shape of change stays within v1: adding a field that
+    // is optional and absent when unset (as `guard.scan` was, issue #29).
+    // Such a change updates the golden AND must pin the prior byte
+    // sequence as a GOLDEN_*_PRE_* constant with a test proving old lines
+    // still deserialize. Any other byte change — removing, renaming,
+    // reordering, or retyping a field — requires a version bump.
 
     const GOLDEN_TOOL_CALL: &str = concat!(
+        r#"{"v":1,"ts":"2026-02-03T04:05:06.789Z","seq":7,"#,
+        r#""session":{"id":"sess-1","transport":"http","remote":"192.0.2.7:52611"},"#,
+        r#""event":"tool_call","#,
+        r#""client":{"name":"example-agent","version":"1.4.2","principal":"alice@example.org"},"#,
+        r#""trace":{"trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331"},"#,
+        r#""request":{"tool":"bug_info","id":"3","params":{"id":1290042,"include_private":false}},"#,
+        r#""guard":{"verdict":"served_filtered","rule":"group-restricted","policy_hash":"2b6e8f5d1c9a4e70","#,
+        r#""suppressed_count":2,"suppressed_ids":[1290040,1290041],"redacted_fields":["cc","flags"],"#,
+        r#""scan":{"scanned":200,"dropped":2}},"#,
+        r#""upstream":{"requests":1,"status":200,"latency_ms":48},"#,
+        r#""outcome":{"class":"ok","duration_ms":52}}"#,
+    );
+
+    /// [`GOLDEN_TOOL_CALL`] as records looked before `guard.scan` existed
+    /// (issue #29). The field was added optional-and-absent-when-unset, so
+    /// lines from older files must keep deserializing — to a `None` scan.
+    const GOLDEN_TOOL_CALL_PRE_SCAN: &str = concat!(
         r#"{"v":1,"ts":"2026-02-03T04:05:06.789Z","seq":7,"#,
         r#""session":{"id":"sess-1","transport":"http","remote":"192.0.2.7:52611"},"#,
         r#""event":"tool_call","#,
@@ -1367,6 +1437,20 @@ mod tests {
     fn golden_audit_gap_json() {
         let event = envelope(9, session_stdio(), sample_gap());
         assert_eq!(serde_json::to_string(&event).unwrap(), GOLDEN_AUDIT_GAP);
+    }
+
+    #[test]
+    fn tool_call_line_without_scan_still_deserializes() {
+        // A pre-#29 record has no `guard.scan` bytes at all; it must parse
+        // into today's types with the scan simply absent.
+        let event: AuditEvent =
+            serde_json::from_str(GOLDEN_TOOL_CALL_PRE_SCAN).expect("an old line must parse");
+        let AuditEventKind::ToolCall(tc) = &event.kind else {
+            panic!("expected a tool_call event");
+        };
+        let guard = tc.guard.as_ref().expect("the old line carries a guard");
+        assert_eq!(guard.scan, None, "absent field means None, not an error");
+        assert_eq!(guard.suppressed_count, 2, "the rest is read unchanged");
     }
 
     #[test]
@@ -2160,6 +2244,83 @@ mod tests {
         let info = cell.into_guard_info(None, true).unwrap();
         assert_eq!(info.verdict, Verdict::ServedFiltered);
         assert_eq!(info.redacted_fields, vec!["summary_view".to_string()]);
+    }
+
+    #[test]
+    fn cell_scan_with_drops_is_a_filtered_serve() {
+        let cell = AuditCell::default();
+        cell.note_verdict(Verdict::Served);
+        cell.note_scan(200, 3);
+        let info = cell.into_guard_info(None, true).unwrap();
+        assert_eq!(
+            info.verdict,
+            Verdict::ServedFiltered,
+            "a search that withheld rows is a filtered serve"
+        );
+        assert_eq!(
+            info.scan,
+            Some(ScanInfo {
+                scanned: 200,
+                dropped: 3
+            })
+        );
+    }
+
+    #[test]
+    fn cell_clean_scan_records_numbers_without_touching_the_verdict() {
+        let cell = AuditCell::default();
+        cell.note_verdict(Verdict::Served);
+        cell.note_scan(30, 0);
+        let info = cell.into_guard_info(None, true).unwrap();
+        assert_eq!(info.verdict, Verdict::Served, "a clean scan stays served");
+        assert_eq!(
+            info.scan,
+            Some(ScanInfo {
+                scanned: 30,
+                dropped: 0
+            })
+        );
+    }
+
+    #[test]
+    fn cell_scan_noted_twice_keeps_the_last_note() {
+        // One search per call by construction; should a second note ever
+        // happen, last write wins — documented, not merged.
+        let cell = AuditCell::default();
+        cell.note_scan(200, 3);
+        cell.note_scan(400, 0);
+        let info = cell.into_guard_info(None, true).unwrap();
+        assert_eq!(
+            info.scan,
+            Some(ScanInfo {
+                scanned: 400,
+                dropped: 0
+            })
+        );
+        // The earlier note's verdict upgrade is NOT rolled back: rows
+        // were withheld at some point of this call, so the record says
+        // filtered (worst-wins, like every other verdict source).
+        assert_eq!(info.verdict, Verdict::ServedFiltered);
+    }
+
+    #[test]
+    fn cell_scan_counts_survive_the_suppressed_ids_config() {
+        // `suppressed_ids = false` elides ids; the scan carries counts
+        // only, so it ships untouched (acceptance (c) of issue #29).
+        let cell = AuditCell::default();
+        cell.note_scan(30, 2);
+        cell.note_suppressed([12, 19]);
+        let info = cell.into_guard_info(None, false).unwrap();
+        assert!(info.suppressed_ids.is_empty(), "ids elided by config");
+        assert_eq!(info.suppressed_count, 2, "the count still ships");
+        assert_eq!(
+            info.scan,
+            Some(ScanInfo {
+                scanned: 30,
+                dropped: 2
+            }),
+            "the scan accounting is counts, never ids"
+        );
     }
 
     #[test]

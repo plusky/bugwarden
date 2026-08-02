@@ -101,5 +101,8 @@ rotate_keep = 8
 # Keep `true` (the default) when the file stays operator-only and you
 # want to answer "which bugs did that agent almost see?"; set `false`
 # when the stream is shipped into a broader log platform where readers
-# are less trusted than the operator. Default: true.
+# are less trusted than the operator. The ids the bugs_quicksearch
+# window scan dropped follow this same switch — there is no second knob
+# — while the scan's counts (`guard.scan.scanned` / `guard.scan.dropped`)
+# are always recorded: counts are not ids. Default: true.
 suppressed_ids = true
