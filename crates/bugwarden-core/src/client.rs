@@ -16,7 +16,7 @@ use serde_json::Value;
 
 /// Fields fetched for guard classification of a bug.
 pub const CLASSIFY_FIELDS: &str =
-    "id,summary,product,component,status,resolution,severity,priority,keywords,groups,whiteboard,creation_time,last_change_time";
+    "id,summary,product,component,status,resolution,severity,priority,keywords,groups,whiteboard,creation_time,last_change_time,creator";
 
 /// Bugzilla `new_since` timestamp format (UTC, second precision, `Z`
 /// suffix).
@@ -68,6 +68,24 @@ impl BugzillaClient {
             .and_then(Value::as_str)
             .map(str::to_owned)
             .ok_or_else(|| anyhow!("bugzilla /version response is missing the \"version\" field"))
+    }
+
+    /// GET `/rest/whoami` — the login name of the account the API key
+    /// authenticates (the response's `name` field).
+    ///
+    /// A missing, non-string, or blank (empty or all-whitespace) `name` is
+    /// a failure, not a login: a blank identity never resolves, so a
+    /// degenerate empty caller can never compare equal to a blank `creator`
+    /// field and grant on no evidence — resolution fails closed instead
+    /// (I4). Authentication and error sanitization are identical to every
+    /// other call: the key never appears in any error this returns (I12).
+    pub async fn whoami(&self, key: &str) -> Result<String> {
+        let v = self.get_json(key, "/whoami", &[]).await?;
+        v.get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("bugzilla /whoami response carries no usable \"name\" field"))
     }
 
     /// Sequential GET of `/rest/version`, `/rest/extensions`, `/rest/time`

@@ -259,6 +259,23 @@ pub struct Matcher {
     /// (I4), whichever side the rule asked about.
     #[serde(default)]
     pub group_restricted: Option<bool>,
+    /// Matches on whether the REQUESTING account authored the bug: `true`
+    /// selects the caller's own bug reports, `false` everyone else's.
+    ///
+    /// This is the one identity-relative criterion — it describes the
+    /// bug–caller relationship, not the bug's content. The caller's login
+    /// is resolved once per tool call (`Guard::resolve_caller`, backed by
+    /// Bugzilla's `whoami` endpoint) and compared case-insensitively
+    /// against the bug's `creator`. When the relationship cannot be
+    /// established — the creator is unreadable, OR the caller's identity
+    /// did not resolve (no identity rule triggered a lookup, or `whoami`
+    /// failed) — the criterion is undecidable and resolves per
+    /// `unknown_matches` fail-closed (I4), whichever side the rule asked
+    /// about. In the create gate the prospective bug's author is
+    /// definitionally the caller, so there `created_by_me` is forced true
+    /// with no lookup at all (see `Guard::may_create`).
+    #[serde(default)]
+    pub created_by_me: Option<bool>,
     /// Matches when `creation_time` is newer than `now - N days`.
     ///
     /// A bug with a missing/unparsable `creation_time` MATCHES this
@@ -368,6 +385,20 @@ impl Matcher {
                 None => unknown = true,
                 Some(groups) => {
                     if !groups.is_empty() != want_restricted {
+                        return MatchOutcome::No;
+                    }
+                }
+            }
+        }
+
+        if let Some(want_mine) = self.created_by_me {
+            match bug.created_by_me {
+                // Creator unreadable or caller identity unresolved: the
+                // relationship answers neither way, whichever side the rule
+                // asked about (I4 — classify() resolves Unknown fail-closed).
+                None => unknown = true,
+                Some(mine) => {
+                    if mine != want_mine {
                         return MatchOutcome::No;
                     }
                 }
@@ -801,6 +832,23 @@ impl Policy {
         }
     }
 
+    /// Whether classifying for [`Operation::Access`] can consult the
+    /// caller's identity, i.e. whether any rule consulted for `access`
+    /// carries a `created_by_me` criterion.
+    ///
+    /// This is the laziness contract behind `Guard::resolve_caller`: a
+    /// policy for which this returns `false` never triggers a `whoami`
+    /// lookup — not once, on any tool call. Rules scoped to ONLY the
+    /// `create` operation do not count: the create gate forces
+    /// `created_by_me` to true without resolving anything (see
+    /// `Guard::may_create`), so a create-scoped identity rule needs no
+    /// identity either.
+    pub fn needs_identity(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|r| r.applies_to(Operation::Access) && r.matcher.created_by_me.is_some())
+    }
+
     /// Build a grant, stripping write capabilities when `global.read_only`.
     fn grant(&self, caps: impl IntoIterator<Item = Capability>, rule: &str) -> Access {
         let mut set: BTreeSet<Capability> = caps.into_iter().collect();
@@ -847,6 +895,12 @@ pub struct BugMeta {
     pub whiteboard: Option<String>,
     /// Creation time; `None` when absent or unparsable.
     pub creation_time: Option<DateTime<Utc>>,
+    /// Whether the requesting account authored this bug. `Some(true/false)`
+    /// is an established relationship; `None` means it cannot be known —
+    /// the bug's `creator` was unreadable, OR the caller's identity was not
+    /// resolved (no identity criterion in the policy, or the `whoami`
+    /// lookup failed). Unknown fails closed like every other field (I4).
+    pub created_by_me: Option<bool>,
 }
 
 /// A string field, or `None` when absent or not a string.
@@ -902,13 +956,21 @@ fn whiteboard_field(v: &Value) -> Option<String> {
 impl BugMeta {
     /// Build classification metadata from a Bugzilla REST bug object.
     ///
+    /// `caller` is the requesting account's login (as resolved by
+    /// `Guard::resolve_caller`), or `None` when the caller's identity is
+    /// unknown. `created_by_me` is established only when BOTH sides are
+    /// known: the bug's `creator` field is a string AND `caller` is
+    /// `Some`, compared case-insensitively (the same normalization the
+    /// glob matcher applies). Either side missing leaves the relationship
+    /// unknown, never assumed.
+    ///
     /// Tolerant on shape — the `component` field may be a string or an array
     /// of strings, `groups` elements may be plain names or objects carrying a
     /// `name` key, the whiteboard may arrive under either key — but tolerance
     /// stops short of pretending a field was there. Anything absent, null,
     /// oddly typed, or only partially recoverable becomes `None`, i.e.
     /// unknown, which fails closed during classification (I4).
-    pub fn from_json(v: &Value) -> BugMeta {
+    pub fn from_json(v: &Value, caller: Option<&str>) -> BugMeta {
         BugMeta {
             id: v.get("id").and_then(Value::as_u64).unwrap_or(0),
             summary: str_field(v, "summary"),
@@ -925,6 +987,12 @@ impl BugMeta {
                 .and_then(Value::as_str)
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&Utc)),
+            created_by_me: match (caller, str_field(v, "creator")) {
+                (Some(login), Some(creator)) => {
+                    Some(login.to_lowercase() == creator.to_lowercase())
+                }
+                _ => None,
+            },
         }
     }
 }
@@ -994,6 +1062,7 @@ mod tests {
             groups: Some(vec![]),
             whiteboard: Some("needs-triage [qa:blocked]".into()),
             creation_time: Some(t("2025-06-01T00:00:00Z")),
+            created_by_me: Some(false),
         }
     }
 
@@ -1312,6 +1381,54 @@ mod tests {
     }
 
     #[test]
+    fn matcher_created_by_me_semantics() {
+        let mine = BugMeta {
+            created_by_me: Some(true),
+            ..meta()
+        };
+        let foreign = BugMeta {
+            created_by_me: Some(false),
+            ..meta()
+        };
+
+        let want_mine = Matcher {
+            created_by_me: Some(true),
+            ..Default::default()
+        };
+        assert!(want_mine.evaluate(&mine, now()).is_yes());
+        assert_eq!(want_mine.evaluate(&foreign, now()), MatchOutcome::No);
+
+        let want_foreign = Matcher {
+            created_by_me: Some(false),
+            ..Default::default()
+        };
+        assert!(want_foreign.evaluate(&foreign, now()).is_yes());
+        assert_eq!(want_foreign.evaluate(&mine, now()), MatchOutcome::No);
+    }
+
+    #[test]
+    fn matcher_created_by_me_unresolved_is_unknown_either_way() {
+        // Creator unreadable or caller identity unresolved: the relationship
+        // answers neither way, whichever side the rule asked about — it is
+        // classify() that resolves the Unknown on the restrictive side (I4).
+        let unresolved = BugMeta {
+            created_by_me: None,
+            ..meta()
+        };
+        for asked in [true, false] {
+            let m = Matcher {
+                created_by_me: Some(asked),
+                ..Default::default()
+            };
+            assert_eq!(
+                m.evaluate(&unresolved, now()),
+                MatchOutcome::Unknown,
+                "asked for created_by_me = {asked}"
+            );
+        }
+    }
+
+    #[test]
     fn matcher_every_criterion_reports_unknown_on_an_unreadable_field() {
         // No criterion may silently treat "could not read" as "empty".
         let cases: Vec<(Matcher, BugMeta)> = vec![
@@ -1412,6 +1529,16 @@ mod tests {
                 },
                 BugMeta {
                     creation_time: None,
+                    ..meta()
+                },
+            ),
+            (
+                Matcher {
+                    created_by_me: Some(true),
+                    ..Default::default()
+                },
+                BugMeta {
+                    created_by_me: None,
                     ..meta()
                 },
             ),
@@ -1821,6 +1948,119 @@ products = ["SUSE*"]
         assert!(!p.rules[1].applies_to(Operation::Access));
         assert!(!p.rules[2].applies_to(Operation::Create));
         assert!(p.rules[2].applies_to(Operation::Access));
+    }
+
+    // ---------- created_by_me (identity-relative matcher) ----------
+
+    #[test]
+    fn created_by_me_toml_spelling_pinned() {
+        // Pins the operator-facing TOML spelling `created_by_me = true|false`
+        // and that an absent key parses as None (criterion not present).
+        let s = concat!(
+            "[[rule]]\nname = \"mine\"\naction = \"deny\"\n",
+            "[rule.match]\ncreated_by_me = true\n",
+            "[[rule]]\nname = \"foreign\"\naction = \"deny\"\n",
+            "[rule.match]\ncreated_by_me = false\n",
+            "[[rule]]\nname = \"absent\"\naction = \"deny\"\n",
+        );
+        let p = Policy::from_toml_str(s).unwrap();
+        assert_eq!(p.rules[0].matcher.created_by_me, Some(true));
+        assert_eq!(p.rules[1].matcher.created_by_me, Some(false));
+        assert_eq!(p.rules[2].matcher.created_by_me, None);
+    }
+
+    #[test]
+    fn classify_identity_unknown_denies_for_deny_and_restrict_alike() {
+        // The I4 machinery, unchanged and uniform: a consulted rule whose
+        // created_by_me criterion cannot be decided denies the bug whatever
+        // the rule's action. Resolving identity-unknown as "criterion
+        // fails" instead would let a created_by_me deny rule be dodged by
+        // making whoami fail — fail open, exactly the asymmetry I4 forbids.
+        let unresolved = BugMeta {
+            created_by_me: None,
+            ..meta()
+        };
+        let known_foreign = meta(); // created_by_me: Some(false)
+
+        let deny_rule = Policy::from_toml_str(concat!(
+            "default_action = \"allow\"\n",
+            "[[rule]]\nname = \"no-self-service\"\naction = \"deny\"\n",
+            "[rule.match]\ncreated_by_me = true\n",
+        ))
+        .unwrap();
+        match deny_rule.classify(&unresolved, now(), Operation::Access) {
+            Access::Denied { rule } => assert_eq!(rule, "no-self-service"),
+            other => panic!("identity-unknown must deny under a deny rule, got {other:?}"),
+        }
+        // With the relationship known and negative, the rule is a definitive
+        // No and the default allows.
+        assert!(deny_rule
+            .classify(&known_foreign, now(), Operation::Access)
+            .allows(Capability::Read));
+
+        // The granting side of the same coin: a restrict rule under a
+        // denying default may neither grant on an unresolved identity nor
+        // be skipped into a later grant.
+        let restrict_rule = Policy::from_toml_str(concat!(
+            "default_action = \"deny\"\n",
+            "[[rule]]\nname = \"my-own\"\naction = \"restrict\"\n",
+            "capabilities = [\"read\"]\n",
+            "[rule.match]\ncreated_by_me = true\n",
+        ))
+        .unwrap();
+        match restrict_rule.classify(&unresolved, now(), Operation::Access) {
+            Access::Denied { rule } => assert_eq!(rule, "my-own:unreadable-metadata"),
+            other => panic!("identity-unknown must deny under a restrict rule, got {other:?}"),
+        }
+        let known_mine = BugMeta {
+            created_by_me: Some(true),
+            ..meta()
+        };
+        assert!(restrict_rule
+            .classify(&known_mine, now(), Operation::Access)
+            .allows(Capability::Read));
+    }
+
+    #[test]
+    fn needs_identity_only_for_access_covering_identity_rules() {
+        // No rules, or rules without the criterion: no identity needed —
+        // this is what keeps whoami at zero calls for every pre-identity
+        // policy.
+        assert!(!Policy::default().needs_identity());
+        assert!(!Policy::from_toml_str(concat!(
+            "[[rule]]\nname = \"embargo\"\naction = \"deny\"\n",
+            "[rule.match]\ngroups = [\"*security*\"]\n",
+        ))
+        .unwrap()
+        .needs_identity());
+
+        // An unscoped identity rule covers access: identity needed.
+        assert!(Policy::from_toml_str(concat!(
+            "[[rule]]\nname = \"mine\"\naction = \"deny\"\n",
+            "[rule.match]\ncreated_by_me = true\n",
+        ))
+        .unwrap()
+        .needs_identity());
+
+        // Explicitly access-scoped: identity needed.
+        assert!(Policy::from_toml_str(concat!(
+            "default_action = \"deny\"\n",
+            "[[rule]]\nname = \"mine\"\naction = \"restrict\"\n",
+            "capabilities = [\"read\"]\noperations = [\"access\"]\n",
+            "[rule.match]\ncreated_by_me = true\n",
+        ))
+        .unwrap()
+        .needs_identity());
+
+        // A create-scoped-ONLY identity rule never needs identity: the
+        // create gate forces created_by_me without any lookup.
+        assert!(!Policy::from_toml_str(concat!(
+            "[[rule]]\nname = \"no-self-filing\"\naction = \"deny\"\n",
+            "operations = [\"create\"]\n",
+            "[rule.match]\ncreated_by_me = true\n",
+        ))
+        .unwrap()
+        .needs_identity());
     }
 
     // ---------- Policy::load ----------
@@ -2397,19 +2637,22 @@ capabilities = ["summary", "create", "attach"]
 
     #[test]
     fn bugmeta_from_json_full_object() {
-        let m = BugMeta::from_json(&json!({
-            "id": 7,
-            "summary": "boom",
-            "product": "P",
-            "component": "C",
-            "status": "NEW",
-            "severity": "Major",
-            "priority": "P1",
-            "keywords": ["k1", "k2"],
-            "groups": ["g1"],
-            "whiteboard": "wb-text",
-            "creation_time": "2025-01-02T03:04:05Z"
-        }));
+        let m = BugMeta::from_json(
+            &json!({
+                "id": 7,
+                "summary": "boom",
+                "product": "P",
+                "component": "C",
+                "status": "NEW",
+                "severity": "Major",
+                "priority": "P1",
+                "keywords": ["k1", "k2"],
+                "groups": ["g1"],
+                "whiteboard": "wb-text",
+                "creation_time": "2025-01-02T03:04:05Z"
+            }),
+            None,
+        );
         assert_eq!(m.id, 7);
         assert_eq!(m.summary.as_deref(), Some("boom"));
         assert_eq!(m.product.as_deref(), Some("P"));
@@ -2426,18 +2669,18 @@ capabilities = ["summary", "create", "attach"]
     #[test]
     fn bugmeta_component_string_or_array() {
         assert_eq!(
-            BugMeta::from_json(&json!({"component": "One"})).components,
+            BugMeta::from_json(&json!({"component": "One"}), None).components,
             Some(vec!["One".to_string()])
         );
         assert_eq!(
-            BugMeta::from_json(&json!({"component": ["One", "Two"]})).components,
+            BugMeta::from_json(&json!({"component": ["One", "Two"]}), None).components,
             Some(vec!["One".to_string(), "Two".to_string()])
         );
     }
 
     #[test]
     fn bugmeta_group_objects_with_name_key() {
-        let m = BugMeta::from_json(&json!({"groups": [{"name": "sec"}, "plain"]}));
+        let m = BugMeta::from_json(&json!({"groups": [{"name": "sec"}, "plain"]}), None);
         assert_eq!(m.groups, Some(vec!["sec".to_string(), "plain".to_string()]));
     }
 
@@ -2452,19 +2695,19 @@ capabilities = ["summary", "create", "attach"]
             json!({"groups": [{"name": "sec"}, {"id": 9}]}),
             json!({"groups": [null]}),
         ] {
-            let m = BugMeta::from_json(&shape);
+            let m = BugMeta::from_json(&shape, None);
             assert_eq!(m.groups, None, "shape {shape}");
         }
         // An empty list is fully readable: the bug really is world-readable.
         assert_eq!(
-            BugMeta::from_json(&json!({"groups": []})).groups,
+            BugMeta::from_json(&json!({"groups": []}), None).groups,
             Some(vec![])
         );
     }
 
     #[test]
     fn bugmeta_missing_fields_are_unknown_not_empty() {
-        let m = BugMeta::from_json(&json!({}));
+        let m = BugMeta::from_json(&json!({}), None);
         assert_eq!(m.id, 0);
         assert!(m.summary.is_none());
         assert!(m.product.is_none());
@@ -2474,16 +2717,19 @@ capabilities = ["summary", "create", "attach"]
         assert!(m.whiteboard.is_none());
         assert!(m.creation_time.is_none());
         // Even a non-object is tolerated.
-        let m = BugMeta::from_json(&Value::Null);
+        let m = BugMeta::from_json(&Value::Null, None);
         assert_eq!(m.id, 0);
         assert!(m.groups.is_none());
     }
 
     #[test]
     fn bugmeta_present_but_empty_is_knowledge() {
-        let m = BugMeta::from_json(&json!({
-            "summary": "", "groups": [], "whiteboard": ""
-        }));
+        let m = BugMeta::from_json(
+            &json!({
+                "summary": "", "groups": [], "whiteboard": ""
+            }),
+            None,
+        );
         assert_eq!(m.summary.as_deref(), Some(""));
         assert_eq!(m.groups, Some(vec![]));
         assert_eq!(m.whiteboard.as_deref(), Some(""));
@@ -2493,16 +2739,22 @@ capabilities = ["summary", "create", "attach"]
     fn bugmeta_wrong_typed_fields_are_unknown() {
         // null or an unexpected type is not "empty" — the policy cannot read
         // it, so it must not be mistaken for a bug that carries nothing.
-        let m = BugMeta::from_json(&json!({
-            "summary": null, "groups": null, "whiteboard": null, "product": null
-        }));
+        let m = BugMeta::from_json(
+            &json!({
+                "summary": null, "groups": null, "whiteboard": null, "product": null
+            }),
+            None,
+        );
         assert!(m.summary.is_none());
         assert!(m.groups.is_none());
         assert!(m.whiteboard.is_none());
         assert!(m.product.is_none());
-        let m = BugMeta::from_json(&json!({
-            "summary": 7, "groups": {"name": "sec"}, "whiteboard": ["a"], "status": true
-        }));
+        let m = BugMeta::from_json(
+            &json!({
+                "summary": 7, "groups": {"name": "sec"}, "whiteboard": ["a"], "status": true
+            }),
+            None,
+        );
         assert!(m.summary.is_none());
         assert!(m.groups.is_none());
         assert!(m.whiteboard.is_none());
@@ -2510,28 +2762,62 @@ capabilities = ["summary", "create", "attach"]
     }
 
     #[test]
+    fn bugmeta_created_by_me_needs_both_creator_and_caller() {
+        let caller = Some("reporter@example.com");
+
+        // Equal: the caller authored the bug.
+        let m = BugMeta::from_json(&json!({"creator": "reporter@example.com"}), caller);
+        assert_eq!(m.created_by_me, Some(true));
+
+        // Unequal: somebody else's bug — knowledge, not ignorance.
+        let m = BugMeta::from_json(&json!({"creator": "other@example.com"}), caller);
+        assert_eq!(m.created_by_me, Some(false));
+
+        // Case-insensitively equal, matching the glob normalization.
+        let m = BugMeta::from_json(&json!({"creator": "Reporter@Example.COM"}), caller);
+        assert_eq!(m.created_by_me, Some(true));
+
+        // Creator absent: the relationship cannot be established.
+        let m = BugMeta::from_json(&json!({}), caller);
+        assert_eq!(m.created_by_me, None);
+
+        // Creator present but not a string: unreadable, not "nobody".
+        for creator in [json!(7), json!(null), json!({"name": "x"}), json!(["x"])] {
+            let m = BugMeta::from_json(&json!({ "creator": creator }), caller);
+            assert_eq!(m.created_by_me, None, "creator {creator}");
+        }
+
+        // Caller unresolved: unknown even with a perfectly readable creator.
+        let m = BugMeta::from_json(&json!({"creator": "reporter@example.com"}), None);
+        assert_eq!(m.created_by_me, None);
+    }
+
+    #[test]
     fn bugmeta_bad_creation_time_is_none() {
-        let m = BugMeta::from_json(&json!({"creation_time": "yesterday"}));
+        let m = BugMeta::from_json(&json!({"creation_time": "yesterday"}), None);
         assert!(m.creation_time.is_none());
-        let m = BugMeta::from_json(&json!({"creation_time": 1700000000}));
+        let m = BugMeta::from_json(&json!({"creation_time": 1700000000}), None);
         assert!(m.creation_time.is_none());
     }
 
     #[test]
     fn bugmeta_status_whiteboard_fallback() {
-        let m = BugMeta::from_json(&json!({"status_whiteboard": "legacy"}));
+        let m = BugMeta::from_json(&json!({"status_whiteboard": "legacy"}), None);
         assert_eq!(m.whiteboard.as_deref(), Some("legacy"));
         // "whiteboard" wins when both are present.
-        let m = BugMeta::from_json(&json!({"whiteboard": "new", "status_whiteboard": "old"}));
+        let m = BugMeta::from_json(
+            &json!({"whiteboard": "new", "status_whiteboard": "old"}),
+            None,
+        );
         assert_eq!(m.whiteboard.as_deref(), Some("new"));
         // An empty primary falls back to the legacy key.
-        let m = BugMeta::from_json(&json!({"whiteboard": "", "status_whiteboard": "old"}));
+        let m = BugMeta::from_json(&json!({"whiteboard": "", "status_whiteboard": "old"}), None);
         assert_eq!(m.whiteboard.as_deref(), Some("old"));
         // An unreadable key on either side makes the whiteboard unknown: the
         // text that could not be read may have held the marker.
-        let m = BugMeta::from_json(&json!({"whiteboard": 7, "status_whiteboard": ""}));
+        let m = BugMeta::from_json(&json!({"whiteboard": 7, "status_whiteboard": ""}), None);
         assert!(m.whiteboard.is_none());
-        let m = BugMeta::from_json(&json!({"whiteboard": "", "status_whiteboard": 7}));
+        let m = BugMeta::from_json(&json!({"whiteboard": "", "status_whiteboard": 7}), None);
         assert!(m.whiteboard.is_none());
     }
 }

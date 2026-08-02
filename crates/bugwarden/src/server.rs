@@ -277,11 +277,17 @@ async fn record_event(
 /// summary-only is served as a summary view, matching what a fresh call would
 /// return. Anything that no longer classifies at all becomes the uniform
 /// restricted entry, byte-identical to a bug that never existed (I2).
+///
+/// `caller` is the SAME identity the up-front assessment used — resolved
+/// once per tool call and threaded here, so a bug the assessment granted on
+/// the caller's authorship cannot be dropped by a re-check running without
+/// that identity.
 fn assemble_bug_info(
     guard: &Guard,
     ids: &[u64],
     assessments: &BTreeMap<u64, (Access, Value)>,
     full: &BTreeMap<u64, Value>,
+    caller: Option<&str>,
 ) -> Value {
     let mut bugs: Vec<Value> = Vec::new();
     let mut restricted: Vec<Value> = Vec::new();
@@ -291,7 +297,7 @@ fn assemble_bug_info(
                 .get(id)
                 // Absent from the body response => fail closed (I4).
                 .and_then(|body| {
-                    let (kept, dropped) = guard.filter_bug_list(vec![body.clone()]);
+                    let (kept, dropped) = guard.filter_bug_list(vec![body.clone()], caller);
                     if dropped > 0 {
                         // The verdict flipped between the two fetches — the
                         // anomaly this re-check exists for. Server-side only
@@ -882,9 +888,17 @@ impl BugWarden {
         }
     }
 
-    /// Guard assessment for the given ids (fail closed, I4).
-    async fn assess(&self, key: &str, ids: &[u64]) -> BTreeMap<u64, (Access, Value)> {
-        self.guard.assess(&self.bz, key, ids).await
+    /// Guard assessment for the given ids (fail closed, I4). `caller` is
+    /// the identity resolved once at the tool entry
+    /// (`Guard::resolve_caller`) — never resolved here, so a tool call
+    /// costs at most one whoami lookup however many assessments it runs.
+    async fn assess(
+        &self,
+        key: &str,
+        ids: &[u64],
+        caller: Option<&str>,
+    ) -> BTreeMap<u64, (Access, Value)> {
+        self.guard.assess(&self.bz, key, ids, caller).await
     }
 
     /// Assess a single bug id and require `cap`. Returns `Some(denial)` when
@@ -896,9 +910,10 @@ impl BugWarden {
         key: &str,
         id: u64,
         cap: Capability,
+        caller: Option<&str>,
         ctx: &RequestContext<RoleServer>,
     ) -> Option<CallToolResult> {
-        let assessments = self.assess(key, &[id]).await;
+        let assessments = self.assess(key, &[id], caller).await;
         let entry = assessments.get(&id);
         let allowed = entry.is_some_and(|(access, _)| access.allows(cap));
         if let Some(cell) = audit_cell(ctx) {
@@ -952,7 +967,12 @@ impl BugWarden {
             return Ok(refusal);
         }
 
-        let assessments = self.assess(&key, &ids).await;
+        // Resolved at most once per tool call and threaded to EVERY
+        // classification below — the assessment, the assemble re-check and
+        // the link disclosure — so one verdict cannot be made with the
+        // identity and another without it.
+        let caller = self.guard.resolve_caller(&self.bz, &key).await;
+        let assessments = self.assess(&key, &ids, caller.as_deref()).await;
 
         // Full fetch only for Read-granted ids.
         let read_ids: Vec<u64> = ids
@@ -994,7 +1014,8 @@ impl BugWarden {
         // batched assessment covers them all; anything that fails to earn a
         // summary is removed before the body is served (I2, and the same bar
         // update_bug_dependencies applies before WRITING such a link).
-        let mut envelope = assemble_bug_info(&self.guard, &ids, &assessments, &full);
+        let mut envelope =
+            assemble_bug_info(&self.guard, &ids, &assessments, &full, caller.as_deref());
         let base_url = self.bz.base_url();
         // Only ids actually SERVED in this envelope are already answered for.
         // A requested id that was denied must not be whitelisted: asking
@@ -1019,7 +1040,10 @@ impl BugWarden {
         // every link is hidden would make "no links" and "links, all hidden"
         // cost different round trips (I2). download_attachment pads the same
         // way.
-        let mut allowed = self.guard.disclosable(&self.bz, &key, &named).await;
+        let mut allowed = self
+            .guard
+            .disclosable(&self.bz, &key, &named, caller.as_deref())
+            .await;
         allowed.extend(served);
         if let Some(bugs) = envelope.get_mut("bugs").and_then(Value::as_array_mut) {
             for bug in bugs.iter_mut() {
@@ -1090,8 +1114,9 @@ impl BugWarden {
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(id = p.id, new_since = ?p.new_since, "tool: bug_history");
         let key = self.api_key(&ctx)?;
+        let caller = self.guard.resolve_caller(&self.bz, &key).await;
         if let Some(denied) = self
-            .deny_unless(&key, p.id, Capability::History, &ctx)
+            .deny_unless(&key, p.id, Capability::History, caller.as_deref(), &ctx)
             .await
         {
             return Ok(denied);
@@ -1103,7 +1128,10 @@ impl BugWarden {
                 // way to read out the existence of bugs the policy hides.
                 let base_url = self.bz.base_url();
                 let named = Guard::history_bug_ids(&history, base_url);
-                let disclosable = self.guard.disclosable(&self.bz, &key, &named).await;
+                let disclosable = self
+                    .guard
+                    .disclosable(&self.bz, &key, &named, caller.as_deref())
+                    .await;
                 if let Some(cell) = audit_cell(&ctx) {
                     let hidden: Vec<u64> = named.difference(&disclosable).copied().collect();
                     if !hidden.is_empty() {
@@ -1139,8 +1167,9 @@ impl BugWarden {
             "tool: bug_comments"
         );
         let key = self.api_key(&ctx)?;
+        let caller = self.guard.resolve_caller(&self.bz, &key).await;
         if let Some(denied) = self
-            .deny_unless(&key, p.id, Capability::Comments, &ctx)
+            .deny_unless(&key, p.id, Capability::Comments, caller.as_deref(), &ctx)
             .await
         {
             return Ok(denied);
@@ -1153,7 +1182,10 @@ impl BugWarden {
                 // of this bug ***" itself, so a hidden bug can name itself in
                 // the comments of one the client may read (I2).
                 let named = Guard::duplicate_marker_ids(&filtered);
-                let disclosable = self.guard.disclosable(&self.bz, &key, &named).await;
+                let disclosable = self
+                    .guard
+                    .disclosable(&self.bz, &key, &named, caller.as_deref())
+                    .await;
                 if let Some(cell) = audit_cell(&ctx) {
                     // Dropped private comments have no bug id: count only.
                     // Scrubbed duplicate-marker ids are the hidden bugs.
@@ -1208,6 +1240,7 @@ impl BugWarden {
 
         // limit/offset address the bugs the client may see; the guard scans
         // and filters upstream rows to fill that window (I2/I3).
+        let caller = self.guard.resolve_caller(&self.bz, &key).await;
         let kept = match self
             .guard
             .quicksearch_window(
@@ -1220,6 +1253,7 @@ impl BugWarden {
                     limit: p.limit,
                     offset: p.offset,
                 },
+                caller.as_deref(),
             )
             .await
         {
@@ -1246,7 +1280,10 @@ impl BugWarden {
             .flat_map(|b| Guard::linked_bug_ids(b, base_url))
             .filter(|id| !served.contains(id))
             .collect();
-        let mut allowed = self.guard.disclosable(&self.bz, &key, &named).await;
+        let mut allowed = self
+            .guard
+            .disclosable(&self.bz, &key, &named, caller.as_deref())
+            .await;
         allowed.extend(served);
         for bug in projected.iter_mut() {
             Guard::scrub_bug_links(bug, base_url, &allowed);
@@ -1344,7 +1381,11 @@ impl BugWarden {
         // COUNT, not the upstream handler's exact latency (a GET classify
         // vs a rejected POST), the same residual the download path accepts.
         if !self.guard.may_create(&payload) {
-            let _ = self.assess(&key, &[0]).await;
+            // No whoami on the create path, ever: the create gate forces
+            // created_by_me itself, and the padding classify against bug id
+            // 0 decides nothing — caller identity is deliberately None so
+            // the refused path keeps costing exactly one upstream request.
+            let _ = self.assess(&key, &[0], None).await;
             tracing::info!(product = %p.product, "guard denied bug creation");
             note_refused(&ctx);
             return Ok(err_text(Guard::create_denial()));
@@ -1387,8 +1428,9 @@ impl BugWarden {
             "tool: add_attachment"
         );
         let key = self.api_key(&ctx)?;
+        let caller = self.guard.resolve_caller(&self.bz, &key).await;
         if let Some(denied) = self
-            .deny_unless(&key, p.bug_id, Capability::Attach, &ctx)
+            .deny_unless(&key, p.bug_id, Capability::Attach, caller.as_deref(), &ctx)
             .await
         {
             return Ok(denied);
@@ -1446,8 +1488,9 @@ impl BugWarden {
             "tool: add_comment"
         );
         let key = self.api_key(&ctx)?;
+        let caller = self.guard.resolve_caller(&self.bz, &key).await;
         if let Some(denied) = self
-            .deny_unless(&key, p.bug_id, Capability::Comment, &ctx)
+            .deny_unless(&key, p.bug_id, Capability::Comment, caller.as_deref(), &ctx)
             .await
         {
             return Ok(denied);
@@ -1490,8 +1533,9 @@ impl BugWarden {
             ));
         }
         let key = self.api_key(&ctx)?;
+        let caller = self.guard.resolve_caller(&self.bz, &key).await;
         if let Some(denied) = self
-            .deny_unless(&key, p.bug_id, Capability::Status, &ctx)
+            .deny_unless(&key, p.bug_id, Capability::Status, caller.as_deref(), &ctx)
             .await
         {
             return Ok(denied);
@@ -1533,8 +1577,9 @@ impl BugWarden {
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(bug_id = p.bug_id, assignee = %p.assignee, "tool: assign_bug");
         let key = self.api_key(&ctx)?;
+        let caller = self.guard.resolve_caller(&self.bz, &key).await;
         if let Some(denied) = self
-            .deny_unless(&key, p.bug_id, Capability::Assign, &ctx)
+            .deny_unless(&key, p.bug_id, Capability::Assign, caller.as_deref(), &ctx)
             .await
         {
             return Ok(denied);
@@ -1607,8 +1652,9 @@ impl BugWarden {
         attach_comment(&mut payload, &p.comment);
 
         let key = self.api_key(&ctx)?;
+        let caller = self.guard.resolve_caller(&self.bz, &key).await;
         if let Some(denied) = self
-            .deny_unless(&key, p.bug_id, Capability::Fields, &ctx)
+            .deny_unless(&key, p.bug_id, Capability::Fields, caller.as_deref(), &ctx)
             .await
         {
             return Ok(denied);
@@ -1688,8 +1734,9 @@ impl BugWarden {
         }
 
         let key = self.api_key(&ctx)?;
+        let caller = self.guard.resolve_caller(&self.bz, &key).await;
         let cell = audit_cell(&ctx);
-        let assessments = self.assess(&key, &ids).await;
+        let assessments = self.assess(&key, &ids, caller.as_deref()).await;
         let note = |id: u64, verdict: Verdict| {
             if let Some(cell) = &cell {
                 match assessments.get(&id) {
@@ -1744,7 +1791,11 @@ impl BugWarden {
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(bug_id = p.bug_id, cc_email = %p.cc_email, "tool: add_cc_to_bug");
         let key = self.api_key(&ctx)?;
-        if let Some(denied) = self.deny_unless(&key, p.bug_id, Capability::Cc, &ctx).await {
+        let caller = self.guard.resolve_caller(&self.bz, &key).await;
+        if let Some(denied) = self
+            .deny_unless(&key, p.bug_id, Capability::Cc, caller.as_deref(), &ctx)
+            .await
+        {
             return Ok(denied);
         }
         let payload = json!({ "cc": { "add": [p.cc_email] } });
@@ -1781,8 +1832,9 @@ impl BugWarden {
         } else {
             vec![p.bug_id, p.duplicate_of]
         };
+        let caller = self.guard.resolve_caller(&self.bz, &key).await;
         let cell = audit_cell(&ctx);
-        let assessments = self.assess(&key, &ids).await;
+        let assessments = self.assess(&key, &ids, caller.as_deref()).await;
         let note = |id: u64, verdict: Verdict| {
             if let Some(cell) = &cell {
                 match assessments.get(&id) {
@@ -1843,8 +1895,15 @@ impl BugWarden {
             "tool: list_attachments"
         );
         let key = self.api_key(&ctx)?;
+        let caller = self.guard.resolve_caller(&self.bz, &key).await;
         if let Some(denied) = self
-            .deny_unless(&key, p.bug_id, Capability::Attachments, &ctx)
+            .deny_unless(
+                &key,
+                p.bug_id,
+                Capability::Attachments,
+                caller.as_deref(),
+                &ctx,
+            )
             .await
         {
             return Ok(denied);
@@ -1919,7 +1978,11 @@ impl BugWarden {
             .and_then(|m| m.get("bug_id"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        let assessments = self.assess(&key, &[assess_id]).await;
+        // Resolved whatever `assess_id` turned out to be: the whoami count
+        // is a function of the policy alone, never of what the metadata
+        // fetch found (I2).
+        let caller = self.guard.resolve_caller(&self.bz, &key).await;
+        let assessments = self.assess(&key, &[assess_id], caller.as_deref()).await;
         let allowed = assessments
             .get(&assess_id)
             .is_some_and(|(access, _)| access.allows(Capability::Attachments));
@@ -2133,8 +2196,9 @@ impl BugWarden {
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(id = p.id, "tool: summarize_bug");
         let key = self.api_key(&ctx)?;
+        let caller = self.guard.resolve_caller(&self.bz, &key).await;
         if let Some(denied) = self
-            .deny_unless(&key, p.id, Capability::Comments, &ctx)
+            .deny_unless(&key, p.id, Capability::Comments, caller.as_deref(), &ctx)
             .await
         {
             return Ok(denied);
@@ -2150,7 +2214,10 @@ impl BugWarden {
         // Same scrub as bug_comments: otherwise a client that would be
         // scrubbed there just asks for a summary instead (I14).
         let named = Guard::duplicate_marker_ids(&comments);
-        let disclosable = self.guard.disclosable(&self.bz, &key, &named).await;
+        let disclosable = self
+            .guard
+            .disclosable(&self.bz, &key, &named, caller.as_deref())
+            .await;
         if let Some(cell) = audit_cell(&ctx) {
             cell.note_suppressed_count((total - comments.len()) as u64);
             let hidden: Vec<u64> = named.difference(&disclosable).copied().collect();
@@ -2432,7 +2499,7 @@ mod tests {
         let assessments = BTreeMap::from([(7u64, (granted(&[Capability::Read]), Value::Null))]);
         let full = BTreeMap::from([(7u64, body(7, &[]))]);
 
-        let out = assemble_bug_info(&g, &[7], &assessments, &full);
+        let out = assemble_bug_info(&g, &[7], &assessments, &full, None);
         assert_eq!(out["bugs"].as_array().unwrap().len(), 1);
         assert_eq!(out["bugs"][0]["id"], json!(7));
         // The full body is served intact, not a redacted view.
@@ -2450,7 +2517,7 @@ mod tests {
         let assessments = BTreeMap::from([(7u64, (granted(&[Capability::Read]), Value::Null))]);
         let full = BTreeMap::from([(7u64, body(7, &["embargo-security"]))]);
 
-        let out = assemble_bug_info(&g, &[7], &assessments, &full);
+        let out = assemble_bug_info(&g, &[7], &assessments, &full, None);
         assert!(
             out["bugs"].as_array().unwrap().is_empty(),
             "a body that no longer passes must not be served"
@@ -2481,7 +2548,7 @@ mod tests {
         // 1 turns out embargoed, 2 never arrived, 3 was denied up front.
         let full = BTreeMap::from([(1u64, body(1, &["embargo-x"]))]);
 
-        let out = assemble_bug_info(&g, &[1, 2, 3], &assessments, &full);
+        let out = assemble_bug_info(&g, &[1, 2, 3], &assessments, &full, None);
         assert!(out["bugs"].as_array().unwrap().is_empty());
         let entries = out["restricted"].as_array().unwrap();
         assert_eq!(entries.len(), 3);
@@ -2516,7 +2583,7 @@ mod tests {
         let assessments = BTreeMap::from([(9u64, (granted(&[Capability::Read]), Value::Null))]);
         let full = BTreeMap::from([(9u64, body(9, &["internal"]))]);
 
-        let out = assemble_bug_info(&g, &[9], &assessments, &full);
+        let out = assemble_bug_info(&g, &[9], &assessments, &full, None);
         let served = &out["bugs"][0];
         assert_eq!(served["_redacted"], json!(true), "served redacted");
         assert!(
@@ -2541,7 +2608,7 @@ mod tests {
         let assessments = BTreeMap::from([(3u64, (granted(&[Capability::Read]), Value::Null))]);
         let full = BTreeMap::from([(3u64, body(3, &["internal"]))]);
 
-        let out = assemble_bug_info(&g, &[3], &assessments, &full);
+        let out = assemble_bug_info(&g, &[3], &assessments, &full, None);
         assert!(out["bugs"].as_array().unwrap().is_empty());
         assert_eq!(out["restricted"][0]["note"], json!(Guard::denial(3)));
     }
@@ -2567,7 +2634,7 @@ mod tests {
         ]);
         let full = BTreeMap::from([(5u64, body(5, &[])), (6u64, body(6, &["embargo-late"]))]);
 
-        let out = assemble_bug_info(&g, &[5, 6, 8], &assessments, &full);
+        let out = assemble_bug_info(&g, &[5, 6, 8], &assessments, &full, None);
         assert_eq!(out["bugs"].as_array().unwrap().len(), 1);
         assert_eq!(out["bugs"][0]["id"], json!(5));
         let restricted = out["restricted"].as_array().unwrap();
@@ -2589,7 +2656,7 @@ mod tests {
         let meta = body(4, &[]);
         let assessments = BTreeMap::from([(4u64, (granted(&[Capability::Summary]), meta.clone()))]);
 
-        let out = assemble_bug_info(&g, &[4], &assessments, &BTreeMap::new());
+        let out = assemble_bug_info(&g, &[4], &assessments, &BTreeMap::new(), None);
         assert_eq!(out["bugs"][0]["id"], json!(4));
         assert_eq!(out["bugs"][0]["_redacted"], json!(true));
     }

@@ -38,7 +38,11 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
   response, or a CONSULTED rule that cannot be decided because the bug object
   did not carry a field that rule asks about (absent, null, wrongly typed, or
   only partially recoverable — including an unparsable `creation_time`) =>
-  Denied. The consulted rules are those whose `operations` cover the
+  Denied. The identity criterion `created_by_me` extends "field the rule asks
+  about" beyond the bug object: it is undecidable when the bug's `creator` is
+  unreadable OR the caller's identity did not resolve (whoami failure), and
+  it resolves through this same machinery with no special case (see
+  "Identity resolution"). The consulted rules are those whose `operations` cover the
   operation being classified (see classify): a rule scoped away from the
   operation is skipped before its matcher runs and can neither grant nor
   deny there — scoping changes which rules are consulted, never how a
@@ -172,6 +176,12 @@ pub struct Matcher {
     #[serde(default)] pub summary_contains: Vec<String>,   // case-insensitive substrings in the one-line summary
     #[serde(default)] pub group_restricted: Option<bool>,  // true: readable only via >=1 Bugzilla group; false: world-readable
     #[serde(default)] pub younger_than_days: Option<i64>,  // creation_time newer than now-N days
+    // The one identity-relative criterion: true selects bugs AUTHORED by the
+    // requesting account, false everyone else's (see "Identity resolution").
+    // TOML spelling `created_by_me = true|false`; absent = not consulted.
+    // Older bugwarden versions reject a policy carrying the key at startup
+    // (strict parsing fails closed) — same story as `operations`.
+    #[serde(default)] pub created_by_me: Option<bool>,
 }
 pub enum MatchOutcome { Yes, No, Unknown }
 
@@ -260,6 +270,11 @@ impl Policy {
     // both the intended filing grant and the reads the capability list
     // withholds). Unknown operation names are rejected by serde.
     pub fn classify(&self, bug: &BugMeta, now: chrono::DateTime<chrono::Utc>, op: Operation) -> Access;
+    // Whether any rule consulted for Operation::Access carries a
+    // created_by_me criterion — the laziness gate for whoami (see
+    // "Identity resolution"). A rule scoped to ONLY `create` does not
+    // count: the create gate forces created_by_me without any lookup.
+    pub fn needs_identity(&self) -> bool;
     // order: global min_bug_age_days first (missing creation_time => Denied, I4;
     // the gate is global, never operation-scoped — it deliberately refuses
     // creation too, since may_create dates the prospective bug NOW), then
@@ -290,12 +305,19 @@ pub struct BugMeta {
     pub groups: Option<Vec<String>>,     // group names; Some(vec![]) = world-readable
     pub whiteboard: Option<String>,      // "whiteboard", falling back to "status_whiteboard"
     pub creation_time: Option<chrono::DateTime<chrono::Utc>>,
+    // Some(true/false) = established bug–caller relationship; None = it
+    // cannot be known (creator unreadable OR caller identity unresolved).
+    pub created_by_me: Option<bool>,
 }
 impl BugMeta {
     // Tolerant on SHAPE (component as string or array, group elements as
     // names or {name} objects, either whiteboard key) but never invents a
     // value: a list with an unreadable element is None, not a shorter list.
-    pub fn from_json(v: &serde_json::Value) -> BugMeta;
+    // `caller` is the requesting account's login (Guard::resolve_caller);
+    // created_by_me = Some(login ==(case-insensitively, to_lowercase — the
+    // glob normalization) bug "creator") only when BOTH the caller and a
+    // string-typed creator are known, else None.
+    pub fn from_json(v: &serde_json::Value, caller: Option<&str>) -> BugMeta;
 }
 
 #[derive(Debug, Clone)]
@@ -353,7 +375,7 @@ impl Guard {
     // the clock). Summary bar, the same one the write paths use.
     pub const LINKED_ID_FIELDS: &[&str];
     pub async fn disclosable(&self, bz: &BugzillaClient, key: &str,
-        ids: &BTreeSet<u64>) -> BTreeSet<u64>;
+        ids: &BTreeSet<u64>, caller: Option<&str>) -> BTreeSet<u64>;
     pub fn linked_bug_ids(bug: &Value, base_url: &str) -> BTreeSet<u64>;
     pub fn scrub_bug_links(bug: &mut Value, base_url: &str, ok: &BTreeSet<u64>);
     pub fn history_bug_ids(history: &Value, base_url: &str) -> BTreeSet<u64>;
@@ -362,10 +384,22 @@ impl Guard {
     pub fn duplicate_marker_ids(comments: &[Value]) -> BTreeSet<u64>;
     pub fn scrub_duplicate_markers(comments: Vec<Value>, ok: &BTreeSet<u64>) -> Vec<Value>;
     pub async fn quicksearch_window(&self, bz: &BugzillaClient, key: &str,
-        req: &SearchRequest<'_>) -> anyhow::Result<Vec<serde_json::Value>>;
+        req: &SearchRequest<'_>, caller: Option<&str>) -> anyhow::Result<Vec<serde_json::Value>>;
 
-    pub async fn assess(&self, bz: &crate::client::BugzillaClient, key: &str, ids: &[u64])
+    // The `caller` parameter on assess/quicksearch_window/disclosable/
+    // filter_bug_list is the identity resolved ONCE per tool call by
+    // resolve_caller and threaded to every classification within that call
+    // — none of these methods performs a lookup of its own (see "Identity
+    // resolution").
+    pub async fn assess(&self, bz: &crate::client::BugzillaClient, key: &str, ids: &[u64],
+        caller: Option<&str>)
         -> std::collections::BTreeMap<u64, (Access, serde_json::Value)>;
+
+    /// Lazy per-tool-call identity resolution: None WITHOUT any HTTP
+    /// request when !policy.needs_identity(); otherwise exactly one
+    /// GET /rest/whoami, with every failure mapped to None (sanitized
+    /// error debug-logged only, I12). See "Identity resolution".
+    pub async fn resolve_caller(&self, bz: &BugzillaClient, key: &str) -> Option<String>;
 
     /// SUMMARY_FIELDS projection of a bug object + "_redacted": true marker.
     pub fn summary_view(bug: &serde_json::Value) -> serde_json::Value;
@@ -373,7 +407,7 @@ impl Guard {
     /// Classify each bug: full read kept as-is, summary-only replaced by
     /// summary_view, denied dropped. Returns (kept, dropped_count) — the count
     /// is for server-side logging ONLY, never sent to the client (I3).
-    pub fn filter_bug_list(&self, bugs: Vec<serde_json::Value>) -> (Vec<serde_json::Value>, usize);
+    pub fn filter_bug_list(&self, bugs: Vec<serde_json::Value>, caller: Option<&str>) -> (Vec<serde_json::Value>, usize);
 
     /// Drops is_private comments unless include_private && policy allows (I5).
     pub fn filter_comments(&self, comments: Vec<serde_json::Value>, include_private: bool) -> Vec<serde_json::Value>;
@@ -421,6 +455,13 @@ impl Guard {
     /// rule for the product's existing bugs (issue #26). creation_time is
     /// forced to NOW, whatever the payload claims, so an age rule refuses
     /// creation wherever it would immediately hide the result.
+    /// created_by_me is forced to Some(true) unconditionally — the creator
+    /// of a bug being filed is definitionally the caller (Bugzilla assigns
+    /// `creator` server-side; the typed create params cannot claim it), so
+    /// NO whoami is ever performed for the create gate. Consequence: a
+    /// create-covering rule with created_by_me = true matches every create
+    /// request that reaches it; with created_by_me = false it can never
+    /// match a create.
     pub fn may_create(&self, requested: &Value) -> bool;
 
     /// Uniform refusal for a bug that was not filed: one fixed text, naming
@@ -437,13 +478,14 @@ impl Guard {
 
 ```rust
 pub const CLASSIFY_FIELDS: &str =
-    "id,summary,product,component,status,resolution,severity,priority,keywords,groups,whiteboard,creation_time,last_change_time";
+    "id,summary,product,component,status,resolution,severity,priority,keywords,groups,whiteboard,creation_time,last_change_time,creator";
 
 pub struct BugzillaClient { /* base_url, api_url = base_url + "/rest", reqwest::Client (30s timeout), use_auth_header */ }
 impl BugzillaClient {
     pub fn new(base_url: &str, use_auth_header: bool) -> anyhow::Result<Self>; // trims trailing '/'
     pub fn base_url(&self) -> &str;
     pub async fn version(&self, key: &str) -> anyhow::Result<String>;
+    pub async fn whoami(&self, key: &str) -> anyhow::Result<String>; // login; missing/non-string/blank "name" = failure
     pub async fn server_info(&self, key: &str) -> anyhow::Result<serde_json::Value>;
     pub async fn get_bugs(&self, key: &str, ids: &[u64], include_fields: Option<&str>) -> anyhow::Result<serde_json::Value>;
     pub async fn bug_history(&self, key: &str, id: u64, new_since: Option<chrono::DateTime<chrono::Utc>>) -> anyhow::Result<serde_json::Value>;
@@ -465,7 +507,8 @@ Endpoint mapping:
 | method | request | returns |
 |---|---|---|
 | version | GET /rest/version | `.version` string |
-| server_info | concurrent GET /rest/version, /rest/extensions, /rest/time, /rest/parameters | `{url, version, extensions, timezone: tz_name, time: web_time, parameters}` |
+| whoami | GET /rest/whoami | `.name` string (the account's login); missing/non-string/blank = error |
+| server_info | sequential GET /rest/version, /rest/extensions, /rest/time, /rest/parameters | `{url, version, extensions, timezone: tz_name, time: web_time, parameters}` |
 | get_bugs | GET /rest/bug?id=1,2,3[&include_fields=..] | whole envelope |
 | bug_history | GET /rest/bug/{id}/history[?new_since=%Y-%m-%dT%H:%M:%SZ] | `bugs[0].history` array as Value |
 | bug_comments | GET /rest/bug/{id}/comment[?new_since=..] | `bugs.{id}.comments` as Vec<Value> |
@@ -484,6 +527,67 @@ query param `api_key={key}`. Always `Accept: application/json`.
 Errors: non-2xx status or body `{"error": true}` => anyhow error containing the
 HTTP status and Bugzilla `message` field; reqwest errors sanitized with
 `.without_url()` (I12).
+
+## Identity resolution (the `created_by_me` matcher)
+
+`created_by_me` is the one identity-relative matcher criterion: it describes
+the bug–caller relationship (did the requesting account author this bug?)
+where every other criterion describes bug content. Decisions, all deliberate:
+
+- **Source.** The caller's login comes from `GET /rest/whoami` (the `name`
+  field; a missing, non-string, or blank — empty or all-whitespace — value
+  is a FAILED resolution, never an empty login: a blank identity must not
+  compare equal to a blank `creator` and grant on no evidence),
+  authenticated and error-sanitized exactly like every other client
+  call (I12). It is compared case-insensitively (`to_lowercase`, the same
+  normalization the glob matcher applies) against the bug's `creator`
+  field, which joined `CLASSIFY_FIELDS` for this purpose. A non-string
+  `creator` leaves the relationship unknown.
+- **Laziness.** `Policy::needs_identity()` = some rule whose `operations`
+  cover `Operation::Access` carries a `created_by_me` criterion. When it is
+  false, `Guard::resolve_caller` returns `None` without any HTTP request —
+  a policy that never consults identity costs ZERO whoami lookups, so
+  pre-identity deployments keep their exact upstream request pattern. A
+  create-scoped-only identity rule does not trigger lookups either: the
+  create gate forces the answer (below).
+- **At most once per MCP tool call.** Each tool resolves the caller at most
+  once, near its entry, and threads the result to EVERY classification in
+  that call — `Guard::assess`, `quicksearch_window`, `disclosable`,
+  `filter_bug_list`, including the synchronous re-check inside
+  `assemble_bug_info`. The threading is load-bearing: if that re-check ran
+  with `caller = None` under an identity policy, a bug the assessment
+  granted on the caller's authorship would be dropped by the re-check.
+  Nothing is cached across tool calls (uniform for stdio and http; a
+  per-session cache is a possible future optimization, deliberately not
+  done now). The whoami count is a function of the policy alone — never of
+  verdicts or upstream answers — so it opens no timing oracle.
+- **Failure => Unknown => I4, no special case.** A whoami failure maps the
+  caller to `None`; a `created_by_me` criterion evaluated without a caller
+  (or without a readable creator) yields `MatchOutcome::Unknown`, and the
+  existing I4 machinery resolves it: a consulted rule that cannot be
+  decided denies the bug, whatever its action. Consequence, INTENDED: if
+  the policy consults identity and whoami fails, every classification
+  consulting the rule denies — a policy that leads with an identity rule
+  blacks out on whoami failure. This is the only uniformly fail-closed
+  reading. The alternative — resolving identity-unknown as "criterion
+  fails" — would let a `created_by_me = true` DENY rule be dodged by
+  making whoami fail (fail open), exactly the asymmetry I4 exists to
+  forbid.
+- **Create gate: forced true, no lookup.** `may_create` forces the
+  prospective bug's `created_by_me` to `Some(true)` unconditionally: the
+  creator of a bug being filed is definitionally the caller — Bugzilla
+  assigns `creator` server-side from the authenticating account, and
+  bugwarden's typed `create_bug` parameters cannot claim it. No whoami is
+  ever performed for the create gate. So a create-covering rule with
+  `created_by_me = true` matches every create request that reaches it, and
+  one with `created_by_me = false` can never match a create.
+- **Cannot widen exposure beyond the credential.** Bugzilla still enforces
+  its own access control on every fetch, so an authorship rule only
+  surfaces bugs the API key's account could already read — it narrows the
+  guard-credential gap, never escapes it.
+- **Deliberately not implemented.** `assigned_to_me` and `cc_me` are the
+  natural extensions of this mechanism; they are intentionally absent, not
+  forgotten.
 
 ## MCP tool surface (crates/bugwarden/src/server.rs)
 
@@ -639,7 +743,26 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   embargo-marked title everywhere, refuses filing elsewhere (omitted and
   claimed group lists alike), keeps existing world-readable desktop bugs
   fully readable (the issue-#26 regression surface), and keeps
-  group-restricted desktop bugs denied.
+  group-restricted desktop bugs denied; created_by_me — the TOML spelling
+  `created_by_me = true|false` is pinned and an absent key is None;
+  evaluate semantics ((true, Some(true)) holds, (true, Some(false)) fails,
+  (true, None) is Unknown and a consulted rule then denies for a deny rule
+  AND a restrict rule alike — the uniformity is pinned — and
+  (false, Some(false)) holds); BugMeta::from_json establishes
+  created_by_me only from a string creator plus a resolved caller (equal,
+  unequal, case-insensitively equal; absent/non-string creator and a None
+  caller are all None); needs_identity is false for a policy without
+  identity criteria, true for an access-covering identity rule, and FALSE
+  when the only identity rule is operations = ["create"]; may_create
+  forces created_by_me true without any client or whoami (a create-covering
+  deny rule on created_by_me = true refuses creation, one on
+  created_by_me = false never matches a create); and the shipped-example
+  pin extends to identity: with the caller known, a group-restricted bug
+  the caller authored grants exactly read/comments/history/attachments and
+  no write, the same bug authored by someone else stays Denied, and with
+  identity UNKNOWN both it and a world-readable desktop bug are Denied —
+  the whoami-failure blackout is pinned so it cannot be "fixed" into
+  fail-open later.
 - Unit tests (#[cfg(test)] in crates/bugwarden/src/server.rs): assemble_bug_info
   re-classification — a body embargoed after the verdict is refused, a body
   that now earns only summary is downgraded, a body granting neither read nor
@@ -662,7 +785,15 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   ids fetched once, no batch to poison; per-id
   fallback fail closed; comment privacy; error mapping; API key absent from
   error text (I12); create_bug and add_attachment endpoint mapping (payload
-  travels untouched to POST /rest/bug and /rest/bug/{id}/attachment).
+  travels untouched to POST /rest/bug and /rest/bug/{id}/attachment);
+  whoami endpoint mapping (GET /rest/whoami => the `name` login; a missing,
+  non-string, or blank — empty/whitespace-only — name is a failure), the
+  API key absent from a whoami transport error (I12), resolve_caller's
+  laziness (zero requests without an identity criterion, one request with,
+  failure mapped to None), and the classify projection itself — the bug
+  mock answers only an include_fields carrying `creator`, so dropping the
+  field from CLASSIFY_FIELDS fails the caller's-own-bug classification
+  instead of passing on a fixture that volunteers fields nobody requested.
 - Integration tests (crates/bugwarden/tests/tools_wiremock.rs, wiremock +
   rmcp client over an in-memory duplex transport): the tools are CALLED
   through a real MCP session, so a tool that stops calling its guard fails
@@ -676,9 +807,26 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   POST is reached) and leaves existing bugs in them searchable
   (issue #26); add_attachment refuses on a
   grant carrying `attachments` (read) without `attach` (write) and uploads
-  on `attach`; the upload size cap refuses before anything is POSTed; and
-  the attachment `comment` travels as a plain string (Bug.add_attachment
-  API shape), pinned by a wiremock body matcher.
+  on `attach`; the upload size cap refuses before anything is POSTed; the
+  attachment `comment` travels as a plain string (Bug.add_attachment
+  API shape), pinned by a wiremock body matcher; and identity end to end —
+  issue #33's exact scenario (a my-own-reports restrict rule above a
+  group_restricted deny: with whoami answering the caller, a
+  group-restricted bug the caller authored is readable through bug_info
+  while the same bug under a foreign creator takes the uniform denial), a
+  whoami 500 makes the caller's own bug byte-identical to the
+  foreign-creator denial (no oracle), the call-count contract (wiremock
+  expect(1) whoami hits for one tool call under an identity policy,
+  expect(0) under a policy without identity criteria), the caller threading
+  beyond bug_info (the caller's own group-restricted bug stays in a
+  bugs_quicksearch window while a foreign one is dropped, and serves its
+  comments through bug_comments and its history through bug_history while
+  a foreign one takes the uniform denial — every tool threads the caller
+  by hand, so each pinned tool is its own mutation surface), the caller
+  reaching a write gate (a carve-out granting `comment` on the caller's
+  own reports POSTs the comment for the caller's bug and refuses a
+  foreign one with nothing POSTed), and a whoami transport error leaking
+  no API key into any client-visible text (I12).
 - Audit tests (crates/bugwarden/tests/audit_wiremock.rs + #[cfg(test)] in
   server.rs and audit.rs): one record per call for EVERY routed tool,
   refusal paths and protocol errors included; the refusal map is total

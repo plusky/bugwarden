@@ -788,3 +788,400 @@ async fn list_tools_serves_the_pruned_instance_router_i13() {
         "a read tool stays listed: {names:?}"
     );
 }
+
+// ---------- created_by_me (identity-relative matcher, issue #33) ----------
+
+/// The issue's policy shape: the caller's own reports carved out of a
+/// blanket group_restricted deny. `operations = ["access"]` keeps the
+/// carve-out away from the create gate.
+const IDENTITY_POLICY: &str = concat!(
+    "[[rule]]\nname = \"my-own-reports\"\naction = \"restrict\"\n",
+    "capabilities = [\"read\", \"comments\", \"history\", \"attachments\"]\n",
+    "operations = [\"access\"]\n",
+    "[rule.match]\ncreated_by_me = true\n",
+    "[[rule]]\nname = \"group-restricted\"\naction = \"deny\"\n",
+    "[rule.match]\ngroup_restricted = true\n",
+);
+
+/// A group-restricted bug with an explicit creator.
+fn restricted_bug(id: u64, creator: &str) -> Value {
+    let mut bug = world_readable_bug(id);
+    bug["groups"] = json!(["secteam"]);
+    bug["creator"] = json!(creator);
+    bug
+}
+
+/// Mount `GET /rest/whoami` answering with `login`, expected `hits` times.
+async fn mount_whoami(mock: &MockServer, login: &str, hits: u64) {
+    Mock::given(method("GET"))
+        .and(path("/rest/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1, "name": login, "real_name": "Reporter",
+        })))
+        .expect(hits)
+        .mount(mock)
+        .await;
+}
+
+/// Mount the classification/full fetch for `bug` (unbounded — bug_info
+/// fetches a Read-granted id twice) and the id=0 link-disclosure padding.
+async fn mount_bug_and_padding(mock: &MockServer, bug: Value) {
+    let id = bug["id"].as_u64().expect("bug fixture has an id");
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", id.to_string()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [bug] })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn created_by_me_carves_own_reports_out_of_a_group_restricted_deny() {
+    // The issue's scenario end to end: under a policy whose blanket rule
+    // denies every group-restricted bug, the caller can still read the
+    // group-restricted bug their own account filed — and nobody else's.
+    let mock = MockServer::start().await;
+    mount_whoami(&mock, "reporter@example.com", 2).await;
+    mount_bug_and_padding(&mock, restricted_bug(7, "reporter@example.com")).await;
+    mount_bug_and_padding(&mock, restricted_bug(8, "other.person@example.com")).await;
+    let client = client_for(IDENTITY_POLICY, &mock).await;
+
+    let own = call(&client, "bug_info", json!({ "bug_ids": [7] })).await;
+    assert!(
+        !is_error(&own),
+        "own report must be served: {}",
+        text_of(&own)
+    );
+    let own: Value = serde_json::from_str(&text_of(&own)).expect("bug_info returns JSON");
+    assert_eq!(
+        own["bugs"][0]["id"],
+        json!(7),
+        "the caller's own group-restricted bug is readable"
+    );
+    assert!(own["restricted"].as_array().unwrap().is_empty());
+
+    let foreign = call(&client, "bug_info", json!({ "bug_ids": [8] })).await;
+    let foreign: Value = serde_json::from_str(&text_of(&foreign)).expect("bug_info returns JSON");
+    assert!(foreign["bugs"].as_array().unwrap().is_empty());
+    assert_eq!(
+        foreign["restricted"][0]["note"],
+        json!("Bug 8 is not accessible through this server"),
+        "someone else's restricted bug takes the uniform denial (I2)"
+    );
+}
+
+#[tokio::test]
+async fn created_by_me_whoami_failure_yields_the_same_uniform_denial() {
+    // whoami down: the caller's own bug must come back with EXACTLY the
+    // bytes a foreign bug gets under a working whoami — no different text,
+    // no different shape, no oracle for "denied because identity failed".
+    let broken = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/whoami"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "error": true, "message": "internal server error"
+        })))
+        .mount(&broken)
+        .await;
+    mount_bug_and_padding(&broken, restricted_bug(7, "reporter@example.com")).await;
+    let client = client_for(IDENTITY_POLICY, &broken).await;
+    let under_outage = call(&client, "bug_info", json!({ "bug_ids": [7] })).await;
+
+    let healthy = MockServer::start().await;
+    mount_whoami(&healthy, "reporter@example.com", 1).await;
+    mount_bug_and_padding(&healthy, restricted_bug(7, "other.person@example.com")).await;
+    let client = client_for(IDENTITY_POLICY, &healthy).await;
+    let foreign = call(&client, "bug_info", json!({ "bug_ids": [7] })).await;
+
+    assert_eq!(
+        serde_json::to_string(&under_outage).unwrap(),
+        serde_json::to_string(&foreign).unwrap(),
+        "a whoami outage must be indistinguishable from a foreign bug (I2/I4)"
+    );
+    let envelope: Value = serde_json::from_str(&text_of(&under_outage)).expect("JSON");
+    assert_eq!(
+        envelope["restricted"][0]["note"],
+        json!("Bug 7 is not accessible through this server")
+    );
+}
+
+#[tokio::test]
+async fn whoami_is_called_once_per_tool_call_under_an_identity_policy() {
+    // The per-call contract: ONE whoami for one tool call, however many
+    // classifications the call runs (assessment, re-check, link
+    // disclosure). The .expect(1) is verified when the mock server drops.
+    let mock = MockServer::start().await;
+    mount_whoami(&mock, "reporter@example.com", 1).await;
+    mount_bug_and_padding(&mock, restricted_bug(7, "reporter@example.com")).await;
+    let client = client_for(IDENTITY_POLICY, &mock).await;
+    let result = call(&client, "bug_info", json!({ "bug_ids": [7] })).await;
+    assert!(!is_error(&result));
+}
+
+#[tokio::test]
+async fn whoami_is_never_called_under_a_policy_without_identity_criteria() {
+    // The laziness contract: a policy that never consults created_by_me
+    // costs ZERO whoami lookups — pre-identity deployments keep their
+    // exact upstream request pattern.
+    let mock = MockServer::start().await;
+    mount_whoami(&mock, "reporter@example.com", 0).await;
+    mount_bug_and_padding(&mock, world_readable_bug(7)).await;
+    let client = client_for(
+        concat!(
+            "[[rule]]\nname = \"group-restricted\"\naction = \"deny\"\n",
+            "[rule.match]\ngroup_restricted = true\n",
+        ),
+        &mock,
+    )
+    .await;
+    let result = call(&client, "bug_info", json!({ "bug_ids": [7] })).await;
+    assert!(!is_error(&result));
+}
+
+#[tokio::test]
+async fn created_by_me_keeps_own_reports_in_quicksearch_results() {
+    // The caller must reach the guard's search scan, not only bug_info:
+    // under the identity policy the caller's own group-restricted bug stays
+    // in the served window while a foreign one is silently dropped (I3) —
+    // and the whole tool call still costs exactly one whoami lookup.
+    let mock = MockServer::start().await;
+    mount_whoami(&mock, "reporter@example.com", 1).await;
+    mount_search(
+        &mock,
+        vec![
+            restricted_bug(101, "reporter@example.com"),
+            restricted_bug(102, "other.person@example.com"),
+        ],
+    )
+    .await;
+    let client = client_for(IDENTITY_POLICY, &mock).await;
+
+    let served = quicksearch_json(&client, "kernel crash").await;
+    let ids: Vec<u64> = served["bugs"]
+        .as_array()
+        .expect("quicksearch returns a bugs array")
+        .iter()
+        .filter_map(|b| b["id"].as_u64())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![101],
+        "search must keep the caller's own restricted bug and drop the foreign one: {served}"
+    );
+}
+
+#[tokio::test]
+async fn created_by_me_carves_own_reports_out_for_bug_comments_too() {
+    // deny_unless gets the same caller threading as bug_info: the caller's
+    // own group-restricted bug serves its comments, a foreign one takes the
+    // uniform denial before anything is fetched — one whoami per tool call
+    // either way (the .expect counts are verified when the mock drops).
+    let mock = MockServer::start().await;
+    mount_whoami(&mock, "reporter@example.com", 2).await;
+    mount_bug_and_padding(&mock, restricted_bug(7, "reporter@example.com")).await;
+    mount_bug_and_padding(&mock, restricted_bug(8, "other.person@example.com")).await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/7/comment"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": { "7": { "comments": [
+                { "id": 1, "bug_id": 7, "text": "first comment", "is_private": false },
+            ] } }
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/8/comment"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": { "8": { "comments": [] } }
+        })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let client = client_for(IDENTITY_POLICY, &mock).await;
+
+    let own = call(&client, "bug_comments", json!({ "id": 7 })).await;
+    assert!(
+        !is_error(&own),
+        "the caller's own report must serve its comments: {}",
+        text_of(&own)
+    );
+    assert!(text_of(&own).contains("first comment"));
+
+    let foreign = call(&client, "bug_comments", json!({ "id": 8 })).await;
+    assert!(is_error(&foreign));
+    assert_eq!(
+        text_of(&foreign),
+        "Bug 8 is not accessible through this server",
+        "someone else's restricted bug takes the uniform denial (I2)"
+    );
+}
+
+#[tokio::test]
+async fn created_by_me_carves_own_reports_out_for_bug_history_too() {
+    // Every tool threads the caller by hand, so every tool is its own
+    // mutation surface: this pins bug_history the way the test above pins
+    // bug_comments — the caller's own group-restricted bug serves its
+    // history, a foreign one takes the uniform denial before anything is
+    // fetched, and each tool call costs exactly one whoami lookup.
+    let mock = MockServer::start().await;
+    mount_whoami(&mock, "reporter@example.com", 2).await;
+    mount_bug_and_padding(&mock, restricted_bug(7, "reporter@example.com")).await;
+    mount_bug_and_padding(&mock, restricted_bug(8, "other.person@example.com")).await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/7/history"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": [{ "id": 7, "history": [{
+                "when": "2020-02-01T00:00:00Z",
+                "who": "someone@example.com",
+                "changes": [
+                    { "field_name": "status", "removed": "NEW", "added": "CONFIRMED" },
+                ],
+            }] }]
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/8/history"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let client = client_for(IDENTITY_POLICY, &mock).await;
+
+    let own = call(&client, "bug_history", json!({ "id": 7 })).await;
+    assert!(
+        !is_error(&own),
+        "the caller's own report must serve its history: {}",
+        text_of(&own)
+    );
+    assert!(text_of(&own).contains("CONFIRMED"));
+
+    let foreign = call(&client, "bug_history", json!({ "id": 8 })).await;
+    assert!(is_error(&foreign));
+    assert_eq!(
+        text_of(&foreign),
+        "Bug 8 is not accessible through this server",
+        "someone else's restricted bug takes the uniform denial (I2)"
+    );
+}
+
+/// A carve-out granting a WRITE capability on the caller's own reports.
+/// [`IDENTITY_POLICY`] cannot exercise the write gate: its grant carries
+/// no write capabilities, so a write tool refuses even the caller's own
+/// bug under it — correctly, but uninformatively for threading coverage.
+const IDENTITY_WRITE_POLICY: &str = concat!(
+    "[[rule]]\nname = \"my-own-reports\"\naction = \"restrict\"\n",
+    "capabilities = [\"read\", \"comment\"]\n",
+    "operations = [\"access\"]\n",
+    "[rule.match]\ncreated_by_me = true\n",
+    "[[rule]]\nname = \"group-restricted\"\naction = \"deny\"\n",
+    "[rule.match]\ngroup_restricted = true\n",
+);
+
+#[tokio::test]
+async fn created_by_me_reaches_the_write_gate_add_comment_too() {
+    // The write tools thread the caller through the same deny_unless shape
+    // as the read tools; pin one representative so a dropped caller on a
+    // write site cannot pass unnoticed. Own bug: the comment is POSTed.
+    // Foreign bug: uniform denial, nothing POSTed.
+    let mock = MockServer::start().await;
+    mount_whoami(&mock, "reporter@example.com", 2).await;
+    mount_bug_and_padding(&mock, restricted_bug(7, "reporter@example.com")).await;
+    mount_bug_and_padding(&mock, restricted_bug(8, "other.person@example.com")).await;
+    Mock::given(method("POST"))
+        .and(path("/rest/bug/7/comment"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 99 })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/rest/bug/8/comment"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 100 })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let client = client_for(IDENTITY_WRITE_POLICY, &mock).await;
+
+    let own = call(
+        &client,
+        "add_comment",
+        json!({ "bug_id": 7, "comment": "adding context" }),
+    )
+    .await;
+    assert!(
+        !is_error(&own),
+        "the caller may comment on their own report: {}",
+        text_of(&own)
+    );
+
+    let foreign = call(
+        &client,
+        "add_comment",
+        json!({ "bug_id": 8, "comment": "adding context" }),
+    )
+    .await;
+    assert!(is_error(&foreign));
+    assert_eq!(
+        text_of(&foreign),
+        "Bug 8 is not accessible through this server",
+        "someone else's restricted bug takes the uniform denial (I2)"
+    );
+}
+
+#[tokio::test]
+async fn whoami_transport_error_does_not_leak_the_api_key_i12() {
+    // Point the server at a closed port: the whoami lookup (and everything
+    // after it) fails at the transport level, where the unsanitized error
+    // would carry the request URL with api_key=... in it. Nothing the
+    // client sees may contain the key.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    drop(listener); // free the port so every connection is refused
+
+    let cfg = Arc::new(Cli::parse_from([
+        "bugwarden",
+        "--bugzilla-server",
+        &format!("http://{addr}"),
+        "--transport",
+        "stdio",
+        "--api-key",
+        "SUPERSECRETKEY123",
+    ]));
+    let guard = Arc::new(Guard {
+        policy: Policy::from_toml_str(IDENTITY_POLICY).expect("test policy must parse"),
+    });
+    let bz =
+        Arc::new(BugzillaClient::new(&format!("http://{addr}"), false).expect("client must build"));
+    let server = BugWarden::new(cfg, guard, bz).expect("server must build");
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let client: RunningService<RoleClient, ()> =
+        ().serve(client_io)
+            .await
+            .expect("MCP handshake must succeed");
+
+    let result = call(&client, "bug_info", json!({ "bug_ids": [7] })).await;
+    let text = serde_json::to_string(&result).unwrap();
+    assert!(
+        !text.contains("SUPERSECRETKEY123"),
+        "API key leaked into a client-visible result: {text}"
+    );
+    // The bug is simply unavailable — the uniform denial, nothing else.
+    let envelope: Value = serde_json::from_str(&text_of(&result)).expect("JSON");
+    assert_eq!(
+        envelope["restricted"][0]["note"],
+        json!("Bug 7 is not accessible through this server")
+    );
+}

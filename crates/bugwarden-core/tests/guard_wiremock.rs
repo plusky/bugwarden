@@ -10,7 +10,7 @@ use bugwarden_core::client::BugzillaClient;
 use bugwarden_core::guard::{Guard, SearchRequest};
 use bugwarden_core::policy::{Access, Capability, Policy};
 use serde_json::json;
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{method, path, query_param, query_param_contains};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 /// Deliberately distinctive so a leak into any error text is unmistakable (I12).
@@ -66,7 +66,7 @@ groups = ["*security*", "*embargo*"]
 "#,
     );
     let bz = client(&server);
-    let out = g.assess(&bz, KEY, &[1, 2]).await;
+    let out = g.assess(&bz, KEY, &[1, 2], None).await;
 
     assert!(matches!(out[&1].0, Access::Denied { .. }));
     assert!(out[&2].0.allows(Capability::Read));
@@ -94,7 +94,7 @@ async fn assess_min_bug_age_denies_young_and_missing_creation_time() {
 
     let g = guard("[global]\nmin_bug_age_days = 7\n");
     let bz = client(&server);
-    let out = g.assess(&bz, KEY, &[1, 2, 3]).await;
+    let out = g.assess(&bz, KEY, &[1, 2, 3], None).await;
 
     assert!(matches!(out[&1].0, Access::Denied { .. }), "young bug");
     assert!(out[&2].0.allows(Capability::Read), "old bug");
@@ -139,7 +139,7 @@ async fn assess_costs_one_request_per_distinct_id_whatever_the_answer() {
 
     let g = guard(""); // default allow-all policy
     let bz = client(&server);
-    let out = g.assess(&bz, KEY, &[1, 2, 3]).await;
+    let out = g.assess(&bz, KEY, &[1, 2, 3], None).await;
 
     assert_eq!(out.len(), 3, "every requested id has an entry (I4)");
     assert!(out[&1].0.allows(Capability::Read));
@@ -183,7 +183,7 @@ async fn assess_never_batches_so_one_bad_id_cannot_poison_the_others() {
 
     let g = guard("");
     let bz = client(&server);
-    let out = g.assess(&bz, KEY, &[9, 1]).await;
+    let out = g.assess(&bz, KEY, &[9, 1], None).await;
 
     assert!(out[&1].0.allows(Capability::Read), "healthy id survives");
     match &out[&9].0 {
@@ -209,7 +209,7 @@ async fn assess_fan_out_is_bounded_and_the_excess_is_denied() {
     let ids: Vec<u64> = (1..=Guard::MAX_ASSESS_IDS as u64 * 4).collect();
     let g = guard("");
     let bz = client(&server);
-    let out = g.assess(&bz, KEY, &ids).await;
+    let out = g.assess(&bz, KEY, &ids, None).await;
 
     assert_eq!(out.len(), ids.len(), "every id still gets an entry (I4)");
     for id in &ids {
@@ -237,7 +237,7 @@ async fn assess_repeated_ids_are_fetched_once() {
 
     let g = guard("");
     let bz = client(&server);
-    let out = g.assess(&bz, KEY, &[5, 5, 5]).await;
+    let out = g.assess(&bz, KEY, &[5, 5, 5], None).await;
 
     assert_eq!(out.len(), 1);
     assert!(out[&5].0.allows(Capability::Read));
@@ -260,7 +260,7 @@ async fn assess_id_absent_from_its_own_response_is_denied() {
 
     let g = guard("");
     let bz = client(&server);
-    let out = g.assess(&bz, KEY, &[1, 2]).await;
+    let out = g.assess(&bz, KEY, &[1, 2], None).await;
 
     assert!(out[&1].0.allows(Capability::Read));
     match &out[&2].0 {
@@ -289,7 +289,7 @@ async fn assess_single_id_failure_makes_exactly_one_request() {
 
     let g = guard(""); // default allow-all policy
     let bz = client(&server);
-    let out = g.assess(&bz, KEY, &[7]).await;
+    let out = g.assess(&bz, KEY, &[7], None).await;
 
     assert_eq!(out.len(), 1, "the requested id has an entry (I4)");
     match &out[&7].0 {
@@ -517,7 +517,7 @@ capabilities = ["summary"]
 "#,
     );
     let bz = client(&server);
-    let out = g.assess(&bz, KEY, &[1]).await;
+    let out = g.assess(&bz, KEY, &[1], None).await;
 
     let (access, raw) = &out[&1];
     assert!(access.allows(Capability::Summary));
@@ -620,7 +620,7 @@ async fn quicksearch_window_pages_have_no_holes_when_bugs_are_hidden() {
     let mut seen = Vec::new();
     for page in 0..4u32 {
         let got = g
-            .quicksearch_window(&bz, KEY, &search("q", 5, page * 5))
+            .quicksearch_window(&bz, KEY, &search("q", 5, page * 5), None)
             .await
             .expect("search succeeds");
         assert_eq!(
@@ -656,13 +656,13 @@ async fn quicksearch_window_pages_are_disjoint_and_gapless() {
     let mut paged = Vec::new();
     for page in 0..8u32 {
         let got = g
-            .quicksearch_window(&bz, KEY, &search("q", 4, page * 4))
+            .quicksearch_window(&bz, KEY, &search("q", 4, page * 4), None)
             .await
             .expect("search succeeds");
         paged.extend(ids_of(&got));
     }
     let whole = g
-        .quicksearch_window(&bz, KEY, &search("q", 32, 0))
+        .quicksearch_window(&bz, KEY, &search("q", 32, 0), None)
         .await
         .expect("search succeeds");
     assert_eq!(
@@ -688,11 +688,11 @@ async fn quicksearch_window_page_is_identical_whether_or_not_bugs_are_hidden() {
 
     let g = guard(EMBARGO_POLICY);
     let clean = g
-        .quicksearch_window(&client(&server_clean), KEY, &search("q", 4, 2))
+        .quicksearch_window(&client(&server_clean), KEY, &search("q", 4, 2), None)
         .await
         .expect("search succeeds");
     let mixed = g
-        .quicksearch_window(&client(&server_mixed), KEY, &search("q", 4, 2))
+        .quicksearch_window(&client(&server_mixed), KEY, &search("q", 4, 2), None)
         .await
         .expect("search succeeds");
     // Clean: visible are 1..12, so offset 2 limit 4 => 3,4,5,6.
@@ -719,12 +719,12 @@ async fn quicksearch_window_runs_out_like_a_normal_end_of_results() {
     let bz = client(&server);
 
     let tail = g
-        .quicksearch_window(&bz, KEY, &search("q", 10, 4))
+        .quicksearch_window(&bz, KEY, &search("q", 10, 4), None)
         .await
         .expect("search succeeds");
     assert_eq!(ids_of(&tail), vec![6, 7]);
     let past = g
-        .quicksearch_window(&bz, KEY, &search("q", 10, 50))
+        .quicksearch_window(&bz, KEY, &search("q", 10, 50), None)
         .await
         .expect("search succeeds");
     assert!(past.is_empty());
@@ -741,7 +741,7 @@ async fn quicksearch_window_scan_is_bounded() {
     let g = guard(EMBARGO_POLICY);
 
     let got = g
-        .quicksearch_window(&client(&server), KEY, &search("q", 50, 0))
+        .quicksearch_window(&client(&server), KEY, &search("q", 50, 0), None)
         .await
         .expect("search succeeds");
     assert!(got.is_empty(), "everything was hidden");
@@ -765,7 +765,7 @@ async fn quicksearch_window_deep_offset_is_empty_whether_or_not_bugs_are_hidden(
         let g = guard(EMBARGO_POLICY);
         for offset in [1_001u32, 1_010, 1_200, u32::MAX] {
             let got = g
-                .quicksearch_window(&client(&server), KEY, &search("q", 1, offset))
+                .quicksearch_window(&client(&server), KEY, &search("q", 1, offset), None)
                 .await
                 .expect("a deep offset is not an error");
             assert!(
@@ -791,7 +791,7 @@ async fn quicksearch_window_scan_target_does_not_track_the_requested_limit() {
         corpus_counted(&server, 1_000, &hidden).await;
         let g = guard(EMBARGO_POLICY);
         let _ = g
-            .quicksearch_window(&client(&server), KEY, &search("q", limit, 0))
+            .quicksearch_window(&client(&server), KEY, &search("q", limit, 0), None)
             .await
             .expect("search succeeds");
         counts.push(requests_to(&server).await);
@@ -821,7 +821,7 @@ async fn quicksearch_window_drops_rows_without_a_readable_id() {
 
     let g = guard(EMBARGO_POLICY);
     let got = g
-        .quicksearch_window(&client(&server), KEY, &search("q", 10, 0))
+        .quicksearch_window(&client(&server), KEY, &search("q", 10, 0), None)
         .await
         .expect("search succeeds");
     assert_eq!(ids_of(&got), vec![1, 2]);
@@ -842,7 +842,7 @@ async fn quicksearch_window_dedupes_rows_repeated_across_chunks() {
 
     let g = guard(EMBARGO_POLICY);
     let got = g
-        .quicksearch_window(&client(&server), KEY, &search("q", 400, 0))
+        .quicksearch_window(&client(&server), KEY, &search("q", 400, 0), None)
         .await
         .expect("search succeeds");
     let ids = ids_of(&got);
@@ -857,7 +857,7 @@ async fn quicksearch_window_zero_limit_touches_nothing() {
     // No mock is mounted: any upstream request would fail the call.
     let g = guard(EMBARGO_POLICY);
     let got = g
-        .quicksearch_window(&client(&server), KEY, &search("q", 0, 0))
+        .quicksearch_window(&client(&server), KEY, &search("q", 0, 0), None)
         .await
         .expect("zero limit is not an error");
     assert!(got.is_empty());
@@ -871,9 +871,173 @@ async fn quicksearch_window_returns_the_classified_objects() {
     corpus(&server, 3, &[2]).await;
     let g = guard(EMBARGO_POLICY);
     let got = g
-        .quicksearch_window(&client(&server), KEY, &search("q", 10, 0))
+        .quicksearch_window(&client(&server), KEY, &search("q", 10, 0), None)
         .await
         .expect("search succeeds");
     assert_eq!(ids_of(&got), vec![1, 3]);
     assert_eq!(got[0]["summary"], json!("test bug"), "full object returned");
+}
+
+// ---------------------------------------------------------------------------
+// whoami + resolve_caller (identity resolution for created_by_me)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn client_whoami_returns_the_login_name() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 4242, "name": "reporter@example.com", "real_name": "Reporter",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let bz = client(&server);
+    assert_eq!(bz.whoami(KEY).await.unwrap(), "reporter@example.com");
+}
+
+#[tokio::test]
+async fn client_whoami_missing_non_string_or_blank_name_is_a_failure() {
+    // A login that cannot be read is a FAILED resolution, never an empty
+    // one — and a blank login IS unreadable: accepting "" would let a
+    // degenerate empty caller compare equal to a blank creator field and
+    // grant on no evidence. resolve_caller maps the failure to None and
+    // identity stays unknown (I4).
+    for body in [
+        json!({ "id": 1 }),
+        json!({ "id": 1, "name": 7 }),
+        json!({ "id": 1, "name": "" }),
+        json!({ "id": 1, "name": "   " }),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/whoami"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+            .mount(&server)
+            .await;
+        let bz = client(&server);
+        let err = bz.whoami(KEY).await.unwrap_err();
+        assert!(
+            err.to_string().contains("name"),
+            "unexpected error for body {body}: {err:#}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn whoami_api_key_absent_from_transport_error_i12() {
+    // Same pattern as api_key_absent_from_transport_error_i12: a connect
+    // error's URL would carry api_key=... — sanitize must strip it.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    drop(listener); // free the port so the connection is refused
+    let bz = BugzillaClient::new(&format!("http://{addr}"), false).expect("client");
+
+    let err = bz.whoami(KEY).await.unwrap_err();
+    let full = format!("{err:#} {err:?}");
+    assert!(
+        !full.contains(KEY),
+        "API key leaked into whoami transport error: {full}"
+    );
+}
+
+#[tokio::test]
+async fn resolve_caller_is_lazy_and_maps_failure_to_none() {
+    // No identity criterion in the policy: no request at all — the
+    // .expect(0) is verified when the mock server drops.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "name": "x@y" })))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let g = guard(
+        "[[rule]]\nname = \"embargo\"\naction = \"deny\"\n[rule.match]\ngroups = [\"*security*\"]\n",
+    );
+    assert_eq!(g.resolve_caller(&client(&server), KEY).await, None);
+    drop(server);
+
+    let identity = concat!(
+        "[[rule]]\nname = \"mine\"\naction = \"restrict\"\ncapabilities = [\"read\"]\n",
+        "operations = [\"access\"]\n[rule.match]\ncreated_by_me = true\n",
+        "[[rule]]\nname = \"rest\"\naction = \"deny\"\n",
+    );
+
+    // Identity policy, working endpoint: exactly one lookup, login returned.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1, "name": "reporter@example.com",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let g = guard(identity);
+    assert_eq!(
+        g.resolve_caller(&client(&server), KEY).await,
+        Some("reporter@example.com".to_string())
+    );
+    drop(server);
+
+    // Identity policy, failing endpoint: None, not an error — the caller
+    // stays unknown and classification fails closed downstream (I4).
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/whoami"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "error": true, "message": "boom"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let g = guard(identity);
+    assert_eq!(g.resolve_caller(&client(&server), KEY).await, None);
+}
+
+#[tokio::test]
+async fn classification_fetch_requests_the_creator_field() {
+    // Pins `creator` in CLASSIFY_FIELDS end to end: the bug mock below only
+    // answers a classify fetch whose projection asks for the creator column,
+    // so dropping the field from CLASSIFY_FIELDS un-matches the mock, the
+    // fetch fails, the caller's own bug collapses to the uniform denial
+    // (fail closed, I4) — and this test fails. Response-side fixtures alone
+    // cannot pin this: they return `creator` whether or not it was asked
+    // for.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1, "name": "reporter@example.com", "real_name": "Reporter",
+        })))
+        .mount(&server)
+        .await;
+    let mut own = bug(7, &["secteam"], OLD);
+    own["creator"] = json!("reporter@example.com");
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .and(query_param_contains("include_fields", "creator"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [own] })))
+        .mount(&server)
+        .await;
+
+    let g = guard(concat!(
+        "[[rule]]\nname = \"my-own-reports\"\naction = \"restrict\"\n",
+        "capabilities = [\"read\"]\noperations = [\"access\"]\n",
+        "[rule.match]\ncreated_by_me = true\n",
+        "[[rule]]\nname = \"group-restricted\"\naction = \"deny\"\n",
+        "[rule.match]\ngroup_restricted = true\n",
+    ));
+    let bz = client(&server);
+    let caller = g.resolve_caller(&bz, KEY).await;
+    assert_eq!(caller.as_deref(), Some("reporter@example.com"));
+    let out = g.assess(&bz, KEY, &[7], caller.as_deref()).await;
+    assert!(
+        out[&7].0.allows(Capability::Read),
+        "the caller's own bug must classify from a creator-carrying projection"
+    );
 }

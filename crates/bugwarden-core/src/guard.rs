@@ -112,12 +112,18 @@ impl Guard {
     /// being fetched. Sequential rather than concurrent because some Bugzilla
     /// deployments drop parallel connections (see `client::server_info`).
     ///
+    /// `caller` is the requesting account's login as resolved ONCE per tool
+    /// call by [`Guard::resolve_caller`] — this method performs no identity
+    /// lookup of its own. `None` leaves the `created_by_me` criterion
+    /// undecidable, which fails closed for every rule consulting it (I4).
+    ///
     /// The API key is only forwarded to the client and never logged (I12).
     pub async fn assess(
         &self,
         bz: &BugzillaClient,
         key: &str,
         ids: &[u64],
+        caller: Option<&str>,
     ) -> BTreeMap<u64, (Access, Value)> {
         let mut out = BTreeMap::new();
         if ids.is_empty() {
@@ -176,7 +182,7 @@ impl Guard {
         for &id in ids {
             let entry = match fetched.get(&id) {
                 Some(bug) => {
-                    let meta = BugMeta::from_json(bug);
+                    let meta = BugMeta::from_json(bug, caller);
                     (
                         self.policy.classify(&meta, now, Operation::Access),
                         bug.clone(),
@@ -255,6 +261,7 @@ impl Guard {
         bz: &BugzillaClient,
         key: &str,
         req: &SearchRequest<'_>,
+        caller: Option<&str>,
     ) -> anyhow::Result<Vec<Value>> {
         let SearchRequest {
             query,
@@ -309,7 +316,7 @@ impl Guard {
                         .is_some_and(|id| seen.insert(id))
                 })
                 .collect();
-            let (kept, dropped) = self.filter_bug_list(fresh);
+            let (kept, dropped) = self.filter_bug_list(fresh, caller);
             dropped_total += dropped;
             visible.extend(kept);
             scanned += returned;
@@ -371,6 +378,7 @@ impl Guard {
         bz: &BugzillaClient,
         key: &str,
         ids: &BTreeSet<u64>,
+        caller: Option<&str>,
     ) -> BTreeSet<u64> {
         let now = Utc::now();
         // Bug id 0 never exists, so an empty candidate set still costs one
@@ -399,7 +407,7 @@ impl Guard {
                 if !ids.contains(&id) {
                     continue;
                 }
-                let meta = BugMeta::from_json(bug);
+                let meta = BugMeta::from_json(bug, caller);
                 if self
                     .policy
                     .classify(&meta, now, Operation::Access)
@@ -732,17 +740,61 @@ impl Guard {
     /// The prospective bug is dated NOW, so an age rule (`younger_than_days`,
     /// `min_bug_age_days`) refuses creation wherever it would immediately
     /// hide the result. Filing a bug nobody may then read is not a service.
+    ///
+    /// `created_by_me` is forced to `Some(true)` unconditionally: the
+    /// creator of a bug being filed is definitionally the caller — Bugzilla
+    /// assigns `creator` server-side from the authenticating account, and
+    /// the typed `create_bug` parameters cannot claim it. No `whoami`
+    /// lookup is ever performed for the create gate (which is also why a
+    /// create-scoped identity rule never triggers one — see
+    /// `Policy::needs_identity`). Consequence: a create-covering rule with
+    /// `created_by_me = true` matches every create request that reaches it,
+    /// and one with `created_by_me = false` can never match a create.
     pub fn may_create(&self, requested: &Value) -> bool {
-        let mut meta = BugMeta::from_json(requested);
+        let mut meta = BugMeta::from_json(requested, None);
         meta.creation_time = Some(Utc::now());
         // Bugzilla augments the group list server-side on creation; the
         // request's claim about it is not knowledge (see above).
         meta.groups = None;
+        // The filer IS the creator — a fact, not a claim (see above).
+        meta.created_by_me = Some(true);
         // Every other field the request does not mention is unknown, not
         // empty, and classification fails closed on it (I4).
         self.policy
             .classify(&meta, Utc::now(), Operation::Create)
             .allows(Capability::Create)
+    }
+
+    /// Resolve the caller's login for this tool call, lazily.
+    ///
+    /// Contract (see DESIGN.md, "Identity resolution"):
+    /// - when the policy consults no identity for access classification
+    ///   ([`Policy::needs_identity`] is false), returns `None` WITHOUT any
+    ///   HTTP request — a policy without `created_by_me` never costs a
+    ///   `whoami` lookup;
+    /// - otherwise performs exactly one `GET /rest/whoami` and returns the
+    ///   account's login, mapping every failure to `None` (the sanitized
+    ///   error is debug-logged only — never the key, I12). `None` makes
+    ///   every `created_by_me` criterion undecidable, which denies every
+    ///   classification consulting it (I4): a whoami outage blacks out
+    ///   what the identity rules cover, it never fails open.
+    ///
+    /// Callers (the MCP tools) invoke this at most once per tool call and
+    /// thread the result to every classification within that call. The
+    /// result is never cached across tool calls.
+    pub async fn resolve_caller(&self, bz: &BugzillaClient, key: &str) -> Option<String> {
+        if !self.policy.needs_identity() {
+            return None;
+        }
+        match bz.whoami(key).await {
+            Ok(login) => Some(login),
+            Err(err) => {
+                // Sanitized by the client (I12); identity stays unknown and
+                // every consulted identity rule fails closed (I4).
+                tracing::debug!(error = %err, "whoami failed; caller identity unresolved");
+                None
+            }
+        }
     }
 
     /// The refusal for a bug that was not filed.
@@ -785,12 +837,17 @@ impl Guard {
     /// The input objects must include the classification fields (callers
     /// fetch `requested ∪ CLASSIFY_FIELDS`), otherwise bugs may be
     /// misclassified against empty metadata.
-    pub fn filter_bug_list(&self, bugs: Vec<Value>) -> (Vec<Value>, usize) {
+    ///
+    /// `caller` is the login resolved once for the surrounding tool call
+    /// ([`Guard::resolve_caller`]); under an identity-consulting policy a
+    /// caller of `None` denies every bug the identity rules are consulted
+    /// for (I4).
+    pub fn filter_bug_list(&self, bugs: Vec<Value>, caller: Option<&str>) -> (Vec<Value>, usize) {
         let now = Utc::now();
         let mut kept = Vec::new();
         let mut dropped = 0usize;
         for bug in bugs {
-            let meta = BugMeta::from_json(&bug);
+            let meta = BugMeta::from_json(&bug, caller);
             let access = self.policy.classify(&meta, now, Operation::Access);
             if access.allows(Capability::Read) {
                 kept.push(bug);
@@ -1361,7 +1418,7 @@ products = ["NoView*"]
             // comments-only grants neither read nor summary => dropped.
             json!({"id": 4, "product": "NoViewer", "summary": "also hidden"}),
         ];
-        let (kept, dropped) = g.filter_bug_list(bugs);
+        let (kept, dropped) = g.filter_bug_list(bugs, None);
         assert_eq!(dropped, 2, "denied and view-less bugs are dropped");
         assert_eq!(kept.len(), 2);
         // Full-read bug passes through unmodified — extra fields intact, no
@@ -1402,7 +1459,7 @@ products = ["NoView*"]
             // evaluated, so this one goes too.
             json!({"id": 6, "groups": []}),
         ];
-        let (kept, dropped) = g.filter_bug_list(bugs);
+        let (kept, dropped) = g.filter_bug_list(bugs, None);
         assert_eq!(dropped, 5, "only the plain, world-readable bug survives");
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0]["id"], json!(1));
@@ -1416,7 +1473,7 @@ products = ["NoView*"]
             ),
         };
         let (kept, dropped) =
-            g.filter_bug_list(vec![json!({"id": 9, "product": "x", "cc": ["a@b"]})]);
+            g.filter_bug_list(vec![json!({"id": 9, "product": "x", "cc": ["a@b"]})], None);
         assert_eq!(dropped, 0);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0]["cc"], json!(["a@b"]));
@@ -1428,7 +1485,7 @@ products = ["NoView*"]
         let g = Guard {
             policy: Policy::default(),
         };
-        let (kept, dropped) = g.filter_bug_list(vec![json!({"id": 1}), json!({"id": 2})]);
+        let (kept, dropped) = g.filter_bug_list(vec![json!({"id": 1}), json!({"id": 2})], None);
         assert_eq!(kept.len(), 2);
         assert_eq!(dropped, 0);
     }
@@ -1438,7 +1495,7 @@ products = ["NoView*"]
         let g = Guard {
             policy: policy("default_action = \"deny\""),
         };
-        let (kept, dropped) = g.filter_bug_list(vec![json!({"id": 1}), json!({"id": 2})]);
+        let (kept, dropped) = g.filter_bug_list(vec![json!({"id": 1}), json!({"id": 2})], None);
         assert!(kept.is_empty());
         assert_eq!(dropped, 2);
     }
@@ -1448,7 +1505,7 @@ products = ["NoView*"]
         let g = Guard {
             policy: Policy::default(),
         };
-        let (kept, dropped) = g.filter_bug_list(Vec::new());
+        let (kept, dropped) = g.filter_bug_list(Vec::new(), None);
         assert!(kept.is_empty());
         assert_eq!(dropped, 0);
     }
@@ -1464,7 +1521,7 @@ products = ["NoView*"]
             json!({"id": 1, "product": "P", "groups": ["suse-security"]}),
             json!({"id": 2, "product": "P", "groups": []}),
         ];
-        let (kept, dropped) = g.filter_bug_list(bugs);
+        let (kept, dropped) = g.filter_bug_list(bugs, None);
         assert_eq!(dropped, 1);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0]["id"], json!(2));
@@ -1637,6 +1694,44 @@ products = ["NoView*"]
     }
 
     #[test]
+    fn may_create_forces_created_by_me_true_without_whoami() {
+        // The account filing a bug is definitionally its creator: Bugzilla
+        // assigns `creator` server-side, and the typed create params cannot
+        // claim it. may_create takes no client and performs no whoami — the
+        // forcing is a fact about the operation, not a lookup. A
+        // create-covering deny rule on created_by_me = true therefore
+        // refuses every create request that reaches it...
+        let deny_own = Guard {
+            policy: policy(concat!(
+                "[[rule]]\nname = \"no-self-filing\"\naction = \"deny\"\n",
+                "operations = [\"create\"]\n",
+                "[rule.match]\ncreated_by_me = true\n",
+            )),
+        };
+        assert!(!deny_own.may_create(&create_request("openSUSE")));
+
+        // ...and one on created_by_me = false can never match a create: the
+        // rule is a definitive No and the allowing default decides.
+        let deny_foreign = Guard {
+            policy: policy(concat!(
+                "[[rule]]\nname = \"no-foreign\"\naction = \"deny\"\n",
+                "[rule.match]\ncreated_by_me = false\n",
+            )),
+        };
+        assert!(deny_foreign.may_create(&create_request("openSUSE")));
+
+        // The unscoped deny-own variant refuses creation too: forcing does
+        // not depend on the rule's scoping, only on the operation.
+        let deny_own_unscoped = Guard {
+            policy: policy(concat!(
+                "[[rule]]\nname = \"no-self-filing\"\naction = \"deny\"\n",
+                "[rule.match]\ncreated_by_me = true\n",
+            )),
+        };
+        assert!(!deny_own_unscoped.may_create(&create_request("openSUSE")));
+    }
+
+    #[test]
     fn shipped_example_policy_files_into_desktop_products_only_and_keeps_reads() {
         // examples/policy.toml promises, in its header: new bug reports are
         // accepted into the desktop products ONLY (the create-scoped
@@ -1681,21 +1776,32 @@ products = ["NoView*"]
         req["groups"] = json!(["security-team"]);
         assert!(!g.may_create(&req), "claimed groups: refused");
 
+        // Every read below runs with the caller's identity KNOWN, as
+        // resolve_caller provides it in production: the "my-own-reports"
+        // rule consults created_by_me, so identity-unknown classification
+        // is a different (pinned further down) regime.
+        let caller = Some("reporter@example.com");
+
         // Issue #26: the create grant is scoped away from access, so an
-        // existing world-readable desktop bug keeps its FULL read — under
-        // the pre-fix policy shape the same rule was first match for reads
-        // and silently revoked everything but `create`.
-        let public = BugMeta::from_json(&json!({
-            "id": 500,
-            "summary": "totem crashes when seeking in a webm file",
-            "product": "GNOME Multimedia",
-            "component": "totem",
-            "groups": [],
-            "keywords": [],
-            "whiteboard": "",
-            "status": "NEW",
-            "creation_time": "2020-01-01T00:00:00Z",
-        }));
+        // existing world-readable desktop bug someone ELSE filed keeps its
+        // FULL read — under the pre-fix policy shape the same rule was
+        // first match for reads and silently revoked everything but
+        // `create`.
+        let public = BugMeta::from_json(
+            &json!({
+                "id": 500,
+                "summary": "totem crashes when seeking in a webm file",
+                "product": "GNOME Multimedia",
+                "component": "totem",
+                "groups": [],
+                "keywords": [],
+                "whiteboard": "",
+                "status": "NEW",
+                "creator": "other.person@example.com",
+                "creation_time": "2020-01-01T00:00:00Z",
+            }),
+            caller,
+        );
         assert!(
             g.policy
                 .classify(&public, Utc::now(), Operation::Access)
@@ -1703,9 +1809,9 @@ products = ["NoView*"]
             "existing desktop bugs must stay fully readable"
         );
 
-        // ...while a group-restricted desktop bug stays denied: the grant
-        // does not shadow the deny rules for reads either.
-        let restricted = BugMeta::from_json(&json!({
+        // ...while a group-restricted desktop bug someone else filed stays
+        // denied: the grant does not shadow the deny rules for reads either.
+        let restricted_foreign = json!({
             "id": 501,
             "summary": "totem crashes when seeking in a webm file",
             "product": "GNOME Multimedia",
@@ -1714,8 +1820,10 @@ products = ["NoView*"]
             "keywords": [],
             "whiteboard": "",
             "status": "NEW",
+            "creator": "other.person@example.com",
             "creation_time": "2020-01-01T00:00:00Z",
-        }));
+        });
+        let restricted = BugMeta::from_json(&restricted_foreign, caller);
         assert!(
             matches!(
                 g.policy
@@ -1723,6 +1831,74 @@ products = ["NoView*"]
                 Access::Denied { .. }
             ),
             "group-restricted desktop bugs must stay denied"
+        );
+
+        // The identity carve-out ("my-own-reports"): the SAME
+        // group-restricted bug, authored by the caller, is readable —
+        // reads, comments, history and attachment listing, and nothing
+        // that writes.
+        let mut own_restricted_json = restricted_foreign.clone();
+        own_restricted_json["creator"] = json!("reporter@example.com");
+        let own_restricted = BugMeta::from_json(&own_restricted_json, caller);
+        let own_access = g
+            .policy
+            .classify(&own_restricted, Utc::now(), Operation::Access);
+        for cap in [
+            Capability::Read,
+            Capability::Comments,
+            Capability::History,
+            Capability::Attachments,
+        ] {
+            assert!(
+                own_access.allows(cap),
+                "the caller's own group-restricted bug must grant {cap:?}"
+            );
+        }
+        for cap in Capability::ALL.iter().filter(|c| c.is_write()) {
+            assert!(
+                !own_access.allows(*cap),
+                "the my-own-reports carve-out must not grant the write {cap:?}"
+            );
+        }
+
+        // Identity unknown (whoami failed): the my-own-reports rule cannot
+        // be decided for ANY bug it is consulted for, and an undecidable
+        // consulted rule denies (I4) — the caller's own restricted bug AND
+        // the world-readable public bug alike. This blackout is the
+        // deliberate fail-closed reading; do not "fix" it into fail-open.
+        for bug_json in [&own_restricted_json, &restricted_foreign] {
+            let unknown = BugMeta::from_json(bug_json, None);
+            assert!(
+                matches!(
+                    g.policy.classify(&unknown, Utc::now(), Operation::Access),
+                    Access::Denied { .. }
+                ),
+                "identity-unknown must deny (blackout), bug {}",
+                bug_json["id"]
+            );
+        }
+        let public_unknown = BugMeta::from_json(
+            &json!({
+                "id": 500,
+                "summary": "totem crashes when seeking in a webm file",
+                "product": "GNOME Multimedia",
+                "component": "totem",
+                "groups": [],
+                "keywords": [],
+                "whiteboard": "",
+                "status": "NEW",
+                "creator": "other.person@example.com",
+                "creation_time": "2020-01-01T00:00:00Z",
+            }),
+            None,
+        );
+        assert!(
+            matches!(
+                g.policy
+                    .classify(&public_unknown, Utc::now(), Operation::Access),
+                Access::Denied { .. }
+            ),
+            "even a world-readable desktop bug is denied while identity is unknown"
         );
     }
 
@@ -1735,23 +1911,30 @@ products = ["NoView*"]
         // comment invites — must not thereby expose security-group bugs.
         // Pin both layers on a bug carrying NO other deniable signal: no
         // marker in the summary, no keywords, empty whiteboard, years past
-        // every freshness window.
+        // every freshness window — and somebody ELSE'S bug under a resolved
+        // caller identity, so the "my-own-reports" carve-out (a definitive
+        // No here) neither grants nor fails closed in the way.
+        let caller = Some("reporter@example.com");
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/policy.toml");
         let toml = std::fs::read_to_string(path).expect("example policy must exist in-repo");
-        let bug = BugMeta::from_json(&json!({
-            "id": 42,
-            "summary": "kernel oops when unplugging a USB dock",
-            "groups": ["team-security"],
-            "keywords": [],
-            "whiteboard": "",
-            "product": "Base System",
-            "component": "Kernel",
-            "status": "NEW",
-            "severity": "major",
-            "priority": "P2",
-            "creation_time": "2020-01-01T00:00:00Z",
-        }));
+        let bug = BugMeta::from_json(
+            &json!({
+                "id": 42,
+                "summary": "kernel oops when unplugging a USB dock",
+                "groups": ["team-security"],
+                "keywords": [],
+                "whiteboard": "",
+                "product": "Base System",
+                "component": "Kernel",
+                "status": "NEW",
+                "severity": "major",
+                "priority": "P2",
+                "creator": "other.person@example.com",
+                "creation_time": "2020-01-01T00:00:00Z",
+            }),
+            caller,
+        );
 
         // The shipped file as-is: denied (the broad rule reaches it first).
         let full = policy(&toml);
@@ -1788,19 +1971,23 @@ products = ["NoView*"]
         // A restricted-but-not-security bug is exactly what an operator
         // removes the broad rule FOR: under the narrowed policy it falls
         // through to default_action and becomes visible.
-        let partner = BugMeta::from_json(&json!({
-            "id": 43,
-            "summary": "invoice import fails for partner deployments",
-            "groups": ["partnerconfidential"],
-            "keywords": [],
-            "whiteboard": "",
-            "product": "Base System",
-            "component": "Billing",
-            "status": "NEW",
-            "severity": "major",
-            "priority": "P2",
-            "creation_time": "2020-01-01T00:00:00Z",
-        }));
+        let partner = BugMeta::from_json(
+            &json!({
+                "id": 43,
+                "summary": "invoice import fails for partner deployments",
+                "groups": ["partnerconfidential"],
+                "keywords": [],
+                "whiteboard": "",
+                "product": "Base System",
+                "component": "Billing",
+                "status": "NEW",
+                "severity": "major",
+                "priority": "P2",
+                "creator": "other.person@example.com",
+                "creation_time": "2020-01-01T00:00:00Z",
+            }),
+            caller,
+        );
         assert!(
             matches!(
                 full.classify(&partner, Utc::now(), Operation::Access),
@@ -1911,14 +2098,17 @@ group_restricted = true
         // create-scoped rule is invisible to access classification, so the
         // bug falls through the deny rule to the allowing default — this is
         // the read the pre-fix policy shape silently revoked.
-        let public = BugMeta::from_json(&json!({
-            "id": 100,
-            "summary": "boot hangs after update",
-            "product": "SUSE Linux Enterprise Server 15",
-            "component": "Kernel",
-            "groups": [],
-            "creation_time": "2020-01-01T00:00:00Z",
-        }));
+        let public = BugMeta::from_json(
+            &json!({
+                "id": 100,
+                "summary": "boot hangs after update",
+                "product": "SUSE Linux Enterprise Server 15",
+                "component": "Kernel",
+                "groups": [],
+                "creation_time": "2020-01-01T00:00:00Z",
+            }),
+            None,
+        );
         match g.policy.classify(&public, Utc::now(), Operation::Access) {
             Access::Granted { rule, .. } => assert_eq!(rule, "default"),
             other => panic!("non-restricted bug must stay readable, got {other:?}"),
@@ -1926,14 +2116,17 @@ group_restricted = true
 
         // A group-restricted bug in the same product stays denied: the
         // create grant does not shadow the deny rule for reads.
-        let restricted = BugMeta::from_json(&json!({
-            "id": 101,
-            "summary": "boot hangs after update",
-            "product": "SUSE Linux Enterprise Server 15",
-            "component": "Kernel",
-            "groups": ["secteam"],
-            "creation_time": "2020-01-01T00:00:00Z",
-        }));
+        let restricted = BugMeta::from_json(
+            &json!({
+                "id": 101,
+                "summary": "boot hangs after update",
+                "product": "SUSE Linux Enterprise Server 15",
+                "component": "Kernel",
+                "groups": ["secteam"],
+                "creation_time": "2020-01-01T00:00:00Z",
+            }),
+            None,
+        );
         match g
             .policy
             .classify(&restricted, Utc::now(), Operation::Access)
