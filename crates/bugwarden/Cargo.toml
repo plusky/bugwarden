@@ -16,7 +16,7 @@ categories = ["command-line-utilities", "web-programming::http-server"]
 workspace = true
 
 [dependencies]
-bugwarden-core = { path = "../bugwarden-core", version = "0.2.0" }
+bugwarden-core = { path = "../bugwarden-core", version = "0.3.0" }
 
 rmcp = { version = "2.2", features = [
     "server",

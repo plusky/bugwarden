@@ -1,6 +1,6 @@
 [package]
 name = "bugwarden-core"
-version = "0.2.0"
+version = "0.3.0"
 description = "Guard policy engine and async Bugzilla REST client for the bugwarden MCP server"
 edition.workspace = true
 rust-version.workspace = true
