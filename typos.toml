@@ -4,7 +4,12 @@
 # once its last real occurrence is gone, and say so.
 
 [files]
-extend-exclude = []
+extend-exclude = [
+  # Generated from the clap CLI (see the rust-assets-drift job); the authored
+  # source that produces them is still spell-checked.
+  "crates/bugwarden/completions/**",
+  "crates/bugwarden/man/**",
+]
 
 [default.extend-words]
 # glob_match backtracking test data in bugwarden-core/src/policy.rs: the

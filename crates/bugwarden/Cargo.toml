@@ -12,6 +12,24 @@ readme = "README.md"
 keywords = ["bugzilla", "mcp", "llm", "security", "server"]
 categories = ["command-line-utilities", "web-programming::http-server"]
 
+# Two bins live here once the gen feature is on; a bare `cargo run -p
+# bugwarden` must mean the shipped binary.
+default-run = "bugwarden"
+
+[[bin]]
+name = "bugwarden"
+path = "src/main.rs"
+
+# Dev/packaging asset generator; built only with `--features gen` so the
+# shipped `bugwarden` binary never drags in clap_complete/clap_mangen.
+[[bin]]
+name = "bugwarden-gen"
+path = "src/bin/bugwarden-gen.rs"
+required-features = ["gen"]
+
+[features]
+gen = ["dep:clap_complete", "dep:clap_mangen"]
+
 [lints]
 workspace = true
 
@@ -37,6 +55,8 @@ thiserror = "2"
 toml = "1.1"
 
 clap = { version = "4", features = ["derive", "env"] }
+clap_complete = { version = "4", optional = true }
+clap_mangen = { version = "0.3", optional = true }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

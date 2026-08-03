@@ -11,6 +11,7 @@ Run commands from the repository root:
 ```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p bugwarden --features gen --all-targets -- -D warnings
 cargo test --workspace --all-targets --locked
 cargo deny check
 ```

@@ -61,6 +61,9 @@ jobs:
           cp target/release/bugwarden LICENSE README.md "$dist/"
           mkdir "$dist/examples"
           cp examples/policy.toml "$dist/examples/"
+          # Committed generated assets, kept in sync by the rust-assets-drift
+          # CI job (`cp -R` exists on both the ubuntu and macOS runners).
+          cp -R crates/bugwarden/man crates/bugwarden/completions "$dist/"
           tar czf "${dist}.tar.gz" "$dist"
           # shasum -a 256 exists on both the ubuntu and macOS runners and its
           # output is compatible with `sha256sum -c`.

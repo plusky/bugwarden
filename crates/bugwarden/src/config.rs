@@ -20,11 +20,13 @@ pub enum Transport {
     Stdio,
 }
 
-/// MCP server for Bugzilla interaction, with operator-controlled security
-/// guards.
-///
-/// `Debug` is implemented by hand to redact `api_key`: the struct holds the
-/// startup key, and key material must never reach logs or error text (I12).
+/// MCP server for Bugzilla with operator-controlled security guards.
+// What `--help` and the man page show is `description` from Cargo.toml (the
+// bare `about` attribute below): with a single-paragraph doc comment clap
+// derives no long_about. Keep this comment to ONE paragraph mirroring that
+// description — a second paragraph resurrects the whole comment as
+// long_about in `--help`, which is how the I12 Debug-redaction note once
+// leaked there (that note lives on the `Debug` impl below).
 #[derive(Parser)]
 #[command(name = "bugwarden", version, about)]
 pub struct Cli {
@@ -72,6 +74,7 @@ pub struct Cli {
     #[arg(
         long,
         env = "BUGZILLA_API_KEY_FILE",
+        value_hint = clap::ValueHint::FilePath,
         value_parser = clap::builder::OsStringValueParser::new().map(PathBuf::from)
     )]
     pub api_key_file: Option<PathBuf>,
@@ -90,13 +93,13 @@ pub struct Cli {
     /// Path to the guard policy TOML file. Environment variable
     /// BUGWARDEN_POLICY can also be used. Without it an allow-all default
     /// policy is used.
-    #[arg(long, env = "BUGWARDEN_POLICY")]
+    #[arg(long, env = "BUGWARDEN_POLICY", value_hint = clap::ValueHint::FilePath)]
     pub policy: Option<PathBuf>,
 
     /// Path to the audit configuration TOML file (see examples/audit.toml).
     /// Environment variable BUGWARDEN_AUDIT_CONFIG can also be used.
     /// Without it no audit stream is written.
-    #[arg(long, env = "BUGWARDEN_AUDIT_CONFIG")]
+    #[arg(long, env = "BUGWARDEN_AUDIT_CONFIG", value_hint = clap::ValueHint::FilePath)]
     pub audit_config: Option<PathBuf>,
 }
 
@@ -118,6 +121,14 @@ impl std::fmt::Debug for Cli {
             .field("audit_config", &self.audit_config)
             .finish()
     }
+}
+
+/// The clap command for the `bugwarden` binary — the single definition the
+/// server parses and `bugwarden-gen` renders into the man page and shell
+/// completions.
+pub fn command() -> clap::Command {
+    use clap::CommandFactory as _;
+    Cli::command()
 }
 
 /// Who holds the Bugzilla API key, resolved exactly once at startup.

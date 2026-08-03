@@ -1,0 +1,175 @@
+.TH bugwarden 1 "" "bugwarden 0.3.0" "General Commands Manual"
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.SH NAME
+bugwarden \- MCP server for Bugzilla with operator\-controlled security guards
+.SH SYNOPSIS
+\fBbugwarden\fR
+\fB\-\-bugzilla\-server\fR <BUGZILLA_SERVER>
+[\fB\-\-transport\fR <TRANSPORT>]
+[\fB\-\-host\fR <HOST>]
+[\fB\-\-port\fR <PORT>]
+[\fB\-\-api\-key\-header\fR <API_KEY_HEADER>]
+[\fB\-\-api\-key\fR <API_KEY>]
+[\fB\-\-api\-key\-file\fR <API_KEY_FILE>]
+[\fB\-\-use\-auth\-header\fR]
+[\fB\-\-read\-only\fR]
+[\fB\-\-policy\fR <POLICY>]
+[\fB\-\-audit\-config\fR <AUDIT_CONFIG>]
+[\fB\-h\fR|\fB\-\-help\fR]
+[\fB\-V\fR|\fB\-\-version\fR]
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.SH DESCRIPTION
+MCP server for Bugzilla with operator\-controlled security guards
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.SH OPTIONS
+.TP
+\fB\-\-bugzilla\-server\fR \fI<BUGZILLA_SERVER>\fR
+Base URL of the Bugzilla server (e.g., \*(Aqhttps://bugzilla.example.com\*(Aq). Environment variable BUGZILLA_SERVER is used if the argument is not provided
+.TP
+\fB\-\-transport\fR \fI<TRANSPORT>\fR [default: http]
+Transport for the MCP server: \*(Aqhttp\*(Aq (default) or \*(Aqstdio\*(Aq. Environment variable MCP_TRANSPORT can also be used
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+http: Streamable HTTP transport (default). Clients send the Bugzilla API key per\-request via the API key header, unless `\-\-api\-key\-file` selects server\-held key mode (then the header is not consulted at all)
+.IP \(bu 2
+stdio: Stdio transport. The API key comes from `\-\-api\-key` / `BUGZILLA_API_KEY` or `\-\-api\-key\-file` at startup
+.RE
+.TP
+\fB\-\-host\fR \fI<HOST>\fR [default: 127.0.0.1]
+Host address for the MCP server to listen on (http transport only). Defaults to 127.0.0.1 or the MCP_HOST environment variable
+.TP
+\fB\-\-port\fR \fI<PORT>\fR [default: 8000]
+Port for the MCP server to listen on (http transport only). Defaults to 8000 or the MCP_PORT environment variable
+.TP
+\fB\-\-api\-key\-header\fR \fI<API_KEY_HEADER>\fR [default: ApiKey]
+HTTP header for clients to send the Bugzilla API key. Defaults to \*(AqApiKey\*(Aq or the MCP_API_KEY_HEADER environment variable. Not consulted in server\-held key mode (\-\-api\-key\-file over http)
+.TP
+\fB\-\-api\-key\fR \fI<API_KEY>\fR
+Bugzilla API key. Required for \-\-transport stdio (no HTTP headers exist there) unless \-\-api\-key\-file provides it. Environment variable BUGZILLA_API_KEY can also be used. Ignored for \-\-transport http (clients send the key per\-request via the API key header; use \-\-api\-key\-file for a server\-held key)
+.TP
+\fB\-\-api\-key\-file\fR \fI<API_KEY_FILE>\fR
+Path to a file holding the Bugzilla API key (e.g. a container secret or systemd LoadCredential path). Mutually exclusive with \-\-api\-key. Over http this selects server\-held key mode: every request is served with this key and the per\-request API key header is not consulted. An empty value counts as absent, like \-\-api\-key (so `BUGZILLA_API_KEY_FILE=` is an unset, not an error)
+.TP
+\fB\-\-use\-auth\-header\fR
+Use \*(AqAuthorization: Bearer\*(Aq header instead of the api_key query parameter (required for some Bugzilla instances)
+.TP
+\fB\-\-read\-only\fR
+Disables all tools which modify the state of a bug. Environment variable MCP_READ_ONLY=true can also be used. Can only tighten the guard policy, never loosen it
+.TP
+\fB\-\-policy\fR \fI<POLICY>\fR
+Path to the guard policy TOML file. Environment variable BUGWARDEN_POLICY can also be used. Without it an allow\-all default policy is used
+.TP
+\fB\-\-audit\-config\fR \fI<AUDIT_CONFIG>\fR
+Path to the audit configuration TOML file (see examples/audit.toml). Environment variable BUGWARDEN_AUDIT_CONFIG can also be used. Without it no audit stream is written
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH EXIT STATUS
+.TP
+.B 0
+Clean shutdown.
+.TP
+.B 1
+Startup or runtime failure: an unreadable policy or audit configuration, a
+key misconfiguration, a Bugzilla client or transport error.
+.TP
+.B 2
+Command\-line usage error.
+.SH ENVIRONMENT
+Each variable is the fallback for one option; a command\-line argument
+always wins over the environment, and the built\-in default applies when
+neither is given.
+.TP
+.B BUGZILLA_SERVER
+Fallback for \fB\-\-bugzilla\-server\fR.
+.TP
+.B MCP_TRANSPORT
+Fallback for \fB\-\-transport\fR.
+.TP
+.B MCP_HOST
+Fallback for \fB\-\-host\fR.
+.TP
+.B MCP_PORT
+Fallback for \fB\-\-port\fR.
+.TP
+.B MCP_API_KEY_HEADER
+Fallback for \fB\-\-api\-key\-header\fR.
+.TP
+.B BUGZILLA_API_KEY
+Fallback for \fB\-\-api\-key\fR.
+.TP
+.B BUGZILLA_API_KEY_FILE
+Fallback for \fB\-\-api\-key\-file\fR.
+.TP
+.B MCP_READ_ONLY
+Fallback for \fB\-\-read\-only\fR.
+.TP
+.B BUGWARDEN_POLICY
+Fallback for \fB\-\-policy\fR.
+.TP
+.B BUGWARDEN_AUDIT_CONFIG
+Fallback for \fB\-\-audit\-config\fR.
+.SH FILES
+.TP
+.I /etc/bugwarden/policy.toml
+Worked example guard policy as installed by distribution packages; the
+source tree and release archives ship it as
+.IR examples/policy.toml .
+The server reads a policy only when one is named with
+.B \-\-policy
+or
+.BR BUGWARDEN_POLICY ;
+without one the built\-in allow\-all default policy applies.
+.TP
+.I /etc/bugwarden/audit.toml
+Worked example audit configuration; the source tree ships it as
+.IR examples/audit.toml .
+Without
+.B \-\-audit\-config
+or
+.B BUGWARDEN_AUDIT_CONFIG
+no audit stream is written.
+.SH EXAMPLES
+Serve a local MCP client over stdio, the server reading the Bugzilla API
+key from a file:
+.PP
+.RS 4
+.nf
+bugwarden \-\-transport stdio \e
+    \-\-bugzilla\-server https://bugzilla.example.com \e
+    \-\-api\-key\-file ~/.config/bugwarden/api\-key \e
+    \-\-policy /etc/bugwarden/policy.toml
+.fi
+.RE
+.PP
+Listen on HTTP (the default transport, 127.0.0.1:8000), each client
+presenting its own key in the API key header:
+.PP
+.RS 4
+.nf
+bugwarden \-\-bugzilla\-server https://bugzilla.example.com \e
+    \-\-policy /etc/bugwarden/policy.toml
+.fi
+.RE
+.PP
+Listen on HTTP with a server\-held key (container secret, systemd
+LoadCredential): every request is served with this key and the per\-request
+key header is not consulted:
+.PP
+.RS 4
+.nf
+bugwarden \-\-bugzilla\-server https://bugzilla.example.com \e
+    \-\-api\-key\-file /run/secrets/bugzilla\-api\-key \e
+    \-\-policy /etc/bugwarden/policy.toml
+.fi
+.RE

@@ -1,0 +1,14 @@
+complete -c bugwarden -l bugzilla-server -d 'Base URL of the Bugzilla server (e.g., \'https://bugzilla.example.com\'). Environment variable BUGZILLA_SERVER is used if the argument is not provided' -r
+complete -c bugwarden -l transport -d 'Transport for the MCP server: \'http\' (default) or \'stdio\'. Environment variable MCP_TRANSPORT can also be used' -r -f -a "http\t'Streamable HTTP transport (default). Clients send the Bugzilla API key per-request via the API key header, unless `--api-key-file` selects server-held key mode (then the header is not consulted at all)'
+stdio\t'Stdio transport. The API key comes from `--api-key` / `BUGZILLA_API_KEY` or `--api-key-file` at startup'"
+complete -c bugwarden -l host -d 'Host address for the MCP server to listen on (http transport only). Defaults to 127.0.0.1 or the MCP_HOST environment variable' -r
+complete -c bugwarden -l port -d 'Port for the MCP server to listen on (http transport only). Defaults to 8000 or the MCP_PORT environment variable' -r
+complete -c bugwarden -l api-key-header -d 'HTTP header for clients to send the Bugzilla API key. Defaults to \'ApiKey\' or the MCP_API_KEY_HEADER environment variable. Not consulted in server-held key mode (--api-key-file over http)' -r
+complete -c bugwarden -l api-key -d 'Bugzilla API key. Required for --transport stdio (no HTTP headers exist there) unless --api-key-file provides it. Environment variable BUGZILLA_API_KEY can also be used. Ignored for --transport http (clients send the key per-request via the API key header; use --api-key-file for a server-held key)' -r
+complete -c bugwarden -l api-key-file -d 'Path to a file holding the Bugzilla API key (e.g. a container secret or systemd LoadCredential path). Mutually exclusive with --api-key. Over http this selects server-held key mode: every request is served with this key and the per-request API key header is not consulted. An empty value counts as absent, like --api-key (so `BUGZILLA_API_KEY_FILE=` is an unset, not an error)' -r -F
+complete -c bugwarden -l policy -d 'Path to the guard policy TOML file. Environment variable BUGWARDEN_POLICY can also be used. Without it an allow-all default policy is used' -r -F
+complete -c bugwarden -l audit-config -d 'Path to the audit configuration TOML file (see examples/audit.toml). Environment variable BUGWARDEN_AUDIT_CONFIG can also be used. Without it no audit stream is written' -r -F
+complete -c bugwarden -l use-auth-header -d 'Use \'Authorization: Bearer\' header instead of the api_key query parameter (required for some Bugzilla instances)'
+complete -c bugwarden -l read-only -d 'Disables all tools which modify the state of a bug. Environment variable MCP_READ_ONLY=true can also be used. Can only tighten the guard policy, never loosen it'
+complete -c bugwarden -s h -l help -d 'Print help (see more with \'--help\')'
+complete -c bugwarden -s V -l version -d 'Print version'
