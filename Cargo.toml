@@ -13,7 +13,7 @@ license = "Apache-2.0"
 authors = ["Martin Pluskal <martin@pluskal.org>"]
 repository = "https://github.com/plusky/bugwarden"
 homepage = "https://github.com/plusky/bugwarden"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

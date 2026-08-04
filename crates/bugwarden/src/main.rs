@@ -17,9 +17,7 @@ use clap::Parser;
 use rmcp::{
     transport::{
         stdio,
-        streamable_http_server::{
-            session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
-        },
+        streamable_http_server::{session::local::LocalSessionManager, StreamableHttpService},
     },
     ServiceExt,
 };
@@ -123,9 +121,8 @@ async fn main() -> anyhow::Result<()> {
             let service = StreamableHttpService::new(
                 move || Ok(server.clone()),
                 LocalSessionManager::default().into(),
-                StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token()),
+                bugwarden::server::http_server_config().with_cancellation_token(ct.child_token()),
             );
-
             let router = axum::Router::new().nest_service("/mcp", service);
             let addr = format!("{}:{}", cfg.host, cfg.port);
             tracing::info!("Starting Bugzilla MCP server on {addr}");

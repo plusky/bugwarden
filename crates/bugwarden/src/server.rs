@@ -6,6 +6,7 @@
 //! nothing). Denials use the uniform text from `Guard::denial` only, so a
 //! policy-denied bug and a nonexistent bug are indistinguishable (I2).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,12 +20,38 @@ use rmcp::{
     model::*,
     schemars,
     service::RequestContext,
-    tool, tool_router, ErrorData as McpError, RoleServer, ServerHandler,
+    tool, tool_router,
+    transport::streamable_http_server::StreamableHttpServerConfig,
+    ErrorData as McpError, RoleServer, ServerHandler,
 };
 use serde_json::{json, Value};
 
 use crate::audit::{self, AuditCell, AuditState, FailMode, TransportKind, Verdict};
 use crate::config::{Cli, KeyCustody, Transport};
+
+/// The MCP revisions this build actually implements, newest last.
+///
+/// Deliberately not `ProtocolVersion::KNOWN_VERSIONS`: the SDK knows more
+/// revisions than it can serve through this handler, and both the rmcp
+/// default for `supported_protocol_versions` and the handshake below
+/// would otherwise accept `2026-07-28` — a revision whose stateless
+/// requests carry no handshake, so audit records would name a client the
+/// server never spoke to (issue #34). A client asking for it gets the
+/// server default instead, and every rmcp bump has to widen this list
+/// deliberately, never by inheriting a longer one.
+const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
+    ProtocolVersion::V_2024_11_05,
+    ProtocolVersion::V_2025_03_26,
+    ProtocolVersion::V_2025_06_18,
+    ProtocolVersion::V_2025_11_25,
+];
+
+/// The revision offered when a client asks for one this build cannot
+/// serve, and the one `get_info` advertises. Pinned rather than left to
+/// `ProtocolVersion::default()`, whose value moves with the SDK: an
+/// rmcp release that advances `LATEST` past what [`SUPPORTED_PROTOCOL_VERSIONS`]
+/// lists would otherwise make the fallback a revision this build rejects.
+const DEFAULT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
 
 /// Names of the tools that modify bug state. These routes are removed from
 /// the router in read-only mode (I13).
@@ -237,6 +264,60 @@ fn client_of(ctx: &RequestContext<RoleServer>) -> audit::ClientInfo {
         version: peer.as_ref().map(|p| p.client_info.version.clone()),
         principal: None,
     }
+}
+
+/// The streamable-HTTP transport configuration this build serves with.
+///
+/// Lives here rather than in `main` so the integration tests serve the
+/// configuration a deployment actually gets. Two rmcp 3.1 defaults are set
+/// by name rather than inherited, because inheriting them changes how a
+/// deployment behaves without anyone choosing it:
+///
+/// * `allowed_hosts` defaults to loopback only — a DNS-rebinding defence
+///   for MCP servers a browser can reach on `localhost`. bugwarden is
+///   reached by MCP clients at whatever address the operator bound and
+///   named, so that default would refuse every deployment not addressed as
+///   `localhost`, containers included. Disabled deliberately: the access
+///   control here is the network boundary, and per-caller authentication
+///   when it lands (issue #32).
+/// * `max_request_body_bytes` is a 4 MiB POST cap with no rmcp 2.2
+///   equivalent. Worth keeping as a memory bound, but it also ceilings
+///   `add_attachment` independently of the operator's
+///   `global.max_attachment_bytes`, so it is pinned to the SDK's current
+///   value: an SDK bump must not move an operator-visible limit. Issue #52
+///   reconciles the two ceilings.
+pub fn http_server_config() -> StreamableHttpServerConfig {
+    StreamableHttpServerConfig::default()
+        .disable_allowed_hosts()
+        .with_max_request_body_bytes(4 * 1024 * 1024)
+}
+
+/// Whether this request took rmcp's handshake-free lifecycle.
+///
+/// The transport routes on the PRESENCE of
+/// `_meta.io.modelcontextprotocol/protocolVersion`, whatever revision that
+/// key names — not on the negotiated revision, and not on
+/// [`SUPPORTED_PROTOCOL_VERSIONS`]. So excluding `2026-07-28` does not keep
+/// a request off that path: a client naming a revision this build does
+/// serve reaches the handler with no `initialize` behind it, and rmcp
+/// synthesises its peer with the SDK's own build identity as `client_info`.
+/// Served, such a call would put a client the server never spoke to into
+/// the audit stream, with no session record anchoring it — a plausible
+/// wrong attribution, which is the one an audit trail can least afford.
+///
+/// No revision this build serves defines that lifecycle, so a request
+/// carrying it is out of contract and is refused.
+fn skips_the_handshake(ctx: &RequestContext<RoleServer>) -> bool {
+    ctx.meta.protocol_version().is_some()
+}
+
+/// The uniform refusal for a request that skipped the handshake. Names no
+/// tool, bug or policy — it is a statement about the request's shape.
+fn handshake_required() -> McpError {
+    McpError::invalid_request(
+        "this server requires the initialize handshake; per-request protocol negotiation is not served",
+        None,
+    )
 }
 
 /// Total elapsed milliseconds since `started`, saturating.
@@ -2430,6 +2511,22 @@ impl ServerHandler for BugWarden {
         // handshake info is stored so later calls (and their audit
         // records) can read it back through `peer_info`.
         context.peer.set_peer_info(request.clone());
+        // Negotiate before recording: the record names the revision the
+        // session actually speaks, not the one the client asked for.
+        // Echo a requested revision this build serves, keep the server
+        // default otherwise — the same shape the SDK's own negotiation
+        // has, tested against `SUPPORTED_PROTOCOL_VERSIONS` rather than
+        // the wider set of revisions the SDK merely knows about.
+        let mut info = self.get_info();
+        if SUPPORTED_PROTOCOL_VERSIONS.contains(&request.protocol_version) {
+            info.protocol_version = request.protocol_version.clone();
+        } else {
+            tracing::warn!(
+                client_requested = %request.protocol_version,
+                server_fallback = %info.protocol_version,
+                "client requested unsupported protocol version; falling back to server default"
+            );
+        }
         if let Some(audit) = &self.audit {
             // Every session start is recorded, unconditionally — no
             // configuration knob: a stream that could omit session
@@ -2440,7 +2537,7 @@ impl ServerHandler for BugWarden {
                     version: Some(request.client_info.version.clone()),
                     principal: None,
                 },
-                protocol_version: Some(request.protocol_version.as_str().to_string()),
+                protocol_version: Some(info.protocol_version.as_str().to_string()),
             });
             let session = self.session_info(&context, audit);
             if record_event(audit, event, session).await.is_err()
@@ -2453,27 +2550,55 @@ impl ServerHandler for BugWarden {
                 return Err(McpError::internal_error("audit unavailable", None));
             }
         }
-        // The default handler's version negotiation, replicated: echo a
-        // client-requested version this SDK knows, keep the server
-        // default otherwise.
-        let mut info = self.get_info();
-        if ProtocolVersion::KNOWN_VERSIONS.contains(&request.protocol_version) {
-            info.protocol_version = request.protocol_version;
-        } else {
-            tracing::warn!(
-                client_requested = %request.protocol_version,
-                server_fallback = %info.protocol_version,
-                "client requested unsupported protocol version; falling back to server default"
-            );
-        }
         Ok(info)
+    }
+
+    /// The revisions this handler serves, narrowing the SDK's default of
+    /// every revision it knows (see [`SUPPORTED_PROTOCOL_VERSIONS`]). The
+    /// SDK consults this on the handshake, on the stateless request path
+    /// and in `server/discover`, so the whole surface narrows with it.
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         mut context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
+        let started = Instant::now();
+        if skips_the_handshake(&context) {
+            // Recorded before it is refused, like every other turned-away
+            // call: a stream that went quiet for a whole request class
+            // could not be read as a complete account. `client` is left
+            // absent rather than carrying the placeholder identity the
+            // handshake-free path synthesises — the record says the caller
+            // is unknown, because it is.
+            if let Some(audit) = self.audit.clone() {
+                let event = audit::AuditEventKind::ToolCall(Box::new(audit::ToolCallEvent {
+                    client: audit::ClientInfo {
+                        name: None,
+                        version: None,
+                        principal: None,
+                    },
+                    trace: None,
+                    request: audit::RequestInfo {
+                        tool: request.name.to_string(),
+                        id: Some(context.id.to_string()),
+                        params: allowlisted(request.arguments.as_ref()),
+                    },
+                    guard: None,
+                    upstream: None,
+                    outcome: audit::OutcomeInfo {
+                        class: audit::OutcomeClass::Error,
+                        duration_ms: elapsed_ms(started),
+                    },
+                }));
+                let session = self.session_info(&context, &audit);
+                let _ = record_event(&audit, event, session).await;
+            }
+            return Err(handshake_required());
+        }
         // Auditing off: byte-identical to the macro-generated dispatch.
         let Some(audit) = self.audit.clone() else {
             return self
@@ -2481,7 +2606,6 @@ impl ServerHandler for BugWarden {
                 .call(ToolCallContext::new(self, request, context))
                 .await;
         };
-        let started = Instant::now();
         let tool = request.name.to_string();
         let session = self.session_info(&context, &audit);
         let client = client_of(&context);
@@ -2492,7 +2616,7 @@ impl ServerHandler for BugWarden {
         // to a byte length anyway.
         let params = allowlisted(request.arguments.as_ref());
         // Trace enrichment (issue #28), extracted BEFORE the router
-        // consumes `request`. The rmcp 2.2 trap: over every serialized
+        // consumes `request`. The rmcp trap: over every serialized
         // transport the wire `params._meta` (SEP-414) does NOT arrive in
         // `CallToolRequestParams.meta` — the SDK's custom `Request`
         // deserializer strips `_meta` out of the params before the
@@ -2543,7 +2667,7 @@ impl ServerHandler for BugWarden {
                 },
             }));
             let _ = record_event(&audit, event, session).await;
-            return Ok(audit_refusal(&tool));
+            return Ok(audit_refusal(&tool).into());
         }
 
         let cell = Arc::new(AuditCell::default());
@@ -2562,8 +2686,12 @@ impl ServerHandler for BugWarden {
             // A guard denial is a well-formed response (the uniform
             // denial text): its `is_error` marker classifies the
             // content, not the call, so the outcome stays `ok` and the
-            // denial lives in guard.verdict.
-            Ok(r) if r.is_error == Some(true) && guard_verdict != Some(Verdict::Denied) => {
+            // denial lives in guard.verdict. Only a completed call
+            // carries that marker; the other `CallToolResponse` variants
+            // belong to revisions this build does not serve.
+            Ok(CallToolResponse::Complete(r))
+                if r.is_error == Some(true) && guard_verdict != Some(Verdict::Denied) =>
+            {
                 audit::OutcomeClass::Refused
             }
             Ok(_) => audit::OutcomeClass::Ok,
@@ -2604,11 +2732,11 @@ impl ServerHandler for BugWarden {
                             Some(Verdict::Denied | Verdict::Refused | Verdict::ServedFiltered)
                         ) =>
                 {
-                    Ok(audit_refusal(&tool))
+                    Ok(audit_refusal(&tool).into())
                 }
                 // A read the guard fully allowed serves unaudited.
                 (FailMode::ClosedWritesDenials, _) => result,
-                (FailMode::ClosedAll, _) => Ok(audit_refusal(&tool)),
+                (FailMode::ClosedAll, _) => Ok(audit_refusal(&tool).into()),
             },
         }
     }
@@ -2616,12 +2744,31 @@ impl ServerHandler for BugWarden {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        // Refused on the same terms as a tool call: the listing is pruned
+        // per deployment (I13), so serving it to a handshake-free caller
+        // would disclose which tools this policy removed. Unrecorded, as
+        // every listing is — schema v1 has no event kind for one.
+        if skips_the_handshake(&context) {
+            return Err(handshake_required());
+        }
         Ok(ListToolsResult {
             tools: self.tool_router.list_all(),
+            result_type: Some(ResultType::COMPLETE),
             meta: None,
             next_cursor: None,
+            // The 2026-07-28 cache hints stay absent, exactly as they
+            // were before this SDK had the fields: no revision this
+            // build serves defines them, and emitting them anyway would
+            // add fields to responses no peer asked for. When the
+            // revision is adopted, `cache_scope` is `Private` — the
+            // listing is pruned per deployment by policy and by
+            // read-only mode (I13), so a shared cache must never serve
+            // one deployment's list to another. `CacheScope::default()`
+            // is `Public`; this field is always written by name.
+            ttl_ms: None,
+            cache_scope: None,
         })
     }
 
@@ -2631,6 +2778,7 @@ impl ServerHandler for BugWarden {
 
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(DEFAULT_PROTOCOL_VERSION)
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
                 "MCP server for Bugzilla. Provides tools to search bugs \
@@ -3041,6 +3189,37 @@ mod tests {
                 logs.contains("created_by_me describes that one account"),
                 expect_warn,
                 "startup logs: {logs}"
+            );
+        }
+    }
+
+    #[test]
+    fn advertised_protocol_versions_are_the_ones_this_build_serves() {
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz).expect("server must build");
+        assert_eq!(
+            server.supported_protocol_versions().as_ref(),
+            SUPPORTED_PROTOCOL_VERSIONS,
+            "the handler must advertise this build's list, never inherit the SDK's"
+        );
+        assert!(
+            !SUPPORTED_PROTOCOL_VERSIONS.contains(&ProtocolVersion::V_2026_07_28),
+            "2026-07-28 requests carry no handshake, so their records could not \
+             name the calling client (issue #34)"
+        );
+        assert!(
+            SUPPORTED_PROTOCOL_VERSIONS.contains(&DEFAULT_PROTOCOL_VERSION),
+            "the negotiation fallback must itself be a revision this build serves"
+        );
+        assert_eq!(
+            server.get_info().protocol_version,
+            DEFAULT_PROTOCOL_VERSION,
+            "the advertised default is pinned here, not taken from the SDK's LATEST"
+        );
+        for version in SUPPORTED_PROTOCOL_VERSIONS {
+            assert!(
+                ProtocolVersion::KNOWN_VERSIONS.contains(version),
+                "the SDK cannot serve {version}, which this build advertises"
             );
         }
     }
@@ -3561,7 +3740,7 @@ mod tests {
             panic!("tool arguments must be a JSON object");
         };
         let mut params = CallToolRequestParams::new(tool.to_string()).with_arguments(args);
-        let mut meta = rmcp::model::Meta::new();
+        let mut meta = rmcp::model::RequestMetaObject::new();
         meta.set_traceparent(traceparent);
         params.meta = Some(meta);
         client
@@ -3778,7 +3957,7 @@ mod tests {
             panic!("tool arguments must be a JSON object");
         };
         let mut params = CallToolRequestParams::new("bug_history".to_string()).with_arguments(args);
-        let mut meta = rmcp::model::Meta::new();
+        let mut meta = rmcp::model::RequestMetaObject::new();
         meta.set_traceparent(TRACEPARENT);
         params.meta = Some(meta);
         let context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer);
@@ -3790,11 +3969,83 @@ mod tests {
         let result = ServerHandler::call_tool(&server, params, context)
             .await
             .expect("the in-process call must not be a protocol error");
+        let CallToolResponse::Complete(result) = result else {
+            panic!("a served tool call completes; this build serves no other response kind")
+        };
         assert!(!is_error(&result), "bug_history must succeed");
 
         let events = read_audit_events(&audit_path);
         let calls = tool_calls(&events);
         assert_eq!(calls.len(), 1, "exactly the direct call is recorded");
         assert_trace_is_canonical(calls[0].trace.as_ref());
+    }
+
+    #[tokio::test]
+    async fn initialize_never_echoes_a_revision_this_build_cannot_serve() {
+        // A dual-revision client probing for 2026-07-28 must be handed
+        // the server default instead. Both halves of the negotiation are
+        // exercised here: this handler's own test against
+        // `SUPPORTED_PROTOCOL_VERSIONS`, and the SDK's, which runs after
+        // the handler returns and takes the handler's value as its
+        // fallback — so a handler that echoed the request would make the
+        // SDK echo it too.
+        use clap::Parser as _;
+        let mock = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
+        let mut cli = Cli::parse_from([
+            "bugwarden",
+            "--bugzilla-server",
+            &mock.uri(),
+            "--transport",
+            "stdio",
+            "--api-key",
+            "test-key",
+        ]);
+        cli.api_key_file = None;
+        let guard = Arc::new(Guard {
+            policy: Policy::from_toml_str("").expect("test policy must parse"),
+        });
+        let bz = Arc::new(BugzillaClient::new(&mock.uri(), false).expect("client must build"));
+        let server = BugWarden::new(Arc::new(cli), guard, bz)
+            .expect("server must build")
+            .with_audit(Arc::clone(&audit));
+
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            if let Ok(running) = server.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        // rmcp serves a `ClientInfo` as its own handler, so this value is
+        // what the client asks for on the wire.
+        let probe = ClientInfo::default().with_protocol_version(ProtocolVersion::V_2026_07_28);
+        let client = probe
+            .serve(client_io)
+            .await
+            .expect("the handshake must succeed");
+
+        assert_eq!(
+            client
+                .peer_info()
+                .expect("the server answers initialize")
+                .protocol_version,
+            DEFAULT_PROTOCOL_VERSION,
+            "a revision this build cannot serve must not be echoed back"
+        );
+
+        let events = read_audit_events(&audit_path);
+        let recorded = events
+            .iter()
+            .find_map(|e| match &e.kind {
+                AuditEventKind::Initialize(ev) => ev.protocol_version.clone(),
+                AuditEventKind::ToolCall(_) | AuditEventKind::AuditGap(_) => None,
+            })
+            .expect("the handshake is recorded");
+        assert_eq!(
+            recorded,
+            DEFAULT_PROTOCOL_VERSION.as_str(),
+            "the record names the revision the session speaks, not the one requested"
+        );
     }
 }

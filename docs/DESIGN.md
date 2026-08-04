@@ -11,7 +11,7 @@ Cargo workspace, two crates:
 
 - `crates/bugwarden-core` — guard policy engine + async Bugzilla REST client.
   MUST NOT depend on rmcp, axum, clap, or any MCP/transport crate.
-- `crates/bugwarden` — the binary: clap CLI, rmcp 2.2 MCP server, stdio and
+- `crates/bugwarden` — the binary: clap CLI, rmcp 3.1 MCP server, stdio and
   streamable-HTTP transports. Depends on `bugwarden-core`. The crate also
   has a lib target (`lib.rs` re-exporting `config` and `server`) consumed by
   `main.rs` and by the integration tests under `crates/bugwarden/tests/`,
@@ -881,14 +881,59 @@ Decisions, all deliberate:
   untouched. Client-invisible by construction (I3): the response is built
   from the window's bugs alone, byte-identical with or without drops.
 
-## rmcp 2.2 usage notes
+## rmcp 3.1 usage notes
 
 Cached reference files (read them): `/tmp/counter.rs` (tool_router + #[tool] +
 Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
 (stdio main), `/tmp/chttp.rs` (StreamableHttpService + axum main),
 `/tmp/rmcp-toolrouter.rs` (ToolRouter API incl. remove_route/has_route).
 
-- `rmcp = { version = "2.2", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }`
+- `rmcp = { version = "3.1", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }`
+- Protocol revisions: `SUPPORTED_PROTOCOL_VERSIONS` (server.rs) lists what
+  this build serves and `supported_protocol_versions()` returns it, narrowing
+  the SDK default of every revision it knows. What that override bounds is
+  precisely which **declared** revisions `initialize`, per-request `_meta` and
+  `server/discover` may agree to; it does not decide which request *lifecycle*
+  the transport routes to (see the trap below). `2026-07-28` is excluded
+  because this build has not adopted it (issue #34, stage 2).
+  The hand-written `initialize` tests the same list — the SDK negotiates
+  again afterwards using the handler's answer as its fallback, so a handler
+  that echoed an unsupported request would make the SDK echo it too — and
+  records the negotiated revision, never the requested one. `get_info` pins
+  `DEFAULT_PROTOCOL_VERSION` rather than inheriting `ProtocolVersion::default()`,
+  which moves with the SDK.
+- **rmcp trap — the handshake-free lifecycle is chosen by `_meta` shape, not
+  by revision.** `message_has_per_request_protocol_version`
+  (`transport/streamable_http_server/tower.rs`) routes a request to the
+  stateless path when `_meta.io.modelcontextprotocol/protocolVersion` is
+  merely PRESENT, whatever revision it names, and that path synthesises a
+  peer whose `client_info` is `Implementation::default()` — the SDK's own
+  crate name and version. Narrowing the revision list therefore does **not**
+  keep a request off it: a client naming `2025-11-25`, which this build
+  serves, would otherwise reach a tool with no `initialize` behind it and
+  land in the audit stream as a client the server never spoke to. So
+  `call_tool` and `list_tools` refuse any request carrying that key
+  (`skips_the_handshake`), and a refused call is recorded with `client`
+  absent rather than with the placeholder. `server/discover` takes the same
+  path unconditionally in rmcp; it answers `get_info` only and reaches no
+  tool, guard or router. General rule: **no `_meta` key and no `Mcp-*` header
+  may carry a security decision** — like `KNOWN_VERSIONS`, they are the SDK's
+  vocabulary, not this build's contract.
+- `list_tools` names every `ListToolsResult` field: `result_type` is
+  `COMPLETE`, and the 2026-07-28 cache hints stay absent while that revision
+  is unserved. When it is adopted, `cache_scope` is `Private` — the listing is
+  pruned per deployment (I13), so a shared cache must never serve one
+  deployment's list to another — and `CacheScope::default()` is `Public`.
+- **Two rmcp 3.1 transport defaults are set by name, not inherited** (main.rs).
+  `allowed_hosts` defaults to loopback only — a DNS-rebinding defence for MCP
+  servers a browser can reach on localhost — which would refuse every
+  deployment not addressed as `localhost`, containers included; bugwarden
+  disables it deliberately, since its access control is the network boundary
+  and, when it lands, per-caller authentication (#32). `max_request_body_bytes`
+  is a 4 MiB POST cap with no rmcp 2.2 equivalent: kept as a memory bound but
+  pinned to the current SDK value, because it also ceilings `add_attachment`
+  independently of `global.max_attachment_bytes` and an SDK bump must not move
+  an operator-visible limit. Reconciling the two ceilings is #52.
 - axum MUST be 0.8 (rmcp's version — extension extraction breaks otherwise);
   schemars 1.x with feature `chrono04`; tokio 1; tokio-util 0.7.
 - Server struct: `#[derive(Clone)] pub struct BugWarden { cfg: Arc<Cli>, guard: Arc<Guard>, bz: Arc<BugzillaClient>, tool_router: ToolRouter<Self>, key_custody: KeyCustody, audit: Option<Arc<AuditState>> }`

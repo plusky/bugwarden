@@ -18,7 +18,7 @@ cargo deny check
 
 Use the toolchain pinned in `rust-toolchain.toml` (repo root, currently
 `1.97.0`). The workspace MSRV is declared once in `Cargo.toml`
-(`rust-version = "1.85"`); do not introduce APIs or dependencies which
+(`rust-version = "1.88"`); do not introduce APIs or dependencies which
 require a newer compiler without deliberately updating both the pin and the
 MSRV policy. CI and reproducible local checks use the committed
 `Cargo.lock`, so use `--locked` for verification.

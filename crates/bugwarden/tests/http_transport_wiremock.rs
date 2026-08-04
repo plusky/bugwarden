@@ -38,7 +38,7 @@ use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    session::local::LocalSessionManager, StreamableHttpService,
 };
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::ServiceExt as _;
@@ -86,7 +86,10 @@ async fn serve_http(
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default(),
+        // The deployed configuration, not a default one: the transport
+        // knobs bugwarden sets by name are only tested if the harness
+        // serves what a deployment serves.
+        bugwarden::server::http_server_config(),
     );
     let router = axum::Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -365,6 +368,144 @@ async fn guard_denies_uniformly_over_http() {
 }
 
 #[tokio::test]
+async fn a_client_addressing_the_server_by_name_is_served() {
+    // rmcp 3.1's `allowed_hosts` default is loopback only, so inheriting it
+    // would answer every request whose `Host` is the name the operator
+    // actually deployed under — every containerised one — with a rejection.
+    // main.rs disables that validation by name; this pins the decision,
+    // since the test harness would otherwise always speak to 127.0.0.1 and
+    // never notice.
+    let mock = MockServer::start().await;
+    let file = key_file("srv-key\n");
+    let cli = http_cli(&mock, Some(file.path()));
+    let addr = serve_http(cli, "", &mock, None).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("Host", "bugwarden.example:8080")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "host-probe", "version": "1" }
+            }
+        }))
+        .send()
+        .await
+        .expect("the request must reach the server");
+    let status = response.status();
+    let body = response.text().await.expect("a body");
+    assert!(
+        status.is_success(),
+        "a non-loopback Host must be served, got {status}: {body}"
+    );
+    assert!(
+        body.contains("protocolVersion"),
+        "the handshake must be answered: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_handshake_free_call_is_refused_and_never_names_a_client() {
+    // rmcp routes a request to its handshake-free lifecycle on the mere
+    // PRESENCE of `_meta.io.modelcontextprotocol/protocolVersion` — whatever
+    // revision that key names — and synthesises the peer with the SDK's own
+    // build identity. So a client naming 2025-11-25, a revision this build
+    // does serve, reaches a tool with no `initialize` behind it, and the
+    // record would name `rmcp`/<sdk version>: a client the server never
+    // spoke to. Narrowing SUPPORTED_PROTOCOL_VERSIONS cannot close this —
+    // the routing never consults it — so the handler refuses the request.
+    let mock = MockServer::start().await;
+    mount_bug_for_key(&mock, world_readable_bug(7), "srv-key").await;
+
+    let dir = tempfile::tempdir().expect("audit temp dir");
+    let audit_path = dir.path().join("audit.jsonl");
+    let sink = AuditSink::open(AuditConfig {
+        path: audit_path.clone(),
+        fsync: false,
+        fail_mode: None,
+        rotate_max_bytes: 0,
+        rotate_keep: 8,
+        suppressed_ids: true,
+    })
+    .expect("audit sink must open");
+    let audit = Arc::new(AuditState::new(sink, FailMode::Open, None));
+
+    let file = key_file("srv-key\n");
+    let cli = http_cli(&mock, Some(file.path()));
+    let addr = serve_http(cli, "", &mock, Some(audit)).await;
+
+    // Raw HTTP: no rmcp client will build this request, which is the point.
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "bug_info",
+                "arguments": { "bug_ids": [7] },
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2025-11-25",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("the request must reach the server");
+    let body = response.text().await.expect("a body");
+    assert!(
+        !body.contains("world-readable"),
+        "a handshake-free call must not be served: {body}"
+    );
+
+    // The guard never ran because the call never reached a tool, so
+    // Bugzilla was never contacted on its behalf.
+    let upstream = mock.received_requests().await.unwrap_or_default();
+    assert!(
+        upstream.is_empty(),
+        "a refused call must contact no upstream: {} request(s)",
+        upstream.len()
+    );
+
+    // Refused, but not silently: the stream carries the attempt, and the
+    // client it could not identify is absent rather than a placeholder.
+    let raw = std::fs::read_to_string(&audit_path).expect("audit file must be readable");
+    assert!(
+        !raw.contains("\"rmcp\""),
+        "no record may name the SDK as the calling client: {raw}"
+    );
+    let events: Vec<AuditEvent> = raw
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("every audit line must parse"))
+        .collect();
+    let calls: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            AuditEventKind::ToolCall(ev) => Some(ev.as_ref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 1, "the refused call is recorded exactly once");
+    assert_eq!(calls[0].request.tool, "bug_info");
+    assert_eq!(calls[0].client.name, None, "no client can be named");
+    assert!(
+        calls[0].guard.is_none(),
+        "the guard never ran, so no verdict may be recorded"
+    );
+}
+
+#[tokio::test]
 async fn traceparent_over_http_lands_in_the_audit_record() {
     // End-to-end over REAL streamable http: the client's `params._meta`
     // traceparent survives serialization, transport, and deserialization
@@ -373,7 +514,7 @@ async fn traceparent_over_http_lands_in_the_audit_record() {
     // `CallToolRequestParams.meta` arrives `None` here — and delivers it
     // to the handler as the extensions-backed `RequestContext.meta`, so
     // this test pins the `context.meta` fallback that every serialized
-    // transport depends on (see the rmcp 2.2 usage notes in DESIGN.md).
+    // transport depends on (see the rmcp 3.1 usage notes in DESIGN.md).
     let mock = MockServer::start().await;
     mount_bug_for_key(&mock, world_readable_bug(7), "srv-key").await;
 
@@ -403,7 +544,7 @@ async fn traceparent_over_http_lands_in_the_audit_record() {
         panic!("tool arguments must be a JSON object");
     };
     let mut params = CallToolRequestParams::new("bug_info".to_string()).with_arguments(args);
-    let mut meta = rmcp::model::Meta::new();
+    let mut meta = rmcp::model::RequestMetaObject::new();
     meta.set_traceparent(traceparent);
     params.meta = Some(meta);
     let traced = client

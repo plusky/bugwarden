@@ -298,7 +298,10 @@ pub struct ToolCallEvent {
 pub struct InitializeEvent {
     /// The client as it introduced itself in the handshake.
     pub client: ClientInfo,
-    /// The MCP protocol version the client requested, when it sent one.
+    /// The MCP protocol version the session negotiated — the revision
+    /// actually spoken, which is not always the one the client asked for:
+    /// a client requesting a revision this build does not serve is handed
+    /// the server default, and this field records what it got.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<String>,
 }
