@@ -53,6 +53,27 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
 /// lists would otherwise make the fallback a revision this build rejects.
 const DEFAULT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
 
+/// The name this server reports as its own, in the handshake and in
+/// `mcp_server_info`.
+const SERVER_NAME: &str = env!("CARGO_PKG_NAME");
+
+/// The version this server reports as its own, in the handshake and in
+/// `mcp_server_info`.
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// This build's identity, as sent in the `initialize` handshake.
+///
+/// Deliberately not `Implementation::from_build_env()` (nor
+/// `Implementation::default()`, which calls it): that constructor expands
+/// `env!("CARGO_CRATE_NAME")` and `env!("CARGO_PKG_VERSION")` *inside
+/// rmcp*, so it names the SDK — every rmcp-based server then introduces
+/// itself identically, and the one question `serverInfo` exists to answer,
+/// which build is deployed, becomes unanswerable from the handshake
+/// (issue #53). The `env!`s here expand in this crate.
+fn server_identity() -> Implementation {
+    Implementation::new(SERVER_NAME, SERVER_VERSION)
+}
+
 /// Names of the tools that modify bug state. These routes are removed from
 /// the router in read-only mode (I13).
 pub const WRITE_TOOLS: &[&str] = &[
@@ -2408,7 +2429,7 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Returns information about this MCP server instance (version, bugzilla server, transport) and a summary of the active guard policy.",
+        description = "Returns information about this MCP server instance (name, version, bugzilla server, transport) and a summary of the active guard policy.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     fn mcp_server_info(&self) -> Result<CallToolResult, McpError> {
@@ -2418,8 +2439,11 @@ impl BugWarden {
         // criteria.
         let policy = &self.guard.policy;
         Ok(ok_json(json!({
-            "name": "bugwarden",
-            "version": env!("CARGO_PKG_VERSION"),
+            // The same two constants the handshake sends, so a client
+            // cannot be told one identity by `initialize` and another by
+            // this tool.
+            "name": SERVER_NAME,
+            "version": SERVER_VERSION,
             "bugzilla_server": self.bz.base_url(),
             "transport": match self.cfg.transport {
                 Transport::Http => "http",
@@ -2779,7 +2803,7 @@ impl ServerHandler for BugWarden {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(DEFAULT_PROTOCOL_VERSION)
-            .with_server_info(Implementation::from_build_env())
+            .with_server_info(server_identity())
             .with_instructions(
                 "MCP server for Bugzilla. Provides tools to search bugs \
                  (bugs_quicksearch), read bug details, comments, history, and \
@@ -4046,6 +4070,98 @@ mod tests {
             recorded,
             DEFAULT_PROTOCOL_VERSION.as_str(),
             "the record names the revision the session speaks, not the one requested"
+        );
+    }
+
+    #[test]
+    fn mcp_server_info_reports_the_identity_the_handshake_advertises() {
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz).expect("server must build");
+
+        // The values, not just the constants: comparing `advertised.name`
+        // to `SERVER_NAME` alone would hold for any value either of them
+        // took, so an empty or renamed constant would pass.
+        let advertised = server.get_info().server_info;
+        assert_eq!(advertised.name, "bugwarden");
+        assert_eq!(advertised.version, env!("CARGO_PKG_VERSION"));
+        // `ServerInfo::new` seeds `server_info` with
+        // `Implementation::from_build_env()`, whose `env!`s expand inside
+        // rmcp, so `get_info` starts from the SDK's identity and only the
+        // explicit `with_server_info` displaces it: dropping that call, or
+        // refactoring back to the constructor, must fail here (issue #53).
+        assert_ne!(
+            advertised.name,
+            Implementation::from_build_env().name,
+            "the handshake must not borrow the SDK's crate name"
+        );
+
+        let reported: Value = serde_json::from_str(&text_of(
+            &server.mcp_server_info().expect("the tool answers"),
+        ))
+        .expect("the tool returns JSON");
+        assert_eq!(
+            reported["name"], advertised.name,
+            "the tool and the handshake must not name two different servers"
+        );
+        assert_eq!(reported["version"], advertised.version);
+    }
+
+    #[test]
+    fn rmcp_default_still_names_the_sdk() {
+        // A pin on the SDK, not on this build, and the reason inheriting
+        // its identity is no substitute for building one: `Default` is
+        // `from_build_env()`, which expands its `env!`s inside rmcp. If a
+        // future rmcp changes that, this is the notice to rewrite the trap
+        // note in DESIGN.md — nothing here is wrong when it fails.
+        assert_eq!(
+            Implementation::default().name,
+            Implementation::from_build_env().name
+        );
+        assert_ne!(Implementation::default().name, SERVER_NAME);
+    }
+
+    #[tokio::test]
+    async fn the_handshake_names_this_build_over_a_real_session() {
+        // Asserted on a served session rather than on `get_info()` alone:
+        // this is the field as a client reads it, which means it survived
+        // serialization into `ServerPeerInfo.server_info` — `Option` on
+        // that side, so "no identity at all" is a shape the wire allows.
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz).expect("server must build");
+
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            if let Ok(running) = server.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        // Bounded: a handler that never answers should fail this test, not
+        // stall the run until CI's own timeout kills it.
+        let client = tokio::time::timeout(std::time::Duration::from_secs(10), ().serve(client_io))
+            .await
+            .expect("the handshake must not hang")
+            .expect("the handshake must succeed");
+
+        let advertised = client
+            .peer_info()
+            .expect("the server answers initialize")
+            .server_info
+            .clone()
+            .expect("the handshake carries a serverInfo");
+        // The name is spelled out — it is meant to be stable, so a package
+        // rename should fail here and be noticed — while the version is
+        // read from the environment, since it moves every release.
+        assert_eq!(
+            advertised.name, "bugwarden",
+            "a client must be told which server answered, not which SDK it was built on"
+        );
+        assert_eq!(advertised.version, env!("CARGO_PKG_VERSION"));
+        // `title` is the field a client DISPLAYS in preference to `name`,
+        // so an SDK identity parked there would reproduce #53 in the only
+        // place a human looks, while every assertion above still passed.
+        assert_eq!(
+            advertised.title, None,
+            "nothing may be displayed in place of the name asserted here"
         );
     }
 }

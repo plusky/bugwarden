@@ -686,7 +686,7 @@ constraints the model must know.
 | bug_url | bug_id | none (I8 exception) | `{base_url}/show_bug.cgi?id={id}` |
 | bugzilla_server_info | — | none | client.server_info |
 | quicksearch_syntax | — | none | HTML doc page |
-| mcp_server_info | — | none | version (CARGO_PKG_VERSION), bugzilla server url, transport, and policy summary per I1 |
+| mcp_server_info | — | none | name (CARGO_PKG_NAME) and version (CARGO_PKG_VERSION), the same two the handshake sends; bugzilla server url, transport, and policy summary per I1 |
 | summarize_bug | id | comments | fetches comments (private filtered with include_private=false), returns the summarization prompt text (fixed prompt template) |
 
 ### Update-field surface (issue #38)
@@ -894,7 +894,7 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   the SDK default of every revision it knows. What that override bounds is
   precisely which **declared** revisions `initialize`, per-request `_meta` and
   `server/discover` may agree to; it does not decide which request *lifecycle*
-  the transport routes to (see the trap below). `2026-07-28` is excluded
+  the transport routes to (see the `_meta`-shape trap below). `2026-07-28` is excluded
   because this build has not adopted it (issue #34, stage 2).
   The hand-written `initialize` tests the same list — the SDK negotiates
   again afterwards using the handler's answer as its fallback, so a handler
@@ -902,6 +902,32 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   records the negotiated revision, never the requested one. `get_info` pins
   `DEFAULT_PROTOCOL_VERSION` rather than inheriting `ProtocolVersion::default()`,
   which moves with the SDK.
+- **rmcp trap — `Implementation::from_build_env()` names the SDK, not this
+  crate.** It expands `env!("CARGO_CRATE_NAME")` / `env!("CARGO_PKG_VERSION")`
+  *inside rmcp*, so a server built on it introduces itself as `rmcp` at the
+  SDK's version. It is not opt-in: `ServerInfo::new()` (i.e.
+  `InitializeResult::new`, model.rs) seeds `server_info` with it, and
+  `Implementation::default()` is that same constructor — so `get_info`
+  starts from the SDK's identity every time and only the explicit
+  `.with_server_info(server_identity())` displaces it. Dropping that one
+  call silently restores the SDK's answer, which is why a test asserts the
+  identity rather than a review. bugwarden builds `server_identity()` from
+  its own `CARGO_PKG_*` (`SERVER_NAME` / `SERVER_VERSION`, server.rs) via
+  `Implementation::new`; the struct-literal form is unavailable anyway, the
+  type being `#[non_exhaustive]`. `mcp_server_info` reports those same two
+  constants — the handshake and the tool must never name two different
+  servers — and the identity is also read back off a served session, which
+  pins that it survives serialization into `ServerPeerInfo.server_info`, a
+  field that is `Option` on the client side. Same constructor as the
+  placeholder `client_info` in the `_meta`-shape trap below, in the other
+  direction: the SDK's build environment is not this build's identity
+  (issue #53). `server/discover` is the second place a peer reads it, and
+  it is answered with no handshake — so until #32 lands, anything that can
+  open the port learns the exact deployed version, unauthenticated and
+  unrecorded. Accepted deliberately: `serverInfo` is a required field of
+  `InitializeResult`, so withholding it is not protocol-legal, and the
+  value being replaced was rmcp's own exact release — a dependency
+  fingerprint, which is not the smaller disclosure.
 - **rmcp trap — the handshake-free lifecycle is chosen by `_meta` shape, not
   by revision.** `message_has_per_request_protocol_version`
   (`transport/streamable_http_server/tower.rs`) routes a request to the

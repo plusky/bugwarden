@@ -506,6 +506,64 @@ async fn a_handshake_free_call_is_refused_and_never_names_a_client() {
 }
 
 #[tokio::test]
+async fn discover_names_this_build_and_reaches_nothing_else() {
+    // `server/discover` is the SECOND place a peer learns who answered, and
+    // it is served with no handshake behind it. It says `bugwarden` today
+    // only because rmcp's default implementation delegates to `get_info` —
+    // an override (#34 stage 2 plausibly adds one) would take the identity
+    // with it, and the handshake tests would not notice.
+    let mock = MockServer::start().await;
+    mount_bug_for_key(&mock, world_readable_bug(7), "srv-key").await;
+    let file = key_file("srv-key\n");
+    let cli = http_cli(&mock, Some(file.path()));
+    let addr = serve_http(cli, "", &mock, None).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2025-11-25",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("the request must reach the server");
+    let body = response.text().await.expect("a body");
+
+    // Compared whole rather than by field: an extra key here is how the
+    // identity gets undermined without contradicting it — `title` is what
+    // a client displays in preference to `name`.
+    let payload: Value = body
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .and_then(|data| serde_json::from_str(data).ok())
+        .unwrap_or_else(|| panic!("discover must answer with a JSON-RPC result: {body}"));
+    assert_eq!(
+        payload["result"]["_meta"]["io.modelcontextprotocol/serverInfo"],
+        json!({ "name": "bugwarden", "version": env!("CARGO_PKG_VERSION") }),
+        "discover must name this build, and nothing else: {body}"
+    );
+    // It answers `get_info` and nothing else: no tool, no guard, no
+    // upstream. That is what makes an unauthenticated pre-request surface
+    // acceptable while #32 is open.
+    let upstream = mock.received_requests().await.unwrap_or_default();
+    assert!(
+        upstream.is_empty(),
+        "discover must contact no upstream: {} request(s)",
+        upstream.len()
+    );
+}
+
+#[tokio::test]
 async fn traceparent_over_http_lands_in_the_audit_record() {
     // End-to-end over REAL streamable http: the client's `params._meta`
     // traceparent survives serialization, transport, and deserialization
