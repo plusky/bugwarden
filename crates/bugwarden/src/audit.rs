@@ -1040,7 +1040,21 @@ pub struct AuditState {
 /// carries. The digest is over the raw file bytes, not any parsed form,
 /// so a record ties to the exact document the operator deployed.
 pub fn policy_hash_of(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    use std::fmt::Write as _;
+
+    // Hex-encode the bytes here rather than formatting the digest with
+    // `{:x}`: the `LowerHex` impl belongs to generic-array's
+    // `GenericArray`, which is sha2 0.10's output type, and 0.11's
+    // hybrid-array `Array` has none — so formatting the digest itself
+    // pins the crate to a major version.
+    let digest = Sha256::digest(bytes);
+    let mut hash = String::with_capacity("sha256:".len() + digest.len() * 2);
+    hash.push_str("sha256:");
+    for byte in &digest {
+        // Writing to a String cannot fail.
+        let _ = write!(hash, "{byte:02x}");
+    }
+    hash
 }
 
 impl AuditState {
@@ -2332,5 +2346,26 @@ mod tests {
             policy_hash_of(b"abc"),
             "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn policy_hash_of_is_fixed_width_lowercase_hex() {
+        // The vector above pins one exact value; this pins the encoding
+        // for inputs of every length up to a block and a bit. Of these 65
+        // digests 55 carry a byte below 0x10 and all 65 carry one above
+        // 0x9f, so a dropped zero pad shortens the string here and an
+        // uppercase digit surfaces here — whichever input hits it.
+        for len in 0..=64 {
+            let hash = policy_hash_of(&vec![b'x'; len]);
+            let hex = hash
+                .strip_prefix("sha256:")
+                .expect("every hash carries the algorithm prefix");
+            assert_eq!(hex.len(), 64, "input of {len} bytes: {hash}");
+            assert!(
+                hex.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                "input of {len} bytes: {hash}"
+            );
+        }
     }
 }
