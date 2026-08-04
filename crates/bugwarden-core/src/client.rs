@@ -7,6 +7,11 @@
 //! sanitized with [`reqwest::Error::without_url`] before it is wrapped, and
 //! request logging records only the HTTP method and path — never the query
 //! string.
+//!
+//! The `User-Agent` every request carries is supplied by the caller and
+//! never derived here: this is a library, so a value built from its own
+//! `CARGO_PKG_*` would name `bugwarden-core` in the access log of every
+//! binary that embeds it (issue #55).
 
 use std::time::Duration;
 
@@ -25,9 +30,10 @@ const TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%SZ";
 /// Async client for the Bugzilla REST API.
 ///
 /// Built once at startup; the underlying [`reqwest::Client`] carries a 30
-/// second timeout and is reused for every request. Authentication is
-/// applied per request: `Authorization: Bearer {key}` when
-/// `use_auth_header` is set, otherwise an `api_key` query parameter.
+/// second timeout and the caller's `User-Agent`, and is reused for every
+/// request. Authentication is applied per request: `Authorization: Bearer
+/// {key}` when `use_auth_header` is set, otherwise an `api_key` query
+/// parameter.
 #[derive(Debug, Clone)]
 pub struct BugzillaClient {
     /// Server base URL with any trailing `/` trimmed.
@@ -40,12 +46,34 @@ pub struct BugzillaClient {
 
 impl BugzillaClient {
     /// Create a client for the Bugzilla instance at `base_url` (trailing
-    /// slashes are trimmed).
-    pub fn new(base_url: &str, use_auth_header: bool) -> Result<Self> {
+    /// slashes are trimmed), sending `user_agent` with every request.
+    ///
+    /// `user_agent` must name the *program* making the request, and is
+    /// deliberately a parameter rather than a constant of this crate: a
+    /// value built here from `CARGO_PKG_NAME`/`CARGO_PKG_VERSION` would
+    /// name `bugwarden-core` in the access log of every binary that embeds
+    /// it, which is both wrong and entirely plausible-looking (issue #55).
+    /// Bugzilla's operator reads the value, so it belongs to the program's
+    /// public identity — a name and version, never the API key, the policy
+    /// path, or anything else about the deployment. That is the discipline
+    /// of I12 applied to a surface I12 does not itself name (it governs
+    /// logs, error messages and tool results).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `user_agent` is blank — an anonymous client is
+    /// what this parameter exists to prevent, so it fails at startup rather
+    /// than sending an empty header — when it is not a valid HTTP header
+    /// value, or when the underlying HTTP client cannot be built.
+    pub fn new(base_url: &str, use_auth_header: bool, user_agent: &str) -> Result<Self> {
+        if user_agent.trim().is_empty() {
+            bail!("bugzilla client: user_agent must name the calling program, and was blank");
+        }
         let base_url = base_url.trim_end_matches('/').to_string();
         let api_url = format!("{base_url}/rest");
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
+            .user_agent(user_agent)
             .build()
             .map_err(sanitize)?;
         Ok(Self {
@@ -469,17 +497,50 @@ mod tests {
     use chrono::TimeZone;
     use reqwest::StatusCode;
 
+    /// Stands in for a real program's identity, naming neither this crate
+    /// nor the binary that ships it; the point of the parameter is that
+    /// this crate never picks one (#55).
+    const UA: &str = "probe-agent/0.0.0";
+
     #[test]
     fn new_trims_trailing_slashes() {
-        let c = BugzillaClient::new("https://bugzilla.example.com/", false).unwrap();
+        let c = BugzillaClient::new("https://bugzilla.example.com/", false, UA).unwrap();
         assert_eq!(c.base_url(), "https://bugzilla.example.com");
         assert_eq!(c.api_url, "https://bugzilla.example.com/rest");
 
-        let c = BugzillaClient::new("https://bugzilla.example.com///", true).unwrap();
+        let c = BugzillaClient::new("https://bugzilla.example.com///", true, UA).unwrap();
         assert_eq!(c.base_url(), "https://bugzilla.example.com");
 
-        let c = BugzillaClient::new("https://bugzilla.example.com", false).unwrap();
+        let c = BugzillaClient::new("https://bugzilla.example.com", false, UA).unwrap();
         assert_eq!(c.base_url(), "https://bugzilla.example.com");
+    }
+
+    #[test]
+    fn new_refuses_to_build_an_anonymous_client() {
+        // A blank identity is the state #55 exists to end, so it fails at
+        // startup rather than sending an empty header to Bugzilla.
+        for blank in ["", " ", "\t\n "] {
+            let e = BugzillaClient::new("https://bugzilla.example.com", false, blank)
+                .expect_err("a blank user agent must not build a client");
+            assert!(
+                e.to_string().contains("user_agent"),
+                "the error must name what is missing: {e:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_refuses_a_user_agent_that_is_not_a_header_value() {
+        // reqwest defers this to build(); it must surface as an error and
+        // not a panic, since the value crosses a public API boundary.
+        let e = BugzillaClient::new("https://bugzilla.example.com", false, "bad\nagent/1.0")
+            .expect_err("a user agent with a newline must not build a client");
+        // And it must be reqwest's refusal, not the blank-identity bail
+        // widened until it swallows this case too.
+        assert!(
+            !e.to_string().contains("blank"),
+            "a malformed identity is not a missing one: {e:#}"
+        );
     }
 
     #[test]

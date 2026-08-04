@@ -17,7 +17,7 @@ use bugwarden::audit::{
     TransportKind, Verdict,
 };
 use bugwarden::config::Cli;
-use bugwarden::server::BugWarden;
+use bugwarden::server::{BugWarden, USER_AGENT};
 use bugwarden_core::client::BugzillaClient;
 use bugwarden_core::guard::Guard;
 use bugwarden_core::policy::Policy;
@@ -84,7 +84,8 @@ async fn audited_client_with(
     let guard = Arc::new(Guard {
         policy: Policy::from_toml_str(policy).expect("test policy must parse"),
     });
-    let bz = Arc::new(BugzillaClient::new(&mock.uri(), false).expect("client must build"));
+    let bz =
+        Arc::new(BugzillaClient::new(&mock.uri(), false, USER_AGENT).expect("client must build"));
     let server = BugWarden::new(cfg, guard, bz)
         .expect("server must build")
         .with_audit(audit);
@@ -120,7 +121,8 @@ async fn plain_client_for(policy: &str, mock: &MockServer) -> RunningService<Rol
     let guard = Arc::new(Guard {
         policy: Policy::from_toml_str(policy).expect("test policy must parse"),
     });
-    let bz = Arc::new(BugzillaClient::new(&mock.uri(), false).expect("client must build"));
+    let bz =
+        Arc::new(BugzillaClient::new(&mock.uri(), false, USER_AGENT).expect("client must build"));
     let server = BugWarden::new(cfg, guard, bz).expect("server must build");
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
     tokio::spawn(async move {

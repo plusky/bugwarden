@@ -13,8 +13,13 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// Deliberately distinctive so a leak into any error text is unmistakable (I12).
 const KEY: &str = "SUPERSECRETKEY123";
 
+/// Any identity will do here — the client requires one (#55) but these
+/// suites assert nothing about it; `user_agent_wiremock.rs` owns that
+/// proof. Names neither crate, so a check for either finds nothing.
+const TEST_USER_AGENT: &str = "probe-agent/0.0.0";
+
 fn client(server: &MockServer) -> BugzillaClient {
-    BugzillaClient::new(&server.uri(), false).expect("client must build")
+    BugzillaClient::new(&server.uri(), false, TEST_USER_AGENT).expect("client must build")
 }
 
 #[tokio::test]

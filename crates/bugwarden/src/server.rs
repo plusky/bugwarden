@@ -74,6 +74,56 @@ fn server_identity() -> Implementation {
     Implementation::new(SERVER_NAME, SERVER_VERSION)
 }
 
+/// The `User-Agent` every request to Bugzilla carries.
+///
+/// The same identity the handshake sends, in the other direction: with a
+/// server-held key (#27) and no per-caller identity yet (#32), one Bugzilla
+/// account carries a whole fleet's traffic, and without this header that
+/// traffic is anonymous — the operator on the other end has no name to
+/// allowlist or complain about — nothing distinguishes it from a person
+/// with a browser (issue #55). The repository is included so that name
+/// leads somewhere; it is read from the manifest rather than written out
+/// again here, so it cannot become a second copy to keep in step.
+///
+/// Everything here is public by construction — it is sent to every
+/// configured Bugzilla and lands in its access log — so it carries the
+/// program's name and version and nothing about the deployment: no key
+/// material, no policy path, no host. That is the discipline of I12 on a
+/// surface I12 does not itself name; the invariant is about logs, error
+/// messages and tool results.
+///
+/// The `env!`s expand in this crate. Built in `bugwarden-core`, where the
+/// client lives, they would expand to `bugwarden-core` and its version —
+/// the shape of issue #53 one layer down, and just as invisible.
+pub const USER_AGENT: &str = concat!(
+    env!("CARGO_PKG_NAME"),
+    "/",
+    env!("CARGO_PKG_VERSION"),
+    " (+",
+    env!("CARGO_PKG_REPOSITORY"),
+    ")"
+);
+
+/// Build the Bugzilla client this build's requests go through.
+///
+/// The single production construction path for [`BugzillaClient`]: it
+/// lives here rather than in `main.rs` so that the identity on the wire is
+/// reachable from a test (`main` is a thin transport wrapper — see the
+/// crate docs), and a second path that skipped it would put an
+/// unidentified client back on the network.
+///
+/// # Errors
+///
+/// Returns an error when [`USER_AGENT`] is not a valid HTTP header value,
+/// or when the underlying HTTP client cannot be built — see
+/// [`BugzillaClient::new`].
+pub fn bugzilla_client(cli: &Cli) -> anyhow::Result<BugzillaClient> {
+    use anyhow::Context as _;
+
+    BugzillaClient::new(&cli.bugzilla_server, cli.use_auth_header, USER_AGENT)
+        .context("failed to build Bugzilla client")
+}
+
 /// Names of the tools that modify bug state. These routes are removed from
 /// the router in read-only mode (I13).
 pub const WRITE_TOOLS: &[&str] = &[
@@ -3126,7 +3176,8 @@ mod tests {
             policy: Policy::from_toml_str(policy).expect("test policy must parse"),
         });
         let bz = Arc::new(
-            BugzillaClient::new("https://bugzilla.example.com", false).expect("client must build"),
+            BugzillaClient::new("https://bugzilla.example.com", false, USER_AGENT)
+                .expect("client must build"),
         );
         (cfg, guard, bz)
     }
@@ -3165,7 +3216,8 @@ mod tests {
             policy: Policy::from_toml_str("").expect("empty policy parses"),
         });
         let bz = Arc::new(
-            BugzillaClient::new("https://bugzilla.example.com", false).expect("client must build"),
+            BugzillaClient::new("https://bugzilla.example.com", false, USER_AGENT)
+                .expect("client must build"),
         );
         let err = match BugWarden::new(Arc::new(cli), guard, bz) {
             Err(e) => e,
@@ -3203,7 +3255,7 @@ mod tests {
                 policy: Policy::from_toml_str(policy).expect("test policy must parse"),
             });
             let bz = Arc::new(
-                BugzillaClient::new("https://bugzilla.example.com", false)
+                BugzillaClient::new("https://bugzilla.example.com", false, USER_AGENT)
                     .expect("client must build"),
             );
             let (server, logs) =
@@ -3484,7 +3536,8 @@ mod tests {
         let guard = Arc::new(Guard {
             policy: Policy::from_toml_str(policy).expect("test policy must parse"),
         });
-        let bz = Arc::new(BugzillaClient::new(mock_uri, false).expect("client must build"));
+        let bz =
+            Arc::new(BugzillaClient::new(mock_uri, false, USER_AGENT).expect("client must build"));
         let mut server = BugWarden::new(cfg, guard, bz).expect("server must build");
         if let Some(audit) = audit {
             server = server.with_audit(audit);
@@ -3958,7 +4011,9 @@ mod tests {
         let guard = Arc::new(Guard {
             policy: Policy::from_toml_str("").expect("test policy must parse"),
         });
-        let bz = Arc::new(BugzillaClient::new(&mock.uri(), false).expect("client must build"));
+        let bz = Arc::new(
+            BugzillaClient::new(&mock.uri(), false, USER_AGENT).expect("client must build"),
+        );
         let server = BugWarden::new(Arc::new(cli), guard, bz)
             .expect("server must build")
             .with_audit(Arc::clone(&audit));
@@ -4030,7 +4085,9 @@ mod tests {
         let guard = Arc::new(Guard {
             policy: Policy::from_toml_str("").expect("test policy must parse"),
         });
-        let bz = Arc::new(BugzillaClient::new(&mock.uri(), false).expect("client must build"));
+        let bz = Arc::new(
+            BugzillaClient::new(&mock.uri(), false, USER_AGENT).expect("client must build"),
+        );
         let server = BugWarden::new(Arc::new(cli), guard, bz)
             .expect("server must build")
             .with_audit(Arc::clone(&audit));
@@ -4162,6 +4219,71 @@ mod tests {
         assert_eq!(
             advertised.title, None,
             "nothing may be displayed in place of the name asserted here"
+        );
+    }
+
+    #[tokio::test]
+    async fn bugzilla_requests_name_this_build_and_never_the_library() {
+        // Driven through `bugzilla_client`, the constructor `main` calls, so
+        // an identity lost between the constant and the wiring fails here
+        // instead of reaching Bugzilla as an anonymous request (issue #55).
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "version": "5.0.4" })))
+            .mount(&mock)
+            .await;
+
+        let cli = {
+            use clap::Parser as _;
+            Cli::parse_from([
+                "bugwarden",
+                "--bugzilla-server",
+                &mock.uri(),
+                "--transport",
+                "stdio",
+                "--api-key",
+                "test-key",
+            ])
+        };
+        let bz = bugzilla_client(&cli).expect("client must build");
+        bz.version("test-key").await.expect("version must parse");
+
+        let requests = mock.received_requests().await.expect("recording enabled");
+        let agent = requests
+            .first()
+            .expect("the request reached the mock")
+            .headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+
+        // The name and the repository are spelled out rather than read
+        // back from the same `env!`s the code reads: comparing the header
+        // to the manifest it was built from would agree with any value the
+        // manifest took, including a repository pointing somewhere else.
+        // Only the version comes from the environment, since it moves every
+        // release and pinning it would fail on each bump.
+        assert_eq!(
+            agent,
+            format!(
+                "bugwarden/{} (+https://github.com/plusky/bugwarden)",
+                env!("CARGO_PKG_VERSION")
+            ),
+            "Bugzilla's operator must be able to tell what reached them"
+        );
+        assert!(
+            !agent.contains("bugwarden-core"),
+            "the library crate must never be the name in Bugzilla's access log: {agent}"
+        );
+        // The two directions of the same identity: what a client is told in
+        // the handshake and what Bugzilla is told on every request are one
+        // build, and cannot drift into naming two.
+        let identity = server_identity();
+        assert!(
+            agent.starts_with(&format!("{}/{}", identity.name, identity.version)),
+            "the wire identity must match the handshake's {identity:?}: {agent}"
         );
     }
 }

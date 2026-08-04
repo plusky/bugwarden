@@ -488,9 +488,9 @@ impl Guard {
 pub const CLASSIFY_FIELDS: &str =
     "id,summary,product,component,status,resolution,severity,priority,keywords,groups,whiteboard,creation_time,last_change_time,creator";
 
-pub struct BugzillaClient { /* base_url, api_url = base_url + "/rest", reqwest::Client (30s timeout), use_auth_header */ }
+pub struct BugzillaClient { /* base_url, api_url = base_url + "/rest", reqwest::Client (30s timeout + the caller's User-Agent), use_auth_header */ }
 impl BugzillaClient {
-    pub fn new(base_url: &str, use_auth_header: bool) -> anyhow::Result<Self>; // trims trailing '/'
+    pub fn new(base_url: &str, use_auth_header: bool, user_agent: &str) -> anyhow::Result<Self>; // trims trailing '/'; blank or invalid user_agent = error
     pub fn base_url(&self) -> &str;
     pub async fn version(&self, key: &str) -> anyhow::Result<String>;
     pub async fn whoami(&self, key: &str) -> anyhow::Result<String>; // login; missing/non-string/blank "name" = failure
@@ -535,6 +535,52 @@ query param `api_key={key}`. Always `Accept: application/json`.
 Errors: non-2xx status or body `{"error": true}` => anyhow error containing the
 HTTP status and Bugzilla `message` field; reqwest errors sanitized with
 `.without_url()` (I12).
+
+**Caller identity on the wire (issue #55).** Every request carries a
+`User-Agent`, set once on the shared `reqwest::Client` so it reaches the
+authenticated REST calls and the unauthenticated `page.cgi` fetch alike.
+The value is a *parameter*, deliberately: this crate is a library, and a
+value built here from its own `CARGO_PKG_*` would name `bugwarden-core` in
+the access log of every binary that embeds it — the shape of #53 one layer
+down, and just as plausible-looking. The binary supplies
+`server::USER_AGENT`, `{name}/{version} (+{repository})` from its own
+manifest, and builds its client through `server::bugzilla_client(&cli)` so
+the wiring is reachable from a test rather than checkable only by eye.
+Consequences that are decisions, not accidents:
+
+- A blank `user_agent` is a construction error, so an embedder cannot get
+  an anonymous client back — the state this parameter exists to end —
+  from a value that silently resolved to nothing. This binary cannot
+  reach it: `USER_AGENT` is a `concat!` of literals and non-empty `env!`s.
+- The value is public — it is sent to every configured Bugzilla and lands
+  in its access log — so it carries name, version and the project's
+  repository and nothing else: no key material, no policy path, no host.
+  That is the discipline of **I12** applied to a surface I12 does not
+  itself name; the invariant governs logs, error messages and tool
+  results, and is not silently widened here.
+- **Disclosing the version is accepted, and unlike #53's it is a choice.**
+  `serverInfo` had to carry one — it is a required field of
+  `InitializeResult` — but a `User-Agent` is optional and nothing was
+  disclosed before, so this is a deliberate addition, not a replacement.
+  It is accepted because the party learning it is not a passer-by: it is
+  the Bugzilla this deployment authenticates to with an API key and sends
+  every query. Naming a version tells that operator whether a reported
+  misbehaviour is fixed in what is deployed and which builds to allowlist
+  — the whole point of #55 — and tells them nothing they could not learn
+  by asking the account holder. The exposure is that an operator, or
+  anyone reading their access log, can match a fleet against a future
+  advisory for this guard; that is the same trade #53 accepted against a
+  wider audience.
+- It is not operator-configurable. A per-deployment or per-caller identity
+  is #32's job (bearer tokens per caller), and a free-text field an
+  operator fills in is exactly where deployment detail, or a key, would
+  end up.
+- With a server-held key (#27) and no per-caller identity yet, one Bugzilla
+  account carries a whole fleet's traffic: this header is all that
+  distinguishes that traffic from a person with a browser (the value is a
+  compile-time constant, identical in every deployment, so it attributes
+  the program and never the caller). Hence the binary's wire identity and
+  the name it gives in the MCP handshake are asserted to be one build.
 
 ## Identity resolution (the `created_by_me` matcher)
 
@@ -927,7 +973,10 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   unrecorded. Accepted deliberately: `serverInfo` is a required field of
   `InitializeResult`, so withholding it is not protocol-legal, and the
   value being replaced was rmcp's own exact release — a dependency
-  fingerprint, which is not the smaller disclosure.
+  fingerprint, which is not the smaller disclosure. The same trap has a
+  non-MCP twin, and it is not rmcp's: the `User-Agent` sent to Bugzilla
+  must likewise be built in this crate rather than in the library that
+  holds the HTTP client (issue #55, "Caller identity on the wire" above).
 - **rmcp trap — the handshake-free lifecycle is chosen by `_meta` shape, not
   by revision.** `message_has_per_request_protocol_version`
   (`transport/streamable_http_server/tower.rs`) routes a request to the
@@ -1200,5 +1249,30 @@ Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
   `served`; and a pre-#29 record line without `guard.scan`
   deserializes with the scan absent (plus the cell-level note_scan
   merge tests and the updated schema golden in audit.rs).
+- Identity tests (#[cfg(test)] in crates/bugwarden/src/server.rs and
+  crates/bugwarden-core/src/client.rs; crates/bugwarden/tests/
+  http_transport_wiremock.rs, crates/bugwarden/tests/binary_user_agent.rs
+  and crates/bugwarden-core/tests/user_agent_wiremock.rs): what this build
+  calls itself, in both directions. Inbound (issue #53) — `mcp_server_info`
+  and the handshake report the same name and version, asserted as VALUES
+  and against `Implementation::from_build_env()`, so an identity inherited
+  from the SDK fails; the SDK's own default is pinned separately, so its
+  drift reads as upstream news rather than a bug here; the identity is read
+  back off a served session, `title` included, since that is the field a
+  client displays in preference to the name; and `server/discover`, the
+  handshake-free surface, names the same build and reaches nothing else.
+  Outbound (issue #55) — the SHIPPED BINARY is spawned against a real
+  HTTP server and its request read off the wire, because every assertion
+  one call frame in (at `bugzilla_client`) still passes for a `main` that
+  builds its own client; that run also pins `--use-auth-header` reaching
+  the same constructor, since dropping it would put the key back in the
+  URL. The name and repository are spelled out rather than read from the
+  manifest the code reads, which would agree with any value the manifest
+  took. In the library, the caller's value reaches the authenticated GET,
+  the POST and PUT bodies and the unauthenticated `page.cgi` fetch, in
+  BOTH auth modes — the header and the credential are chosen by one
+  constructor, so a per-mode identity would send nothing at all in the
+  other — and a blank or non-header-value identity fails at construction
+  rather than going out anonymously.
 - CI: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace --locked`, `cargo deny check`.

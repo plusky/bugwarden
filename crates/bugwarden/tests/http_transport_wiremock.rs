@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use bugwarden::audit::{AuditConfig, AuditEvent, AuditEventKind, AuditSink, AuditState, FailMode};
 use bugwarden::config::Cli;
-use bugwarden::server::BugWarden;
+use bugwarden::server::{BugWarden, USER_AGENT};
 use bugwarden_core::client::BugzillaClient;
 use bugwarden_core::guard::Guard;
 use bugwarden_core::policy::Policy;
@@ -77,7 +77,8 @@ async fn serve_http(
     let guard = Arc::new(Guard {
         policy: Policy::from_toml_str(policy).expect("test policy must parse"),
     });
-    let bz = Arc::new(BugzillaClient::new(&mock.uri(), false).expect("client must build"));
+    let bz =
+        Arc::new(BugzillaClient::new(&mock.uri(), false, USER_AGENT).expect("client must build"));
     let mut server = BugWarden::new(cli, guard, bz).expect("server must build");
     if let Some(audit) = audit {
         server = server.with_audit(audit);

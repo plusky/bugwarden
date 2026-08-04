@@ -12,7 +12,7 @@ use bugwarden::audit::{
     policy_hash_of, AuditConfig, AuditSink, AuditState, FailMode, TransportKind,
 };
 use bugwarden::{config, server};
-use bugwarden_core::{client::BugzillaClient, guard::Guard, policy::Policy};
+use bugwarden_core::{guard::Guard, policy::Policy};
 use clap::Parser;
 use rmcp::{
     transport::{
@@ -52,10 +52,10 @@ async fn main() -> anyhow::Result<()> {
     // file handling) is resolved inside BugWarden::new — before the audit
     // sink below, so a key misconfiguration aborts startup without first
     // creating or rotating an audit file.
-    let bz = Arc::new(
-        BugzillaClient::new(&cli.bugzilla_server, cli.use_auth_header)
-            .context("failed to build Bugzilla client")?,
-    );
+    // Built in the library target, not here: the client's identity to
+    // Bugzilla (I12-adjacent, issue #55) is only testable where a test can
+    // reach the constructor.
+    let bz = Arc::new(server::bugzilla_client(&cli)?);
     let guard = Arc::new(Guard { policy });
     let cfg = Arc::new(cli);
     let server =

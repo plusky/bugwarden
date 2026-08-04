@@ -16,6 +16,11 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 /// Deliberately distinctive so a leak into any error text is unmistakable (I12).
 const KEY: &str = "SUPERSECRETKEY123";
 
+/// Any identity will do here — the client requires one (#55) but these
+/// suites assert nothing about it; `user_agent_wiremock.rs` owns that
+/// proof. Names neither crate, so a check for either finds nothing.
+const TEST_USER_AGENT: &str = "probe-agent/0.0.0";
+
 fn guard(toml: &str) -> Guard {
     Guard {
         policy: Policy::from_toml_str(toml).expect("test policy must parse"),
@@ -23,7 +28,7 @@ fn guard(toml: &str) -> Guard {
 }
 
 fn client(server: &MockServer) -> BugzillaClient {
-    BugzillaClient::new(&server.uri(), false).expect("client must build")
+    BugzillaClient::new(&server.uri(), false, TEST_USER_AGENT).expect("client must build")
 }
 
 fn bug(id: u64, groups: &[&str], creation_time: &str) -> serde_json::Value {
@@ -396,7 +401,8 @@ async fn api_key_absent_from_transport_error_i12() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     drop(listener); // free the port so the connection is refused
-    let bz = BugzillaClient::new(&format!("http://{addr}"), false).expect("client");
+    let bz =
+        BugzillaClient::new(&format!("http://{addr}"), false, TEST_USER_AGENT).expect("client");
 
     let err = bz.get_bugs(KEY, &[1], None).await.unwrap_err();
     let full = format!("{err:#} {err:?}");
@@ -428,7 +434,7 @@ async fn auth_header_mode_sends_bearer_and_no_query_key() {
         .mount(&server)
         .await;
 
-    let bz = BugzillaClient::new(&server.uri(), true).expect("client");
+    let bz = BugzillaClient::new(&server.uri(), true, TEST_USER_AGENT).expect("client");
     let v = bz.get_bugs(KEY, &[1], None).await.unwrap();
     assert_eq!(v["seen_auth"], json!(format!("Bearer {KEY}")));
     assert_eq!(v["query_key"], json!(false));
@@ -1042,7 +1048,8 @@ async fn whoami_api_key_absent_from_transport_error_i12() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     drop(listener); // free the port so the connection is refused
-    let bz = BugzillaClient::new(&format!("http://{addr}"), false).expect("client");
+    let bz =
+        BugzillaClient::new(&format!("http://{addr}"), false, TEST_USER_AGENT).expect("client");
 
     let err = bz.whoami(KEY).await.unwrap_err();
     let full = format!("{err:#} {err:?}");

@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use bugwarden::config::Cli;
-use bugwarden::server::{BugWarden, WRITE_TOOLS};
+use bugwarden::server::{BugWarden, USER_AGENT, WRITE_TOOLS};
 use bugwarden_core::client::BugzillaClient;
 use bugwarden_core::guard::Guard;
 use bugwarden_core::policy::Policy;
@@ -57,7 +57,8 @@ async fn client_for(policy: &str, mock: &MockServer) -> RunningService<RoleClien
     let guard = Arc::new(Guard {
         policy: Policy::from_toml_str(policy).expect("test policy must parse"),
     });
-    let bz = Arc::new(BugzillaClient::new(&mock.uri(), false).expect("client must build"));
+    let bz =
+        Arc::new(BugzillaClient::new(&mock.uri(), false, USER_AGENT).expect("client must build"));
     let server = BugWarden::new(cfg, guard, bz).expect("server must build");
 
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
@@ -1456,8 +1457,10 @@ async fn whoami_transport_error_does_not_leak_the_api_key_i12() {
     let guard = Arc::new(Guard {
         policy: Policy::from_toml_str(IDENTITY_POLICY).expect("test policy must parse"),
     });
-    let bz =
-        Arc::new(BugzillaClient::new(&format!("http://{addr}"), false).expect("client must build"));
+    let bz = Arc::new(
+        BugzillaClient::new(&format!("http://{addr}"), false, USER_AGENT)
+            .expect("client must build"),
+    );
     let server = BugWarden::new(cfg, guard, bz).expect("server must build");
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
     tokio::spawn(async move {
