@@ -340,7 +340,7 @@ fn client_of(ctx: &RequestContext<RoleServer>) -> audit::ClientInfo {
 /// The streamable-HTTP transport configuration this build serves with.
 ///
 /// Lives here rather than in `main` so the integration tests serve the
-/// configuration a deployment actually gets. Two rmcp 3.1 defaults are set
+/// configuration a deployment actually gets. These rmcp 3.1 defaults are set
 /// by name rather than inherited, because inheriting them changes how a
 /// deployment behaves without anyone choosing it:
 ///
@@ -357,6 +357,14 @@ fn client_of(ctx: &RequestContext<RoleServer>) -> audit::ClientInfo {
 ///   `global.max_attachment_bytes`, so it is pinned to the SDK's current
 ///   value: an SDK bump must not move an operator-visible limit. Issue #52
 ///   reconciles the two ceilings.
+///
+/// `allowed_origins` is the browser-facing sibling of `allowed_hosts` and the
+/// same reasoning covers it, but it is left inherited: its empty default IS
+/// the disabled state, so naming it would assert nothing. Anything that
+/// changes the `allowed_hosts` call above should decide this one too rather
+/// than leave it behind. The remaining fields, and why each stays inherited,
+/// are inventoried in DESIGN.md under "rmcp 3.1 usage notes"; the caller in
+/// `main` adds `cancellation_token` so shutdown reaches the live transport.
 pub fn http_server_config() -> StreamableHttpServerConfig {
     StreamableHttpServerConfig::default()
         .disable_allowed_hosts()

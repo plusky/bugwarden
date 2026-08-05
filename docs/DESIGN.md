@@ -1009,16 +1009,66 @@ wired, `server.rs` and `main.rs` are the reference.
   is unserved. When it is adopted, `cache_scope` is `Private` — the listing is
   pruned per deployment (I13), so a shared cache must never serve one
   deployment's list to another — and `CacheScope::default()` is `Public`.
-- **Two rmcp 3.1 transport defaults are set by name, not inherited** (main.rs).
-  `allowed_hosts` defaults to loopback only — a DNS-rebinding defence for MCP
-  servers a browser can reach on localhost — which would refuse every
-  deployment not addressed as `localhost`, containers included; bugwarden
-  disables it deliberately, since its access control is the network boundary
-  and, when it lands, per-caller authentication (#32). `max_request_body_bytes`
-  is a 4 MiB POST cap with no rmcp 2.2 equivalent: kept as a memory bound but
-  pinned to the current SDK value, because it also ceilings `add_attachment`
+- **Every `StreamableHttpServerConfig` field is accounted for below** — set by
+  name or inherited for a stated reason. `http_server_config()` (server.rs)
+  names two; main.rs adds a third at the call site. The struct is
+  `#[non_exhaustive]`, so an SDK bump may grow it: a field this table does not
+  list is an unreviewed default, and adding the row is part of the bump, not a
+  follow-up. Counting them in prose is what let two fields go unlisted here
+  before.
+
+  | field | rmcp 3.1 default | this build |
+  |---|---|---|
+  | `allowed_hosts` | `localhost`, `127.0.0.1`, `::1` | **set** — `disable_allowed_hosts()` |
+  | `max_request_body_bytes` | 4 MiB | **set** — pinned to that same 4 MiB |
+  | `cancellation_token` | fresh token | **set** (main.rs) — a child of the process token |
+  | `allowed_origins` | `[]`, i.e. validation off | inherited, deliberately |
+  | `stateless_protocol_metadata_required` | `false` | inherited; #34 decides it |
+  | `legacy_session_mode` | `true` | inherited |
+  | `session_store` | `None` | inherited |
+  | `json_response` | `false` | inherited |
+  | `sse_keep_alive` / `sse_retry` | 15 s / 3 s | inherited |
+
+  `allowed_hosts` is a DNS-rebinding defence for MCP servers a browser can
+  reach on localhost, and its default would refuse every deployment not
+  addressed as `localhost`, containers included; bugwarden disables it
+  deliberately, since its access control is the network boundary and, when it
+  lands, per-caller authentication (#32). `max_request_body_bytes` is a 4 MiB
+  POST cap with no rmcp 2.2 equivalent: kept as a memory bound but pinned to
+  the current SDK value, because it also ceilings `add_attachment`
   independently of `global.max_attachment_bytes` and an SDK bump must not move
-  an operator-visible limit. Reconciling the two ceilings is #52.
+  an operator-visible limit. Reconciling the two ceilings is #52. The
+  `cancellation_token` is named so ctrl_c tears the live transport down with
+  the process instead of leaving it to outlive the shutdown.
+
+  `allowed_origins` is the browser-facing sibling of `allowed_hosts`, and the
+  #32 argument covers it identically. It is inherited rather than named because
+  the empty default IS the disabled state — `origin_is_allowed` returns true on
+  an empty list, exactly what `disable_allowed_origins()` would produce — so
+  naming it would assert nothing the default does not already say. The
+  asymmetry with `allowed_hosts` is real and not an oversight: the host default
+  refuses ordinary requests from this build's clients, whereas Origin is only
+  checked when the header is present and a non-browser MCP client does not send
+  one. An rmcp that shipped a non-empty `allowed_origins` still would not lock
+  such a client out.
+
+  `stateless_protocol_metadata_required` is the transport-level enforcement of
+  the per-request `_meta` that the handshake-free lifecycle needs. It must stay
+  `false` while this build serves the legacy revisions: rmcp clients negotiated
+  below `2026-07-28` do not attach that metadata, so enabling it refuses their
+  ordinary requests, and the field's own rustdoc says a server using it should
+  advertise only `2026-07-28` and later. Adopting the revision (#34) therefore
+  has to pick one — enforce at the transport and drop `2024-11-05` through
+  `2025-11-25`, or keep them and enforce in the handler — and that choice
+  belongs to #34, not here. Moot today: `skips_the_handshake` refuses the whole
+  request class before it reaches a tool. `legacy_session_mode` is inherited
+  `true`, so sessions exist for the revisions served; per SEP-2567 rmcp serves
+  `2026-07-28` requests statelessly whatever this flag says, which #34 inherits
+  rather than configures. `session_store` stays `None`: the client's
+  `initialize` parameters remain in-process, and there is one process here and
+  no cross-instance recovery to do. `json_response`, `sse_keep_alive` and
+  `sse_retry` set response framing and SSE liveness — client-visible timing,
+  with no guard or operator-visible limit riding on them.
 - axum MUST be 0.8 (rmcp's version — extension extraction breaks otherwise);
   schemars 1.x with feature `chrono04`; tokio 1; tokio-util 0.7.
 - Server struct: `#[derive(Clone)] pub struct BugWarden { cfg: Arc<Cli>, guard: Arc<Guard>, bz: Arc<BugzillaClient>, tool_router: ToolRouter<Self>, key_custody: KeyCustody, audit: Option<Arc<AuditState>> }`
@@ -1028,7 +1078,7 @@ wired, `server.rs` and `main.rs` are the reference.
   update_bug_fields, update_bug_dependencies, add_cc_to_bug, mark_as_duplicate,
   create_bug, add_attachment.
 - API key resolution: a match on `key_custody` (resolved once at startup, see Key custody — never re-read per request): `Server(key)` => the server's key, without touching the request at all; `PerRequest` => `ctx.extensions.get::<axum::http::request::Parts>()`, then `parts.headers.get(lowercased_header_name)`.
-- HTTP serving: `StreamableHttpService::new(move || Ok(server.clone()), LocalSessionManager::default().into(), StreamableHttpServerConfig::default())`, `axum::Router::new().nest_service("/mcp", service)`, `tokio::net::TcpListener::bind`, graceful shutdown on ctrl_c.
+- HTTP serving: `StreamableHttpService::new(move || Ok(server.clone()), LocalSessionManager::default().into(), http_server_config().with_cancellation_token(ct.child_token()))` — never a bare `StreamableHttpServerConfig::default()`, see the field table above — then `axum::Router::new().nest_service("/mcp", service)`, `tokio::net::TcpListener::bind`, graceful shutdown on ctrl_c cancelling `ct`.
 - Request `_meta` (SEP-414, e.g. `traceparent`): over every serialized
   transport the wire `params._meta` does NOT arrive in the params struct
   (`CallToolRequestParams.meta` stays `None`) — the SDK's custom
