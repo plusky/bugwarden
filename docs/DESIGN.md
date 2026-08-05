@@ -1059,8 +1059,17 @@ wired, `server.rs` and `main.rs` are the reference.
   ordinary requests, and the field's own rustdoc says a server using it should
   advertise only `2026-07-28` and later. Adopting the revision (#34) therefore
   has to pick one — enforce at the transport and drop `2024-11-05` through
-  `2025-11-25`, or keep them and enforce in the handler — and that choice
-  belongs to #34, not here. Moot today: `skips_the_handshake` refuses the whole
+  `2025-11-25`, or keep them and enforce in the handler. **DECIDED 2026-08-05:
+  keep the legacy revisions and enforce in the handler**, so this field stays
+  `false` and #34 adds `2026-07-28` to the existing list rather than replacing
+  it. Flipping it to `true` is not a tuning knob: it silently drops every
+  revision this build serves. The rejected alternative is rejected on timing,
+  not on cleanliness — transport-level enforcement is the tidier mechanism, but
+  `2026-07-28` is not yet even rmcp's own `LATEST` (upstream PR #1105 is open),
+  so taking it now would strand every current client to gain validation the
+  handler can do itself, in a handler that already polices this exact request
+  class. Revisit when the ecosystem has moved and dropping the legacy revisions
+  costs little. Moot until then: `skips_the_handshake` refuses the whole
   request class before it reaches a tool. `legacy_session_mode` is inherited
   `true`, so sessions exist for the revisions served; per SEP-2567 rmcp serves
   `2026-07-28` requests statelessly whatever this flag says, which #34 inherits
