@@ -929,10 +929,20 @@ Decisions, all deliberate:
 
 ## rmcp 3.1 usage notes
 
-Cached reference files (read them): `/tmp/counter.rs` (tool_router + #[tool] +
-Parameters + #[tool_handler] ServerHandler + get_info), `/tmp/cstdio.rs`
-(stdio main), `/tmp/chttp.rs` (StreamableHttpService + axum main),
-`/tmp/rmcp-toolrouter.rs` (ToolRouter API incl. remove_route/has_route).
+Reference source is the rmcp this workspace pins, unpacked in the local
+registry: `~/.cargo/registry/src/*/rmcp-3.1.0/` — today's version, and the
+directory holding the `rmcp` package's `manifest_path` in `cargo metadata
+--format-version 1` on any day, so it follows `Cargo.lock` rather than a copy
+of it and is by construction the source this build compiles against. Every rmcp
+path cited below is relative to that tree's `src/`. The modules these notes rest
+on: `transport/streamable_http_server/tower.rs` (the transport config and both
+routing traps), `handler/server/router/tool.rs` (`ToolRouter`, incl.
+`remove_route` / `has_route` — I13), `model.rs` and `model/serde_impl.rs`
+(`InitializeResult`, the `_meta` strip), `service.rs` (the serve loop); the
+`#[tool_router]` / `#[tool_handler]` expansions are in the sibling
+`rmcp-macros-3.1.0` tree. The published crate carries no `examples/` — those
+live upstream at the `rmcp-v3.1.0` tag — but for how this server is actually
+wired, `server.rs` and `main.rs` are the reference.
 
 - `rmcp = { version = "3.1", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }`
 - Protocol revisions: `SUPPORTED_PROTOCOL_VERSIONS` (server.rs) lists what
