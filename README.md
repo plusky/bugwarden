@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="bugwarden logo" width="180">
+  <img src="https://raw.githubusercontent.com/plusky/bugwarden/main/assets/logo.svg" alt="bugwarden logo" width="180">
 </p>
 
 # bugwarden
