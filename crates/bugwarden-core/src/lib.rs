@@ -15,8 +15,10 @@
 //!   classification fetch, the uniform denial text (I2), the redacted
 //!   summary projection, silent search-result filtering (I3), and
 //!   private-comment gating (I5). All paths fail closed (I4).
-//! - [`client`] — minimal async Bugzilla REST client (reqwest + rustls).
-//!   Errors are sanitized so the API key can never leak through them (I12).
+//! - [`client`] — minimal async Bugzilla REST client (reqwest + rustls,
+//!   aws-lc-rs provider, OS trust store via `rustls-platform-verifier`, with
+//!   `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` honored). Errors are sanitized so
+//!   the API key can never leak through them (I12).
 
 pub mod client;
 pub mod guard;

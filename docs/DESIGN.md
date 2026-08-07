@@ -536,6 +536,23 @@ Errors: non-2xx status or body `{"error": true}` => anyhow error containing the
 HTTP status and Bugzilla `message` field; reqwest errors sanitized with
 `.without_url()` (I12).
 
+**TLS stack and outbound network behavior.** `reqwest = { version = "0.13",
+default-features = false, features = ["json", "query", "rustls",
+"system-proxy"] }`. The `rustls` feature (renamed from 0.12's `rustls-tls`)
+pulls `rustls-platform-verifier`, so trust anchors come from the **OS trust
+store** rather than the bundled Mozilla `webpki-roots` set — deliberate for a
+Bugzilla instance behind a corporate or internal CA, and an accepted,
+operator-visible change from the previous release. The crypto provider is
+`aws-lc-rs`, reqwest 0.13's default (0.12 used `ring`); `aws-lc-sys` needs a C
+toolchain at build time, which the release workflow's `ubuntu-latest` and
+`macos-latest` runners provide. `system-proxy` keeps `HTTPS_PROXY` /
+`HTTP_PROXY` / `NO_PROXY` honored exactly as 0.12 did unconditionally —
+without this feature the 0.13 default is to ignore them, which would be a
+silent regression for the corporate deployments this server targets. `query`
+is likewise required, not cosmetic: `apply_auth`'s `?api_key=` mode and
+`quicksearch_syntax_html` both call `.query(...)`, a compile error without
+the feature in 0.13.
+
 **Caller identity on the wire (issue #55).** Every request carries a
 `User-Agent`, set once on the shared `reqwest::Client` so it reaches the
 authenticated REST calls and the unauthenticated `page.cgi` fetch alike.
