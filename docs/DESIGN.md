@@ -102,6 +102,20 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
   Client-visible responses are byte-identical with auditing on, off, or
   failing — except the scoped fail-closed refusals, which reuse the tools'
   existing uniform failure texts and never vary with the guard's verdict.
+- **I16** `bugzilla_products` and `bug_fields` return Bugzilla instance
+  metadata (products, components, versions, milestones, bug fields and
+  their legal values) exactly as Bugzilla returned it to the caller's own
+  key — NEVER filtered against the guard policy. A policy-filtered catalog
+  would itself be a policy-enumeration oracle, exactly what `create_bug`'s
+  padded uniform refusal exists to deny (cross-reference that row below).
+  They return no bug data and no bug ids, so no capability applies and no
+  classification runs (I8 does not apply — there is no bug id to assess).
+  Both are removed from the tool listing (`ToolRouter::remove_route`,
+  I13) unless the operator sets `global.allow_discovery = true`; the
+  default is `false`. `components[].default_assigned_to` and
+  `default_qa_contact` (account emails) are stripped by the SERVER's own
+  projection, never merely omitted from an upstream `include_fields`
+  request — the omission is enforced locally, not trusted upstream.
 
 ## bugwarden-core API (exact signatures)
 
@@ -508,6 +522,9 @@ impl BugzillaClient {
     pub async fn quicksearch_syntax_html(&self) -> anyhow::Result<String>;
     pub async fn attachment_meta(&self, key: &str, attachment_id: u64) -> anyhow::Result<Option<serde_json::Value>>; // exclude_fields=data
     pub async fn attachment_data(&self, key: &str, attachment_id: u64) -> anyhow::Result<Option<serde_json::Value>>; // includes base64 `data`
+    pub async fn enterable_product_ids(&self, key: &str) -> anyhow::Result<Vec<u64>>; // .ids, string or number, both accepted
+    pub async fn products(&self, key: &str, ids: &[u64], names: &[&str], include_fields: Option<&[&str]>) -> anyhow::Result<serde_json::Value>;
+    pub async fn bug_fields(&self, key: &str, name: Option<&str>) -> anyhow::Result<serde_json::Value>; // name is percent-encoded as one path segment
 }
 ```
 
@@ -531,6 +548,9 @@ Endpoint mapping:
 | attachment_meta | GET /rest/bug/attachment/{attachment_id}?exclude_fields=data | `envelope.attachments.{id}` object, `None` when absent |
 | attachment_data | GET /rest/bug/attachment/{attachment_id} | `envelope.attachments.{id}` object incl. base64 `data`, `None` when absent |
 | quicksearch_syntax_html | GET {base_url}/page.cgi?id=quicksearch.html (no auth needed) | HTML string |
+| enterable_product_ids | GET /rest/product_enterable | `.ids` as `Vec<u64>`; every element must parse as a numeric string or a JSON number, else error |
+| products | GET /rest/product?ids=..&names=..[&include_fields=..] (any of the three may be empty/absent) | whole envelope (`{"products":[..]}`), raw — no local projection at this layer |
+| bug_fields | GET /rest/field/bug, or /rest/field/bug/{name} with `name` percent-encoded as one path segment (`Url::path_segments_mut`, never string-interpolated) | whole envelope (`{"fields":[..]}`) |
 
 Auth per request: `use_auth_header` ? header `Authorization: Bearer {key}` :
 query param `api_key={key}`. Always `Accept: application/json`.
@@ -857,6 +877,8 @@ constraints the model must know.
 | download_attachment | attachment_id, include_private: bool = false | attachments (on the owning bug) | metadata fetched FIRST (no blob) for guard assessment + attachment_gate; unknown id, metadata OR blob fetch failure, denied owning bug, missing bug_id, and private-without-opt-in all yield the uniform attachment denial. Constant upstream request count on every path (a metadata miss still runs one classify call against bug id 0) so call latency is not an existence oracle. The gate AND the bug-id check re-run on the blob response (TOCTOU), then the actual base64 size is re-checked against the cap (a lying `size` cannot bypass it). Raster image types from a strict allowlist => ContentBlock::image; everything else (incl. image/svg+xml) => BlobResourceContents whose uri carries only the attachment id (uploader-chosen file_name never enters the uri) |
 | bug_url | bug_id | none (I8 exception) | `{base_url}/show_bug.cgi?id={id}` |
 | bugzilla_server_info | — | none | client.server_info |
+| bugzilla_products | products?: Vec<String> (max 5) | none — present only when `global.allow_discovery = true` (I16) | no `products` named: `enterable_product_ids` then `products(ids, [], [id,name])`, projected to `{id, name}` catalog entries; `products` named: `products([], names, None)`, projected to `{name, description, is_active, default_milestone, has_unconfirmed, components[{name,description,is_active}], versions[{name,is_active}], milestones[{name,is_active}]}` — `default_assigned_to`/`default_qa_contact` are never selected. Over-cap (>5 names) refuses with a fixed text and makes ZERO upstream requests, since the refusal is a pure function of the request's own shape |
+| bug_fields | field_names?: Vec<String> (max 5), on_bug_entry_only: bool = false | none — present only when `global.allow_discovery = true` (I16) | no `field_names`: `bug_fields(None)`, projected per field to `{name, display_name, type, is_custom, is_mandatory, is_on_bug_entry, visibility_field, visibility_values, has_values}` — NEVER `values` — optionally filtered to `is_on_bug_entry` fields; `field_names` named: one `bug_fields(Some(name))` call per name (sequential; Bugzilla's field lookup is single-field), same projection plus `values` reduced to legal-value NAMES only. Over-cap (>5 names) refuses with a fixed text and makes ZERO upstream requests. A named field Bugzilla does not recognise is a call-level failure (the generic `Failed to fetch bug fields` text), not a partial result |
 | quicksearch_syntax | — | none | HTML doc page |
 | mcp_server_info | — | none | name (CARGO_PKG_NAME) and version (CARGO_PKG_VERSION), the same two the handshake sends; bugzilla server url, transport, and policy summary per I1 |
 | summarize_bug | id | comments | fetches comments (private filtered with include_private=false), returns the summarization prompt text (fixed prompt template) |

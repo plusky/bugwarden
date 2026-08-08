@@ -412,6 +412,73 @@ impl BugzillaClient {
             .filter(|att| !att.is_null()))
     }
 
+    /// GET `/rest/product_enterable` — ids of the products the caller's key
+    /// may file a bug into.
+    ///
+    /// Bugzilla's documented example encodes ids as strings; some
+    /// deployments return JSON numbers instead. Both are accepted; any
+    /// other shape is an error, never a silently dropped entry.
+    pub async fn enterable_product_ids(&self, key: &str) -> Result<Vec<u64>> {
+        let v = self.get_json(key, "/product_enterable", &[]).await?;
+        let ids = v.get("ids").and_then(Value::as_array).ok_or_else(|| {
+            anyhow!("bugzilla /product_enterable response carries no usable \"ids\" array")
+        })?;
+        ids.iter()
+            .map(|id| {
+                parse_id(id).ok_or_else(|| {
+                    anyhow!("bugzilla /product_enterable response contains a non-numeric id")
+                })
+            })
+            .collect()
+    }
+
+    /// GET `/rest/product?ids=..&names=..[&include_fields=..]` — returns the
+    /// whole response envelope (`{"products":[..]}`). `ids`/`names` are
+    /// independently optional; Bugzilla accepts either, both, or neither
+    /// (neither means "every accessible product").
+    pub async fn products(
+        &self,
+        key: &str,
+        ids: &[u64],
+        names: &[&str],
+        include_fields: Option<&[&str]>,
+    ) -> Result<Value> {
+        let mut query: Vec<(&str, String)> = Vec::new();
+        for id in ids {
+            query.push(("ids", id.to_string()));
+        }
+        for name in names {
+            query.push(("names", (*name).to_string()));
+        }
+        if let Some(fields) = include_fields {
+            query.push(("include_fields", fields.join(",")));
+        }
+        self.get_json(key, "/product", &query).await
+    }
+
+    /// GET `/rest/field/bug[/{name}]` — returns the whole response envelope
+    /// (`{"fields":[..]}`), every field when `name` is `None`.
+    ///
+    /// `name` is a caller-supplied string, so it is percent-encoded as a
+    /// single URL path segment (`Url::path_segments_mut`) rather than
+    /// interpolated into a format string: an unescaped `/` in `name` must
+    /// not be able to address a different endpoint.
+    pub async fn bug_fields(&self, key: &str, name: Option<&str>) -> Result<Value> {
+        match name {
+            Some(n) => {
+                let mut url = reqwest::Url::parse(&self.api_url)
+                    .map_err(|e| anyhow!("bugzilla api_url is not a valid URL: {e}"))?;
+                url.path_segments_mut()
+                    .map_err(|()| anyhow!("bugzilla api_url cannot be a base for path segments"))?
+                    .push("field")
+                    .push("bug")
+                    .push(n);
+                self.get_json_url(key, url).await
+            }
+            None => self.get_json(key, "/field/bug", &[]).await,
+        }
+    }
+
     /// GET `{base_url}/page.cgi?id=quicksearch.html` — the quicksearch
     /// syntax documentation page. This is a plain HTML page, not a REST
     /// endpoint, and needs no authentication: no API key is attached.
@@ -467,6 +534,22 @@ impl BugzillaClient {
         parse_response(status, &body)
     }
 
+    /// Authenticated GET of a full, already-built URL — for callers that
+    /// must percent-encode a caller-supplied path segment
+    /// (`Url::path_segments_mut`) instead of interpolating it into a
+    /// format string. Logs the URL's path only, same as [`Self::get_json`]
+    /// (I12).
+    async fn get_json_url(&self, key: &str, url: reqwest::Url) -> Result<Value> {
+        let path = url.path().to_string();
+        let rb = self
+            .http
+            .get(url)
+            .header(reqwest::header::ACCEPT, "application/json");
+        let rb = self.apply_auth(rb, key);
+        let (status, body) = self.send(rb, "GET", &path).await?;
+        parse_response(status, &body)
+    }
+
     /// Authenticated POST/PUT of a JSON payload to a REST path, returning
     /// the parsed JSON body.
     async fn send_json_body(
@@ -493,6 +576,17 @@ impl BugzillaClient {
 /// log line (I12).
 fn sanitize(e: reqwest::Error) -> anyhow::Error {
     anyhow::Error::new(e.without_url())
+}
+
+/// Parse a Bugzilla-reported id that may be a JSON number or a numeric
+/// string — `product_enterable`'s documented example encodes them as
+/// strings, some deployments as numbers.
+fn parse_id(v: &Value) -> Option<u64> {
+    match v {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
 }
 
 /// Fail on HTTP-level errors: a non-2xx status, or a Bugzilla error body

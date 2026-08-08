@@ -95,6 +95,13 @@ read_only = false
 # decoded bytes. 0 removes the cap. Default: 2 MiB.
 #max_attachment_bytes = 2097152
 
+# Exposes bugzilla_products and bug_fields: read-only product/field metadata
+# returned exactly as Bugzilla answers it to this server's key, NEVER
+# filtered by this policy — a filtered catalog would itself let a client
+# probe the rules above. Leave this off if product or field names are
+# themselves confidential. Default: false.
+#allow_discovery = false
+
 # ---------------------------------------------------------------------------
 # 0. New bug reports: accepted into the desktop products, and only there.
 #

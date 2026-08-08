@@ -1536,3 +1536,259 @@ async fn whoami_transport_error_does_not_leak_the_api_key_i12() {
         json!("Bug 7 is not accessible through this server")
     );
 }
+
+/// Discovery is off unless the operator opts in.
+const DISCOVERY_POLICY: &str = "[global]\nallow_discovery = true\n";
+
+#[tokio::test]
+async fn bugzilla_products_catalog_is_id_name_pairs_only() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/product_enterable"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ids": [1, 2] })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/product"))
+        .and(query_param("ids", "1"))
+        .and(query_param("ids", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "products": [
+                { "id": 1, "name": "TestProduct", "description": "hidden from the catalog" },
+                { "id": 2, "name": "OtherProduct" },
+            ]
+        })))
+        .mount(&mock)
+        .await;
+    let client = client_for(DISCOVERY_POLICY, &mock).await;
+
+    let result = call(&client, "bugzilla_products", json!({})).await;
+    assert!(!is_error(&result), "{}", text_of(&result));
+    let envelope: Value = serde_json::from_str(&text_of(&result)).expect("JSON");
+    assert_eq!(
+        envelope["products"],
+        json!([
+            { "id": 1, "name": "TestProduct" },
+            { "id": 2, "name": "OtherProduct" },
+        ])
+    );
+}
+
+#[tokio::test]
+async fn bugzilla_products_detail_strips_account_fields() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/product"))
+        .and(query_param("names", "TestProduct"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "products": [{
+                "id": 1,
+                "name": "TestProduct",
+                "description": "A test product.",
+                "is_active": true,
+                "default_milestone": "---",
+                "has_unconfirmed": true,
+                "components": [{
+                    "name": "core",
+                    "description": "Core component",
+                    "is_active": true,
+                    "default_assigned_to": "admin@bugzilla.org",
+                    "default_qa_contact": "qa@bugzilla.org",
+                }],
+                "versions": [{ "name": "1.0", "is_active": true }],
+                "milestones": [{ "name": "---", "is_active": true }],
+            }]
+        })))
+        .mount(&mock)
+        .await;
+    let client = client_for(DISCOVERY_POLICY, &mock).await;
+
+    let result = call(
+        &client,
+        "bugzilla_products",
+        json!({ "products": ["TestProduct"] }),
+    )
+    .await;
+    assert!(!is_error(&result), "{}", text_of(&result));
+    let text = text_of(&result);
+    assert!(
+        !text.contains("default_assigned_to") && !text.contains("default_qa_contact"),
+        "account emails must never appear in the response: {text}"
+    );
+    let envelope: Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(
+        envelope["products"][0],
+        json!({
+            "name": "TestProduct",
+            "description": "A test product.",
+            "is_active": true,
+            "default_milestone": "---",
+            "has_unconfirmed": true,
+            "components": [{ "name": "core", "description": "Core component", "is_active": true }],
+            "versions": [{ "name": "1.0", "is_active": true }],
+            "milestones": [{ "name": "---", "is_active": true }],
+        })
+    );
+}
+
+#[tokio::test]
+async fn bugzilla_products_over_cap_makes_no_upstream_request() {
+    let mock = MockServer::start().await;
+    let client = client_for(DISCOVERY_POLICY, &mock).await;
+    let result = call(
+        &client,
+        "bugzilla_products",
+        json!({ "products": ["a", "b", "c", "d", "e", "f"] }),
+    )
+    .await;
+    assert!(is_error(&result));
+    assert_eq!(text_of(&result), "At most 5 products per call");
+    assert!(
+        mock.received_requests().await.unwrap().is_empty(),
+        "the cap refusal must make zero upstream requests"
+    );
+}
+
+#[tokio::test]
+async fn bug_fields_catalog_carries_no_values() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "fields": [{
+                "id": 13,
+                "name": "priority",
+                "display_name": "Priority",
+                "type": 2,
+                "is_custom": false,
+                "is_mandatory": false,
+                "is_on_bug_entry": false,
+                "visibility_field": null,
+                "visibility_values": [],
+                "values": [{ "name": "P1" }, { "name": "P2" }],
+            }]
+        })))
+        .mount(&mock)
+        .await;
+    let client = client_for(DISCOVERY_POLICY, &mock).await;
+
+    let result = call(&client, "bug_fields", json!({})).await;
+    assert!(!is_error(&result), "{}", text_of(&result));
+    let text = text_of(&result);
+    assert!(
+        !text.contains("\"values\""),
+        "catalog must carry no values: {text}"
+    );
+    let envelope: Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(
+        envelope["fields"][0],
+        json!({
+            "name": "priority",
+            "display_name": "Priority",
+            "type": 2,
+            "is_custom": false,
+            "is_mandatory": false,
+            "is_on_bug_entry": false,
+            "visibility_field": null,
+            "visibility_values": [],
+            "has_values": true,
+        })
+    );
+}
+
+#[tokio::test]
+async fn bug_fields_catalog_can_be_filtered_to_bug_entry_fields() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "fields": [
+                { "name": "priority", "is_on_bug_entry": false },
+                { "name": "cf_severity_extra", "is_on_bug_entry": true },
+            ]
+        })))
+        .mount(&mock)
+        .await;
+    let client = client_for(DISCOVERY_POLICY, &mock).await;
+
+    let result = call(&client, "bug_fields", json!({ "on_bug_entry_only": true })).await;
+    assert!(!is_error(&result), "{}", text_of(&result));
+    let envelope: Value = serde_json::from_str(&text_of(&result)).expect("JSON");
+    let names: Vec<&str> = envelope["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["cf_severity_extra"]);
+}
+
+#[tokio::test]
+async fn bug_fields_detail_includes_legal_value_names() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug/bug_status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "fields": [{
+                "name": "bug_status",
+                "display_name": "Status",
+                "is_custom": false,
+                "is_mandatory": false,
+                "is_on_bug_entry": false,
+                "values": [{ "name": "NEW" }, { "name": "CONFIRMED" }],
+            }]
+        })))
+        .mount(&mock)
+        .await;
+    let client = client_for(DISCOVERY_POLICY, &mock).await;
+
+    let result = call(
+        &client,
+        "bug_fields",
+        json!({ "field_names": ["bug_status"] }),
+    )
+    .await;
+    assert!(!is_error(&result), "{}", text_of(&result));
+    let envelope: Value = serde_json::from_str(&text_of(&result)).expect("JSON");
+    assert_eq!(envelope["fields"][0]["values"], json!(["NEW", "CONFIRMED"]));
+}
+
+#[tokio::test]
+async fn bug_fields_over_cap_makes_no_upstream_request() {
+    let mock = MockServer::start().await;
+    let client = client_for(DISCOVERY_POLICY, &mock).await;
+    let result = call(
+        &client,
+        "bug_fields",
+        json!({ "field_names": ["a", "b", "c", "d", "e", "f"] }),
+    )
+    .await;
+    assert!(is_error(&result));
+    assert_eq!(text_of(&result), "At most 5 field names per call");
+    assert!(
+        mock.received_requests().await.unwrap().is_empty(),
+        "the cap refusal must make zero upstream requests"
+    );
+}
+
+#[tokio::test]
+async fn discovery_tools_absent_from_the_listing_by_default() {
+    let mock = MockServer::start().await;
+    let client = client_for("", &mock).await;
+    let tools = client
+        .list_all_tools()
+        .await
+        .expect("list_tools must succeed");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert!(!names.contains(&"bugzilla_products"));
+    assert!(!names.contains(&"bug_fields"));
+
+    let client = client_for(DISCOVERY_POLICY, &mock).await;
+    let tools = client
+        .list_all_tools()
+        .await
+        .expect("list_tools must succeed");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert!(names.contains(&"bugzilla_products"));
+    assert!(names.contains(&"bug_fields"));
+}

@@ -589,6 +589,15 @@ pub struct GlobalGuards {
     /// Bugzilla's own `eq` — case-sensitive (see DESIGN.md).
     #[serde(default)]
     pub identity_login: Option<String>,
+    /// Whether the product/field discovery tools (`bugzilla_products`,
+    /// `bug_fields`) are exposed at all. Defaults to `false`: they return
+    /// instance metadata exactly as Bugzilla returned it, unfiltered by
+    /// this policy (I16), so an operator who treats product or field names
+    /// as confidential must opt in explicitly rather than rely on a
+    /// filtered catalog — filtering it would itself be a
+    /// policy-enumeration oracle.
+    #[serde(default)]
+    pub allow_discovery: bool,
 }
 
 fn default_max_attachment_bytes() -> u64 {
@@ -607,6 +616,7 @@ impl Default for GlobalGuards {
             max_attachment_bytes: default_max_attachment_bytes(),
             identity_source: IdentitySource::default(),
             identity_login: None,
+            allow_discovery: false,
         }
     }
 }
@@ -1765,6 +1775,15 @@ products = ["SUSE*"]
         assert!(!d.global.allow_private_comments); // I5
         assert!(!d.global.read_only);
         assert_eq!(d.global.min_bug_age_days, 0);
+        assert!(!d.global.allow_discovery); // I16: off unless opted in
+    }
+
+    #[test]
+    fn allow_discovery_defaults_false_and_parses_true() {
+        let p = Policy::from_toml_str("").unwrap();
+        assert!(!p.global.allow_discovery);
+        let p = Policy::from_toml_str("[global]\nallow_discovery = true\n").unwrap();
+        assert!(p.global.allow_discovery);
     }
 
     #[test]

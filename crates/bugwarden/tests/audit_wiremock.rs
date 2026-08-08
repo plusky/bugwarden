@@ -272,6 +272,16 @@ async fn mount_fixture(mock: &MockServer) {
         .respond_with(ResponseTemplate::new(200).set_body_string("<html>quicksearch</html>"))
         .mount(mock)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/product_enterable"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ids": [] })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "fields": [] })))
+        .mount(mock)
+        .await;
 }
 
 /// Minimal valid arguments for each routed tool against [`mount_fixture`].
@@ -307,6 +317,8 @@ fn minimal_args(tool: &str) -> Value {
         "download_attachment" => json!({ "attachment_id": 55 }),
         "bug_url" => json!({ "bug_id": 7 }),
         "bugzilla_server_info" => json!({}),
+        "bugzilla_products" => json!({}),
+        "bug_fields" => json!({}),
         "quicksearch_syntax" => json!({}),
         "mcp_server_info" => json!({}),
         "summarize_bug" => json!({ "id": 7 }),
@@ -318,7 +330,9 @@ fn minimal_args(tool: &str) -> Value {
 async fn every_routed_tool_writes_exactly_one_record_per_call() {
     let mock = MockServer::start().await;
     mount_fixture(&mock).await;
-    let audited = audited_client_for("", &mock, "test-key").await;
+    // allow_discovery = true so the full router — discovery tools included
+    // (I16) — is exercised by this one-record-per-call guarantee (I15).
+    let audited = audited_client_for("[global]\nallow_discovery = true\n", &mock, "test-key").await;
 
     let tools = audited
         .client

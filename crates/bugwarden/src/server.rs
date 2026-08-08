@@ -138,6 +138,10 @@ pub const WRITE_TOOLS: &[&str] = &[
     "add_attachment",
 ];
 
+/// Names of the product/field discovery tools. These routes are removed
+/// from the router unless `global.allow_discovery = true` (I13, I16).
+pub const DISCOVERY_TOOLS: &[&str] = &["bugzilla_products", "bug_fields"];
+
 /// Success result: ONE text block containing pretty-printed JSON.
 fn ok_json(value: Value) -> CallToolResult {
     let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
@@ -212,6 +216,8 @@ fn audit_refusal_text(tool: &str) -> Option<String> {
         "list_attachments" => "Failed to fetch bug attachments".to_string(),
         "download_attachment" => "Failed to fetch attachment".to_string(),
         "bugzilla_server_info" => "Failed to fetch bugzilla server info".to_string(),
+        "bugzilla_products" => "Failed to fetch products".to_string(),
+        "bug_fields" => "Failed to fetch bug fields".to_string(),
         "quicksearch_syntax" => "Failed to fetch quicksearch documentation".to_string(),
         "bug_url" => "Failed to compute the bug url".to_string(),
         "mcp_server_info" => "Failed to compute server info".to_string(),
@@ -261,6 +267,7 @@ const PARAM_ALLOWLIST: &[&str] = &[
     "depends_on_add",
     "depends_on_remove",
     "duplicate_of",
+    "field_names",
     "file_name",
     "groups",
     "id",
@@ -274,10 +281,12 @@ const PARAM_ALLOWLIST: &[&str] = &[
     "limit",
     "new_since",
     "offset",
+    "on_bug_entry_only",
     "op_sys",
     "platform",
     "priority",
     "product",
+    "products",
     "query",
     "resolution",
     "severity",
@@ -563,6 +572,148 @@ fn id_list_advisory(query: &str, status: &str) -> Option<String> {
             .to_string()
     };
     Some(format!("{semantics} {steer}"))
+}
+
+/// Cap on named entries in one discovery call
+/// ([`BugzillaProductsParams::products`], [`BugFieldsParams::field_names`]):
+/// the catalog of a large instance is hundreds of KB and lands verbatim in
+/// the model's context, so the detail path is capped rather than left
+/// unbounded (I16).
+const MAX_DISCOVERY_NAMES: usize = 5;
+
+/// Project one `/rest/product` response object to the catalog shape
+/// (`bugzilla_products` with no `products` named): `{id, name}` only.
+fn project_product_catalog(envelope: &Value) -> Vec<Value> {
+    envelope
+        .get("products")
+        .and_then(Value::as_array)
+        .map(|products| {
+            products
+                .iter()
+                .map(|p| {
+                    json!({
+                        "id": p.get("id").cloned().unwrap_or(Value::Null),
+                        "name": p.get("name").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Project one `/rest/product` response object to the detail shape
+/// (`bugzilla_products` with `products` named). `default_assigned_to` and
+/// `default_qa_contact` are account emails and are stripped by never being
+/// selected — an enforced omission, not an unenforced `include_fields`
+/// request (I16).
+fn project_product_detail(envelope: &Value) -> Vec<Value> {
+    envelope
+        .get("products")
+        .and_then(Value::as_array)
+        .map(|products| products.iter().map(project_one_product).collect())
+        .unwrap_or_default()
+}
+
+fn project_one_product(p: &Value) -> Value {
+    fn named_list(p: &Value, key: &str) -> Vec<Value> {
+        p.get(key)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|i| {
+                        json!({
+                            "name": i.get("name").cloned().unwrap_or(Value::Null),
+                            "is_active": i.get("is_active").cloned().unwrap_or(Value::Null),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    let components: Vec<Value> = p
+        .get("components")
+        .and_then(Value::as_array)
+        .map(|cs| {
+            cs.iter()
+                .map(|c| {
+                    json!({
+                        "name": c.get("name").cloned().unwrap_or(Value::Null),
+                        "description": c.get("description").cloned().unwrap_or(Value::Null),
+                        "is_active": c.get("is_active").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "name": p.get("name").cloned().unwrap_or(Value::Null),
+        "description": p.get("description").cloned().unwrap_or(Value::Null),
+        "is_active": p.get("is_active").cloned().unwrap_or(Value::Null),
+        "default_milestone": p.get("default_milestone").cloned().unwrap_or(Value::Null),
+        "has_unconfirmed": p.get("has_unconfirmed").cloned().unwrap_or(Value::Null),
+        "components": components,
+        "versions": named_list(p, "versions"),
+        "milestones": named_list(p, "milestones"),
+    })
+}
+
+/// The fields common to both `bug_fields` shapes — everything but `values`.
+fn project_field_common(f: &Value) -> Value {
+    let has_values = f
+        .get("values")
+        .and_then(Value::as_array)
+        .is_some_and(|v| !v.is_empty());
+    json!({
+        "name": f.get("name").cloned().unwrap_or(Value::Null),
+        "display_name": f.get("display_name").cloned().unwrap_or(Value::Null),
+        "type": f.get("type").cloned().unwrap_or(Value::Null),
+        "is_custom": f.get("is_custom").cloned().unwrap_or(Value::Null),
+        "is_mandatory": f.get("is_mandatory").cloned().unwrap_or(Value::Null),
+        "is_on_bug_entry": f.get("is_on_bug_entry").cloned().unwrap_or(Value::Null),
+        "visibility_field": f.get("visibility_field").cloned().unwrap_or(Value::Null),
+        "visibility_values": f.get("visibility_values").cloned().unwrap_or(Value::Null),
+        "has_values": json!(has_values),
+    })
+}
+
+/// Project the `/rest/field/bug` catalog response (`bug_fields` with no
+/// `field_names`): every field via [`project_field_common`] — never
+/// `values`, which is what makes the catalog cheap — optionally filtered to
+/// fields Bugzilla marks `is_on_bug_entry`.
+fn project_field_catalog(envelope: &Value, on_bug_entry_only: bool) -> Vec<Value> {
+    envelope
+        .get("fields")
+        .and_then(Value::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter(|f| {
+                    !on_bug_entry_only
+                        || f.get("is_on_bug_entry")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                })
+                .map(project_field_common)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Project one `/rest/field/bug/{name}` response to the detail shape
+/// (`bug_fields` with `field_names` named): [`project_field_common`] plus
+/// `values`, reduced to the legal value NAMES only.
+fn project_field_detail(f: &Value) -> Value {
+    let mut obj = project_field_common(f);
+    let values: Vec<Value> = f
+        .get("values")
+        .and_then(Value::as_array)
+        .map(|vs| vs.iter().filter_map(|v| v.get("name").cloned()).collect())
+        .unwrap_or_default();
+    if let Value::Object(map) = &mut obj {
+        map.insert("values".to_string(), Value::Array(values));
+    }
+    obj
 }
 
 /// Project a bug object to the requested field set, preserving the
@@ -971,6 +1122,26 @@ pub struct SummarizeBugParams {
     pub id: u64,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct BugzillaProductsParams {
+    /// Product names to fetch detail for (max 5): components, versions,
+    /// milestones. Omit for the catalog of enterable product names only.
+    #[serde(default)]
+    pub products: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct BugFieldsParams {
+    /// Field names to fetch full detail for, including legal values (max
+    /// 5). Omit for the catalog, which never carries legal values.
+    #[serde(default)]
+    pub field_names: Vec<String>,
+    /// Restrict the catalog to fields Bugzilla marks shown on bug entry.
+    /// Ignored when `field_names` is set.
+    #[serde(default)]
+    pub on_bug_entry_only: bool,
+}
+
 /// The MCP server: guard policy, Bugzilla client, and the pruned tool
 /// router (I13). Construct with [`BugWarden::new`]; serve over any rmcp
 /// transport.
@@ -1064,6 +1235,12 @@ impl BugWarden {
         for name in &guard.policy.global.disabled_tools {
             tracing::info!(tool = %name, "policy: removing disabled tool");
             tool_router.remove_route(name);
+        }
+        if !guard.policy.global.allow_discovery {
+            for name in DISCOVERY_TOOLS {
+                tracing::info!(tool = name, "discovery disabled: removing tool");
+                tool_router.remove_route(name);
+            }
         }
         Ok(Self {
             cfg,
@@ -2621,6 +2798,102 @@ impl BugWarden {
     }
 
     #[tool(
+        description = "Lists this Bugzilla instance's products, or fetches detail for up to 5 named products (components, versions, milestones). Returned exactly as Bugzilla reports it to this server's key — never filtered by this server's guard policy. Only present when the operator enabled global.allow_discovery.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn bugzilla_products(
+        &self,
+        Parameters(p): Parameters<BugzillaProductsParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        tracing::info!(product_count = p.products.len(), "tool: bugzilla_products");
+        let key = self.api_key(&ctx)?;
+        if p.products.len() > MAX_DISCOVERY_NAMES {
+            note_refused(&ctx);
+            return Ok(err_text(format!(
+                "At most {MAX_DISCOVERY_NAMES} products per call"
+            )));
+        }
+        if p.products.is_empty() {
+            let ids = match self.bz.enterable_product_ids(&key).await {
+                Ok(ids) => ids,
+                Err(e) => return Ok(err_text(format!("Failed to fetch products\nReason: {e}"))),
+            };
+            if ids.is_empty() {
+                return Ok(ok_json(json!({ "products": [] })));
+            }
+            match self
+                .bz
+                .products(&key, &ids, &[], Some(&["id", "name"]))
+                .await
+            {
+                Ok(v) => Ok(ok_json(json!({ "products": project_product_catalog(&v) }))),
+                Err(e) => Ok(err_text(format!("Failed to fetch products\nReason: {e}"))),
+            }
+        } else {
+            let names: Vec<&str> = p.products.iter().map(String::as_str).collect();
+            match self.bz.products(&key, &[], &names, None).await {
+                Ok(v) => Ok(ok_json(json!({ "products": project_product_detail(&v) }))),
+                Err(e) => Ok(err_text(format!("Failed to fetch products\nReason: {e}"))),
+            }
+        }
+    }
+
+    #[tool(
+        description = "Lists this Bugzilla instance's bug fields (without legal values), or fetches detail for up to 5 named fields including their legal values. Returned exactly as Bugzilla reports it to this server's key — never filtered by this server's guard policy. Only present when the operator enabled global.allow_discovery.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn bug_fields(
+        &self,
+        Parameters(p): Parameters<BugFieldsParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        tracing::info!(
+            field_count = p.field_names.len(),
+            on_bug_entry_only = p.on_bug_entry_only,
+            "tool: bug_fields"
+        );
+        let key = self.api_key(&ctx)?;
+        if p.field_names.len() > MAX_DISCOVERY_NAMES {
+            note_refused(&ctx);
+            return Ok(err_text(format!(
+                "At most {MAX_DISCOVERY_NAMES} field names per call"
+            )));
+        }
+        if p.field_names.is_empty() {
+            match self.bz.bug_fields(&key, None).await {
+                Ok(v) => Ok(ok_json(json!({
+                    "fields": project_field_catalog(&v, p.on_bug_entry_only)
+                }))),
+                Err(e) => Ok(err_text(format!("Failed to fetch bug fields\nReason: {e}"))),
+            }
+        } else {
+            let mut fields = Vec::with_capacity(p.field_names.len());
+            for name in &p.field_names {
+                let v = match self.bz.bug_fields(&key, Some(name)).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Ok(err_text(format!("Failed to fetch bug fields\nReason: {e}")))
+                    }
+                };
+                match v
+                    .get("fields")
+                    .and_then(Value::as_array)
+                    .and_then(|f| f.first())
+                {
+                    Some(field) => fields.push(project_field_detail(field)),
+                    None => {
+                        return Ok(err_text(format!(
+                            "Failed to fetch bug fields\nReason: no such field '{name}'"
+                        )))
+                    }
+                }
+            }
+            Ok(ok_json(json!({ "fields": fields })))
+        }
+    }
+
+    #[tool(
         description = "Access the documentation of the bugzilla quicksearch syntax. LLM can learn using this tool. Response is in HTML. Note: through this server's bugs_quicksearch the status filter is prefixed to the query, so under any non-empty status (the default is ALL) a number in the query is content-matched as text; the syntax page's jump-to-bug-number shortcut applies only when status is empty and the query is nothing but numbers. Look up known bug ids with the bug_info tool.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
@@ -3564,6 +3837,38 @@ mod tests {
         let server = BugWarden::new(cfg, guard, bz).expect("server builds");
         assert!(server.tool_router.has_route("create_bug"));
         assert!(server.tool_router.has_route("add_attachment"));
+    }
+
+    #[test]
+    fn discovery_tools_absent_by_default_present_when_enabled_i16() {
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz).expect("server builds");
+        for name in DISCOVERY_TOOLS {
+            assert!(
+                !server.tool_router.has_route(name),
+                "discovery tool {name} must be absent by default (I16)"
+            );
+        }
+
+        let (cfg, guard, bz) = parts("[global]\nallow_discovery = true\n");
+        let server = BugWarden::new(cfg, guard, bz).expect("server builds");
+        for name in DISCOVERY_TOOLS {
+            assert!(
+                server.tool_router.has_route(name),
+                "discovery tool {name} must be present under allow_discovery = true"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_tools_names_a_discovery_tool_with_discovery_off() {
+        // A discovery tool name stays a valid disabled_tools entry even
+        // though discovery-off removes its route first (validation runs
+        // against the full router, same ordering as read-only/I13).
+        let (cfg, guard, bz) = parts("[global]\ndisabled_tools = [\"bug_fields\"]\n");
+        let server = BugWarden::new(cfg, guard, bz).expect("discovery tool name must stay valid");
+        assert!(!server.tool_router.has_route("bug_fields"));
+        assert!(!server.tool_router.has_route("bugzilla_products"));
     }
 
     #[test]
