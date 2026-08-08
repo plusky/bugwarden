@@ -21,7 +21,11 @@
 //!   instead of falling back to `context.meta` (the inverse mutant,
 //!   reading only `context.meta`, is behavior-preserving over every
 //!   serialized transport and is killed by the direct in-process call
-//!   test in server.rs instead).
+//!   test in server.rs instead);
+//! - the POST body cap going back to a fixed value, which refuses uploads
+//!   the operator's `global.max_attachment_bytes` permits, or losing its
+//!   4 MiB floor, which would let a policy shrink the transport's memory
+//!   bound (or remove it entirely at `0`).
 
 use std::io::Write as _;
 use std::net::SocketAddr;
@@ -84,13 +88,15 @@ async fn serve_http(
         server = server.with_audit(audit);
     }
 
+    // The deployed configuration, not a default one, and derived the way
+    // main derives it: the server reads its OWN policy for the POST body
+    // cap, so this harness cannot agree with a deployment that reads a
+    // different field or a constant.
+    let config = server.http_server_config();
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
-        // The deployed configuration, not a default one: the transport
-        // knobs bugwarden sets by name are only tested if the harness
-        // serves what a deployment serves.
-        bugwarden::server::http_server_config(),
+        config,
     );
     let router = axum::Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -639,4 +645,98 @@ async fn traceparent_over_http_lands_in_the_audit_record() {
         .expect("the traced call's record must carry the sent ids");
     assert_eq!(trace.trace_id, "0af7651916cd43dd8448eb211c80319c");
     assert_eq!(trace.span_id, "b7ad6b7169203331");
+}
+
+/// POST a raw JSON-RPC `initialize` whose serialized body is at least
+/// `bytes` long, and answer with the HTTP status the transport gave it.
+///
+/// The size rides on `clientInfo.title`, a plain string field: what is
+/// under test is the transport's body cap, which is applied while the body
+/// is still being collected — before any tool, session or guard exists —
+/// so the cheapest well-formed request that the cap can refuse is the
+/// handshake itself. A body the cap admits is answered `200`; one it
+/// refuses is answered `413` with no JSON-RPC message at all.
+async fn initialize_body_of(addr: SocketAddr, bytes: usize) -> reqwest::StatusCode {
+    let request = |title: String| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "cap-test", "version": "1", "title": title }
+            }
+        })
+    };
+    let envelope = serde_json::to_vec(&request(String::new()))
+        .expect("serialize")
+        .len();
+    let body = serde_json::to_vec(&request("A".repeat(bytes.saturating_sub(envelope))))
+        .expect("serialize");
+    assert!(
+        body.len() >= bytes,
+        "the padding must reach the target size"
+    );
+
+    reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("the request must reach the server")
+        .status()
+}
+
+#[tokio::test]
+async fn the_body_cap_follows_the_policy_attachment_ceiling() {
+    // Issue #52: two ceilings governed one thing. The transport's POST cap
+    // was pinned at 4 MiB, so base64 expansion (4/3) plus JSON-RPC framing
+    // put every `max_attachment_bytes` above ~3 MiB out of reach: the
+    // operator raised the limit, and the transport refused the upload
+    // anyway — with a bare 413 that reaches no tool and therefore leaves no
+    // audit record. The cap is now derived from the policy, so what the
+    // guard permits is what the transport admits.
+    let mock = MockServer::start().await;
+    let file = key_file("srv-key\n");
+
+    // 6 MiB decoded => ceil(6 MiB / 3) * 4 + 1 MiB framing = 9 MiB of body.
+    let permissive = serve_http(
+        http_cli(&mock, Some(file.path())),
+        "[global]\nmax_attachment_bytes = 6291456\n",
+        &mock,
+        None,
+    )
+    .await;
+    let admitted = initialize_body_of(permissive, 5 * 1024 * 1024).await;
+    assert_eq!(
+        admitted, 200,
+        "a body the policy's own attachment cap permits must not be refused \
+         by the transport"
+    );
+    assert_eq!(
+        initialize_body_of(permissive, 10 * 1024 * 1024).await,
+        413,
+        "past the derived cap the memory bound still holds"
+    );
+
+    // Nothing was loosened for everyone else: under the default policy the
+    // 4 MiB floor stands, and the very same 5 MiB body is refused.
+    let floored = serve_http(http_cli(&mock, Some(file.path())), "", &mock, None).await;
+    assert_eq!(
+        initialize_body_of(floored, 5 * 1024 * 1024).await,
+        413,
+        "a policy that permits no such attachment keeps the 4 MiB floor"
+    );
+
+    // A refused body reaches neither tool nor guard, so it also reaches no
+    // upstream: 413 is a transport verdict, invisible to the audit stream.
+    let upstream = mock.received_requests().await.unwrap_or_default();
+    assert!(
+        upstream.is_empty(),
+        "no handshake may contact Bugzilla: {} request(s)",
+        upstream.len()
+    );
 }

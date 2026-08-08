@@ -346,38 +346,64 @@ fn client_of(ctx: &RequestContext<RoleServer>) -> audit::ClientInfo {
     }
 }
 
-/// The streamable-HTTP transport configuration this build serves with.
+/// The POST body cap this build pinned before it was derived from policy,
+/// and the floor it never goes below.
+const MAX_REQUEST_BODY_FLOOR: usize = 4 * 1024 * 1024;
+
+/// The largest POST body this build will buffer, whatever the policy says.
 ///
-/// Lives here rather than in `main` so the integration tests serve the
-/// configuration a deployment actually gets. These rmcp 3.1 defaults are set
-/// by name rather than inherited, because inheriting them changes how a
-/// deployment behaves without anyone choosing it:
+/// The transport collects a body before anything inspects it, so the cap is
+/// a memory bound first and an attachment allowance second. 64 MiB carries
+/// every decoded `max_attachment_bytes` up to ~47 MiB, far above any
+/// plausible Bugzilla attachment limit, while keeping the bound finite for
+/// the values that are not a considered number at all — an "unlimited"
+/// spelled as a huge integer, or a typo with too many digits.
+const MAX_REQUEST_BODY_CEILING: usize = 64 * 1024 * 1024;
+
+/// The transport's POST body cap for a policy whose decoded attachment
+/// ceiling is `max_attachment_bytes` (`0` = no policy cap).
 ///
-/// * `allowed_hosts` defaults to loopback only — a DNS-rebinding defence
-///   for MCP servers a browser can reach on `localhost`. bugwarden is
-///   reached by MCP clients at whatever address the operator bound and
-///   named, so that default would refuse every deployment not addressed as
-///   `localhost`, containers included. Disabled deliberately: the access
-///   control here is the network boundary, and per-caller authentication
-///   when it lands (issue #32).
-/// * `max_request_body_bytes` is a 4 MiB POST cap with no rmcp 2.2
-///   equivalent. Worth keeping as a memory bound, but it also ceilings
-///   `add_attachment` independently of the operator's
-///   `global.max_attachment_bytes`, so it is pinned to the SDK's current
-///   value: an SDK bump must not move an operator-visible limit. Issue #52
-///   reconciles the two ceilings.
+/// Sized so that every upload the guard would allow fits through the
+/// transport: `add_attachment` takes its payload base64-encoded, which
+/// expands the decoded bytes by 4/3 (`ceil(n / 3) * 4`, padding included),
+/// and 1 MiB of headroom covers the JSON-RPC envelope plus the call's other
+/// arguments — `file_name`, `summary`, `content_type`, `comment`. The
+/// expansion assumes canonical unwrapped base64, which is what MCP clients
+/// send; an encoder that wraps its output at a line length spends another
+/// ~1.4% on separators, eroding that headroom for decoded caps above
+/// roughly 30 MiB.
 ///
-/// `allowed_origins` is the browser-facing sibling of `allowed_hosts` and the
-/// same reasoning covers it, but it is left inherited: its empty default IS
-/// the disabled state, so naming it would assert nothing. Anything that
-/// changes the `allowed_hosts` call above should decide this one too rather
-/// than leave it behind. The remaining fields, and why each stays inherited,
-/// are inventoried in DESIGN.md under "rmcp 3.1 usage notes"; the caller in
-/// `main` adds `cancellation_token` so shutdown reaches the live transport.
-pub fn http_server_config() -> StreamableHttpServerConfig {
-    StreamableHttpServerConfig::default()
-        .disable_allowed_hosts()
-        .with_max_request_body_bytes(4 * 1024 * 1024)
+/// Clamped at both ends, and the clamps are the point:
+///
+/// * never below `MAX_REQUEST_BODY_FLOOR` — the value this build served
+///   before the cap was derived, so non-attachment traffic and the
+///   transport's memory bound are unchanged by the derivation, and a policy
+///   that lowers `max_attachment_bytes` cannot shrink the body cap under
+///   ordinary requests. `0` returns the floor too: it means "the guard
+///   imposes no attachment ceiling", not "the transport imposes no memory
+///   bound";
+/// * never above `MAX_REQUEST_BODY_CEILING` — over HTTP an unbounded body
+///   is an unbounded-memory lever for anyone who can reach the port, and no
+///   policy value may hand that out, whether it is `0` or a number so large
+///   the derivation would saturate. The honest consequence: a policy cap
+///   above ~47 MiB decoded is NOT honored over HTTP, exactly as `0` is not
+///   honored as "unlimited" there. Both are deliberate, and recorded in
+///   DESIGN.md.
+///
+/// Saturating throughout: `max_attachment_bytes` is operator input and may
+/// be `u64::MAX`, where the derivation must clamp rather than panic in
+/// debug or wrap in release.
+fn max_request_body_bytes(max_attachment_bytes: u64) -> usize {
+    if max_attachment_bytes == 0 {
+        return MAX_REQUEST_BODY_FLOOR;
+    }
+    let needed = max_attachment_bytes
+        .div_ceil(3)
+        .saturating_mul(4)
+        .saturating_add(1024 * 1024);
+    usize::try_from(needed)
+        .unwrap_or(usize::MAX)
+        .clamp(MAX_REQUEST_BODY_FLOOR, MAX_REQUEST_BODY_CEILING)
 }
 
 /// Whether this request took rmcp's handshake-free lifecycle.
@@ -1258,6 +1284,68 @@ impl BugWarden {
     pub fn with_audit(mut self, audit: Arc<AuditState>) -> Self {
         self.audit = Some(audit);
         self
+    }
+
+    /// The streamable-HTTP transport configuration this server is served
+    /// with.
+    ///
+    /// A method on the server rather than a free function taking the cap,
+    /// so the transport is sized from the very policy this instance
+    /// enforces: the deployment and its integration tests cannot end up
+    /// deriving the limit from a different value than the guard uses, and
+    /// there is one place where the policy field is read. Call it before
+    /// the server moves into the service closure.
+    ///
+    /// These rmcp 3.1 defaults are set by name rather than inherited,
+    /// because inheriting them changes how a deployment behaves without
+    /// anyone choosing it:
+    ///
+    /// * `allowed_hosts` defaults to loopback only — a DNS-rebinding
+    ///   defence for MCP servers a browser can reach on `localhost`.
+    ///   bugwarden is reached by MCP clients at whatever address the
+    ///   operator bound and named, so that default would refuse every
+    ///   deployment not addressed as `localhost`, containers included.
+    ///   Disabled deliberately: the access control here is the network
+    ///   boundary, and per-caller authentication when it lands (issue #32).
+    /// * `max_request_body_bytes` is a POST cap with no rmcp 2.2
+    ///   equivalent, worth keeping as a memory bound — but it also ceilings
+    ///   `add_attachment`, so a fixed value silently overrides the
+    ///   operator's `global.max_attachment_bytes`: at the SDK's 4 MiB,
+    ///   base64 expansion alone put every decoded cap above ~3 MiB out of
+    ///   reach, and the upload the operator had permitted was refused by
+    ///   the transport (issue #52). It is therefore derived from this
+    ///   server's policy by `max_request_body_bytes` — `ceil(cap / 3) * 4`
+    ///   for the encoding plus 1 MiB of framing headroom, clamped to
+    ///   `MAX_REQUEST_BODY_FLOOR` (4 MiB, which `0` also returns) and
+    ///   `MAX_REQUEST_BODY_CEILING` (64 MiB, so no policy value can ask
+    ///   this transport to buffer without bound). Derived, not inherited:
+    ///   an SDK bump still must not move an operator-visible limit.
+    ///
+    /// A body over that cap is refused by rmcp's tower layer with a bare
+    /// `413`, which reaches neither `call_tool` nor the guard — so it
+    /// leaves NO audit record and names neither the tool nor the caller,
+    /// the same unrecordability as a pre-handler auth refusal (issue #32).
+    /// An operator diagnosing a 413 therefore has to compare the request
+    /// body's size with the cap derived here from
+    /// `global.max_attachment_bytes`, since nothing on the server side will
+    /// have recorded the attempt. That the boundary is observable to an
+    /// unauthenticated client, and what it discloses, is recorded in
+    /// DESIGN.md under "rmcp 3.1 usage notes".
+    ///
+    /// `allowed_origins` is the browser-facing sibling of `allowed_hosts`
+    /// and the same reasoning covers it, but it is left inherited: its
+    /// empty default IS the disabled state, so naming it would assert
+    /// nothing. Anything that changes the `allowed_hosts` call below should
+    /// decide this one too rather than leave it behind. The remaining
+    /// fields, and why each stays inherited, are inventoried in DESIGN.md
+    /// under "rmcp 3.1 usage notes"; the caller in `main` adds
+    /// `cancellation_token` so shutdown reaches the live transport.
+    pub fn http_server_config(&self) -> StreamableHttpServerConfig {
+        StreamableHttpServerConfig::default()
+            .disable_allowed_hosts()
+            .with_max_request_body_bytes(max_request_body_bytes(
+                self.guard.policy.global.max_attachment_bytes,
+            ))
     }
 
     /// Turn a silent identity blackout into a loud startup failure.
@@ -4816,5 +4904,90 @@ mod tests {
             agent.starts_with(&format!("{}/{}", identity.name, identity.version)),
             "the wire identity must match the handshake's {identity:?}: {agent}"
         );
+    }
+
+    #[test]
+    fn no_policy_cap_still_bounds_the_request_body() {
+        // `0` means the guard imposes no attachment ceiling. It must NOT
+        // mean an unbounded POST body: the transport buffers what it
+        // accepts, so an unbounded body is an unbounded-memory lever for
+        // anyone who can reach the port.
+        assert_eq!(max_request_body_bytes(0), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_default_attachment_cap_leaves_the_body_cap_at_the_floor() {
+        // 2 MiB decoded expands to ~2.67 MiB encoded plus 1 MiB framing —
+        // still under the floor, so the default policy serves exactly the
+        // 4 MiB this build served before the cap was derived.
+        let default_cap = Policy::default().global.max_attachment_bytes;
+        assert_eq!(default_cap, 2 * 1024 * 1024, "the default policy moved");
+        assert_eq!(max_request_body_bytes(default_cap), MAX_REQUEST_BODY_FLOOR);
+    }
+
+    #[test]
+    fn a_raised_attachment_cap_raises_the_body_cap() {
+        // The bug in #52: at 3 MiB decoded the base64 payload alone is
+        // 4 MiB, so the old pin refused an upload the policy permitted.
+        let cap = 3 * 1024 * 1024;
+        let derived = max_request_body_bytes(cap);
+        assert!(
+            derived > MAX_REQUEST_BODY_FLOOR,
+            "a cap the floor cannot carry must raise it: {derived}"
+        );
+        assert_eq!(derived, 3 * 1024 * 1024 / 3 * 4 + 1024 * 1024);
+    }
+
+    #[test]
+    fn the_encoded_size_rounds_up_to_the_base64_quantum() {
+        // A cap that is not a multiple of 3: base64 pads the trailing group
+        // out to four characters, so the encoded size rounds UP. Truncating
+        // division would size the transport one quantum short of the
+        // largest upload the policy permits — the #52 bug in miniature, and
+        // invisible to any test whose cap divides by 3.
+        let cap = 3 * 1024 * 1024 + 1;
+        assert_eq!(
+            max_request_body_bytes(cap),
+            (1024 * 1024 + 1) * 4 + 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn a_cap_past_the_ceiling_clamps_to_it() {
+        // 47.25 MiB decoded is the largest cap the ceiling can carry:
+        // ceil(n / 3) * 4 + 1 MiB lands exactly on 64 MiB. Just under it
+        // the derivation is still doing arithmetic, not clamping; just over
+        // it the memory bound takes precedence over the policy's wish.
+        const EXACTLY_THE_CEILING: u64 = 49_545_216;
+        assert_eq!(
+            max_request_body_bytes(EXACTLY_THE_CEILING),
+            MAX_REQUEST_BODY_CEILING
+        );
+        assert_eq!(
+            max_request_body_bytes(EXACTLY_THE_CEILING - 3),
+            MAX_REQUEST_BODY_CEILING - 4,
+            "below the ceiling the cap must still follow the policy"
+        );
+        assert_eq!(
+            max_request_body_bytes(EXACTLY_THE_CEILING + 3),
+            MAX_REQUEST_BODY_CEILING
+        );
+    }
+
+    #[test]
+    fn an_enormous_attachment_cap_clamps_instead_of_overflowing() {
+        // Operator input, so u64::MAX is reachable — an "unlimited" spelled
+        // as a huge number, or a typo. Neither may become an unbounded POST
+        // body: the transport buffers what it accepts before any guard
+        // runs, so the memory bound has to survive every input. The
+        // arithmetic saturates on the way (at three quarters of the u64
+        // range the framing headroom overflows; at u64::MAX the base64
+        // expansion does) rather than panicking in debug or wrapping to a
+        // tiny cap in release, and the clamp then lands on the ceiling.
+        assert_eq!(
+            max_request_body_bytes(u64::MAX / 4 * 3),
+            MAX_REQUEST_BODY_CEILING
+        );
+        assert_eq!(max_request_body_bytes(u64::MAX), MAX_REQUEST_BODY_CEILING);
     }
 }

@@ -123,10 +123,16 @@ async fn main() -> anyhow::Result<()> {
         Transport::Http => {
             let ct = tokio_util::sync::CancellationToken::new();
 
+            // Derived from the server's own guard policy (the POST body cap
+            // follows `global.max_attachment_bytes`, issue #52), so it is
+            // built while `server` can still be borrowed.
+            let config = server
+                .http_server_config()
+                .with_cancellation_token(ct.child_token());
             let service = StreamableHttpService::new(
                 move || Ok(server.clone()),
                 LocalSessionManager::default().into(),
-                bugwarden::server::http_server_config().with_cancellation_token(ct.child_token()),
+                config,
             );
             let router = axum::Router::new().nest_service("/mcp", service);
             let addr = format!("{}:{}", cfg.host, cfg.port);

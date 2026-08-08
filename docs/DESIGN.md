@@ -865,7 +865,7 @@ constraints the model must know.
 | bug_comments | id, include_private: bool = false, new_since? | comments | filter_comments applied (I5) |
 | bugs_quicksearch | query, status: String = "ALL", include_fields: String = "id,product,component,assigned_to,status,resolution,summary,last_change_time", limit: u32 = 50, offset: u32 = 0 | post-filter | fetch include_fields = requested ∪ CLASSIFY_FIELDS; after filter, project kept bugs to requested fields (keep `_redacted` marker); envelope `{"bugs":[..]}` only (I3), except an advisory `note` when the query is nothing but bug ids (comma/whitespace-separated, optional `#` per id) steering exact id sets to bug_info — the note is a pure function of the CLIENT'S REQUEST (the query and status strings), never of results, verdicts, or anything upstream said (no new oracle), and the `bugs` array is byte-identical with or without it (the query is still searched, never rerouted); its wording tracks the request: a non-empty status is prefixed to the query so upstream content-matches the whole expression, while an empty status sends the query bare and Bugzilla routes a bare all-number query to an exact id lookup (bug_id + anyexact) — on that path the note drops the content-matching claim — and a query naming more distinct ids than MAX_ASSESS_IDS steers to batched bug_info calls (the cap is already public in the too_many_ids refusal text) instead of straight into that refusal | **limit/offset address the bugs the client may SEE, not upstream rows** (Guard::quicksearch_window): filtering an already-paginated page left a hole exactly where a hidden bug sat — a short page the next offset contradicted — and since quicksearch matches summary text that hole was a probe for the hidden title, one word at a time. The guard now scans upstream from row 0 in 200-row chunks, classifies each, and fills the window from the survivors; rows are deduped on the server-reported id (relevance order is not stable between calls) and an id-less row is dropped (I4). Bounds: MAX_SEARCH_WINDOW=1000 addressable, 2000 rows scanned (<=10 sequential requests); hitting either truncates, which looks exactly like the end of results. The objects returned are the ones classified. The scan target is quantised to whole chunks so the stopping point does not track the client's `limit`; without that, `limit` could be binary-searched against the clock to recover each block's exact hidden count. Residual, accepted: filling a window of VISIBLE bugs needs more rows when bugs are hidden, so a stopwatch still learns one bit per scanned block ("not entirely visible"). Removing that would mean scanning the worst case on every search, or letting pages go short again. Search failure returns a bare "Search failed"; the upstream text is logged server-side only (it can name a bug and say whether it exists). The scan's accounting — rows examined, verdict-dropped ids — goes to the audit record only (`guard.scan` plus the suppressed-ids machinery, issue #29); the response is byte-identical with or without drops |
 | create_bug | product, component, summary, version, description = "", severity?, priority?, op_sys?, platform?, keywords?: Vec<String>, groups?: Vec<String> | create (write), judged on the bug AS REQUESTED (Guard::may_create) | there is no bug id to assess, so the request itself is classified BEFORE any upstream call (I8): the rules that hide a product by name refuse filing into it, a field the request omits fails closed (I4), and a client-claimed `groups` list is never trusted — Bugzilla unions the product's mandatory groups in server-side, so may_create forces groups to unknown, which means a group-consulting rule refuses every create request that REACHES it — creation is possible only where an earlier rule covering the create operation grants it (a rule carrying `operations = ["create"]`, placed ahead of the group-consulting rules, is how an operator permits filing without that grant shadowing reads of existing bugs — issue #26), and a policy with no such grant refuses all creation. **Both refusals are one refusal**: a policy refusal and an upstream failure return the same fixed create_denial text after the same single upstream request — the refused path burns one classify call against bug id 0 (never a valid id, creates nothing; download_attachment's padding precedent) instead of the POST. Two texts, or 0 vs 1 requests, would be a free policy-enumeration oracle: send a guaranteed-invalid `version` plus a probe product and read the policy off which refusal (or which latency) comes back, with nothing created. Residual, accepted: a SUCCESSFUL create still confirms the product is allowed — that is the tool doing its job, and it costs a real, attributable bug; and the padding equalizes request count, not the upstream handler's exact latency (GET classify vs rejected POST). Bugzilla's failure message is logged server-side only (it can say whether a product/component exists) |
-| add_attachment | bug_id, data (base64), file_name, summary, content_type, comment = "", is_private = false, is_patch = false | attach (write) on bug_id | guard assessment before the upload (I8), uniform denial (I2); then global.max_attachment_bytes caps the DECODED size of `data` (0 = no cap) — the ceiling the operator set on downloads binds uploads through the same server too, measured after base64 expansion is stripped so encoding overhead cannot shrink it. The refusal names neither the payload's size nor the cap value (max_attachment_bytes is not I1-disclosable, exactly as on the download path). `comment` travels as a PLAIN string — Bug.add_attachment documents it so; the `{"comment": {"body": ..}}` shape belongs to Bug.update only |
+| add_attachment | bug_id, data (base64), file_name, summary, content_type, comment = "", is_private = false, is_patch = false | attach (write) on bug_id | guard assessment before the upload (I8), uniform denial (I2); then global.max_attachment_bytes caps the DECODED size of `data` (0 = no cap) — the ceiling the operator set on downloads binds uploads through the same server too, measured after base64 expansion is stripped so encoding overhead cannot shrink it. The refusal names neither the payload's size nor the cap value (max_attachment_bytes is not I1-disclosable, exactly as on the download path). Over http that non-disclosure is partial and knowingly so: the transport's POST body cap is derived from this same value (#52), so its 413 boundary is probeable once the cap exceeds ~2.25 MiB decoded — accepted, with the reasoning, under "rmcp 3.1 usage notes" below. Nothing here changes: this refusal still names neither size nor cap. `comment` travels as a PLAIN string — Bug.add_attachment documents it so; the `{"comment": {"body": ..}}` shape belongs to Bug.update only |
 | add_comment | bug_id, comment, is_private: bool = false | comment (write) | |
 | update_bug_status | bug_id, status, resolution?, comment: String = "" | status (write) | CLOSED requires resolution (error otherwise); when reopening (status not CLOSED/VERIFIED and no resolution given) set `"resolution": ""` |
 | assign_bug | bug_id, assignee (email), comment = "" | assign (write) | payload `{"assigned_to": ..}` |
@@ -1158,8 +1158,8 @@ wired, `server.rs` and `main.rs` are the reference.
   pruned per deployment (I13), so a shared cache must never serve one
   deployment's list to another — and `CacheScope::default()` is `Public`.
 - **Every `StreamableHttpServerConfig` field is accounted for below** — set by
-  name or inherited for a stated reason. `http_server_config()` (server.rs)
-  names two; main.rs adds a third at the call site. The struct is
+  name or inherited for a stated reason. `BugWarden::http_server_config()`
+  (server.rs) names two; main.rs adds a third at the call site. The struct is
   `#[non_exhaustive]`, so an SDK bump may grow it: a field this table does not
   list is an unreviewed default, and adding the row is part of the bump, not a
   follow-up. Counting them in prose is what let two fields go unlisted here
@@ -1168,7 +1168,7 @@ wired, `server.rs` and `main.rs` are the reference.
   | field | rmcp 3.1 default | this build |
   |---|---|---|
   | `allowed_hosts` | `localhost`, `127.0.0.1`, `::1` | **set** — `disable_allowed_hosts()` |
-  | `max_request_body_bytes` | 4 MiB | **set** — pinned to that same 4 MiB |
+  | `max_request_body_bytes` | 4 MiB | **set** — derived from `global.max_attachment_bytes`, floored at that same 4 MiB (see below) |
   | `cancellation_token` | fresh token | **set** (main.rs) — a child of the process token |
   | `allowed_origins` | `[]`, i.e. validation off | inherited, deliberately |
   | `stateless_protocol_metadata_required` | `false` | inherited; #34 decides it |
@@ -1181,13 +1181,58 @@ wired, `server.rs` and `main.rs` are the reference.
   reach on localhost, and its default would refuse every deployment not
   addressed as `localhost`, containers included; bugwarden disables it
   deliberately, since its access control is the network boundary and, when it
-  lands, per-caller authentication (#32). `max_request_body_bytes` is a 4 MiB
-  POST cap with no rmcp 2.2 equivalent: kept as a memory bound but pinned to
-  the current SDK value, because it also ceilings `add_attachment`
-  independently of `global.max_attachment_bytes` and an SDK bump must not move
-  an operator-visible limit. Reconciling the two ceilings is #52. The
-  `cancellation_token` is named so ctrl_c tears the live transport down with
-  the process instead of leaving it to outlive the shutdown.
+  lands, per-caller authentication (#32). `max_request_body_bytes` is a POST
+  cap with no rmcp 2.2 equivalent: kept as a memory bound, but it also
+  ceilings `add_attachment`, so a fixed value silently overrides the
+  operator's `global.max_attachment_bytes` — at the SDK's 4 MiB, base64
+  expansion alone put every decoded cap above ~3 MiB out of reach (#52). It is
+  therefore **derived** from the policy, in `max_request_body_bytes`
+  (server.rs), which `BugWarden::http_server_config` calls with its own
+  guard's value — one place reads the policy field, so a deployment and its
+  tests cannot size the transport from different numbers.
+  `ceil(max_attachment_bytes / 3) * 4` for the base64 expansion, plus 1 MiB
+  of headroom for the JSON-RPC framing and the call's other arguments,
+  **clamped to [4 MiB, 64 MiB]** and saturating at every step (the policy
+  value is operator input up to `u64::MAX`, and this runs in the startup
+  path). Derived rather than inherited for the original reason: an SDK bump
+  still must not move an operator-visible limit. Both clamps exist because
+  the transport buffers a body before anything inspects it, so this is a
+  memory bound first and an attachment allowance second. The 4 MiB floor is
+  what this build served before the derivation, so ordinary traffic is
+  unchanged and a small policy cap cannot shrink it; `0` — "no policy cap" —
+  returns that floor rather than an unbounded body, since an unbounded body
+  is an unbounded-memory lever for anyone who can reach the port. The 64 MiB
+  ceiling says the same thing about a huge finite value, which is the same
+  operator intent spelled differently (an "unlimited", or a typo): it carries
+  every decoded cap up to ~47 MiB, far above any plausible Bugzilla
+  attachment limit, and refuses to let a policy number remove the bound.
+  Honest consequence, the mirror of the `0` case: a policy cap above ~47 MiB
+  decoded is not honored over HTTP. A body over the cap is refused by rmcp's
+  tower layer with a bare `413` that reaches neither `call_tool` nor the
+  guard, so it is **unrecordable** in the audit stream — the same class as a
+  pre-handler auth refusal (#32), and accepted on the same terms; an operator
+  diagnosing a 413 compares the body size against the derived cap, because
+  nothing server-side recorded the attempt.
+
+  That boundary is also observable to an unauthenticated client, which is
+  **ACCEPTED**: whenever the derivation exceeds the floor (a decoded cap above
+  ~2.25 MiB) the 413 threshold is a function of `max_attachment_bytes`, so
+  binary-searching body sizes recovers it — a value the add_attachment row
+  above and the download refusal deliberately do not disclose, neither the
+  size nor the cap. It is accepted for three reasons. Below ~2.25 MiB —
+  including the 2 MiB default and `0` — the cap is the constant 4 MiB floor
+  and discloses nothing about the policy at all. What leaks above it is a
+  memory-tuning number, not bug data: no rule name, no match criterion, no
+  bug's existence or content, so I1's "the policy file is never readable
+  through MCP" and I2/I3 are untouched — this is the one policy-derived
+  number a transport-level limit inherently exposes, in exchange for the
+  operator's configured limit actually working. And the probing itself needs
+  network reach, which is the access control until per-caller authentication
+  lands (#32); a caller who can binary-search POST sizes can already call
+  tools. If #32 changes that calculus, revisit here and at the add_attachment
+  row together. The `cancellation_token` is named so ctrl_c tears the live
+  transport down with the process instead of leaving it to outlive the
+  shutdown.
 
   `allowed_origins` is the browser-facing sibling of `allowed_hosts`, and the
   #32 argument covers it identically. It is inherited rather than named because
@@ -1235,7 +1280,7 @@ wired, `server.rs` and `main.rs` are the reference.
   update_bug_fields, update_bug_dependencies, add_cc_to_bug, mark_as_duplicate,
   create_bug, add_attachment.
 - API key resolution: a match on `key_custody` (resolved once at startup, see Key custody — never re-read per request): `Server(key)` => the server's key, without touching the request at all; `PerRequest` => `ctx.extensions.get::<axum::http::request::Parts>()`, then `parts.headers.get(lowercased_header_name)`.
-- HTTP serving: `StreamableHttpService::new(move || Ok(server.clone()), LocalSessionManager::default().into(), http_server_config().with_cancellation_token(ct.child_token()))` — never a bare `StreamableHttpServerConfig::default()`, see the field table above — then `axum::Router::new().nest_service("/mcp", service)`, `tokio::net::TcpListener::bind`, graceful shutdown on ctrl_c cancelling `ct`.
+- HTTP serving: `let config = server.http_server_config().with_cancellation_token(ct.child_token());` — built while `server` can still be borrowed, since the body cap comes from its own guard policy — then `StreamableHttpService::new(move || Ok(server.clone()), LocalSessionManager::default().into(), config)`, never a bare `StreamableHttpServerConfig::default()`, see the field table above — then `axum::Router::new().nest_service("/mcp", service)`, `tokio::net::TcpListener::bind`, graceful shutdown on ctrl_c cancelling `ct`.
 - Request `_meta` (SEP-414, e.g. `traceparent`): over every serialized
   transport the wire `params._meta` does NOT arrive in the params struct
   (`CallToolRequestParams.meta` stays `None`) — the SDK's custom
@@ -1471,7 +1516,17 @@ wired, `server.rs` and `main.rs` are the reference.
   http lands its ids in the audit record with the response unchanged —
   the end-to-end proof that the wire `_meta` is read from where the SDK
   delivers it (`RequestContext.meta`), not from the params-struct field
-  that stays empty over serialized transports.
+  that stays empty over serialized transports; and the derived POST body
+  cap (#52) — a ~5 MiB body is ADMITTED by a server whose policy sets
+  `max_attachment_bytes = 6 MiB`, refused (413) once past that policy's
+  derived cap, and the very same body is refused under the default policy,
+  where the 4 MiB floor stands. The unit derivation itself is pinned in
+  server.rs: `0` and the 2 MiB default both give the 4 MiB floor; 3 MiB
+  gives 5 MiB (expansion plus the 1 MiB headroom); a cap ≡ 1 (mod 3) rounds
+  the encoded size UP, which a truncating division would not; 47.25 MiB
+  decoded lands exactly on the 64 MiB ceiling, one quantum below it still
+  derives and one above clamps; and `u64::MAX` clamps to the ceiling rather
+  than panicking, wrapping, or saturating into an unbounded body.
 - Audit tests (crates/bugwarden/tests/audit_wiremock.rs + #[cfg(test)] in
   server.rs and audit.rs): one record per call for EVERY routed tool,
   refusal paths and protocol errors included; the refusal map is total
