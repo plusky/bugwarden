@@ -22,7 +22,7 @@ use chrono::Utc;
 use serde_json::{Map, Value};
 
 use crate::client::{BugzillaClient, CLASSIFY_FIELDS};
-use crate::policy::{Access, BugMeta, Capability, Operation, Policy};
+use crate::policy::{Access, BugMeta, Capability, IdentitySource, Operation, Policy};
 
 /// Fields kept by the redacted summary-only projection of a bug
 /// ([`Guard::summary_view`]). Everything else — assignee, CC, groups,
@@ -811,13 +811,19 @@ impl Guard {
     /// - when the policy consults no identity for access classification
     ///   ([`Policy::needs_identity`] is false), returns `None` WITHOUT any
     ///   HTTP request — a policy without `created_by_me` never costs a
-    ///   `whoami` lookup;
-    /// - otherwise performs exactly one `GET /rest/whoami` and returns the
-    ///   account's login, mapping every failure to `None` (the sanitized
-    ///   error is debug-logged only — never the key, I12). `None` makes
-    ///   every `created_by_me` criterion undecidable, which denies every
+    ///   lookup, under either identity source;
+    /// - `global.identity_source = "whoami"` (the default): performs
+    ///   exactly one `GET /rest/whoami` and returns the account's login,
+    ///   mapping every failure to `None` (the sanitized error is
+    ///   warn-logged — never the key, I12). `None` makes every
+    ///   `created_by_me` criterion undecidable, which denies every
     ///   classification consulting it (I4): a whoami outage blacks out
-    ///   what the identity rules cover, it never fails open.
+    ///   what the identity rules cover, it never fails open;
+    /// - `global.identity_source = "declared"`: returns
+    ///   `global.identity_login` directly, with **zero** HTTP requests —
+    ///   it was verified once at startup against `GET /rest/valid_login`
+    ///   (see `BugWarden::preflight`), so nothing here can fail and there
+    ///   is nothing left to look up.
     ///
     /// Callers (the MCP tools) invoke this at most once per tool call and
     /// thread the result to every classification within that call. The
@@ -826,25 +832,28 @@ impl Guard {
         if !self.policy.needs_identity() {
             return None;
         }
-        match bz.whoami(key).await {
-            Ok(login) => Some(login),
-            Err(err) => {
-                // Sanitized by the client (I12); identity stays unknown and
-                // every consulted identity rule fails closed (I4). warn!,
-                // not debug!: under per-request key custody this per-call
-                // failure is the only diagnosis available (server-held
-                // custody also gets a startup preflight — see
-                // `BugWarden::preflight`) — a server that starts and then
-                // silently denies everything is exactly the blackout this
-                // is meant to surface.
-                tracing::warn!(
-                    error = %err,
-                    "whoami failed; caller identity unresolved (this endpoint may not exist \
-                     on this deployment — stock Bugzilla Core v1 does not define \
-                     /rest/whoami)"
-                );
-                None
-            }
+        match self.policy.global.identity_source {
+            IdentitySource::Declared => self.policy.global.identity_login.clone(),
+            IdentitySource::Whoami => match bz.whoami(key).await {
+                Ok(login) => Some(login),
+                Err(err) => {
+                    // Sanitized by the client (I12); identity stays unknown and
+                    // every consulted identity rule fails closed (I4). warn!,
+                    // not debug!: under per-request key custody this per-call
+                    // failure is the only diagnosis available (server-held
+                    // custody also gets a startup preflight — see
+                    // `BugWarden::preflight`) — a server that starts and then
+                    // silently denies everything is exactly the blackout this
+                    // is meant to surface.
+                    tracing::warn!(
+                        error = %err,
+                        "whoami failed; caller identity unresolved (this endpoint may not \
+                         exist on this deployment — stock Bugzilla Core v1 does not define \
+                         /rest/whoami)"
+                    );
+                    None
+                }
+            },
         }
     }
 

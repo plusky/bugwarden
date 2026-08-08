@@ -494,6 +494,7 @@ impl BugzillaClient {
     pub fn base_url(&self) -> &str;
     pub async fn version(&self, key: &str) -> anyhow::Result<String>;
     pub async fn whoami(&self, key: &str) -> anyhow::Result<String>; // login; missing/non-string/blank "name" = failure
+    pub async fn valid_login(&self, key: &str, login: &str) -> anyhow::Result<bool>; // {"result": bool} or bare bool; any other shape = error, never false
     pub async fn server_info(&self, key: &str) -> anyhow::Result<serde_json::Value>;
     pub async fn get_bugs(&self, key: &str, ids: &[u64], include_fields: Option<&str>) -> anyhow::Result<serde_json::Value>;
     pub async fn bug_history(&self, key: &str, id: u64, new_since: Option<chrono::DateTime<chrono::Utc>>) -> anyhow::Result<serde_json::Value>;
@@ -516,6 +517,7 @@ Endpoint mapping:
 |---|---|---|
 | version | GET /rest/version | `.version` string |
 | whoami | GET /rest/whoami | `.name` string (the account's login); missing/non-string/blank = error |
+| valid_login | GET /rest/valid_login?login=\<login\> | boolean: `{"result": bool}` or a bare `bool`; any other shape = error, never read as `false` |
 | server_info | sequential GET /rest/version, /rest/extensions, /rest/time, /rest/parameters | `{url, version, extensions, timezone: tz_name, time: web_time, parameters}` |
 | get_bugs | GET /rest/bug?id=1,2,3[&include_fields=..] | whole envelope |
 | bug_history | GET /rest/bug/{id}/history[?new_since=%Y-%m-%dT%H:%M:%SZ] | `bugs[0].history` array as Value |
@@ -622,27 +624,49 @@ Consequences that are decisions, not accidents:
 the bug–caller relationship (did the requesting account author this bug?)
 where every other criterion describes bug content. Decisions, all deliberate:
 
-- **Source.** The caller's login comes from `GET /rest/whoami` (the `name`
-  field; a missing, non-string, or blank — empty or all-whitespace — value
-  is a FAILED resolution, never an empty login: a blank identity must not
-  compare equal to a blank `creator` and grant on no evidence),
-  authenticated and error-sanitized exactly like every other client
-  call (I12). It is compared case-insensitively (`to_lowercase`, the same
-  normalization the glob matcher applies) against the bug's `creator`
-  field, which joined `CLASSIFY_FIELDS` for this purpose. A non-string
-  `creator` leaves the relationship unknown. "The requesting account" is
-  whatever key custody says authenticates: per-request http custody gives
-  each caller their own identity, while `Server` custody (stdio, or http
-  server-held mode — see "Key custody") resolves EVERY caller to the one
-  account that owns the server's key; under server-held http custody the
-  collapse is warned about at startup.
+- **Source.** `global.identity_source` (default `"whoami"`) picks how
+  `Guard::resolve_caller` gets the caller's login:
+  - `"whoami"` — `GET /rest/whoami` (the `name` field; a missing,
+    non-string, or blank — empty or all-whitespace — value is a FAILED
+    resolution, never an empty login: a blank identity must not compare
+    equal to a blank `creator` and grant on no evidence), authenticated
+    and error-sanitized exactly like every other client call (I12). "The
+    requesting account" is whatever key custody says authenticates:
+    per-request http custody gives each caller their own identity, while
+    `Server` custody (stdio, or http server-held mode — see "Key custody")
+    resolves EVERY caller to the one account that owns the server's key;
+    under server-held http custody the collapse is warned about at
+    startup.
+  - `"declared"` — `global.identity_login` directly, with ZERO HTTP
+    requests per call. It is verified once at startup, not per call
+    (`BugWarden::preflight`, "Identity preflight" below), against
+    `GET /rest/valid_login?login=<login>` — an endpoint Bugzilla Core v1
+    DOES define — so it works on a stock deployment `whoami` cannot reach.
+    A declared login names the account owning the *server's* key, so it is
+    meaningful only under `Server` custody; `BugWarden::new` refuses to
+    construct a `declared` + per-request-custody server at all (a hard
+    startup error, not a warning — unlike `whoami`, which stays
+    per-caller-correct under per-request custody).
+
+  Either source's result is compared case-insensitively (`to_lowercase`,
+  the same normalization the glob matcher applies) against the bug's
+  `creator` field, which joined `CLASSIFY_FIELDS` for this purpose. A
+  non-string `creator` leaves the relationship unknown.
+  `Policy::validate` rejects `identity_source = "declared"` without a
+  non-blank `identity_login`, and rejects `identity_login` set under
+  `identity_source = "whoami"` (a silently-ignored key is exactly the class
+  of typo `deny_unknown_fields` exists to catch elsewhere) — both hard
+  startup errors. `valid_login` compares logins the way Bugzilla's own
+  `Bugzilla->login` does: Perl `eq`, case-sensitively — a declared login
+  differing only in case fails closed at startup, not at some later
+  `created_by_me` evaluation.
 - **Laziness.** `Policy::needs_identity()` = some rule whose `operations`
   cover `Operation::Access` carries a `created_by_me` criterion. When it is
-  false, `Guard::resolve_caller` returns `None` without any HTTP request —
-  a policy that never consults identity costs ZERO whoami lookups, so
-  pre-identity deployments keep their exact upstream request pattern. A
-  create-scoped-only identity rule does not trigger lookups either: the
-  create gate forces the answer (below).
+  false, `Guard::resolve_caller` returns `None` without any HTTP request,
+  under EITHER source — a policy that never consults identity costs ZERO
+  lookups, so pre-identity deployments keep their exact upstream request
+  pattern. A create-scoped-only identity rule does not trigger lookups
+  either: the create gate forces the answer (below).
 - **At most once per MCP tool call.** Each tool resolves the caller at most
   once, near its entry, and threads the result to EVERY classification in
   that call — `Guard::assess`, `quicksearch_window`, `disclosable`,
@@ -665,7 +689,10 @@ where every other criterion describes bug content. Decisions, all deliberate:
   reading. The alternative — resolving identity-unknown as "criterion
   fails" — would let a `created_by_me = true` DENY rule be dodged by
   making whoami fail (fail open), exactly the asymmetry I4 exists to
-  forbid.
+  forbid. `identity_source = "declared"` has no equivalent per-call failure
+  mode: the login was already verified at startup, so `resolve_caller`
+  always returns `Some` there — the only way to blackout under `declared`
+  is to never start (see "Identity preflight").
 - **Create gate: forced true, no lookup.** `may_create` forces the
   prospective bug's `created_by_me` to `Some(true)` unconditionally: the
   creator of a bug being filed is definitionally the caller — Bugzilla
@@ -687,12 +714,24 @@ where every other criterion describes bug content. Decisions, all deliberate:
   a fork/BMO extension. On a stock deployment every lookup fails, every
   `created_by_me` criterion is `Unknown`, and I4 denies everything a
   `created_by_me` rule is consulted for: a blackout, not a narrower grant.
-  Because of this, `examples/policy.toml` ships its `created_by_me` rule
-  ("my-own-reports") commented out — documented as an opt-in the operator
-  enables only after confirming their Bugzilla answers `whoami` — rather
-  than active by default. `BugWarden::preflight` (see "MCP tool surface")
-  turns an unconfirmed deployment into a loud startup failure instead of a
-  silent per-call blackout.
+  `identity_source = "declared"` is the portable answer: it never calls
+  `whoami` at all, verifying the operator's declared login once at startup
+  against `valid_login` instead — an endpoint the same reference DOES
+  document. The source × custody matrix:
+
+  | `identity_source` | stdio / http server-held key | http per-request key |
+  |---|---|---|
+  | `whoami` (default) | verified at startup (`BugWarden::preflight`); one `GET /rest/whoami` per tool call | unverifiable at startup (warns instead); one `GET /rest/whoami` per tool call |
+  | `declared` | verified once at startup via `GET /rest/valid_login`; **zero** identity requests per tool call | **startup error** (`BugWarden::new`) — no server-held key for the declared login to describe |
+
+  Because of the `whoami` row's stock-deployment gap, `examples/policy.toml`
+  ships its `created_by_me` rule ("my-own-reports") commented out —
+  documented as an opt-in the operator enables only after either
+  confirming their Bugzilla answers `whoami`, or declaring and verifying a
+  login instead — rather than active by default. `BugWarden::preflight`
+  (see "MCP tool surface") turns an unconfirmed `whoami` deployment into a
+  loud startup failure instead of a silent per-call blackout, and verifies
+  a declared login the same way.
 
 ## MCP tool surface (crates/bugwarden/src/server.rs)
 
@@ -740,6 +779,14 @@ units and container specs). Decisions, all deliberate:
   consults identity (`Policy::needs_identity`).
 - **`PerRequest` custody** (http without a key file): each request must
   carry the key header; a missing key is `McpError::invalid_request`.
+- **A declared login is a hard error under `PerRequest` custody.**
+  `identity_source = "declared"` names the account owning the SERVER's
+  key (A5); `PerRequest` custody holds no server-side key at all, so
+  `BugWarden::new` refuses to construct — `anyhow::bail!`, not a warning —
+  when a `needs_identity()` policy pairs `declared` with `PerRequest`. This
+  is stricter than the `whoami` row above precisely because `whoami` stays
+  per-caller-correct under `PerRequest` (it just cannot be verified at
+  startup); a declared login under `PerRequest` describes nobody.
 - **No fallback between custodies, in either direction.** Server-held mode
   exists so fleet clients can hold NOTHING — a client holding the real key
   could bypass the guard by talking to Bugzilla directly — so falling back
@@ -773,17 +820,20 @@ call. `main.rs` calls `server.preflight().await?` right after `new`, BEFORE
 the audit sink is opened — the same ordering rationale as key custody
 resolution: a failed preflight must not create or rotate an audit file.
 
-Behaviour, by `Policy::needs_identity()` and key custody:
+Behaviour, by `Policy::needs_identity()`, `global.identity_source` and key
+custody:
 
-| `needs_identity()` | custody | preflight does |
-|---|---|---|
-| false | any | `Ok(())`, ZERO upstream requests — the laziness contract now covers startup too |
-| true | `Server(key)` | one `GET /rest/whoami`; success logs the resolved login at `info!` and returns `Ok(())`; failure `anyhow::bail!`s naming the endpoint, that stock Bugzilla Core v1 does not define it, and that starting anyway would deny every access classification the policy's identity rules reach (I4) |
-| true | `PerRequest` | `tracing::warn!` the same compatibility statement and return `Ok(())` — there is no server-held key to probe with (A5); each caller still resolves identity correctly per call, an unreachable endpoint here only surfaces as a denial once a tool is called |
+| `needs_identity()` | `identity_source` | custody | preflight does |
+|---|---|---|---|
+| false | any | any | `Ok(())`, ZERO upstream requests — the laziness contract now covers startup too |
+| true | `whoami` | `Server(key)` | one `GET /rest/whoami`; success logs the resolved login at `info!` and returns `Ok(())`; failure `anyhow::bail!`s naming the endpoint, that stock Bugzilla Core v1 does not define it, and that starting anyway would deny every access classification the policy's identity rules reach (I4) |
+| true | `whoami` | `PerRequest` | `tracing::warn!` the same compatibility statement and return `Ok(())` — there is no server-held key to probe with (A5); each caller still resolves identity correctly per call, an unreachable endpoint here only surfaces as a denial once a tool is called |
+| true | `declared` | `Server(key)` | one `GET /rest/valid_login?login=<identity_login>`; `true` logs the verified login at `info!` and returns `Ok(())` — `resolve_caller` never looks it up again per call; `false` `anyhow::bail!`s naming the login the key does NOT authenticate as (distinct wording from a transport failure — a wrong login is not a broken key); a transport/parse error `anyhow::bail!`s naming the endpoint |
+| true | `declared` | `PerRequest` | unreachable: `BugWarden::new` already refuses to construct this combination (A5) — the match arm still exists and fails closed rather than trusting that invariant silently |
 
-The failure path attaches the sanitized client error (I12: `whoami`
-already strips the URL) as the `anyhow` error's source/context — no key
-material reaches the bailed-out message either.
+The failure path attaches the sanitized client error (I12: `whoami` /
+`valid_login` already strip the URL) as the `anyhow` error's source/context
+— no key material reaches the bailed-out message either.
 
 Tool descriptions: concise and action-oriented; state the defaults and
 constraints the model must know.
@@ -1245,7 +1295,14 @@ wired, `server.rs` and `main.rs` are the reference.
   authored by someone else stays Denied, and with identity UNKNOWN that
   bug, the foreign one, and a world-readable bug are all Denied — the
   whoami-failure blackout is pinned so it cannot be "fixed" into fail-open
-  later.
+  later; `global.identity_source`/`identity_login` — the default is
+  `whoami` with no login, `declared` with a non-blank login parses,
+  `declared` without (or with a blank) `identity_login` is a hard startup
+  error, `identity_login` set under `whoami` is a hard startup error (the
+  silently-ignored-key class of typo), and an unknown `identity_source`
+  value is rejected; `resolve_caller` under `declared` returns the login
+  with ZERO HTTP requests (pinned against both `/rest/whoami` and
+  `/rest/valid_login` with `expect(0)`).
 - Unit tests (#[cfg(test)] in crates/bugwarden/src/server.rs): assemble_bug_info
   re-classification — a body embargoed after the verdict is refused, a body
   that now earns only summary is downgraded, a body granting neither read nor
@@ -1253,8 +1310,11 @@ wired, `server.rs` and `main.rs` are the reference.
   identical restricted entries; the distinct-id bound; read-only delists
   create_bug and add_attachment (I13); the upload size gate measures decoded
   (never base64-encoded) bytes, is disabled at 0, and its refusal names no
-  number; and stdio without any key source fails at `BugWarden::new`
-  construction, never at first request.
+  number; stdio without any key source fails at `BugWarden::new`
+  construction, never at first request; and `identity_source = "declared"`
+  under `KeyCustody::PerRequest` plus a `needs_identity()` policy fails at
+  `BugWarden::new` construction naming both "declared" and "per-request",
+  while the same policy under a server-held key builds successfully (A5).
 - Unit tests (#[cfg(test)] in crates/bugwarden/src/config.rs): the key
   custody table — the mutual-exclusion error names both flags (each pinned
   with its env var, since `--api-key` is a substring of `--api-key-file`);
@@ -1295,7 +1355,14 @@ wired, `server.rs` and `main.rs` are the reference.
   failure mapped to None), and the classify projection itself — the bug
   mock answers only an include_fields carrying `creator`, so dropping the
   field from CLASSIFY_FIELDS fails the caller's-own-bug classification
-  instead of passing on a fixture that volunteers fields nobody requested.
+  instead of passing on a fixture that volunteers fields nobody requested;
+  valid_login endpoint mapping (GET /rest/valid_login?login=.. accepts
+  both `{"result": bool}` and a bare bool for true AND false; any other
+  shape — an object without a boolean `result`, a string, a number,
+  `null` — is an ERROR, never silently read as `false`), the API key
+  absent from a valid_login transport error (I12), and
+  resolve_caller under `identity_source = "declared"` costing ZERO HTTP
+  requests to either endpoint for one tool call.
 - Integration tests (crates/bugwarden/tests/tools_wiremock.rs, wiremock +
   rmcp client over an in-memory duplex transport): the tools are CALLED
   through a real MCP session, so a tool that stops calling its guard fails
@@ -1343,7 +1410,12 @@ wired, `server.rs` and `main.rs` are the reference.
   reaching a write gate (a carve-out granting `comment` on the caller's
   own reports POSTs the comment for the caller's bug and refuses a
   foreign one with nothing POSTed), and a whoami transport error leaking
-  no API key into any client-visible text (I12).
+  no API key into any client-visible text (I12); and the declared-login
+  counterpart of the issue-#33 scenario — the same my-own-reports carve-out
+  resolved via `identity_source = "declared"` grants the caller's own
+  group-restricted bug through bug_info and denies a foreign one
+  identically, with `expect(0)` whoami hits proving the endpoint is never
+  touched.
 - Integration tests (crates/bugwarden/tests/preflight_wiremock.rs,
   wiremock): `BugWarden::preflight` — a missing `/rest/whoami` under
   server-held key custody plus an identity-consulting policy fails
@@ -1353,8 +1425,12 @@ wired, `server.rs` and `main.rs` are the reference.
   criterion costs ZERO whoami requests at preflight (the laziness contract
   extends to startup); `KeyCustody::PerRequest` under an identity policy
   passes preflight (warn only) while issuing zero whoami requests, since
-  there is no server-held key to verify it with (A5); and a transport-level
-  whoami failure leaks no API key into the preflight error text (I12).
+  there is no server-held key to verify it with (A5); a transport-level
+  whoami failure leaks no API key into the preflight error text (I12); and
+  the `declared` arm — a correct declared login passes preflight via one
+  `valid_login` request and zero whoami requests, a login the key does NOT
+  authenticate as fails preflight naming that login, and a transport-level
+  `valid_login` failure fails preflight naming the endpoint.
 - Integration tests (crates/bugwarden/tests/http_transport_wiremock.rs,
   wiremock + rmcp client over REAL streamable HTTP — the only harness in
   which the per-request key header physically exists; the wiremock upstream

@@ -25,7 +25,7 @@ use bugwarden_core::client::BugzillaClient;
 use bugwarden_core::guard::Guard;
 use bugwarden_core::policy::Policy;
 use clap::Parser as _;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// The issue's policy shape: an access-scoped `created_by_me` carve-out
@@ -46,12 +46,41 @@ const NO_IDENTITY_POLICY: &str = concat!(
     "[rule.match]\ngroup_restricted = true\n",
 );
 
+/// The declared-login counterpart of [`IDENTITY_POLICY`]: same rule shape,
+/// but resolved without `whoami` at all (PR C,
+/// `plans/ISSUE_WHOAMI_IDENTITY.md`).
+const DECLARED_IDENTITY_POLICY: &str = concat!(
+    "[global]\n",
+    "identity_source = \"declared\"\n",
+    "identity_login = \"svc@example.com\"\n",
+    "[[rule]]\nname = \"my-own-reports\"\naction = \"restrict\"\n",
+    "capabilities = [\"read\", \"comments\", \"history\", \"attachments\"]\n",
+    "operations = [\"access\"]\n",
+    "[rule.match]\ncreated_by_me = true\n",
+    "[[rule]]\nname = \"group-restricted\"\naction = \"deny\"\n",
+    "[rule.match]\ngroup_restricted = true\n",
+);
+
 /// Mount `GET /rest/whoami` answering with `login`, expected `hits` times.
 async fn mount_whoami(mock: &MockServer, login: &str, hits: u64) {
     Mock::given(method("GET"))
         .and(path("/rest/whoami"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": 1, "name": login, "real_name": "Reporter",
+        })))
+        .expect(hits)
+        .mount(mock)
+        .await;
+}
+
+/// Mount `GET /rest/valid_login?login=<login>` answering `result`,
+/// expected `hits` times.
+async fn mount_valid_login(mock: &MockServer, login: &str, result: bool, hits: u64) {
+    Mock::given(method("GET"))
+        .and(path("/rest/valid_login"))
+        .and(query_param("login", login))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": result,
         })))
         .expect(hits)
         .mount(mock)
@@ -174,6 +203,61 @@ async fn preflight_warns_but_succeeds_under_per_request_custody() {
         .preflight()
         .await
         .expect("per-request custody must not fail preflight");
+}
+
+#[tokio::test]
+async fn preflight_succeeds_for_a_correct_declared_login_with_zero_whoami_hits() {
+    // valid_login verifies the server's key at startup; resolve_caller
+    // never looks it up again per call, so whoami must be untouched too.
+    let mock = MockServer::start().await;
+    mount_valid_login(&mock, "svc@example.com", true, 1).await;
+    mount_whoami(&mock, "svc@example.com", 0).await;
+    let server = server_custody_server(DECLARED_IDENTITY_POLICY, &mock);
+
+    server
+        .preflight()
+        .await
+        .expect("a key that authenticates as the declared login must pass preflight");
+}
+
+#[tokio::test]
+async fn preflight_fails_closed_when_the_key_does_not_own_the_declared_login() {
+    // A wrong declared login is fail-closed (I4): starting anyway would
+    // deny every access classification the identity rules reach.
+    let mock = MockServer::start().await;
+    mount_valid_login(&mock, "svc@example.com", false, 1).await;
+    let server = server_custody_server(DECLARED_IDENTITY_POLICY, &mock);
+
+    let err = server
+        .preflight()
+        .await
+        .expect_err("a login the key does not own must fail preflight");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("svc@example.com"),
+        "preflight error must name the declared login: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn preflight_declared_login_transport_error_names_the_endpoint() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/valid_login"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock)
+        .await;
+    let server = server_custody_server(DECLARED_IDENTITY_POLICY, &mock);
+
+    let err = server
+        .preflight()
+        .await
+        .expect_err("a failing valid_login endpoint must fail preflight");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("GET /rest/valid_login"),
+        "preflight error must name the failing endpoint: {msg}"
+    );
 }
 
 #[tokio::test]

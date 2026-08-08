@@ -527,6 +527,27 @@ impl Rule {
     }
 }
 
+/// Where [`Guard::resolve_caller`](crate::guard::Guard::resolve_caller) gets
+/// the caller's identity from, for `created_by_me` matching.
+///
+/// `whoami` (the default) calls the fork/BMO-only `GET /rest/whoami` once
+/// per tool call and is unaffected by existing 0.3.0 policies, which never
+/// write this key. `declared` names an operator-configured login instead,
+/// verified once at startup against `GET /rest/valid_login` and never
+/// looked up again — the portable path for a stock Bugzilla Core v1
+/// deployment that has no identity endpoint at all. See DESIGN.md,
+/// "Identity resolution".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentitySource {
+    /// `GET /rest/whoami`, resolved fresh on every tool call.
+    #[default]
+    Whoami,
+    /// `global.identity_login`, verified once at startup and never looked
+    /// up again.
+    Declared,
+}
+
 /// Policy-wide guards applied on top of (and before) the rule list.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -556,6 +577,18 @@ pub struct GlobalGuards {
     /// in the model's context, so unlimited is an explicit operator choice.
     #[serde(default = "default_max_attachment_bytes")]
     pub max_attachment_bytes: u64,
+    /// How `created_by_me` resolves the caller's identity. Defaults to
+    /// `whoami`, so every 0.3.0 policy keeps its current behaviour
+    /// unmodified. See [`IdentitySource`].
+    #[serde(default)]
+    pub identity_source: IdentitySource,
+    /// The login `identity_source = "declared"` asserts. Required (and
+    /// validated non-blank) exactly when `identity_source = "declared"`;
+    /// setting it under `whoami` is a hard startup error rather than a
+    /// silently ignored key (see [`Policy::validate`]). Compared with
+    /// Bugzilla's own `eq` — case-sensitive (see DESIGN.md).
+    #[serde(default)]
+    pub identity_login: Option<String>,
 }
 
 fn default_max_attachment_bytes() -> u64 {
@@ -572,6 +605,8 @@ impl Default for GlobalGuards {
             read_only: false,
             disabled_tools: Vec::new(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            identity_source: IdentitySource::default(),
+            identity_login: None,
         }
     }
 }
@@ -673,6 +708,27 @@ impl Policy {
                 "default_action must be \"allow\" or \"deny\": \"restrict\" is only \
                  meaningful on a rule, where it names the granted capabilities"
             );
+        }
+        let login_is_blank = self
+            .global
+            .identity_login
+            .as_deref()
+            .is_none_or(|l| l.trim().is_empty());
+        match self.global.identity_source {
+            IdentitySource::Declared if login_is_blank => {
+                anyhow::bail!(
+                    "global.identity_source = \"declared\" requires a non-blank \
+                     global.identity_login"
+                );
+            }
+            IdentitySource::Whoami if !login_is_blank => {
+                anyhow::bail!(
+                    "global.identity_login is set but global.identity_source is \
+                     \"whoami\" (the default), so it would be silently ignored; \
+                     set identity_source = \"declared\" or remove identity_login"
+                );
+            }
+            _ => {}
         }
         for rule in &self.rules {
             match rule.action {
@@ -2063,6 +2119,77 @@ products = ["SUSE*"]
         ))
         .unwrap()
         .needs_identity());
+    }
+
+    // ---------- global.identity_source / identity_login ----------
+
+    #[test]
+    fn identity_source_defaults_to_whoami_with_no_login() {
+        let p = Policy::default();
+        assert_eq!(p.global.identity_source, IdentitySource::Whoami);
+        assert_eq!(p.global.identity_login, None);
+
+        // An empty policy file parses to the same default.
+        let p = Policy::from_toml_str("").unwrap();
+        assert_eq!(p.global.identity_source, IdentitySource::Whoami);
+    }
+
+    #[test]
+    fn identity_source_declared_with_login_parses() {
+        let p = Policy::from_toml_str(concat!(
+            "[global]\n",
+            "identity_source = \"declared\"\n",
+            "identity_login = \"svc@example.com\"\n",
+        ))
+        .unwrap();
+        assert_eq!(p.global.identity_source, IdentitySource::Declared);
+        assert_eq!(p.global.identity_login.as_deref(), Some("svc@example.com"));
+    }
+
+    #[test]
+    fn identity_source_declared_without_login_is_a_hard_error() {
+        let err = Policy::from_toml_str("[global]\nidentity_source = \"declared\"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("identity_login"),
+            "error should name identity_login: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_source_declared_with_blank_login_is_a_hard_error() {
+        // Whitespace-only counts as blank, not "set" — the same rule the
+        // whoami /name field applies (client.rs::whoami).
+        let err = Policy::from_toml_str(concat!(
+            "[global]\n",
+            "identity_source = \"declared\"\n",
+            "identity_login = \"   \"\n",
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("identity_login"),
+            "error should name identity_login: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_login_under_whoami_is_a_hard_error() {
+        // Setting identity_login without identity_source = "declared" would
+        // otherwise be silently ignored — that is exactly the class of
+        // typo `deny_unknown_fields` exists to catch elsewhere.
+        let err =
+            Policy::from_toml_str("[global]\nidentity_login = \"svc@example.com\"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("identity_source"),
+            "error should name identity_source: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_source_unknown_value_is_rejected() {
+        let err = Policy::from_toml_str("[global]\nidentity_source = \"guessed\"\n").unwrap_err();
+        // toml/serde's own unknown-variant message; just confirm it fails
+        // rather than silently defaulting.
+        assert!(!err.to_string().is_empty());
     }
 
     // ---------- Policy::load ----------

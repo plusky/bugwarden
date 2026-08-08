@@ -15,10 +15,13 @@
 #   * OPTIONAL, SHIPPED DISABLED: the caller's OWN bug reports — bugs
 #     authored by the account whose API key makes the request — can be made
 #     always readable (read, comments, history, attachments; no writes),
-#     even where a rule above would hide them. This needs a Bugzilla that
-#     exposes an identity endpoint (stock Bugzilla Core v1 does not — see
-#     section 0b) and comes with a documented identity-failure blackout, so
-#     it ships commented out rather than enabled by default;
+#     even where a rule above would hide them. This needs a way to resolve
+#     the caller's identity: either `global.identity_source = "whoami"`
+#     (the default; stock Bugzilla Core v1 does not define this endpoint)
+#     or `"declared"` (an operator-configured, startup-verified login that
+#     works on stock Bugzilla too — see section 0b), and comes with a
+#     documented identity-failure blackout, so it ships commented out
+#     rather than enabled by default;
 #   * new bug reports are accepted into the desktop products ONLY — see the
 #     "reporters" rule in section 0, whose `operations = ["create"]` scope
 #     grants filing without touching what may be read — except that a title
@@ -156,26 +159,43 @@ products = ["GNOME*", "KDE*"]
 # 0b. OPTIONAL, SHIPPED DISABLED: the caller's own reports, readable even
 #     where the rules below would hide them.
 #
-# PREREQUISITE, CHECK THIS FIRST: this rule needs a Bugzilla deployment that
-# exposes an identity endpoint. The current Bugzilla Core v1 REST reference
-# does not define `/rest/whoami` — it is a fork/BMO extension (see
-# docs/DESIGN.md, "Identity resolution", Portability) — so on a stock
-# instance every lookup fails, the caller's identity is always unknown, and
-# — per the fail-closed behaviour below — this rule alone denies EVERY
-# access classification it is consulted for the moment it is enabled. That
-# is why this rule ships commented out rather than active: an example file
-# cannot know whether the operator's Bugzilla has the endpoint, and enabling
-# it against one that does not is a silent blackout, not a carve-out.
-# Confirm your deployment answers `GET /rest/whoami` before uncommenting the
-# `[[rule]]` block below.
+# PREREQUISITE, CHECK THIS FIRST: this rule needs a way to resolve the
+# caller's identity, chosen via `global.identity_source` (default
+# `"whoami"`):
 #
-# Once confirmed, `created_by_me = true` matches bugs AUTHORED by the
-# account whose API key makes the request — the one identity-relative
-# criterion. The server resolves the caller's login at most once per tool
-# call (GET /rest/whoami, only when a policy actually uses this criterion)
-# and compares it case-insensitively against the bug's creator. Placed
-# ABOVE the deny rules, this rule carves the caller's own reports out of
-# them: people keep following the bugs they themselves filed —
+#   * "whoami" calls `GET /rest/whoami` on every tool call. The current
+#     Bugzilla Core v1 REST reference does not define this endpoint — it is
+#     a fork/BMO extension (see docs/DESIGN.md, "Identity resolution",
+#     Portability) — so on a stock instance every lookup fails, the
+#     caller's identity is always unknown, and — per the fail-closed
+#     behaviour below — this rule alone denies EVERY access classification
+#     it is consulted for the moment it is enabled. Confirm your deployment
+#     answers `GET /rest/whoami` before choosing this source.
+#   * "declared" names an operator-configured login in `identity_login`
+#     instead, verified ONCE at startup against `GET /rest/valid_login` —
+#     an endpoint the same reference DOES define — and never looked up
+#     again per call. This is the portable choice on a stock deployment: it
+#     needs `global.identity_source = "declared"` plus
+#     `global.identity_login = "you@example.com"` (exactly as Bugzilla
+#     stores it — the comparison is case-sensitive), and only works with a
+#     server-held API key (stdio, or http server-held mode): it names the
+#     account owning THIS server's key, and per-request http key custody
+#     holds no such key for it to describe (a hard startup error there).
+#
+# Either way this rule ships commented out rather than active: an example
+# file cannot know whether the operator's Bugzilla has `/rest/whoami`, nor
+# what the operator's own Bugzilla login is, and enabling it against a
+# wrong assumption is a silent blackout (or a startup failure), not a
+# carve-out.
+#
+# Once you have picked and configured a source, `created_by_me = true`
+# matches bugs AUTHORED by the resolved account — the one identity-relative
+# criterion — comparing case-insensitively against the bug's creator. Under
+# "whoami" the server performs at most one lookup per tool call (only when
+# a policy actually uses this criterion); under "declared" it performs
+# ZERO lookups per call, since the login was already verified at startup.
+# Placed ABOVE the deny rules, this rule carves the caller's own reports
+# out of them: people keep following the bugs they themselves filed —
 # group-restricted ones included — while everyone else's hidden bugs stay
 # hidden. Reading is granted, writing is not, so "follow your own report"
 # does not become "edit your own report". Note the flip side of
@@ -183,7 +203,7 @@ products = ["GNOME*", "KDE*"]
 # rule first and are therefore read-only through this server under this
 # example.
 #
-# This rule is an EXPLICIT OPT-IN even where the endpoint exists — an
+# This rule is an EXPLICIT OPT-IN even where identity resolves cleanly — an
 # operator who does not want it simply leaves it commented out and keeps
 # today's behaviour. In particular, a deployment whose clients share one
 # service-account API key should NOT enable this rule: there, "created by
@@ -196,17 +216,21 @@ products = ["GNOME*", "KDE*"]
 # first match for every request and — granting no "create" capability —
 # would refuse ALL filing, section 0 notwithstanding. Scoped to access, it
 # decides reads only and the create gate never consults it (and never
-# performs a whoami lookup).
+# performs an identity lookup).
 #
-# Failure mode, deliberate: if the whoami lookup fails, the caller's
-# identity is unknown, this rule can be decided for NO bug, and an
+# Failure mode, deliberate: under "whoami", if the lookup fails, the
+# caller's identity is unknown, this rule can be decided for NO bug, and an
 # undecidable consulted rule denies whatever its action (see "Unreadable
 # metadata" above). While whoami is down (or simply absent — see the
 # prerequisite above), a policy that leads with this rule therefore denies
 # every read — a blackout — rather than serving what an unverified identity
 # should not see. That is the only uniformly fail-closed reading: treating
 # unknown identity as "criterion fails" would let a created_by_me deny rule
-# be dodged by making whoami fail.
+# be dodged by making whoami fail. `BugWarden::preflight` fails the server
+# at STARTUP instead of serving this blackout, for either source — see
+# docs/DESIGN.md, "Identity preflight". Under "declared" there is no
+# per-call failure mode left: the login was already verified once at
+# startup, so the only way to blackout is to never start.
 #
 # This criterion cannot widen exposure beyond the credential: Bugzilla
 # still enforces its own permissions on every fetch, so an authorship rule
@@ -214,11 +238,13 @@ products = ["GNOME*", "KDE*"]
 # between the guard and the credential, never escapes it.
 #
 # NOTE: bugwarden versions without identity support REJECT a policy using
-# `created_by_me` at startup — parsing is strict, so the whole file fails
-# closed instead of the rule being silently ignored.
+# `created_by_me`, `identity_source`, or `identity_login` at startup —
+# parsing is strict, so the whole file fails closed instead of the rule
+# being silently ignored.
 
-# Uncomment the block below ONLY after confirming your Bugzilla answers
-# GET /rest/whoami (see the prerequisite above).
+# Uncomment the block below ONLY after picking and configuring an
+# identity_source above (default "whoami" needs no [global] change; a
+# "declared" login needs the [global] keys set first).
 #[[rule]]
 #name = "my-own-reports"
 #description = "Bugs the caller's own account filed stay readable, never writable"

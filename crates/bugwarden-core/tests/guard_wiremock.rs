@@ -9,7 +9,7 @@
 use bugwarden_core::client::BugzillaClient;
 use bugwarden_core::guard::{Guard, SearchRequest};
 use bugwarden_core::policy::{Access, Capability, Policy};
-use serde_json::json;
+use serde_json::{json, Value};
 use wiremock::matchers::{method, path, query_param, query_param_contains};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -1059,6 +1059,86 @@ async fn whoami_api_key_absent_from_transport_error_i12() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// valid_login (portable identity verifier for declared-login identity)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn client_valid_login_accepts_wrapped_and_bare_boolean_bodies() {
+    for body in [json!({ "result": true }), json!(true)] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/valid_login"))
+            .and(query_param("login", "svc@example.com"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bz = client(&server);
+        assert!(
+            bz.valid_login(KEY, "svc@example.com").await.unwrap(),
+            "body {body} should read as true"
+        );
+    }
+
+    for body in [json!({ "result": false }), json!(false)] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/valid_login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+            .mount(&server)
+            .await;
+        let bz = client(&server);
+        assert!(
+            !bz.valid_login(KEY, "someone@example.com").await.unwrap(),
+            "body {body} should read as false"
+        );
+    }
+}
+
+#[tokio::test]
+async fn client_valid_login_unusable_shape_is_an_error_never_false() {
+    // A shape neither a bare bool nor {"result": bool} must fail loudly,
+    // not silently read as "not this account" (fail closed, never fail
+    // open behind a fail-closed-looking `false`).
+    for body in [
+        json!({ "id": 1 }),
+        json!({ "result": "true" }),
+        json!("true"),
+        json!(1),
+        Value::Null,
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/valid_login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+            .mount(&server)
+            .await;
+        let bz = client(&server);
+        let err = bz.valid_login(KEY, "svc@example.com").await.unwrap_err();
+        assert!(
+            err.to_string().contains("result"),
+            "unexpected error for body {body}: {err:#}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn valid_login_api_key_absent_from_transport_error_i12() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    drop(listener); // free the port so the connection is refused
+    let bz =
+        BugzillaClient::new(&format!("http://{addr}"), false, TEST_USER_AGENT).expect("client");
+
+    let err = bz.valid_login(KEY, "svc@example.com").await.unwrap_err();
+    let full = format!("{err:#} {err:?}");
+    assert!(
+        !full.contains(KEY),
+        "API key leaked into valid_login transport error: {full}"
+    );
+}
+
 #[tokio::test]
 async fn resolve_caller_is_lazy_and_maps_failure_to_none() {
     // No identity criterion in the policy: no request at all — the
@@ -1112,6 +1192,42 @@ async fn resolve_caller_is_lazy_and_maps_failure_to_none() {
         .await;
     let g = guard(identity);
     assert_eq!(g.resolve_caller(&client(&server), KEY).await, None);
+}
+
+#[tokio::test]
+async fn resolve_caller_under_declared_identity_makes_zero_http_requests() {
+    // Verified once at startup (BugWarden::preflight), never looked up
+    // again per call — the whole point of a declared login on a stock
+    // deployment with no whoami at all. `.expect(0)` on BOTH endpoints
+    // proves neither is consulted here.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/whoami"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "name": "should-not-be-called" })),
+        )
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/valid_login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!(true)))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let g = guard(concat!(
+        "[global]\n",
+        "identity_source = \"declared\"\n",
+        "identity_login = \"svc@example.com\"\n",
+        "[[rule]]\nname = \"mine\"\naction = \"restrict\"\ncapabilities = [\"read\"]\n",
+        "operations = [\"access\"]\n[rule.match]\ncreated_by_me = true\n",
+        "[[rule]]\nname = \"rest\"\naction = \"deny\"\n",
+    ));
+    assert_eq!(
+        g.resolve_caller(&client(&server), KEY).await,
+        Some("svc@example.com".to_string())
+    );
 }
 
 #[tokio::test]

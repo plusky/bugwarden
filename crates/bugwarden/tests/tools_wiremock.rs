@@ -1173,6 +1173,56 @@ async fn created_by_me_carves_own_reports_out_of_a_group_restricted_deny() {
     );
 }
 
+/// The declared-login counterpart of [`IDENTITY_POLICY`] (PR C,
+/// `plans/ISSUE_WHOAMI_IDENTITY.md`): the same carve-out, resolved from an
+/// operator-declared, startup-verified login instead of `whoami` — the
+/// portable path for a stock Bugzilla Core v1 deployment with no identity
+/// endpoint at all.
+const DECLARED_IDENTITY_POLICY: &str = concat!(
+    "[global]\n",
+    "identity_source = \"declared\"\n",
+    "identity_login = \"reporter@example.com\"\n",
+    "[[rule]]\nname = \"my-own-reports\"\naction = \"restrict\"\n",
+    "capabilities = [\"read\", \"comments\", \"history\", \"attachments\"]\n",
+    "operations = [\"access\"]\n",
+    "[rule.match]\ncreated_by_me = true\n",
+    "[[rule]]\nname = \"group-restricted\"\naction = \"deny\"\n",
+    "[rule.match]\ngroup_restricted = true\n",
+);
+
+#[tokio::test]
+async fn declared_identity_carves_own_reports_out_with_zero_whoami_hits() {
+    // End to end, mirroring created_by_me_carves_own_reports_out_of_a_group
+    // _restricted_deny, but under a declared login: the caller's own
+    // group-restricted bug is readable, a foreign one takes the uniform
+    // denial (I2), and NOT ONE whoami request is made — the declared login
+    // was verified once at startup (BugWarden::preflight), never looked up
+    // again per call.
+    let mock = MockServer::start().await;
+    mount_whoami(&mock, "reporter@example.com", 0).await;
+    mount_bug_and_padding(&mock, restricted_bug(7, "reporter@example.com")).await;
+    mount_bug_and_padding(&mock, restricted_bug(8, "other.person@example.com")).await;
+    let client = client_for(DECLARED_IDENTITY_POLICY, &mock).await;
+
+    let own = call(&client, "bug_info", json!({ "bug_ids": [7] })).await;
+    let own: Value = serde_json::from_str(&text_of(&own)).expect("bug_info returns JSON");
+    assert_eq!(
+        own["bugs"][0]["id"],
+        json!(7),
+        "the caller's own group-restricted bug is readable under a declared login"
+    );
+    assert!(own["restricted"].as_array().unwrap().is_empty());
+
+    let foreign = call(&client, "bug_info", json!({ "bug_ids": [8] })).await;
+    let foreign: Value = serde_json::from_str(&text_of(&foreign)).expect("bug_info returns JSON");
+    assert!(foreign["bugs"].as_array().unwrap().is_empty());
+    assert_eq!(
+        foreign["restricted"][0]["note"],
+        json!("Bug 8 is not accessible through this server"),
+        "someone else's restricted bug takes the uniform denial (I2)"
+    );
+}
+
 #[tokio::test]
 async fn created_by_me_whoami_failure_yields_the_same_uniform_denial() {
     // whoami down: the caller's own bug must come back with EXACTLY the

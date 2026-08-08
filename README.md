@@ -396,6 +396,8 @@ A complete, commented example ships in
 | `read_only` | boolean | `false` | Strip write capabilities from every grant and remove write tools from the tool listing. The `--read-only` flag ORs into this |
 | `disabled_tools` | array of strings | `[]` | Tool names to remove from the tool listing entirely |
 | `max_attachment_bytes` | integer | `2097152` (2 MiB) | Largest attachment `download_attachment` may return, and the same ceiling on what `add_attachment` may upload — both measured on the decoded size. `0` removes this cap; over http the transport still refuses a request body above 4 MiB, so an upload stays bounded either way. Downloaded content is embedded base64 in the tool result and lands in the model's context — raise deliberately |
+| `identity_source` | `"whoami"` \| `"declared"` | `"whoami"` | How `created_by_me` resolves the caller's login. `whoami` calls Bugzilla's `GET /rest/whoami` — a fork/BMO extension absent from stock Bugzilla Core v1. `declared` names an operator-configured login instead (see `identity_login`), verified once at startup against the *stock* `GET /rest/valid_login` endpoint and never looked up again per call — the portable path when the deployment has no identity endpoint at all. See the `created_by_me` row below and "Identity resolution" in `docs/DESIGN.md` |
+| `identity_login` | string | none | Required (and must be non-blank) exactly when `identity_source = "declared"`; a hard startup error if set under `identity_source = "whoami"` (it would otherwise be silently ignored). Names the account that owns *this server's* API key, so it is only meaningful under a server-held key (stdio, or http server-held mode) — a startup error under http per-request key custody, where there is no server-held key for it to describe. Bugzilla compares logins case-sensitively (Perl `eq`); declare it exactly as Bugzilla stores it |
 
 ### `[[rule]]`
 
@@ -438,7 +440,18 @@ write two consecutive rules.
 | `summary_contains` | array of strings | case-insensitive substring search in the bug's one-line summary |
 | `group_restricted` | boolean | `true` matches bugs readable only through at least one Bugzilla group, `false` matches world-readable bugs |
 | `younger_than_days` | integer | matches bugs created within the last N days |
-| `created_by_me` | boolean | whether the API key's account authored the bug: the caller's login is resolved per request via Bugzilla's `whoami` endpoint (at most one lookup per tool call, and none at all under a policy without an access-covering `created_by_me` rule — a rule scoped to `operations = ["create"]` alone never triggers a lookup) and compared case-insensitively to the bug's creator. `true` matches the caller's own reports, `false` everyone else's. **`whoami` is not part of stock Bugzilla Core v1** — it is a fork/BMO extension — so on a deployment without it every lookup fails. An unresolvable identity (`whoami` failure or absence) makes the criterion **unknown**, which denies (see Unreadable metadata); a policy that consults this criterion therefore denies everything it reaches on such a deployment. In the create gate the prospective bug always counts as created by the caller — no lookup happens there. Older bugwarden versions reject a policy using this key at startup (strict parsing fails closed) |
+| `created_by_me` | boolean | whether the caller's account authored the bug, compared case-insensitively to the bug's creator. `true` matches the caller's own reports, `false` everyone else's. How the caller's login is resolved depends on `global.identity_source` (default `whoami`): see the source × custody table below. Either source costs at most one lookup per tool call — `whoami` a fresh `GET /rest/whoami`, `declared` zero HTTP requests, since it was verified once at startup — and none at all under a policy without an access-covering `created_by_me` rule (a rule scoped to `operations = ["create"]` alone never triggers one). An unresolvable identity makes the criterion **unknown**, which denies (see Unreadable metadata); a policy that consults this criterion therefore denies everything it reaches while identity cannot be resolved. In the create gate the prospective bug always counts as created by the caller — no lookup happens there. Older bugwarden versions reject a policy using this key, or `global.identity_source`/`global.identity_login`, at startup (strict parsing fails closed) |
+
+Identity resolution by source and API-key custody:
+
+| `identity_source` | stdio / http server-held key | http per-request key |
+|---|---|---|
+| `whoami` (default) | verified at startup (`BugWarden::preflight`); one `GET /rest/whoami` per tool call | unverifiable at startup (warns instead); one `GET /rest/whoami` per tool call |
+| `declared` | verified once at startup via `GET /rest/valid_login`; **zero** identity requests per tool call | **startup error** — there is no server-held key for the declared login to describe |
+
+`whoami` is a fork/BMO extension absent from stock Bugzilla Core v1;
+`valid_login` is documented there, which is what makes `declared` the
+portable path on a deployment that has no identity endpoint at all.
 
 #### Unreadable metadata
 
@@ -447,13 +460,17 @@ of an unexpected type, or a list with an element the parser cannot read. Such
 a field is **unknown**, and a rule that consults one is undecidable: it neither
 holds nor fails. One criterion needs more than the bug object:
 `created_by_me` also needs the caller's identity, and if either half is
-missing — an unreadable creator, or a `whoami` lookup that failed or does
-not exist on the deployment — it is just as undecidable and resolves the
-same way. A policy consulting identity therefore denies everything its
-identity rules are consulted for while `whoami` is unavailable — including
-permanently, on a stock Bugzilla Core v1 deployment that never exposes it;
-that is deliberate (treating unknown identity as "does not match" would let
-a `created_by_me` deny rule be defeated by breaking `whoami`). The criterion
+missing — an unreadable creator, or an identity lookup that failed (under
+`identity_source = "whoami"`) or does not exist on the deployment — it is
+just as undecidable and resolves the same way. A policy consulting identity
+therefore denies everything its identity rules are consulted for while
+identity is unavailable — including permanently, under `whoami` on a stock
+Bugzilla Core v1 deployment that never exposes it; that is deliberate
+(treating unknown identity as "does not match" would let a `created_by_me`
+deny rule be defeated by breaking `whoami`). `identity_source = "declared"`
+sidesteps this on such a deployment: the login is verified once at startup
+(`BugWarden::preflight` fails to start rather than serve a blackout) and
+never looked up again, so there is no per-call failure mode left. The criterion
 cannot widen exposure beyond the credential: Bugzilla enforces its own
 permissions on every fetch, so an authorship rule only surfaces bugs the API
 key could already read.

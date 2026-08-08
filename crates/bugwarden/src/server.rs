@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use bugwarden_core::client::{BugzillaClient, CLASSIFY_FIELDS};
 use bugwarden_core::guard::{Guard, SearchRequest, SearchWindow};
-use bugwarden_core::policy::{Access, Action, Capability};
+use bugwarden_core::policy::{Access, Action, Capability, IdentitySource};
 use chrono::{DateTime, Utc};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
@@ -1018,6 +1018,25 @@ impl BugWarden {
                  clients, never an individual caller's"
             );
         }
+        // A declared login names the account owning the SERVER's key
+        // (A5, plans/ISSUE_WHOAMI_IDENTITY.md). Per-request custody holds
+        // no server-side key at all — each caller supplies their own — so
+        // there is nothing the declared login could describe, and unlike
+        // `whoami` (which stays per-caller-correct there and only warns)
+        // this is a hard startup error rather than a warning.
+        if matches!(key_custody, KeyCustody::PerRequest)
+            && guard.policy.global.identity_source == IdentitySource::Declared
+            && guard.policy.needs_identity()
+        {
+            anyhow::bail!(
+                "guard policy sets global.identity_source = \"declared\", but this server \
+                 holds no API key of its own under per-request key custody: a declared \
+                 login names the account owning the SERVER's key, and there is no such \
+                 key here for it to describe. Use identity_source = \"whoami\" (verified \
+                 per caller) instead, or run with a server-held key (--api-key / \
+                 --api-key-file)"
+            );
+        }
         let mut tool_router = Self::tool_router();
         // Validate disabled_tools against the FULL router, before any route
         // removal: a write-tool name stays a valid entry even when read-only
@@ -1099,37 +1118,96 @@ impl BugWarden {
     ///   statement and return `Ok(())`: per-request custody stays
     ///   correct per call (DESIGN.md, "Identity resolution"), it is only
     ///   unverifiable up front.
+    ///
+    /// `global.identity_source = "declared"` (see DESIGN.md) replaces the
+    /// probe with one `GET /rest/valid_login?login=<identity_login>`: a
+    /// `true` result verifies the server's key at startup so
+    /// `Guard::resolve_caller` never looks it up again per call; `false`
+    /// bails naming the login the key does NOT authenticate as (fail
+    /// closed, distinct from a transport failure so the operator does not
+    /// mistake a wrong login for a broken key); a transport/parse error
+    /// bails naming the endpoint, the same as the `whoami` arm.
+    /// [`BugWarden::new`] already refuses to construct a declared-identity
+    /// server under per-request custody (A5), so that combination cannot
+    /// reach this method — the match below still names it explicitly
+    /// rather than relying on that invariant silently.
     pub async fn preflight(&self) -> anyhow::Result<()> {
         use anyhow::Context as _;
 
         if !self.guard.policy.needs_identity() {
             return Ok(());
         }
-        match &self.key_custody {
-            KeyCustody::Server(key) => match self.bz.whoami(key).await {
-                Ok(login) => {
-                    tracing::info!(login, "identity endpoint verified");
+        match self.guard.policy.global.identity_source {
+            IdentitySource::Whoami => match &self.key_custody {
+                KeyCustody::Server(key) => match self.bz.whoami(key).await {
+                    Ok(login) => {
+                        tracing::info!(login, "identity endpoint verified");
+                        Ok(())
+                    }
+                    Err(err) => Err(err).context(
+                        "GET /rest/whoami failed during startup preflight; the guard policy \
+                         consults created_by_me, which needs this endpoint to resolve the \
+                         caller's identity. Stock Bugzilla Core v1 does not define /rest/whoami \
+                         (it is a fork/BMO extension) — if this deployment does not have it, \
+                         starting anyway would deny every access classification the policy's \
+                         identity rules reach (I4). Confirm the endpoint exists, set \
+                         global.identity_source = \"declared\" instead, or remove the \
+                         created_by_me criteria from the policy",
+                    ),
+                },
+                KeyCustody::PerRequest => {
+                    tracing::warn!(
+                        "the policy consults created_by_me, but per-request key custody holds \
+                         no server-side key to verify /rest/whoami with at startup; each \
+                         caller's identity is still resolved per call, but an unreachable \
+                         endpoint on this deployment will only surface as a denial once a \
+                         tool is called — stock Bugzilla Core v1 does not define /rest/whoami \
+                         (it is a fork/BMO extension)"
+                    );
                     Ok(())
                 }
-                Err(err) => Err(err).context(
-                    "GET /rest/whoami failed during startup preflight; the guard policy \
-                     consults created_by_me, which needs this endpoint to resolve the \
-                     caller's identity. Stock Bugzilla Core v1 does not define /rest/whoami \
-                     (it is a fork/BMO extension) — if this deployment does not have it, \
-                     starting anyway would deny every access classification the policy's \
-                     identity rules reach (I4). Confirm the endpoint exists, or remove the \
-                     created_by_me criteria from the policy",
-                ),
             },
-            KeyCustody::PerRequest => {
-                tracing::warn!(
-                    "the policy consults created_by_me, but per-request key custody holds no \
-                     server-side key to verify /rest/whoami with at startup; each caller's \
-                     identity is still resolved per call, but an unreachable endpoint on this \
-                     deployment will only surface as a denial once a tool is called — stock \
-                     Bugzilla Core v1 does not define /rest/whoami (it is a fork/BMO extension)"
-                );
-                Ok(())
+            IdentitySource::Declared => {
+                let key = match &self.key_custody {
+                    KeyCustody::Server(key) => key,
+                    // BugWarden::new bails on this combination before a
+                    // server is ever constructed (A5); fail closed rather
+                    // than trust that invariant silently if it is ever
+                    // reordered.
+                    KeyCustody::PerRequest => anyhow::bail!(
+                        "guard policy sets global.identity_source = \"declared\" under \
+                         per-request key custody, which holds no server-side key for the \
+                         declared login to describe; this should have been rejected at \
+                         server construction"
+                    ),
+                };
+                // Policy::validate requires a non-blank login whenever
+                // identity_source = "declared"; needs_identity() already
+                // confirmed a rule consults it, so this is always Some.
+                let login = self
+                    .guard
+                    .policy
+                    .global
+                    .identity_login
+                    .as_deref()
+                    .unwrap_or_default();
+                match self.bz.valid_login(key, login).await {
+                    Ok(true) => {
+                        tracing::info!(login, "declared identity verified");
+                        Ok(())
+                    }
+                    Ok(false) => anyhow::bail!(
+                        "GET /rest/valid_login says the configured API key does not \
+                         authenticate as \"{login}\" (global.identity_login); Bugzilla \
+                         compares logins case-sensitively, so check for a case mismatch as \
+                         well as a wrong account. Fail closed: starting anyway would deny \
+                         every access classification the policy's identity rules reach (I4)",
+                    ),
+                    Err(err) => Err(err).context(format!(
+                        "GET /rest/valid_login failed during startup preflight while \
+                         verifying the declared login \"{login}\" (global.identity_login)",
+                    )),
+                }
             }
         }
     }
@@ -3345,6 +3423,76 @@ mod tests {
                 "startup logs: {logs}"
             );
         }
+    }
+
+    #[test]
+    fn new_rejects_declared_identity_under_per_request_custody() {
+        // A5: a declared login names the account owning the SERVER's key.
+        // Per-request http custody holds no server-side key at all, so
+        // there is nothing for the declared login to describe — this must
+        // be a hard startup error, unlike whoami's warn-and-continue.
+        use clap::Parser as _;
+        let mut cli = Cli::parse_from([
+            "bugwarden",
+            "--bugzilla-server",
+            "https://bugzilla.example.com",
+            "--transport",
+            "http",
+        ]);
+        cli.api_key = None;
+        cli.api_key_file = None; // stays per-request: no server-held key
+        let guard = Arc::new(Guard {
+            policy: Policy::from_toml_str(concat!(
+                "[global]\n",
+                "identity_source = \"declared\"\n",
+                "identity_login = \"svc@example.com\"\n",
+                "[[rule]]\nname = \"mine\"\naction = \"allow\"\n",
+                "[rule.match]\ncreated_by_me = true\n",
+            ))
+            .expect("test policy must parse"),
+        });
+        let bz = Arc::new(
+            BugzillaClient::new("https://bugzilla.example.com", false, USER_AGENT)
+                .expect("client must build"),
+        );
+        let err = match BugWarden::new(Arc::new(cli), guard, bz) {
+            Err(e) => e,
+            Ok(_) => panic!("declared identity under per-request custody must fail to build"),
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("declared"), "{msg}");
+        assert!(msg.contains("per-request"), "{msg}");
+    }
+
+    #[test]
+    fn new_allows_declared_identity_under_server_held_custody() {
+        // The companion positive case: a server-held key is exactly what a
+        // declared login describes, so construction must succeed.
+        use clap::Parser as _;
+        let cli = Cli::parse_from([
+            "bugwarden",
+            "--bugzilla-server",
+            "https://bugzilla.example.com",
+            "--transport",
+            "stdio",
+            "--api-key",
+            "test-key",
+        ]);
+        let guard = Arc::new(Guard {
+            policy: Policy::from_toml_str(concat!(
+                "[global]\n",
+                "identity_source = \"declared\"\n",
+                "identity_login = \"svc@example.com\"\n",
+                "[[rule]]\nname = \"mine\"\naction = \"allow\"\n",
+                "[rule.match]\ncreated_by_me = true\n",
+            ))
+            .expect("test policy must parse"),
+        });
+        let bz = Arc::new(
+            BugzillaClient::new("https://bugzilla.example.com", false, USER_AGENT)
+                .expect("client must build"),
+        );
+        BugWarden::new(Arc::new(cli), guard, bz).expect("server must build");
     }
 
     #[test]

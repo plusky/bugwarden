@@ -116,6 +116,41 @@ impl BugzillaClient {
             .ok_or_else(|| anyhow!("bugzilla /whoami response carries no usable \"name\" field"))
     }
 
+    /// GET `/rest/valid_login?login=<login>` — whether the API key
+    /// authenticates as exactly `login` (Bugzilla `Bugzilla->login`
+    /// compares with Perl `eq`, i.e. case-sensitively).
+    ///
+    /// This is a portable identity *verifier*, not a discoverer: unlike
+    /// `whoami` (a fork/BMO extension), `valid_login` is documented in the
+    /// current Bugzilla Core v1 REST reference, so it works against a
+    /// stock deployment. It answers exactly one question — "does this key
+    /// authenticate as this login" — never "who does this key
+    /// authenticate as".
+    ///
+    /// Bugzilla's REST layer normally wraps a scalar result as
+    /// `{"result": true}`; a bare `true`/`false` body is accepted too. Any
+    /// other shape (an object without a boolean `result`, a string, a
+    /// number, `null`, …) is an error, never read as `false` — a response
+    /// shape neither of those forms silently reading as "not this account"
+    /// would be a fail-open surface hiding behind a fail-closed name.
+    /// Authentication and error sanitization are identical to every other
+    /// call: the key never appears in any error this returns (I12).
+    pub async fn valid_login(&self, key: &str, login: &str) -> Result<bool> {
+        let v = self
+            .get_json(key, "/valid_login", &[("login", login.to_string())])
+            .await?;
+        match &v {
+            Value::Bool(b) => Ok(*b),
+            Value::Object(_) => v.get("result").and_then(Value::as_bool).ok_or_else(|| {
+                anyhow!("bugzilla /valid_login response carries no usable boolean \"result\" field")
+            }),
+            _ => bail!(
+                "bugzilla /valid_login response is neither a boolean nor an object with a \
+                 boolean \"result\" field"
+            ),
+        }
+    }
+
     /// Sequential GET of `/rest/version`, `/rest/extensions`, `/rest/time`
     /// and `/rest/parameters`, combined into
     /// `{url, version, extensions, timezone, time, parameters}`.
