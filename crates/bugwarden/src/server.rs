@@ -1878,6 +1878,10 @@ impl BugWarden {
                 // Bugzilla writes "*** Bug N has been marked as a duplicate
                 // of this bug ***" itself, so a hidden bug can name itself in
                 // the comments of one the client may read (I2).
+                // LOAD-BEARING: harvest from the FILTERED list, never the raw
+                // one. A dropped private comment is already counted id-less
+                // below; naming its marker id too would put one comment in
+                // both tallies, and guard.suppressed_count sums them (#68).
                 let named = Guard::duplicate_marker_ids(&filtered);
                 let disclosable = self
                     .guard
@@ -3108,6 +3112,10 @@ impl BugWarden {
         let comments = self.guard.filter_comments(comments, false);
         // Same scrub as bug_comments: otherwise a client that would be
         // scrubbed there just asks for a summary instead (I14).
+        // LOAD-BEARING, as in bug_comments: `comments` is already the
+        // FILTERED list here. Harvesting marker ids from the pre-filter one
+        // would count a dropped private comment in both tallies, and
+        // guard.suppressed_count sums them (#68).
         let named = Guard::duplicate_marker_ids(&comments);
         let disclosable = self
             .guard

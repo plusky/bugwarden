@@ -75,6 +75,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 /// The audit record schema version stamped into every event (`v`).
+///
+/// It tracks the STRUCTURE a reader must handle — fields, their names,
+/// their types — and not the meaning of what those fields hold. A field
+/// whose definition is corrected without changing the wire shape keeps
+/// `v`, so a corpus at one version can span both readings and the
+/// deployed build, not this number, is the boundary between them (see
+/// `guard.suppressed_count` in DESIGN.md, issue #68). Re-encoding the
+/// stream so that meaning changes ARE visible is #34's business.
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// How often a persistently failing sink repeats its `tracing` diagnostic.
@@ -522,10 +530,26 @@ pub struct GuardInfo {
     /// the exact policy that produced it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_hash: Option<String>,
-    /// How many bugs the guard removed from the response. This count is
-    /// authoritative: [`GuardInfo::suppressed_ids`] may be elided
-    /// (empty) or a subset by configuration, so consumers must never
-    /// infer the count from the id list.
+    /// How much the guard withheld from the response, in total: the
+    /// withheld bug ids PLUS the suppressed content that carries no bug
+    /// id of its own — private comments and private attachment metadata
+    /// the I5 gate removed. Not a count of bugs, then, and not a count of
+    /// either tally alone.
+    ///
+    /// The two populations are disjoint by construction, so the sum can
+    /// never double-count. The two tools that feed BOTH tallies —
+    /// `bug_comments` and `summarize_bug` — derive their duplicate-marker
+    /// ids from the comments that SURVIVED the private filter, so a
+    /// dropped comment contributes its id to nothing even when it carries
+    /// one; `list_attachments`, the third id-less site, names no ids at
+    /// all.
+    ///
+    /// This count is authoritative — it is the only tally that always
+    /// ships. [`GuardInfo::suppressed_ids`] carries bug ids alone, and
+    /// may be elided entirely by [`AuditConfig::suppressed_ids`], so
+    /// consumers must never infer the count from the id list: two ids
+    /// under a count of five says three withheld items had no bug id, not
+    /// that the record contradicts itself.
     pub suppressed_count: u64,
     /// The removed bug ids. Left empty by the recording call sites when
     /// [`AuditConfig::suppressed_ids`] is `false`.
@@ -1219,6 +1243,11 @@ impl AuditCell {
     /// Note `n` suppressions that carry no bug id (private comments or
     /// attachment metadata filtered out). Adds across notes; upgrades the
     /// verdict exactly as [`AuditCell::note_suppressed`] does.
+    ///
+    /// This tally and [`AuditCell::note_suppressed`]'s id set must stay
+    /// disjoint populations: [`GuardInfo::suppressed_count`] SUMS them,
+    /// so a call site that counted an item here and also named it there
+    /// would count it twice.
     pub fn note_suppressed_count(&self, n: u64) {
         if n == 0 {
             return;
@@ -1265,8 +1294,9 @@ impl AuditCell {
     /// verdict was ever noted — the tool performed no guard assessment.
     /// When `suppressed_ids_cfg` is `false` the ids are dropped and only
     /// the count ships ([`AuditConfig::suppressed_ids`]). The count is
-    /// the larger of the id set and the id-less counter, so it can only
-    /// ever under-name, never under-count.
+    /// the id set PLUS the id-less counter (issue #68): the two are
+    /// disjoint populations, so their sum is the total withheld and
+    /// nothing is counted twice.
     pub fn into_guard_info(
         &self,
         policy_hash: Option<&str>,
@@ -1274,7 +1304,8 @@ impl AuditCell {
     ) -> Option<GuardInfo> {
         let state = std::mem::take(&mut *self.lock());
         let verdict = state.verdict?;
-        let suppressed_count = (state.suppressed_ids.len() as u64).max(state.suppressed_extra);
+        let suppressed_count =
+            (state.suppressed_ids.len() as u64).saturating_add(state.suppressed_extra);
         Some(GuardInfo {
             verdict,
             rule: state.rule,
@@ -2264,13 +2295,19 @@ mod tests {
     }
 
     #[test]
-    fn cell_suppressed_count_is_max_of_ids_and_counter() {
+    fn cell_suppressed_count_sums_ids_and_counter() {
+        // Issue #68: the two tallies are disjoint populations, so the
+        // count is their TOTAL — not the larger of them, which would
+        // silently under-report whenever both are non-empty.
         let cell = AuditCell::default();
         cell.note_suppressed([7]);
         cell.note_suppressed_count(2);
         cell.note_suppressed_count(1);
         let info = cell.into_guard_info(None, true).unwrap();
-        assert_eq!(info.suppressed_count, 3, "id-less counter adds up");
+        assert_eq!(
+            info.suppressed_count, 4,
+            "one named id plus three id-less suppressions"
+        );
         assert_eq!(info.suppressed_ids, vec![7]);
     }
 
@@ -2278,9 +2315,13 @@ mod tests {
     fn cell_suppressed_ids_config_ships_the_count_only() {
         let cell = AuditCell::default();
         cell.note_suppressed([40, 41]);
+        cell.note_suppressed_count(3);
         let info = cell.into_guard_info(None, false).unwrap();
         assert!(info.suppressed_ids.is_empty(), "ids elided by config");
-        assert_eq!(info.suppressed_count, 2, "the count still ships");
+        assert_eq!(
+            info.suppressed_count, 5,
+            "the elided ids still count, and the id-less ones add to them"
+        );
     }
 
     #[test]

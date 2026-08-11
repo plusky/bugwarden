@@ -678,6 +678,192 @@ async fn suppressed_ids_off_records_the_count_never_the_ids() {
     );
 }
 
+/// Bug 7's comments mix BOTH suppression populations in one call (issue
+/// #68): three private comments the I5 gate drops, which carry no bug id
+/// of their own, and two duplicate markers naming the
+/// [`HIDE_SECRET_POLICY`]-hidden bugs 666 and 667, which do.
+///
+/// One of the three private comments is ITSELF a duplicate marker, naming
+/// a third hidden bug 668. That comment is what makes the fixture defend
+/// the disjointness the sum rests on rather than merely assume it: the
+/// marker ids are harvested from the comments that SURVIVED the private
+/// filter, so 668 is counted once as id-less content and never named —
+/// total 5. Harvest the ids from the pre-filter list instead and the same
+/// dropped comment is counted twice, once in each tally: 6, over a
+/// three-id list. Both classify fetches are mounted so that mutation
+/// fails on the NUMBER rather than on an unmatched mock.
+async fn mount_mixed_suppression(mock: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [world_bug(7)] })))
+        .mount(mock)
+        .await;
+    let secret = |id: u64| {
+        let mut bug = world_bug(id);
+        bug["product"] = json!("SecretSauce");
+        bug
+    };
+    // The link-disclosure fetch asks for the whole candidate set at once.
+    // Expected exactly once: without the expectation an id list the guard
+    // never asks for still 404s into disclosable's fail-closed arm, which
+    // withholds 666/667 anyway and leaves the fixture decorative.
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "666,667"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "bugs": [secret(666), secret(667)] })),
+        )
+        .expect(1)
+        .mount(mock)
+        .await;
+    // Never requested while the harvest stays post-filter — mounted so a
+    // pre-filter harvest gets a truthful answer and is caught by the
+    // count, not by a 404.
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "666,667,668"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "bugs": [secret(666), secret(667), secret(668)] })),
+        )
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/7/comment"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": { "7": { "comments": [
+                { "id": 1, "bug_id": 7, "is_private": false, "text": "public comment" },
+                { "id": 2, "bug_id": 7, "is_private": true, "text": "canary-private-8a1c one" },
+                { "id": 3, "bug_id": 7, "is_private": true, "text": "canary-private-8a1c two" },
+                // Private AND a duplicate marker: id-less content by the
+                // only reading that keeps the two tallies disjoint.
+                { "id": 4, "bug_id": 7, "is_private": true,
+                  "text": "canary-private-8a1c *** Bug 668 has been marked as a duplicate of this bug ***" },
+                { "id": 5, "bug_id": 7, "is_private": false,
+                  "text": "*** Bug 666 has been marked as a duplicate of this bug ***" },
+                { "id": 6, "bug_id": 7, "is_private": false,
+                  "text": "*** Bug 667 has been marked as a duplicate of this bug ***" },
+            ] } }
+        })))
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn suppressed_count_totals_both_populations_in_one_call() {
+    // Issue #68: one call suppresses three id-less private comments AND
+    // two duplicate-marker bug ids. The count is the TOTAL — five — not
+    // the larger tally, which would report three beside a two-id list and
+    // silently lose two withheld items.
+    let mock = MockServer::start().await;
+    mount_mixed_suppression(&mock).await;
+    let audited = audited_client_for(HIDE_SECRET_POLICY, &mock, "test-key").await;
+
+    let result = call(&audited.client, "bug_comments", json!({ "id": 7 })).await;
+    assert_ne!(result.is_error, Some(true), "bug 7's comments are served");
+    let envelope = serde_json::to_string(&result).unwrap();
+    for id in ["666", "667"] {
+        assert!(
+            !envelope.contains(id),
+            "the hidden id must be scrubbed from the served comments (I14): {envelope}"
+        );
+    }
+    assert!(
+        !envelope.contains("canary-private-8a1c"),
+        "the private comments must not reach the client (I5): {envelope}"
+    );
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.request.tool, "bug_comments");
+    let guard = tc.guard.as_ref().expect("guard info recorded");
+    assert_eq!(guard.verdict, Verdict::ServedFiltered);
+    assert_eq!(
+        guard.suppressed_ids,
+        vec![666, 667],
+        "the surviving comments' marker ids are named, and 668's — noted \
+         only inside a DROPPED private comment — is not: naming it would \
+         count that one comment in both tallies"
+    );
+    assert_eq!(
+        guard.suppressed_count, 5,
+        "three id-less comments plus two withheld ids: {guard:?}"
+    );
+    assert!(
+        guard.suppressed_ids.len() < guard.suppressed_count as usize,
+        "the count is authoritative and outruns the id list it may not be \
+         inferred from: {guard:?}"
+    );
+}
+
+#[tokio::test]
+async fn summarize_bug_records_the_same_total_as_bug_comments() {
+    // summarize_bug filters and scrubs the same comments as bug_comments
+    // and notes both tallies from its own call site (server.rs), so this
+    // diff changes the number it records too — it needs its own record,
+    // not bug_comments' by analogy.
+    let mock = MockServer::start().await;
+    mount_mixed_suppression(&mock).await;
+    let audited = audited_client_for(HIDE_SECRET_POLICY, &mock, "test-key").await;
+
+    let result = call(&audited.client, "summarize_bug", json!({ "id": 7 })).await;
+    assert_ne!(result.is_error, Some(true), "the summary prompt is served");
+    let envelope = serde_json::to_string(&result).unwrap();
+    for id in ["666", "667", "668"] {
+        assert!(
+            !envelope.contains(id),
+            "no hidden id may reach the summarization prompt (I14): {envelope}"
+        );
+    }
+    assert!(
+        !envelope.contains("canary-private-8a1c"),
+        "no private comment may reach the summarization prompt (I5): {envelope}"
+    );
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.request.tool, "summarize_bug");
+    let guard = tc.guard.as_ref().expect("guard info recorded");
+    assert_eq!(guard.verdict, Verdict::ServedFiltered);
+    assert_eq!(
+        guard.suppressed_ids,
+        vec![666, 667],
+        "the same two ids bug_comments names, and 668 no more than it does"
+    );
+    assert_eq!(
+        guard.suppressed_count, 5,
+        "three id-less comments plus two withheld ids: {guard:?}"
+    );
+}
+
+#[tokio::test]
+async fn suppressed_count_totals_both_populations_with_the_ids_elided() {
+    // The same call under `suppressed_ids = false`, which is the case the
+    // issue calls out: with no id list at all, the count is the operator's
+    // ONLY signal that anything was withheld (I3 keeps it from the
+    // client), so it must still total both populations.
+    let mock = MockServer::start().await;
+    mount_mixed_suppression(&mock).await;
+    let audited = audited_client_with(HIDE_SECRET_POLICY, &mock, "test-key", false).await;
+
+    let result = call(&audited.client, "bug_comments", json!({ "id": 7 })).await;
+    assert_ne!(result.is_error, Some(true), "bug 7's comments are served");
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    let guard = tc.guard.as_ref().expect("guard info recorded");
+    assert!(
+        guard.suppressed_ids.is_empty(),
+        "ids are elided when the knob is off: {:?}",
+        guard.suppressed_ids
+    );
+    assert_eq!(
+        guard.suppressed_count, 5,
+        "the elided ids still count, and the id-less comments add to them: {guard:?}"
+    );
+}
+
 /// Serve a quicksearch corpus (issue #29 tests): search requests are paged
 /// by limit/offset the way Bugzilla pages them, and the I14 link-disclosure
 /// classify fetch — which addresses bugs by id, not by query — gets an

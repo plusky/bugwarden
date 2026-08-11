@@ -1103,6 +1103,59 @@ Decisions, all deliberate:
   `guard` object. Re-encoding a default decision AS absence would be a
   record-schema change and is deferred to #34; schema v1 records
   `"default"`.
+- **What `guard.suppressed_count` totals (issue #68).** The cell keeps two
+  tallies: a `BTreeSet` of bug ids the guard withheld (`note_suppressed` —
+  I14-scrubbed links, scrubbed duplicate markers, verdict-dropped search
+  rows) and a plain counter of suppressed content that HAS no bug id
+  (`note_suppressed_count` — private comments in `bug_comments` and
+  `summarize_bug`, private attachment metadata in `list_attachments`).
+  `suppressed_count` is their SUM. It used to be their maximum, which is
+  not a count of anything: a `summarize_bug` call that dropped three
+  private comments while scrubbing two duplicate-marker ids recorded
+  `3` beside a two-element id list, under-reporting by two and still
+  validating. Summing is sound because the populations are disjoint by
+  construction — both comment sites derive their marker ids from the
+  comments that SURVIVED the private filter, so a dropped comment can
+  never also contribute an id, and the attachment site names no ids at
+  all; within the id set itself a `BTreeSet` dedupes the overlap between
+  the search scan's dropped ids and the link ids scrubbed beside them.
+  Disjointness is what makes the sum sound, so it is load-bearing rather
+  than incidental: both harvest sites in `server.rs` carry a comment
+  saying so, and the fixture behind the record tests plants a duplicate
+  marker inside a PRIVATE comment — harvesting pre-filter would count
+  that one comment in both tallies and over-report, which is strictly
+  worse than the under-report being fixed.
+  This matters because I3 forbids telling the CLIENT anything was
+  withheld, so the audit stream is the only place the fact surfaces, and
+  `suppressed_ids` is gated behind the `suppressed_ids` config switch
+  while the count always ships — a maximum cannot be the authoritative
+  number the field claims to be.
+  ACCEPTED COST, deliberate: no field is added or removed and the wire
+  shape is unchanged, so this stays schema v1 — but parseable is not
+  comparable, and the change of MEANING inside v1 is undetectable from a
+  record. There is no discriminator: an event carries `v`, `ts`, `seq`
+  and `session` only, `initialize` records the CLIENT's version and never
+  bugwarden's build, `policy_hash` is unchanged unless the operator
+  edited policy, and `suppressed_count >= len(suppressed_ids)` holds
+  under both readings, so there is no structural tell either. A `v: 1`
+  corpus spanning the upgrade therefore carries both readings under one
+  version stamp, with the deployed BUILD as the boundary:
+  `{suppressed_count: 3, suppressed_ids: [666, 667]}` reads as "3
+  withheld" after and "at least 5 withheld" before. The safe reading of a
+  pre-upgrade record is "at least `max(suppressed_count,
+  len(suppressed_ids))`, possibly more"; a consumer that asserted
+  equality between the two, or alerted on the inequality, changes
+  behaviour on mixed calls — observable only where `suppressed_ids =
+  true`, since with ids elided the two readings are indistinguishable. A
+  version bump was considered and rejected: it would fork every reader
+  over a record whose fields, names and types are identical, for a field
+  already documented as authoritative — which a maximum never satisfied,
+  making this a correction to the stated contract rather than a new one.
+  The rule this relies on is that `v` tracks structure, not meaning; it
+  is now stated on `SCHEMA_VERSION` itself. Splitting the tallies into
+  two fields (`suppressed_ids_count` and `suppressed_other_count`) is the
+  cleaner end state, would have made the change self-announcing, and
+  stays with the v2 work in #34.
 
 ## rmcp 3.1 usage notes
 
@@ -1608,7 +1661,19 @@ wired, `server.rs` and `main.rs` are the reference.
   allow side alike, while a CLEAN search (no drops, so nothing the scan
   merge could have cleared) records no rule at all even though a named
   rule granted every row it served, since absence means "no single rule
-  decided" and not "the default decided".
+  decided" and not "the default decided"; and what `suppressed_count`
+  totals (issue #68) — `bug_comments` AND `summarize_bug`, each on a
+  call that drops three private comments while scrubbing two
+  duplicate-marker ids in the SAME request, record
+  `suppressed_count == 5` over a two-element `suppressed_ids`, so the
+  count exceeds the id list rather than being the larger tally, and with
+  `suppressed_ids = false` the same call still records `5` with no id at
+  all — the operator's only signal. One of those three private comments
+  is itself a duplicate marker naming a third hidden bug, so the fixture
+  DEFENDS the disjointness the sum rests on: harvesting marker ids from
+  the pre-filter comment list counts that one comment in both tallies
+  and records `6` over three ids, and both tools' tests fail on the
+  number (plus the cell-level sum tests in audit.rs).
 - Identity tests (#[cfg(test)] in crates/bugwarden/src/server.rs and
   crates/bugwarden-core/src/client.rs; crates/bugwarden/tests/
   http_transport_wiremock.rs, crates/bugwarden/tests/binary_user_agent.rs
