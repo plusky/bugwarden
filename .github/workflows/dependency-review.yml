@@ -49,3 +49,20 @@ jobs:
             EPL-2.0,
             MPL-1.1,
             OSL-3.0
+          # Swatinem/rust-cache is LGPL-3.0 and exempt from the list above,
+          # which exists for dependencies that get COMPILED INTO the binary
+          # we distribute. This is a GitHub Action: it runs on the runner,
+          # saves and restores ~/.cargo and target/, is never linked, never
+          # vendored, and never conveyed — so its copyleft cannot reach an
+          # artifact we ship. release.yml, which builds the tarballs and
+          # publishes to crates.io, does not use it at all; only ci.yml does.
+          # The exemption changes nothing in substance: the same LGPL-3.0
+          # code is already pinned on main, and only a version bump makes
+          # dependency-review look at it (it inspects CHANGED dependencies),
+          # so without this every future bump fails identically.
+          # deny.toml remains the sole authority for crates, where copyleft
+          # would be a real distribution problem — it is deliberately NOT
+          # relaxed here. Exempt one action, not `pkg:githubactions/*`, so a
+          # new copyleft action still trips the check and gets a decision.
+          allow-dependencies-licenses: >-
+            pkg:githubactions/Swatinem/rust-cache
