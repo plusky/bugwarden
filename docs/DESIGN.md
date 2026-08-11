@@ -1079,6 +1079,30 @@ Decisions, all deliberate:
   withheld rows IS a filtered serve; a clean scan leaves the verdict
   untouched. Client-invisible by construction (I3): the response is built
   from the window's bugs alone, byte-identical with or without drops.
+- **The `guard.rule` encoding (issue #67).** `Access` carries
+  `rule: String`, never an `Option`, so every assessment names what
+  decided it — the policy default included, under the literal `"default"`.
+  That is deliberate, and strictly more informative than absence: it
+  separates "the default decided this call" from "no single rule decided
+  it", which one absent field cannot express. Beside the operator's own
+  names the guard emits three further synthetic ones —
+  `"min_bug_age_days"` (the age quarantine, before any rule runs),
+  `"<rule>:unreadable-metadata"` (a GRANTING rule whose verdict hinged on
+  metadata nobody could read, I4; an undecidable deny rule keeps its plain
+  name, having denied for its own reason), and `"unavailable"` (the
+  classification fetch never reached the bug). Nothing reserves those
+  spellings against an operator choosing the same rule name, so `rule`
+  names what decided without proving which kind of thing it was. Absence
+  therefore carries exactly one meaning — no single rule decided the
+  call: a refusal answered from the request alone, the pre-dispatch gate
+  (the guard never ran), a search (the verdict is the window's, not one
+  bug's), the create gate on either arm (it judges the request as a
+  whole), an id with no matching `Access`, and the attachment withhold
+  together with its constant-cost bug-0 padding assessment. A tool the
+  router never carried (I13) is not this case at all: it records no
+  `guard` object. Re-encoding a default decision AS absence would be a
+  record-schema change and is deferred to #34; schema v1 records
+  `"default"`.
 
 ## rmcp 3.1 usage notes
 
@@ -1578,7 +1602,13 @@ wired, `server.rs` and `main.rs` are the reference.
   are elided; a clean search records `scan.dropped == 0` under verdict
   `served`; and a pre-#29 record line without `guard.scan`
   deserializes with the scan absent (plus the cell-level note_scan
-  merge tests and the updated schema golden in audit.rs).
+  merge tests and the updated schema golden in audit.rs); and the
+  `guard.rule` encoding (issue #67) — a call decided by the policy
+  default records the literal `"default"`, on the deny side and the
+  allow side alike, while a CLEAN search (no drops, so nothing the scan
+  merge could have cleared) records no rule at all even though a named
+  rule granted every row it served, since absence means "no single rule
+  decided" and not "the default decided".
 - Identity tests (#[cfg(test)] in crates/bugwarden/src/server.rs and
   crates/bugwarden-core/src/client.rs; crates/bugwarden/tests/
   http_transport_wiremock.rs, crates/bugwarden/tests/binary_user_agent.rs

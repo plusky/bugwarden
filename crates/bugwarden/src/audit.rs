@@ -474,8 +474,48 @@ pub struct RequestInfo {
 pub struct GuardInfo {
     /// The overall verdict for the call.
     pub verdict: Verdict,
-    /// Name of the policy rule that decided the verdict, when one did
-    /// (absent when the policy default decided).
+    /// Name of the rule that decided the verdict, when a single rule did.
+    ///
+    /// A call the policy DEFAULT decided records the literal `"default"` —
+    /// NOT an absent field. Beside the operator's own rule names the guard
+    /// emits four synthetic ones: `"default"` (no rule matched),
+    /// `"min_bug_age_days"` (the age quarantine denied before any rule
+    /// ran), `"<rule>:unreadable-metadata"` (a granting rule whose verdict
+    /// hinged on metadata nobody could read, I4), and `"unavailable"` (the
+    /// classification fetch never reached the bug). They share one
+    /// namespace with the operator's names and nothing reserves them, so a
+    /// policy may define a rule literally called `default`: this field
+    /// names what decided, it does not prove which kind of thing it was.
+    ///
+    /// Absent only where no single rule decided the call:
+    ///
+    /// - a refusal answered from the request alone — bad arguments, too
+    ///   many ids;
+    /// - the pre-dispatch audit gate, where the guard never ran at all;
+    /// - a search, whose verdict is the window's and not one bug's;
+    /// - the create gate, refusing or granting: it judges the request as a
+    ///   whole and names no rule either way;
+    /// - an id the guard produced no matching [`Access`] for — none at
+    ///   all, or one whose variant the re-checked outcome contradicts;
+    /// - withheld attachment content after a granted assessment, and the
+    ///   constant-cost padding assessment against bug id 0, neither of
+    ///   which any rule decided.
+    ///
+    /// A tool the router never carried is a different case again, not an
+    /// absent rule: read-only mode, `global.disabled_tools` and discovery
+    /// being off REMOVE the route at construction (I13), so the call
+    /// reaches no guard, touches no cell, and its record carries no
+    /// `guard` object at all.
+    ///
+    /// [`AuditCell`]'s worst-wins merge carries this through: a rule-less
+    /// note that outranks a rule-decided one clears the rule.
+    ///
+    /// Recording `"default"` rather than absence is deliberate — absence
+    /// could not also express "no single rule decided". Schema v1 encodes
+    /// it this way; the decision is recorded in DESIGN.md under "Audit
+    /// stream", and #34 tracks the schema change.
+    ///
+    /// [`Access`]: bugwarden_core::policy::Access
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule: Option<String>,
     /// Digest of the policy document in force, so a record can be tied to
@@ -1127,7 +1167,7 @@ impl AuditCell {
 
     /// Worst-wins verdict merge. The rule follows the deciding verdict: a
     /// strict upgrade replaces the stored rule with the new one (present
-    /// or not — a default-decided verdict has none), an equally severe
+    /// or not — a rule-less verdict clears it), an equally severe
     /// verdict may only fill an empty slot (first rule recorded wins),
     /// and a less severe verdict changes nothing.
     fn merge(&self, verdict: Verdict, rule: Option<&str>) {
@@ -1150,8 +1190,13 @@ impl AuditCell {
         }
     }
 
-    /// Note a verdict with no deciding rule (the policy default, or a
-    /// refusal that never consulted a rule).
+    /// Note a verdict no single rule decided: a refusal that never
+    /// consulted one, a search or create gate judging the request as a
+    /// whole, an id the guard produced no matching decision for, or a
+    /// withheld attachment — [`GuardInfo::rule`] carries the full list.
+    /// NOT for a policy-default decision: the default decides under the
+    /// rule name `"default"` and goes through
+    /// [`AuditCell::note_verdict_rule`] like any other.
     pub fn note_verdict(&self, verdict: Verdict) {
         self.merge(verdict, None);
     }
@@ -2182,10 +2227,12 @@ mod tests {
     }
 
     #[test]
-    fn cell_upgrade_by_a_default_decision_clears_the_rule() {
+    fn cell_upgrade_by_a_rule_less_verdict_clears_the_rule() {
         // The rule names the DECIDING rule of the worst verdict: when a
-        // default-decided denial outranks a rule-decided serve, no rule
-        // may stay attached.
+        // denial no single rule decided outranks a rule-decided serve, no
+        // rule may stay attached. A policy-DEFAULT denial is not this
+        // case — it decides under the name "default" and arrives through
+        // note_verdict_rule.
         let cell = AuditCell::default();
         cell.note_verdict_rule(Verdict::Served, "allow-most");
         cell.note_verdict(Verdict::Denied);

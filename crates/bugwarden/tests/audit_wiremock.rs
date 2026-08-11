@@ -447,6 +447,49 @@ async fn refusal_paths_write_exactly_one_record_each() {
 }
 
 #[tokio::test]
+async fn a_default_decided_call_records_the_literal_default_rule() {
+    // Issue #67: the policy default is a NAMED decision. Both arms of it
+    // write the literal "default" into the record — an absent rule means
+    // no single rule decided, which is a different statement. Asserted on
+    // the audit record rather than on Access, because the record is what
+    // a consumer reads.
+    let mock = MockServer::start().await;
+    mount_fixture(&mock).await;
+
+    // Denying default, no rules at all: bug 7 is denied by the default.
+    let audited = audited_client_for("default_action = \"deny\"\n", &mock, "test-key").await;
+    let denied = call(&audited.client, "bug_history", json!({ "id": 7 })).await;
+    assert_eq!(denied.is_error, Some(true));
+    let events = read_events(&audited.audit_path);
+    let guard = last_tool_call(&events)
+        .guard
+        .as_ref()
+        .expect("the guard was consulted");
+    assert_eq!(guard.verdict, Verdict::Denied);
+    assert_eq!(
+        guard.rule.as_deref(),
+        Some("default"),
+        "a default-decided denial is named, not rule-less"
+    );
+
+    // Allowing default, no rules at all: the same name on the serve side.
+    let audited = audited_client_for("default_action = \"allow\"\n", &mock, "test-key").await;
+    let served = call(&audited.client, "bug_history", json!({ "id": 7 })).await;
+    assert_ne!(served.is_error, Some(true), "the history is served");
+    let events = read_events(&audited.audit_path);
+    let guard = last_tool_call(&events)
+        .guard
+        .as_ref()
+        .expect("the guard was consulted");
+    assert_eq!(guard.verdict, Verdict::Served);
+    assert_eq!(
+        guard.rule.as_deref(),
+        Some("default"),
+        "a default-decided serve is named too"
+    );
+}
+
+#[tokio::test]
 async fn unknown_and_stripped_tools_error_identically_and_still_record() {
     let mock = MockServer::start().await;
     let read_only = "[global]\nread_only = true\n";
@@ -805,6 +848,40 @@ async fn quicksearch_clean_scan_records_zero_drops_and_stays_served() {
     assert_eq!(guard.verdict, Verdict::Served, "a clean scan stays served");
     assert!(guard.suppressed_ids.is_empty());
     assert_eq!(guard.suppressed_count, 0);
+}
+
+#[tokio::test]
+async fn quicksearch_records_no_rule_even_when_a_named_rule_judged_every_row() {
+    // The other half of issue #67: a search verdict belongs to the WINDOW,
+    // not to any one bug, so the record names no rule — here even though
+    // `allow-openSUSE` is what granted every row it served. Asserted on a
+    // CLEAN scan deliberately: once a scan drops rows it merges
+    // served_filtered rule-lessly, which would clear any rule the search
+    // had noted and make this assertion pass for the wrong reason.
+    let policy = concat!(
+        "default_action = \"deny\"\n",
+        "[[rule]]\nname = \"allow-openSUSE\"\naction = \"allow\"\n",
+        "[rule.match]\nproducts = [\"openSUSE\"]\n",
+    );
+    let mock = MockServer::start().await;
+    mount_search_corpus(&mock, vec![world_bug(1), world_bug(2), world_bug(3)]).await;
+    let audited = audited_client_for(policy, &mock, "test-key").await;
+
+    let result = call(&audited.client, "bugs_quicksearch", json!({ "query": "q" })).await;
+    assert_ne!(result.is_error, Some(true), "the search is served");
+
+    let events = read_events(&audited.audit_path);
+    let guard = last_tool_call(&events)
+        .guard
+        .as_ref()
+        .expect("guard info recorded");
+    assert_eq!(guard.verdict, Verdict::Served, "a clean scan stays served");
+    assert_eq!(guard.scan.expect("a search records its scan").dropped, 0);
+    assert_eq!(
+        guard.rule.as_deref(),
+        None,
+        "no single rule decided the window"
+    );
 }
 
 #[tokio::test]

@@ -825,7 +825,10 @@ impl Policy {
     ///    whose `operations` cover `op`. The scope check precedes matcher
     ///    evaluation, so a rule scoped away from `op` can neither match nor
     ///    fail closed on unreadable metadata for this classification.
-    /// 3. `default_action`.
+    /// 3. `default_action`, which decides under the synthetic rule name
+    ///    `"default"` — allow and deny alike. A default decision is NAMED,
+    ///    never rule-less: downstream records carry `"default"`, not an
+    ///    absent rule.
     ///
     /// Every grant — from a rule or from the default — has write capabilities
     /// stripped when `global.read_only` is set.
@@ -1068,9 +1071,12 @@ impl BugMeta {
 /// The outcome of classifying one bug against the policy.
 #[derive(Debug, Clone)]
 pub enum Access {
-    /// No access at all. `rule` names the deciding rule (or the synthetic
-    /// `"min_bug_age_days"` / `"default"` / `"unavailable"`) for server-side
-    /// logging only — it is never sent to the MCP client (I1/I2).
+    /// No access at all. `rule` names the deciding rule (or one of the
+    /// synthetic `"min_bug_age_days"` / `"default"` /
+    /// `"<rule>:unreadable-metadata"` / `"unavailable"`, none of which
+    /// validation reserves against an operator choosing the same name) for
+    /// server-side logging only — it is never sent to the MCP client
+    /// (I1/I2).
     Denied {
         /// Server-side-only name of the deciding rule.
         rule: String,
@@ -1079,7 +1085,9 @@ pub enum Access {
     Granted {
         /// The granted capability set (writes already stripped if read-only).
         caps: BTreeSet<Capability>,
-        /// Server-side-only name of the deciding rule.
+        /// Server-side-only name of the deciding rule, or `"default"` — the
+        /// one synthetic name that appears on this side too, when an
+        /// allowing `default_action` is what granted.
         rule: String,
     },
 }
