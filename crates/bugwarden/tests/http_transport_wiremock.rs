@@ -418,6 +418,46 @@ async fn a_client_addressing_the_server_by_name_is_served() {
 }
 
 #[tokio::test]
+async fn allowed_hosts_serve_the_named_authority_and_refuse_the_others() {
+    // `--allowed-hosts` is the operator's opt-in back into rmcp's Host
+    // validation: naming an authority can only narrow what the disabled
+    // state serves (I9), so the named one is answered and every other name
+    // — including the loopback the harness dials — is refused.
+    let mock = MockServer::start().await;
+    let file = key_file("srv-key\n");
+    let mut cli = Arc::into_inner(http_cli(&mock, Some(file.path()))).expect("the sole owner");
+    cli.allowed_hosts = vec!["bugwarden.example:8080".into()];
+    let addr = serve_http(Arc::new(cli), "", &mock, None).await;
+
+    for (host, served) in [("bugwarden.example:8080", true), ("evil.example", false)] {
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/mcp"))
+            .header("Host", host)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "host-probe", "version": "1" }
+                }
+            }))
+            .send()
+            .await
+            .expect("the request must reach the server");
+        assert_eq!(
+            response.status().is_success(),
+            served,
+            "Host {host} must {} be served",
+            if served { "" } else { "not" }
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_handshake_free_call_is_refused_and_never_names_a_client() {
     // rmcp routes a request to its handshake-free lifecycle on the mere
     // PRESENCE of `_meta.io.modelcontextprotocol/protocolVersion` — whatever

@@ -51,6 +51,13 @@ pub struct Cli {
     #[arg(long, env = "MCP_PORT", default_value_t = 8000)]
     pub port: u16,
 
+    /// Hostname or 'host:port' authority accepted in an inbound Host header
+    /// (http transport only). Repeat the flag to allow further hosts. Command
+    /// line only, no environment variable; without it Host validation stays
+    /// off and any Host header is served.
+    #[arg(long, value_name = "HOST")]
+    pub allowed_hosts: Vec<String>,
+
     /// HTTP header for clients to send the Bugzilla API key. Defaults to
     /// 'ApiKey' or the MCP_API_KEY_HEADER environment variable. Not consulted
     /// in server-held key mode (--api-key-file over http).
@@ -112,6 +119,7 @@ impl std::fmt::Debug for Cli {
             .field("transport", &self.transport)
             .field("host", &self.host)
             .field("port", &self.port)
+            .field("allowed_hosts", &self.allowed_hosts)
             .field("api_key_header", &self.api_key_header)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("api_key_file", &self.api_key_file)

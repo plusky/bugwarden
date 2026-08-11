@@ -1172,7 +1172,7 @@ wired, `server.rs` and `main.rs` are the reference.
 
   | field | rmcp 3.1 default | this build |
   |---|---|---|
-  | `allowed_hosts` | `localhost`, `127.0.0.1`, `::1` | **set** — `disable_allowed_hosts()` |
+  | `allowed_hosts` | `localhost`, `127.0.0.1`, `::1` | **set** — `disable_allowed_hosts()`, or the operator's `--allowed-hosts` list when given |
   | `max_request_body_bytes` | 4 MiB | **set** — derived from `global.max_attachment_bytes`, floored at that same 4 MiB (see below) |
   | `cancellation_token` | fresh token | **set** (main.rs) — a child of the process token |
   | `allowed_origins` | `[]`, i.e. validation off | inherited, deliberately |
@@ -1238,6 +1238,13 @@ wired, `server.rs` and `main.rs` are the reference.
   row together. The `cancellation_token` is named so ctrl_c tears the live
   transport down with the process instead of leaving it to outlive the
   shutdown.
+
+  An operator who does know the authorities their deployment answers to names
+  them with a repeated `--allowed-hosts`, which turns that validation back on
+  for exactly that list. Tighten-only like every other CLI knob (I9), since
+  the disabled state serves every `Host`; command line only, and deliberately
+  without an environment variable, because it is a per-deployment network fact
+  stated where the bind address is stated.
 
   `allowed_origins` is the browser-facing sibling of `allowed_hosts`, and the
   #32 argument covers it identically. It is inherited rather than named because

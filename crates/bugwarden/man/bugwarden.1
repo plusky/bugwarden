@@ -9,6 +9,7 @@ bugwarden \- MCP server for Bugzilla with operator\-controlled security guards
 [\fB\-\-transport\fR <TRANSPORT>]
 [\fB\-\-host\fR <HOST>]
 [\fB\-\-port\fR <PORT>]
+[\fB\-\-allowed\-hosts\fR <HOST>]
 [\fB\-\-api\-key\-header\fR <API_KEY_HEADER>]
 [\fB\-\-api\-key\fR <API_KEY>]
 [\fB\-\-api\-key\-file\fR <API_KEY_FILE>]
@@ -47,6 +48,9 @@ Host address for the MCP server to listen on (http transport only). Defaults to 
 .TP
 \fB\-\-port\fR \fI<PORT>\fR [default: 8000]
 Port for the MCP server to listen on (http transport only). Defaults to 8000 or the MCP_PORT environment variable
+.TP
+\fB\-\-allowed\-hosts\fR \fI<HOST>\fR
+Hostname or \*(Aqhost:port\*(Aq authority accepted in an inbound Host header (http transport only). Repeat the flag to allow further hosts. Command line only, no environment variable; without it Host validation stays off and any Host header is served
 .TP
 \fB\-\-api\-key\-header\fR \fI<API_KEY_HEADER>\fR [default: ApiKey]
 HTTP header for clients to send the Bugzilla API key. Defaults to \*(AqApiKey\*(Aq or the MCP_API_KEY_HEADER environment variable. Not consulted in server\-held key mode (\-\-api\-key\-file over http)

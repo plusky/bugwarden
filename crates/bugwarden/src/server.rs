@@ -1342,8 +1342,11 @@ impl BugWarden {
     ///   bugwarden is reached by MCP clients at whatever address the
     ///   operator bound and named, so that default would refuse every
     ///   deployment not addressed as `localhost`, containers included.
-    ///   Disabled deliberately: the access control here is the network
-    ///   boundary, and per-caller authentication when it lands (issue #32).
+    ///   Disabled deliberately when the operator names no host: the access
+    ///   control here is the network boundary, and per-caller
+    ///   authentication when it lands (issue #32). `--allowed-hosts` names
+    ///   the authorities this deployment answers to, which only ever
+    ///   narrows what the disabled state serves (I9).
     /// * `max_request_body_bytes` is a POST cap with no rmcp 2.2
     ///   equivalent, worth keeping as a memory bound — but it also ceilings
     ///   `add_attachment`, so a fixed value silently overrides the
@@ -1378,11 +1381,15 @@ impl BugWarden {
     /// under "rmcp 3.1 usage notes"; the caller in `main` adds
     /// `cancellation_token` so shutdown reaches the live transport.
     pub fn http_server_config(&self) -> StreamableHttpServerConfig {
-        StreamableHttpServerConfig::default()
+        let config = StreamableHttpServerConfig::default()
             .disable_allowed_hosts()
             .with_max_request_body_bytes(max_request_body_bytes(
                 self.guard.policy.global.max_attachment_bytes,
-            ))
+            ));
+        match self.cfg.allowed_hosts.as_slice() {
+            [] => config,
+            hosts => config.with_allowed_hosts(hosts.iter().map(String::as_str)),
+        }
     }
 
     /// Turn a silent identity blackout into a loud startup failure.
