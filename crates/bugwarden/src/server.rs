@@ -3840,6 +3840,10 @@ mod tests {
             let (server, logs) =
                 crate::testlog::capture_logs(|| BugWarden::new(Arc::new(cli), guard, bz));
             drop(server.expect("server must build"));
+            // The `false` arm asserts an absence, which an empty capture
+            // satisfies while proving nothing. This is what separates "the
+            // warning was not emitted" from "nothing was captured at all".
+            crate::testlog::assert_captured(&logs);
             assert_eq!(
                 logs.contains("created_by_me describes that one account"),
                 expect_warn,

@@ -445,11 +445,11 @@ mod tests {
         cli.api_key_file = Some(file.path().to_path_buf());
         let (custody, logs) = crate::testlog::capture_logs(|| cli.resolve_key_custody());
         drop(custody.expect("key file resolves"));
-        assert!(logs.contains("server-held"), "startup log: {logs}");
-        assert!(
-            logs.contains(&file.path().display().to_string()),
-            "the log must name the source path: {logs}"
-        );
+        crate::testlog::assert_logged(&logs, "server-held");
+        crate::testlog::assert_logged(&logs, &file.path().display().to_string());
+        // The I12 check below is a negative: on its own an empty capture would
+        // satisfy it. It is evidence only because the positive assertions above
+        // run first and fail loudly on one — keep them ahead of it.
         assert!(
             !logs.contains("hush-key"),
             "the log must never carry key material (I12): {logs}"
@@ -458,9 +458,6 @@ mod tests {
         let cli = base_cli("http");
         let (custody, logs) = crate::testlog::capture_logs(|| cli.resolve_key_custody());
         drop(custody.expect("http resolves"));
-        assert!(
-            logs.contains("per-request via the 'ApiKey' header"),
-            "startup log: {logs}"
-        );
+        crate::testlog::assert_logged(&logs, "per-request via the 'ApiKey' header");
     }
 }
