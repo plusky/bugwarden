@@ -22,7 +22,9 @@ use chrono::Utc;
 use serde_json::{Map, Value};
 
 use crate::client::{BugzillaClient, CLASSIFY_FIELDS};
-use crate::policy::{Access, BugMeta, Capability, IdentitySource, Operation, Policy};
+use crate::policy::{
+    Access, BugMeta, Capability, IdentitySource, Operation, Policy, RULE_UNAVAILABLE,
+};
 
 /// Fields kept by the redacted summary-only projection of a bug
 /// ([`Guard::summary_view`]). Everything else — assignee, CC, groups,
@@ -217,7 +219,7 @@ impl Guard {
                 // or fetch failure — all fail closed identically (I4).
                 None => (
                     Access::Denied {
-                        rule: "unavailable".into(),
+                        rule: RULE_UNAVAILABLE.into(),
                     },
                     Value::Null,
                 ),

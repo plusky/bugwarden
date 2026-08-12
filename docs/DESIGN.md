@@ -279,17 +279,22 @@ impl Default for Policy; // allow-all, no rules, defaults
 impl Policy {
     pub fn from_toml_str(s: &str) -> anyhow::Result<Policy>; // strict parse + validate
     pub fn load(path: &std::path::Path) -> anyhow::Result<Policy>; // read + from_toml_str; on unix warn (tracing::warn) if file is group/other-writable
-    // validate: Restrict rules need >=1 capability; Allow/Deny rules must have
-    // empty capabilities; default_action must not be Restrict; a written
-    // `operations = []` is an error (a rule applying to no operation is dead
-    // configuration); a Restrict rule scoped to ONLY `create` must grant
-    // exactly the `create` capability (without it the rule could grant
-    // nothing reachable, and any other capability it named would be dead —
-    // the create gate consults only `create`); a Restrict rule scoped away
-    // from `create` must not grant `create` (nothing outside the create
-    // gate consults it, so a typoed scope would otherwise silently lose
-    // both the intended filing grant and the reads the capability list
-    // withholds). Unknown operation names are rejected by serde.
+    // validate: every rule name is non-blank, unique, and not one the guard
+    // decides under itself ("default", "min_bug_age_days", "unavailable",
+    // or any name ending in ":unreadable-metadata") — the collision
+    // comparisons are exact, so "Default" and " default" stay legal, while
+    // the blank check trims; Restrict rules need >=1 capability; Allow/Deny
+    // rules must have empty capabilities; default_action must not be
+    // Restrict; a written `operations = []` is an error (a rule applying to
+    // no operation is dead configuration); a Restrict rule scoped to ONLY
+    // `create` must grant exactly the `create` capability (without it the
+    // rule could grant nothing reachable, and any other capability it named
+    // would be dead — the create gate consults only `create`); a Restrict
+    // rule scoped away from `create` must not grant `create` (nothing
+    // outside the create gate consults it, so a typoed scope would
+    // otherwise silently lose both the intended filing grant and the reads
+    // the capability list withholds). Unknown operation names are rejected
+    // by serde.
     pub fn classify(&self, bug: &BugMeta, now: chrono::DateTime<chrono::Utc>, op: Operation) -> Access;
     // Whether any rule consulted for Operation::Access carries a
     // created_by_me criterion — the laziness gate for whoami (see
@@ -1090,14 +1095,15 @@ Decisions, all deliberate:
   `"<rule>:unreadable-metadata"` (a GRANTING rule whose verdict hinged on
   metadata nobody could read, I4; an undecidable deny rule keeps its plain
   name, having denied for its own reason), and `"unavailable"` (the
-  classification fetch never reached the bug). Nothing reserves those
-  spellings against an operator choosing the same rule name, so `rule`
-  names what decided without proving which kind of thing it was. Absence
-  therefore carries exactly one meaning — no single rule decided the
-  call: a refusal answered from the request alone, the pre-dispatch gate
-  (the guard never ran), a search (the verdict is the window's, not one
-  bug's), the create gate on either arm (it judges the request as a
-  whole), an id with no matching `Access`, the attachment withhold
+  classification fetch never reached the bug). For a policy loaded from
+  TOML, validation reserves those spellings against an operator choosing
+  the same rule name (issue #84, below), so `rule` names what decided AND
+  which kind of thing it was. Absence therefore carries exactly one
+  meaning — no single rule decided the call: a refusal answered from the
+  request alone, the pre-dispatch gate (the guard never ran), a search
+  (the verdict is the window's, not one bug's), the create gate on either
+  arm (it judges the request as a whole), an id with no matching
+  `Access`, the attachment withhold
   together with its constant-cost bug-0 padding assessment, and a SERVE
   the cell later upgraded to `served_filtered` through a rule-less note —
   a suppression, a redaction, a dropping scan — since that note outranks
@@ -1161,6 +1167,51 @@ Decisions, all deliberate:
   two fields (`suppressed_ids_count` and `suppressed_other_count`) is the
   cleaner end state, would have made the change self-announcing, and
   stays with the v2 work in #34.
+- **Rule names the operator may not take (issue #84).** `Policy::validate`
+  rejects a rule named `"default"`, `"min_bug_age_days"` or
+  `"unavailable"`, a rule whose name ends in `":unreadable-metadata"`, a
+  blank name, and two rules sharing one name. Those four spellings are
+  exactly what the guard decides under on its own behalf — the first two
+  and the suffix form from `Policy::classify`, `"unavailable"` from
+  `Guard::assess` — and an audit record must identify what decided it.
+  Without the reservation a log consumer counting default-decided calls by
+  `rule == "default"` over-counted silently, a duplicate name said nothing
+  about which of two rules decided, and a blank name identified nothing at
+  all; I3 keeps that fact from the client, so the stream is the only place
+  it can hold. This is the same startup-error class `validate` already
+  applies to dead configuration (`operations = []`, a capability list on an
+  allow/deny rule, a create-scoped restrict rule whose capabilities
+  disagree with its scope). BOOT-BREAKING and accepted: a policy that
+  started before now fails at startup with an error naming the rule — the
+  correct direction, because the server refusing to run beats it writing
+  ambiguous audit records. The comparison is EXACT, byte equality on the
+  string that reaches the record: `"Default"`, `" default"` and
+  `"unreadable-metadata"` (no colon) collide with nothing and stay legal,
+  and over-rejecting them would break policies that never had the problem.
+  Blank is the one check that is not about collision — `trim().is_empty()`,
+  the same reading `global.identity_login` gets in the same function —
+  because a name that identifies nothing is the one thing the field exists
+  to prevent; its error is POSITIONAL (`rule #3 (name = "")`) since the
+  name is exactly what cannot identify the rule there. Blankness is still
+  judged bytewise, so `"embargo"` and `"embargo\u{200B}"` are two accepted
+  names that any log viewer renders identically — the guarantee is
+  byte-level, not human-reader-level, and nothing normalizes a name
+  anywhere between `Rule::name` and the JSON record. That is deliberate:
+  normalizing would break the exactness the collision checks rest on, and
+  the policy file is the trust root, so a name only its author can
+  distinguish is operator self-harm across no privilege boundary. The
+  reservation is SINGLE-SOURCED rather than restated: `RULE_DEFAULT`,
+  `RULE_MIN_BUG_AGE_DAYS`, `RULE_UNAVAILABLE` and
+  `UNREADABLE_METADATA_SUFFIX` are consumed both by the emit sites
+  (`Policy::classify`, and `Guard::assess` across the module boundary) and
+  by `RESERVED_RULE_NAMES`, so renaming a decision renames what is
+  reserved with it and the reservation cannot drift from what the engine
+  writes into a record. The set is also CLOSED: no accepted name may end
+  in the suffix and names are unique, so no generated
+  `"<rule>:unreadable-metadata"` can ever equal a bare reserved name. The
+  alternative, namespacing the synthetics in the record (a `rule_kind`
+  field, or a prefix), was rejected here: it is a record-schema change and
+  belongs to #34.
 
 ## rmcp 3.1 usage notes
 
@@ -1425,7 +1476,16 @@ wired, `server.rs` and `main.rs` are the reference.
   skipped into an allowing default — and validation rejects
   `operations = []`, unknown operation names, a restrict rule scoped to
   only `create` whose capabilities are not exactly `create`, and a
-  restrict rule scoped away from `create` that grants `create`; the
+  restrict rule scoped away from `create` that grants `create`; rule names
+  — validation rejects a rule named `default`, `min_bug_age_days` or
+  `unavailable`, a name ending in `:unreadable-metadata`, a blank
+  (empty or whitespace-only) name, and two rules sharing a name even when
+  they are not adjacent, while near misses stay LEGAL (`default-allow`,
+  `my-default`, `Default`, ` default`, `unreadable-metadata` without the
+  colon), and every name `classify` actually emits is checked to be one
+  validation rejects — with `Guard::assess`'s `"unavailable"` checked the
+  same way in `guard_wiremock.rs`, so the reservation cannot drift from
+  what the engine writes into a record; the
   shipped examples/policy.toml is pinned end to end against its own
   header: it parses, accepts filing into the desktop products, refuses an
   embargo-marked title everywhere, refuses filing elsewhere (omitted and

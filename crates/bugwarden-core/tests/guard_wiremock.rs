@@ -150,7 +150,18 @@ async fn assess_costs_one_request_per_distinct_id_whatever_the_answer() {
     assert!(out[&1].0.allows(Capability::Read));
     for id in [2u64, 3] {
         match &out[&id].0 {
-            Access::Denied { rule } => assert_eq!(rule, "unavailable"),
+            Access::Denied { rule } => {
+                assert_eq!(rule, "unavailable");
+                // Whatever name the guard denies under here, validation must
+                // refuse an operator rule spelled the same — the reservation
+                // has to track the name actually emitted, not a copy of it
+                // that a rename could leave behind (#84).
+                let policy = format!("[[rule]]\nname = \"{rule}\"\naction = \"deny\"\n");
+                assert!(
+                    Policy::from_toml_str(&policy).is_err(),
+                    "an operator rule may not be named {rule:?}"
+                );
+            }
             other => panic!("bug {id} must be denied, got {other:?}"),
         }
         assert!(out[&id].1.is_null());

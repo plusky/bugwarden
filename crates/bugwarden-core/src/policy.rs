@@ -476,6 +476,11 @@ pub enum Operation {
 #[serde(deny_unknown_fields)]
 pub struct Rule {
     /// Operator-facing identifier (logged server-side, never sent to clients).
+    ///
+    /// Must be non-blank, unique across the policy, and not one of the names
+    /// the guard decides under itself — all three enforced by
+    /// [`Policy::from_toml_str`] validation, because an audit record names
+    /// the deciding rule and nothing else says what decided a call.
     pub name: String,
     /// Free-form operator documentation.
     #[serde(default)]
@@ -654,6 +659,33 @@ impl Default for Policy {
     }
 }
 
+/// Name [`Policy::classify`] decides under when no rule matched and
+/// `default_action` settled it — grant and denial alike.
+pub(crate) const RULE_DEFAULT: &str = "default";
+
+/// Name [`Policy::classify`] denies under when the global age quarantine
+/// fired, before any rule ran.
+pub(crate) const RULE_MIN_BUG_AGE_DAYS: &str = "min_bug_age_days";
+
+/// Name `Guard::assess` denies under when the classification fetch never
+/// reached the bug.
+pub(crate) const RULE_UNAVAILABLE: &str = "unavailable";
+
+/// Suffix [`Policy::classify`] appends to a GRANTING rule's name when that
+/// rule's verdict hinged on metadata nobody could read (I4), so a rule
+/// literally named `foo:unreadable-metadata` would collide with what a rule
+/// named `foo` denies under there.
+pub(crate) const UNREADABLE_METADATA_SUFFIX: &str = ":unreadable-metadata";
+
+/// Every rule name the guard decides under on its own behalf, which no
+/// operator rule may take.
+///
+/// This is the single source for both the emit sites above and
+/// [`Policy::validate`]'s rejection, so the reservation cannot drift from
+/// what the engine actually writes into a record: renaming a decision
+/// renames what is reserved with it.
+const RESERVED_RULE_NAMES: [&str; 3] = [RULE_DEFAULT, RULE_MIN_BUG_AGE_DAYS, RULE_UNAVAILABLE];
+
 impl Policy {
     /// Strict parse + validation of a policy document.
     ///
@@ -661,6 +693,13 @@ impl Policy {
     /// typo like `product = [...]` for `products` fails loudly instead of
     /// silently matching nothing. Validation then enforces:
     ///
+    /// - every rule has a non-blank name, no two rules share one, and none
+    ///   takes a name the guard decides under itself (`"default"`,
+    ///   `"min_bug_age_days"`, `"unavailable"`, or anything ending in
+    ///   `":unreadable-metadata"`) — an audit record names the deciding rule
+    ///   and nothing else does, so the name has to identify exactly one
+    ///   thing. The comparison is exact: `"Default"` and `" default"` reach
+    ///   the record as themselves and collide with nothing;
     /// - `restrict` rules carry at least one capability;
     /// - `allow`/`deny` rules carry no capabilities (a capability list on
     ///   them would be dead configuration masking operator intent);
@@ -740,7 +779,61 @@ impl Policy {
             }
             _ => {}
         }
-        for rule in &self.rules {
+        // A rule name has to identify exactly one thing: it is the only
+        // field in an audit record saying what decided an assessment, and I3
+        // keeps that fact out of the client's reach entirely, so the stream
+        // is where it has to hold. Beside the operator's rules the guard
+        // decides under synthetic names of its own; a rule spelled the same,
+        // or a second rule sharing a name, makes the record ambiguous.
+        // The COLLISION comparisons are exact — byte equality is what a log
+        // consumer greps, so "Default" and " default" collide with nothing
+        // and stay legal. The blank check is the one that trims, because it
+        // asks a different question: not "does this name collide" but "does
+        // it name anything at all". Blankness is judged bytewise too, so
+        // "embargo" and "embargo\u{200B}" are two accepted names a log
+        // viewer renders identically; nothing here normalizes a name, by
+        // design (the policy file is the trust root).
+        let mut seen_names: BTreeSet<&str> = BTreeSet::new();
+        for (idx, rule) in self.rules.iter().enumerate() {
+            if rule.name.trim().is_empty() {
+                // Positional, because the name is exactly what cannot
+                // identify the rule here.
+                anyhow::bail!(
+                    "rule #{} (name = \"{}\"): name must not be blank; the name \
+                     is what an audit record reports as the rule that decided \
+                     a call",
+                    idx + 1,
+                    rule.name
+                );
+            }
+            if RESERVED_RULE_NAMES.contains(&rule.name.as_str()) {
+                anyhow::bail!(
+                    "rule \"{}\": the name is reserved for the guard's own \
+                     decisions (\"{}\"), which an audit record could then no \
+                     longer tell apart from this rule's — rename the rule",
+                    rule.name,
+                    RESERVED_RULE_NAMES.join("\", \"")
+                );
+            }
+            if rule.name.ends_with(UNREADABLE_METADATA_SUFFIX) {
+                anyhow::bail!(
+                    "rule \"{}\": names ending in \"{}\" are reserved for the \
+                     guard's own decisions — it denies under \"<rule>{}\" when a \
+                     granting rule's verdict hinged on metadata it could not \
+                     read — rename the rule",
+                    rule.name,
+                    UNREADABLE_METADATA_SUFFIX,
+                    UNREADABLE_METADATA_SUFFIX
+                );
+            }
+            if !seen_names.insert(rule.name.as_str()) {
+                anyhow::bail!(
+                    "rule \"{}\": two rules carry this name; an audit record \
+                     names the rule that decided a call and could not say \
+                     which of them it was — give each rule a distinct name",
+                    rule.name
+                );
+            }
             match rule.action {
                 Action::Restrict if rule.capabilities.is_empty() => {
                     anyhow::bail!(
@@ -846,7 +939,7 @@ impl Policy {
             };
             if too_young {
                 return Access::Denied {
-                    rule: "min_bug_age_days".to_string(),
+                    rule: RULE_MIN_BUG_AGE_DAYS.to_string(),
                 };
             }
         }
@@ -887,18 +980,18 @@ impl Policy {
                             rule: rule.name.clone(),
                         },
                         Action::Allow | Action::Restrict => Access::Denied {
-                            rule: format!("{}:unreadable-metadata", rule.name),
+                            rule: format!("{}{UNREADABLE_METADATA_SUFFIX}", rule.name),
                         },
                     };
                 }
             }
         }
         match self.default_action {
-            Action::Allow => self.grant(Capability::ALL.iter().copied(), "default"),
+            Action::Allow => self.grant(Capability::ALL.iter().copied(), RULE_DEFAULT),
             // `Restrict` as default is rejected by validation; if it appears
             // in a hand-constructed Policy, fail closed and deny.
             Action::Deny | Action::Restrict => Access::Denied {
-                rule: "default".to_string(),
+                rule: RULE_DEFAULT.to_string(),
             },
         }
     }
@@ -1073,10 +1166,10 @@ impl BugMeta {
 pub enum Access {
     /// No access at all. `rule` names the deciding rule (or one of the
     /// synthetic `"min_bug_age_days"` / `"default"` /
-    /// `"<rule>:unreadable-metadata"` / `"unavailable"`, none of which
-    /// validation reserves against an operator choosing the same name) for
-    /// server-side logging only — it is never sent to the MCP client
-    /// (I1/I2).
+    /// `"<rule>:unreadable-metadata"` / `"unavailable"`, every one of which
+    /// [`Policy::from_toml_str`] validation reserves against an operator
+    /// choosing the same name) for server-side logging only — it is never
+    /// sent to the MCP client (I1/I2).
     Denied {
         /// Server-side-only name of the deciding rule.
         rule: String,
@@ -1870,6 +1963,165 @@ products = ["SUSE*"]
         let err = Policy::from_toml_str("default_action = \"restrict\"").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("default_action"), "unexpected error: {msg}");
+    }
+
+    // ---------- rule names ----------
+
+    #[test]
+    fn reject_rule_named_after_a_guard_decision() {
+        // Each spelling the guard itself decides under: a rule taking one
+        // would be indistinguishable from the guard's own record.
+        for name in ["default", "min_bug_age_days", "unavailable"] {
+            let s = format!("[[rule]]\nname = \"{name}\"\naction = \"deny\"\n");
+            let err = Policy::from_toml_str(&s).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(&format!("rule \"{name}\"")),
+                "unexpected error: {msg}"
+            );
+            assert!(msg.contains("reserved"), "unexpected error: {msg}");
+        }
+    }
+
+    #[test]
+    fn reject_rule_name_ending_in_the_unreadable_metadata_suffix() {
+        // classify() denies under `format!("{name}:unreadable-metadata")`,
+        // so a rule spelled that way collides with the synthetic name
+        // generated for a rule named "x".
+        let s = "[[rule]]\nname = \"x:unreadable-metadata\"\naction = \"deny\"\n";
+        let err = Policy::from_toml_str(s).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("rule \"x:unreadable-metadata\"") && msg.contains("reserved"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_duplicate_rule_names() {
+        // NOT adjacent: the rule is "no two rules share a name", not "no two
+        // CONSECUTIVE rules do", so the repeat is separated by a third rule.
+        let s = concat!(
+            "[[rule]]\nname = \"embargo\"\naction = \"deny\"\n",
+            "[[rule]]\nname = \"reporters\"\naction = \"deny\"\n",
+            "[[rule]]\nname = \"embargo\"\naction = \"allow\"\n",
+        );
+        let err = Policy::from_toml_str(s).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("rule \"embargo\"") && msg.contains("two rules"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_blank_rule_name() {
+        // "" (and whitespace) in a record names nothing at all, the one
+        // thing the field exists to say. The error is positional because the
+        // name cannot point at the rule here — put the blank one second so a
+        // wrong index shows up.
+        for name in ["", "   "] {
+            let s = format!(
+                "[[rule]]\nname = \"first\"\naction = \"deny\"\n\
+                 [[rule]]\nname = \"{name}\"\naction = \"deny\"\n"
+            );
+            let err = Policy::from_toml_str(&s).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("blank"), "unexpected error: {msg}");
+            assert!(msg.contains("rule #2"), "error must locate it: {msg}");
+        }
+    }
+
+    #[test]
+    fn rule_names_merely_resembling_a_reserved_one_are_accepted() {
+        // The collision is byte equality in the record, so the check is
+        // exact: anything that reaches the audit stream as a different
+        // string is a different name and stays legal. Over-rejecting here
+        // would break policies that never had the problem.
+        for name in [
+            "default-allow",
+            "my-default",
+            "Default",
+            " default",
+            "default ",
+            "MIN_BUG_AGE_DAYS",
+            "Unavailable",
+            "unreadable-metadata",
+            "x:unreadable-metadata-2",
+            "x-unreadable-metadata",
+        ] {
+            let s = format!("[[rule]]\nname = \"{name}\"\naction = \"deny\"\n");
+            let p = Policy::from_toml_str(&s)
+                .unwrap_or_else(|e| panic!("name {name:?} must stay valid: {e:#}"));
+            assert_eq!(p.rules[0].name, name);
+        }
+    }
+
+    #[test]
+    fn distinct_rule_names_validate() {
+        let s = concat!(
+            "[[rule]]\nname = \"embargo\"\naction = \"deny\"\n",
+            "[[rule]]\nname = \"reporters\"\naction = \"restrict\"\n",
+            "capabilities = [\"summary\"]\n",
+            "[[rule]]\nname = \"Embargo\"\naction = \"allow\"\n",
+        );
+        let p = Policy::from_toml_str(s).unwrap();
+        assert_eq!(p.rules.len(), 3);
+    }
+
+    #[test]
+    fn every_name_classify_can_emit_is_reserved() {
+        // Pins the reservation to what the engine actually emits: drive
+        // each synthetic path and check validation refuses a rule spelled
+        // the same. ("unavailable" is Guard::assess's, tied to the same
+        // constant and checked against validation in `guard_wiremock.rs`.)
+        let deny_default = Policy::from_toml_str("default_action = \"deny\"").unwrap();
+        let aged = Policy::from_toml_str("[global]\nmin_bug_age_days = 30\n").unwrap();
+        let granting = Policy::from_toml_str(concat!(
+            "default_action = \"deny\"\n",
+            "[[rule]]\nname = \"x\"\naction = \"allow\"\n",
+            "[rule.match]\ngroups = [\"secret\"]\n",
+        ))
+        .unwrap();
+        let emitted = [
+            deny_default.classify(
+                &BugMeta::default(),
+                t("2024-05-01T00:00:00Z"),
+                Operation::Access,
+            ),
+            aged.classify(
+                &BugMeta::default(),
+                t("2024-05-01T00:00:00Z"),
+                Operation::Access,
+            ),
+            granting.classify(
+                &BugMeta::default(),
+                t("2024-05-01T00:00:00Z"),
+                Operation::Access,
+            ),
+        ];
+        let names: Vec<String> = emitted
+            .into_iter()
+            .map(|access| match access {
+                Access::Denied { rule } => rule,
+                Access::Granted { rule, .. } => rule,
+            })
+            .collect();
+        // Each fixture must still drive a DIFFERENT synthetic path: if one
+        // ever fell through to another (a changed BugMeta default would send
+        // the suffix fixture to "default", also reserved), the loop below
+        // would keep passing while covering one path twice.
+        assert_eq!(
+            names,
+            ["default", "min_bug_age_days", "x:unreadable-metadata"]
+        );
+        for name in names {
+            let s = format!("[[rule]]\nname = \"{name}\"\naction = \"deny\"\n");
+            assert!(
+                Policy::from_toml_str(&s).is_err(),
+                "classify emits {name:?} but validation accepts a rule named that"
+            );
+        }
     }
 
     // ---------- operations (rule scoping) ----------

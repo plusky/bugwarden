@@ -380,6 +380,14 @@ is a `restrict` rule without capabilities, an `allow`/`deny` rule *with*
 capabilities, or `default_action = "restrict"`. On Unix, bugwarden logs a
 warning at startup if the policy file is group- or other-writable.
 
+**Upgrading with an existing policy:** rule names are now checked at startup
+(see `name` below), so a policy file that started an older bugwarden can stop
+this one from starting at all — if it names a rule `default`,
+`min_bug_age_days` or `unavailable`, ends a name with `:unreadable-metadata`,
+leaves a name blank, or uses one name twice. The error names the offending
+rule; rename it and the file loads unchanged. Nothing else about the file's
+meaning changed.
+
 A complete, commented example ships in
 [`examples/policy.toml`](examples/policy.toml).
 
@@ -410,7 +418,7 @@ applies. Put your most specific (usually most restrictive) rules first.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `name` | string | *required* | Rule identifier. It reaches the audit stream, where it names the rule that decided a call, and nothing a client can see |
+| `name` | string | *required* | Rule identifier. It reaches the audit stream, where it names the rule that decided a call, and nothing a client can see. Must be non-blank and unique within the file, and may not be one of the names the guard decides under itself — `default`, `min_bug_age_days`, `unavailable`, or anything ending in `:unreadable-metadata` — otherwise an audit record could not say whether your rule or the guard decided. A reserved name, a blank name and a repeated name are each a startup error naming the offending rule. The *collision* checks compare exactly, so `Default`, ` default` and `unreadable-metadata` (no colon) are ordinary names; only the blank check ignores surrounding whitespace |
 | `description` | string | `""` | Free-form operator documentation |
 | `match` | table | `{}` (matches every bug) | Match criteria, see below |
 | `action` | `"allow"` \| `"deny"` \| `"restrict"` | *required* | `allow` grants all capabilities, `deny` grants none, `restrict` grants exactly `capabilities` |
@@ -617,7 +625,7 @@ consult the guard — a `guard` object:
 | `guard` field | Meaning |
 |---------------|---------|
 | `verdict` | `served`, `served_filtered`, `denied` or `refused`; the worst verdict of the call wins |
-| `rule` | What decided a per-bug assessment. Alongside the policy's own rule names the guard reports its own: `default` when no rule matched — a default-decided call records that literal, never an absent field — `min_bug_age_days` for the age quarantine, `<name>:unreadable-metadata` for a *granting* rule whose verdict hinged on metadata that could not be read (an undecidable deny rule keeps its plain name, having denied for its own reason), `unavailable` for a bug the classification fetch could not reach. Nothing stops you naming one of your own rules `default`, so this field says what decided, not what kind of thing it was. Absent only where no single rule decided: a refusal, the pre-dispatch gate, a search, either arm of the create gate, an id the guard could not assess, and a withheld attachment. A tool removed from the router (read-only mode, `disabled_tools`, discovery off) records no `guard` object at all |
+| `rule` | What decided a per-bug assessment. Alongside the policy's own rule names the guard reports its own: `default` when no rule matched — a default-decided call records that literal, never an absent field — `min_bug_age_days` for the age quarantine, `<name>:unreadable-metadata` for a *granting* rule whose verdict hinged on metadata that could not be read (an undecidable deny rule keeps its plain name, having denied for its own reason), `unavailable` for a bug the classification fetch could not reach. A policy naming one of its own rules `default` — or any of the others — is a startup error, so this field says what decided *and* what kind of thing it was. Absent only where no single rule decided: a refusal, the pre-dispatch gate, a search, either arm of the create gate, an id the guard could not assess, and a withheld attachment. A tool removed from the router (read-only mode, `disabled_tools`, discovery off) records no `guard` object at all |
 | `policy_hash` | `sha256:` over the raw policy file bytes, so a record says which policy text judged the call. Absent when no policy file is loaded |
 | `suppressed_count` | How much the response withheld, in total: bug ids on a search or a multi-bug read, plus the private comments and attachment metadata the private-content gate removed. The two never overlap — a call reads its bug ids off the content that survived filtering — so the field is their sum, and it is the authoritative number: never infer a count from the id list, which names bugs only and can be switched off entirely. Two ids under a count of five means three withheld items had no bug id of their own |
 | `suppressed_ids` | The withheld bug ids, subject to the `suppressed_ids` switch |

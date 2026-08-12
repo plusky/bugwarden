@@ -35,6 +35,15 @@
 # is never visible to the MCP client. Parsing is strict: unknown keys anywhere
 # are a startup error, so typos cannot silently disable a guard.
 #
+# Rule names: each `name` below reaches the audit stream as the rule that
+# decided a call, so it has to identify exactly one thing. A blank name, two
+# rules sharing a name, and the names the guard decides under itself
+# ("default", "min_bug_age_days", "unavailable", or anything ending in
+# ":unreadable-metadata") are all startup errors. The COLLISION checks are
+# exact — "Default" and "unreadable-metadata" are ordinary names; only the
+# blank check ignores surrounding whitespace. An upgrade can therefore stop
+# a policy file that started an older bugwarden; the error names the rule.
+#
 # Rule evaluation order:
 #   1. global.min_bug_age_days (a too-young bug is invisible, no rule runs;
 #      this gate is global — it is never operation-scoped, and it refuses

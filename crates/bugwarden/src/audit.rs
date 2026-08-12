@@ -491,9 +491,10 @@ pub struct GuardInfo {
     /// ran), `"<rule>:unreadable-metadata"` (a granting rule whose verdict
     /// hinged on metadata nobody could read, I4), and `"unavailable"` (the
     /// classification fetch never reached the bug). They share one
-    /// namespace with the operator's names and nothing reserves them, so a
-    /// policy may define a rule literally called `default`: this field
-    /// names what decided, it does not prove which kind of thing it was.
+    /// namespace with the operator's names, and for a policy loaded from
+    /// TOML validation reserves all four against it — such a policy
+    /// defining a rule literally called `default` is a startup error — so
+    /// this field names what decided and proves which kind of thing it was.
     ///
     /// Absent only where no single rule decided the call:
     ///
