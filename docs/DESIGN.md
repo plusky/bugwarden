@@ -1097,12 +1097,17 @@ Decisions, all deliberate:
   call: a refusal answered from the request alone, the pre-dispatch gate
   (the guard never ran), a search (the verdict is the window's, not one
   bug's), the create gate on either arm (it judges the request as a
-  whole), an id with no matching `Access`, and the attachment withhold
-  together with its constant-cost bug-0 padding assessment. A tool the
-  router never carried (I13) is not this case at all: it records no
-  `guard` object. Re-encoding a default decision AS absence would be a
-  record-schema change and is deferred to #34; schema v1 records
-  `"default"`.
+  whole), an id with no matching `Access`, the attachment withhold
+  together with its constant-cost bug-0 padding assessment, and a SERVE
+  the cell later upgraded to `served_filtered` through a rule-less note —
+  a suppression, a redaction, a dropping scan — since that note outranks
+  the grant and the worst-wins merge clears the rule with it (a
+  `list_attachments` call that dropped private metadata is the plain
+  case: the default granted the bug, and the record still names no
+  rule). A tool the router never carried (I13) is not this case at all:
+  it records no `guard` object. Re-encoding a default decision AS
+  absence would be a record-schema change and is deferred to #34; schema
+  v1 records `"default"`.
 - **What `guard.suppressed_count` totals (issue #68).** The cell keeps two
   tallies: a `BTreeSet` of bug ids the guard withheld (`note_suppressed` —
   I14-scrubbed links, scrubbed duplicate markers, verdict-dropped search
@@ -1673,7 +1678,24 @@ wired, `server.rs` and `main.rs` are the reference.
   DEFENDS the disjointness the sum rests on: harvesting marker ids from
   the pre-filter comment list counts that one comment in both tallies
   and records `6` over three ids, and both tools' tests fail on the
-  number (plus the cell-level sum tests in audit.rs).
+  number (plus the cell-level sum tests in audit.rs); and the counter's
+  zero guard (issue #87) — a `bug_comments` call whose private filter
+  dropped nothing records verdict `served`, `suppressed_count == 0` and
+  the rule that decided it, so deleting `note_suppressed_count`'s
+  `n == 0` early return, which would merge `served_filtered` (rule-less,
+  clearing the rule) on EVERY call of the three tools that feed the
+  counter, fails on the verdict rather than on a count that stays `0`
+  either way; and `list_attachments`, the id-less site whose guard fields
+  no record assertion had reached (the one-record-per-call test calls the
+  tool but reads only its envelope), records a non-zero count over an
+  EMPTY `suppressed_ids` when the I5 gate drops private attachment
+  metadata, and `served` with a zero count over a listing of PUBLIC
+  attachments the gate kept — a real "nothing was withheld" rather than
+  an empty list's "nothing to withhold". Between them: deleting that
+  counter call, counting the whole list rather than the drop, and adding
+  any unconditional note beside it (a `note_redacted`, a rule-less
+  `note_verdict`) — which the zero guard, living inside
+  `note_suppressed_count`, cannot stop — are all detectable.
 - Identity tests (#[cfg(test)] in crates/bugwarden/src/server.rs and
   crates/bugwarden-core/src/client.rs; crates/bugwarden/tests/
   http_transport_wiremock.rs, crates/bugwarden/tests/binary_user_agent.rs

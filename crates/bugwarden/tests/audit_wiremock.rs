@@ -864,6 +864,174 @@ async fn suppressed_count_totals_both_populations_with_the_ids_elided() {
     );
 }
 
+#[tokio::test]
+async fn bug_comments_with_nothing_filtered_stays_served_and_counts_zero() {
+    // Issue #87: the id-less counter is fed on EVERY call of these tools,
+    // with `0` on the common path where the private filter dropped
+    // nothing. `note_suppressed_count` returns early on zero for exactly
+    // that reason — without it this record would claim `served_filtered`
+    // over an empty suppression, and the one field an operator filters on
+    // to find the calls the guard acted upon would say the same thing
+    // about every call.
+    let mock = MockServer::start().await;
+    mount_fixture(&mock).await;
+    let audited = audited_client_for(HIDE_SECRET_POLICY, &mock, "test-key").await;
+
+    let result = call(&audited.client, "bug_comments", json!({ "id": 7 })).await;
+    assert_ne!(result.is_error, Some(true), "bug 7's comments are served");
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.request.tool, "bug_comments");
+    let guard = tc.guard.as_ref().expect("guard info recorded");
+    assert_eq!(
+        guard.verdict,
+        Verdict::Served,
+        "the fixture's only comment is public and names no bug, so nothing \
+         was withheld: {guard:?}"
+    );
+    assert_eq!(guard.suppressed_count, 0);
+    assert!(guard.suppressed_ids.is_empty());
+    assert_eq!(
+        guard.rule.as_deref(),
+        Some("default"),
+        "and the rule that decided the call survives — a filtered merge \
+         outranks a clean serve and would clear it"
+    );
+}
+
+/// One row of bug 7's attachment metadata, as Bugzilla serves it with the
+/// content excluded.
+fn attachment(id: u64, is_private: bool, file_name: &str) -> Value {
+    json!({
+        "id": id,
+        "bug_id": 7,
+        "is_private": is_private,
+        "file_name": file_name,
+        "summary": "attached",
+        "content_type": "text/plain",
+        "size": 3,
+    })
+}
+
+/// Serve `rows` as bug 7's attachment metadata — the `list_attachments`
+/// counter site. The private rows are what the I5 gate drops, and what it
+/// drops carries no bug id of its own: this tool names no ids at all, so
+/// the call feeds the id-less tally and nothing else.
+async fn mount_attachments(mock: &MockServer, rows: Vec<Value>) {
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [world_bug(7)] })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/7/attachment"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": { "7": rows } })))
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn list_attachments_counts_the_private_metadata_it_dropped() {
+    // Issue #87: the third id-less site. Two private attachments the I5
+    // gate withheld are counted and never named, so this record carries a
+    // non-zero count over an EMPTY id list — the shape only this tool
+    // produces, and the reason nothing else was pinning its counter.
+    let mock = MockServer::start().await;
+    mount_attachments(
+        &mock,
+        vec![
+            attachment(51, false, "log.txt"),
+            attachment(52, true, "canary-private-3f7b-one.txt"),
+            attachment(53, true, "canary-private-3f7b-two.txt"),
+        ],
+    )
+    .await;
+    let audited = audited_client_for(HIDE_SECRET_POLICY, &mock, "test-key").await;
+
+    let result = call(&audited.client, "list_attachments", json!({ "bug_id": 7 })).await;
+    assert_ne!(result.is_error, Some(true), "the public metadata is served");
+    let envelope = serde_json::to_string(&result).unwrap();
+    assert!(
+        !envelope.contains("canary-private-3f7b"),
+        "private attachment metadata must not reach the client (I5): {envelope}"
+    );
+    // Nor into the operator's own stream: the record counts the drop, it
+    // does not describe what was dropped.
+    let raw = std::fs::read_to_string(&audited.audit_path).expect("audit file readable");
+    assert!(
+        !raw.contains("canary-private-3f7b"),
+        "the withheld metadata must not reach the audit file either"
+    );
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.request.tool, "list_attachments");
+    let guard = tc.guard.as_ref().expect("guard info recorded");
+    assert_eq!(guard.verdict, Verdict::ServedFiltered);
+    assert_eq!(
+        guard.suppressed_count, 2,
+        "both dropped attachments are counted: {guard:?}"
+    );
+    assert!(
+        guard.suppressed_ids.is_empty(),
+        "and neither is named — list_attachments names no ids at all: {:?}",
+        guard.suppressed_ids
+    );
+}
+
+#[tokio::test]
+async fn list_attachments_with_nothing_private_stays_served_and_counts_zero() {
+    // Issue #87 at the CALL SITE, which the zero guard alone does not
+    // cover: an unconditional note added beside the counter — a
+    // `note_redacted`, a rule-less `note_verdict` — leaves the `n == 0`
+    // early return intact and still marks every clean listing
+    // `served_filtered`.
+    //
+    // Two PUBLIC attachments rather than an empty list: the filter keeps
+    // both, so the recorded zero means "nothing was withheld" and not
+    // "there was nothing to withhold", and a counter fed the list length
+    // instead of the drop fails here as well.
+    let mock = MockServer::start().await;
+    mount_attachments(
+        &mock,
+        vec![
+            attachment(51, false, "log.txt"),
+            attachment(52, false, "trace.txt"),
+        ],
+    )
+    .await;
+    let audited = audited_client_for(HIDE_SECRET_POLICY, &mock, "test-key").await;
+
+    let result = call(&audited.client, "list_attachments", json!({ "bug_id": 7 })).await;
+    assert_ne!(result.is_error, Some(true), "both attachments are served");
+    let envelope = serde_json::to_string(&result).unwrap();
+    for file_name in ["log.txt", "trace.txt"] {
+        assert!(
+            envelope.contains(file_name),
+            "the gate kept {file_name}, so nothing was withheld: {envelope}"
+        );
+    }
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.request.tool, "list_attachments");
+    let guard = tc.guard.as_ref().expect("guard info recorded");
+    assert_eq!(
+        guard.verdict,
+        Verdict::Served,
+        "a listing that withheld nothing is a clean serve: {guard:?}"
+    );
+    assert_eq!(guard.suppressed_count, 0);
+    assert!(guard.suppressed_ids.is_empty());
+    assert!(
+        guard.redacted_fields.is_empty(),
+        "and nothing was redacted from it either: {:?}",
+        guard.redacted_fields
+    );
+}
+
 /// Serve a quicksearch corpus (issue #29 tests): search requests are paged
 /// by limit/offset the way Bugzilla pages them, and the I14 link-disclosure
 /// classify fetch — which addresses bugs by id, not by query — gets an
