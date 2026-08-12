@@ -900,6 +900,140 @@ async fn bug_comments_with_nothing_filtered_stays_served_and_counts_zero() {
     );
 }
 
+/// The counterpart to [`mount_hidden_link`]: bug 7 names bug 808 twice —
+/// its `depends_on` links it, and its one comment is a duplicate marker
+/// naming it — and 808 is a plain bug [`HIDE_SECRET_POLICY`] lets through.
+/// That comment is public, so the I5 gate drops nothing either.
+///
+/// The point is that each id-set call site HAS a candidate to weigh: a
+/// clean record over this fixture means "the guard withheld nothing", not
+/// "there was nothing to withhold". A guard that never classified 808 —
+/// or classified it and said no — fails closed and scrubs the link, which
+/// shows up here as a suppression rather than as a pass.
+///
+/// Every row is load-bearing, which is the property a fixture built
+/// against vacuity had better have: deleting 808's classification mock,
+/// making 808 a hidden `Secret*` bug, dropping the `depends_on` link,
+/// emptying the comment list, making the comment private, and replacing
+/// the marker with plain text each turn one of the two tests below red.
+async fn mount_disclosable_link(mock: &MockServer) {
+    let mut linked = world_bug(7);
+    linked["depends_on"] = json!([808]);
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [linked] })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "808"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [world_bug(808)] })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/7/comment"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": { "7": { "comments": [
+                { "id": 1, "bug_id": 7, "is_private": false,
+                  "text": "*** Bug 808 has been marked as a duplicate of this bug ***" },
+            ] } }
+        })))
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn summarize_bug_with_nothing_filtered_stays_served_and_counts_zero() {
+    // Issue #88, the sibling of the bug_comments case above: summarize_bug
+    // feeds BOTH tallies on every call — the id-less counter
+    // unconditionally, the id set under `if !hidden.is_empty()`. Drop that
+    // guard and `note_suppressed` fires with an empty iterator and merges
+    // `served_filtered` into every summarize_bug record, over an empty
+    // `suppressed_ids`; the one field an operator filters on to find the
+    // calls the guard acted upon would then say the same thing about all
+    // of them. The other tally leans on the `n == 0` early return inside
+    // `note_suppressed_count`, which the issue #87 tests pin for
+    // bug_comments and list_attachments but not at this third call site.
+    let mock = MockServer::start().await;
+    mount_disclosable_link(&mock).await;
+    let audited = audited_client_for(HIDE_SECRET_POLICY, &mock, "test-key").await;
+
+    let result = call(&audited.client, "summarize_bug", json!({ "id": 7 })).await;
+    assert_ne!(result.is_error, Some(true), "the summary prompt is served");
+    let envelope = serde_json::to_string(&result).unwrap();
+    assert!(
+        envelope.contains("Bug 808 has been marked as a duplicate"),
+        "the marker names a bug the policy allows, so the scrub keeps it \
+         and the recorded zero means nothing was withheld: {envelope}"
+    );
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.request.tool, "summarize_bug");
+    let guard = tc.guard.as_ref().expect("guard info recorded");
+    assert_eq!(
+        guard.verdict,
+        Verdict::Served,
+        "every comment is public and the only bug they name is disclosable, \
+         so nothing was withheld: {guard:?}"
+    );
+    assert_eq!(guard.suppressed_count, 0);
+    assert!(guard.suppressed_ids.is_empty());
+    assert_eq!(
+        guard.rule.as_deref(),
+        Some("default"),
+        "and the rule that decided the call survives — a filtered merge \
+         outranks a clean serve and would clear it"
+    );
+}
+
+#[tokio::test]
+async fn bug_info_with_every_link_disclosable_stays_served_and_redacts_nothing() {
+    // The same defect class at bug_info's two notes, neither of which
+    // anything was pinning: the I14-scrubbed link ids under
+    // `if !hidden_links.is_empty()`, and the summary-view marker under
+    // `if redacted`. Both notes fire unconditionally once their guard is
+    // gone, and either one merges `served_filtered` into every bug_info
+    // record — the redaction note additionally naming a view the client
+    // was never put into.
+    let mock = MockServer::start().await;
+    mount_disclosable_link(&mock).await;
+    let audited = audited_client_for(HIDE_SECRET_POLICY, &mock, "test-key").await;
+
+    let result = call(&audited.client, "bug_info", json!({ "bug_ids": [7] })).await;
+    assert_ne!(result.is_error, Some(true), "bug 7 is served");
+    let envelope = serde_json::to_string(&result).unwrap();
+    assert!(
+        envelope.contains("808"),
+        "the link names a bug the policy allows, so I14 keeps it and the \
+         empty suppression means nothing was withheld: {envelope}"
+    );
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.request.tool, "bug_info");
+    let guard = tc.guard.as_ref().expect("guard info recorded");
+    assert_eq!(
+        guard.verdict,
+        Verdict::Served,
+        "bug 7 is served whole and its only link was disclosable: {guard:?}"
+    );
+    assert_eq!(guard.suppressed_count, 0);
+    assert!(guard.suppressed_ids.is_empty());
+    assert!(
+        guard.redacted_fields.is_empty(),
+        "and the bug was served whole, not as a summary view: {:?}",
+        guard.redacted_fields
+    );
+    assert_eq!(
+        guard.rule.as_deref(),
+        Some("default"),
+        "and the rule that decided the call survives — a filtered merge \
+         outranks a clean serve and would clear it"
+    );
+}
+
 /// One row of bug 7's attachment metadata, as Bugzilla serves it with the
 /// content excluded.
 fn attachment(id: u64, is_private: bool, file_name: &str) -> Value {

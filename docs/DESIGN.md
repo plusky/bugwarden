@@ -1755,7 +1755,29 @@ wired, `server.rs` and `main.rs` are the reference.
   counter call, counting the whole list rather than the drop, and adding
   any unconditional note beside it (a `note_redacted`, a rule-less
   `note_verdict`) — which the zero guard, living inside
-  `note_suppressed_count`, cannot stop — are all detectable.
+  `note_suppressed_count`, cannot stop — are all detectable; and the
+  empty-set guards at the note call sites themselves (issue #88), where
+  the counter's zero guard reaches nothing: `note_suppressed` merges
+  `served_filtered` whatever it is handed, so a call site that drops its
+  `if !hidden.is_empty()` claims a filtered serve over an EMPTY
+  `suppressed_ids` on every call, and `note_redacted` does the same over
+  a `redacted_fields` naming a view the client was never put into. A
+  `summarize_bug` call whose comments are all public and name one
+  DISCLOSABLE bug records verdict `served`, `suppressed_count == 0`, no
+  id and the rule that decided it — pinning that tool's id-set guard and
+  giving the counter's third call site the clean-call record #87 left it
+  without; a `bug_info` call over a bug served whole whose only link the
+  guard weighed and allowed records the same clean serve with an empty
+  `redacted_fields`, pinning both of that tool's notes on the side no
+  assertion had reached — its link suppression had only ever been read
+  on a call that DID suppress, its redaction note on no record at all.
+  The one shared fixture hands each id-set site a candidate to weigh
+  instead of an empty set, and earns bug 7 a FULL grant rather than a
+  summary view, so a clean record means "the guard withheld nothing" and
+  not "there was nothing to withhold". The remaining note sites —
+  `bug_history`'s and `bug_comments`' id sets, `bugs_quicksearch`'s two
+  id sets and its redaction note — already fail on a clean-call record
+  above, but over fixtures with nothing to weigh.
 - Identity tests (#[cfg(test)] in crates/bugwarden/src/server.rs and
   crates/bugwarden-core/src/client.rs; crates/bugwarden/tests/
   http_transport_wiremock.rs, crates/bugwarden/tests/binary_user_agent.rs
