@@ -35,7 +35,7 @@ jobs:
         # Tag runs re-verify a release: keep them off restored build state;
         # PR/main runs keep the cache.
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: Swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e  # v2
+        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3  # v2
         with:
           workspaces: . -> target
       - name: Format
@@ -70,7 +70,7 @@ jobs:
         # Tag runs re-verify a release: keep them off restored build state;
         # PR/main runs keep the cache.
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: Swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e  # v2
+        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3  # v2
         with:
           workspaces: . -> target
       - name: Clippy
@@ -96,7 +96,7 @@ jobs:
           components: clippy
       - name: Cache cargo
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: Swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e  # v2
+        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3  # v2
         with:
           workspaces: . -> target
       - name: Clippy (beta)
@@ -137,7 +137,7 @@ jobs:
           toolchain: "1.88"
       - name: Cache cargo
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: Swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e  # v2
+        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3  # v2
         with:
           workspaces: . -> target
       - name: Build (MSRV)
@@ -159,7 +159,7 @@ jobs:
           toolchain: "1.97.0"
       - name: Cache cargo
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: Swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e  # v2
+        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3  # v2
         with:
           workspaces: . -> target
       - name: Regenerate man page + completions
