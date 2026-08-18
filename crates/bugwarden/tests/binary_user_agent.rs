@@ -21,12 +21,14 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The ambient environment must not reach the child: every one of these is
-/// read by `Cli` (`RUST_LOG` only muddies the captured stderr). Scrubbed as
+/// read by `Cli`, or — the `OTEL_*` four — by `bugwarden::otel` outside
+/// clap entirely (`RUST_LOG` only muddies the captured stderr). Scrubbed as
 /// one set rather than per test — the http-only knobs are inert for a stdio
 /// run today, and pruning them is how the list falls behind `Cli` again.
 /// `the_scrub_list_covers_every_environment_fallback` holds it to every
-/// `env`-backed flag, so adding one cannot quietly leave a hole here.
-const SCRUBBED_ENV: [&str; 13] = [
+/// `env`-backed flag AND to every variable the otel module names, so adding
+/// one in either population cannot quietly leave a hole here.
+const SCRUBBED_ENV: [&str; 20] = [
     "BUGZILLA_SERVER",
     "BUGZILLA_API_KEY",
     "BUGZILLA_API_KEY_FILE",
@@ -40,6 +42,19 @@ const SCRUBBED_ENV: [&str; 13] = [
     "MCP_API_KEY_HEADER",
     "MCP_READ_ONLY",
     "RUST_LOG",
+    // Read by the otel module, not by `Cli`: a developer exporting to a
+    // collector would otherwise have every spawned child export too, and
+    // an unreachable one would slow this test down for no reason.
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_SERVICE_NAME",
+    // The signal-specific trio, which the OTLP spec makes override the
+    // three above — so leaving them ambient would override the test's own
+    // world, not merely add to it.
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+    "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
 ];
 
 /// The scrub list above is only as good as its coverage of `Cli`, and a
@@ -62,6 +77,17 @@ fn the_scrub_list_covers_every_environment_fallback() {
     assert!(
         unscrubbed.is_empty(),
         "these environment fallbacks reach the spawned binary: {unscrubbed:?}"
+    );
+
+    // The second population: variables read outside clap, which the sweep
+    // above cannot see because no `Arg` carries them.
+    let unscrubbed: Vec<&str> = bugwarden::otel::ENV_VARS
+        .into_iter()
+        .filter(|var| !SCRUBBED_ENV.contains(var))
+        .collect();
+    assert!(
+        unscrubbed.is_empty(),
+        "these otel variables reach the spawned binary: {unscrubbed:?}"
     );
 }
 

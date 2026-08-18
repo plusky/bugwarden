@@ -496,12 +496,15 @@ Gotchas specific to the image:
   has to be readable by uid 65532 — a host-side `0600` file owned by your
   account is not, so `chown 65532` it or run with `podman --userns=keep-id`.
 - **The audit stream needs a persistent volume.** With
-  `BUGWARDEN_AUDIT_CONFIG` set, the guard writes JSONL files itself — it
-  exports nothing — so the directory in `path` must be a volume writable by
-  uid 65532. Without one the records live in the container's writable layer,
-  which `--rm` throws away; with one that uid 65532 cannot write, startup
-  fails outright, and over HTTP the default fail mode is `closed_all`, so a
-  directory that becomes unwritable later stops the server serving.
+  `BUGWARDEN_AUDIT_CONFIG` pointing at a file, the guard writes JSONL
+  itself, and the file is authoritative whether or not
+  [OTLP export](#opentelemetry-export) is also on — so the directory in
+  `path` must be a volume writable by uid 65532. Without one the records
+  live in the container's writable layer, which `--rm` throws away; with
+  one that uid 65532 cannot write, startup fails outright, and over HTTP
+  the default fail mode is `closed_all`, so a directory that becomes
+  unwritable later stops the server serving. `BUGWARDEN_AUDIT_CONFIG=none`
+  with an OTLP endpoint writes no file and needs no volume.
 - **Signals.** The process handles `SIGINT` and `SIGTERM`. Over HTTP both
   cancel the transport token and let axum drain. Over stdio both end the
   process immediately (status 0): rmcp reads stdin on a blocking thread
@@ -557,7 +560,14 @@ Command-line arguments take precedence over environment variables.
 | — | `BUGWARDEN_HTTP_READ_TOKEN` | — | Bearer token granting the **read** scope over http: the read tools only. Same rules, and it must differ from the write token. Either token may be set alone |
 | `--read-only` | `MCP_READ_ONLY` | `false` | Disable all write tools. Tighten-only: ORed with the policy's `global.read_only`; cannot re-enable writes a policy forbids. As an environment variable it takes the literal `true` or `false` — `1`, `yes` and an empty value are a usage error, not a synonym |
 | `--policy <PATH>` | `BUGWARDEN_POLICY` | — | Path to the guard policy TOML. Without it, an allow-all policy applies (with private comments off and the 2 MiB attachment cap still in force) |
-| `--audit-config <PATH>` | `BUGWARDEN_AUDIT_CONFIG` | — | Path to the audit stream configuration TOML (worked example in [`examples/audit.toml`](examples/audit.toml)). Without it, no audit stream is written. Records carry W3C trace ids when the client sends a `traceparent` in the request's `_meta`, enabling correlation with client-side traces |
+| `--audit-config <PATH>` | `BUGWARDEN_AUDIT_CONFIG` | — | Path to the audit stream configuration TOML (worked example in [`examples/audit.toml`](examples/audit.toml)), or the exact value `none` to disable the file (OTLP-only when an endpoint is set). Unset with no OTLP endpoint writes no stream; an endpoint with no file decision, or `none` with no endpoint, is a startup error. Records carry W3C trace ids when the client sends a `traceparent` in the request's `_meta`, enabling correlation with client-side traces |
+| — | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | Base URL of an OpenTelemetry collector, e.g. `http://127.0.0.1:4318`; bugwarden appends `/v1/logs` itself. Unset or empty means no export at all — no task, no thread, no request. See [OpenTelemetry export](#opentelemetry-export) |
+| — | `OTEL_EXPORTER_OTLP_HEADERS` | — | Headers added to every export request, `key=value` separated by commas — typically the collector's own credential. Environment only, like the bearer tokens, and never logged (I12). Values are used verbatim: percent-encoding is **not** decoded |
+| — | `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | The OTLP transport. `http/protobuf` is the only value this build speaks; anything else is a startup error. Not consulted while export is off |
+| — | `OTEL_SERVICE_NAME` | `bugwarden` | `service.name` on the exported records |
+| — | `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | — | Logs-specific endpoint. Overrides `OTEL_EXPORTER_OTLP_ENDPOINT` per the OTLP spec, and is used **as given** — write the whole URL including `/v1/logs`. Set alone it still turns export on |
+| — | `OTEL_EXPORTER_OTLP_LOGS_HEADERS` | — | Logs-specific headers; overrides `OTEL_EXPORTER_OTLP_HEADERS`. Same secrecy rules |
+| — | `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | — | Logs-specific protocol; overrides `OTEL_EXPORTER_OTLP_PROTOCOL`. Same single accepted value |
 | — | `RUST_LOG` | `info` | Tracing filter for the diagnostic log, which always goes to **stderr** — stdout belongs to the stdio transport. An unparsable value falls back to `info` |
 
 An empty value counts as unset for `--api-key`, `--api-key-file`,
@@ -568,7 +578,8 @@ is a startup error of its own), `MCP_ALLOWED_HOSTS=` names no host, leaving
 `Host` validation off as if it were never set, and an emptied token variable
 is an unset one — which over http means the deny-by-default refusal, not an
 open port. An empty `BUGWARDEN_POLICY` or `BUGWARDEN_AUDIT_CONFIG` is a usage
-error.
+error. `OTEL_EXPORTER_OTLP_ENDPOINT=` follows the same "cleared variable"
+reading, and there it is the off switch for the whole export.
 
 Exit status: `0` on clean shutdown, `1` on a startup or runtime failure (a
 missing or malformed http bearer token, an unreadable policy or audit
@@ -754,14 +765,21 @@ nonexistent one, filtered search results vanish without a trace, and no rule
 is ever named in a response. The audit stream is the other half of that
 bargain — the operator's own record of what was asked and what the guard
 decided. It carries exactly the facts the client must never see, which is
-why it goes only to a local file the operator controls: no MCP surface can
-read it, and it is never mixed into the diagnostic stderr stream.
+why it goes only to the sinks the operator named — a local file, an OTLP
+collector, both, or neither: no MCP surface can read it, and it is never
+mixed into the diagnostic stderr stream.
 
-Auditing is off until `--audit-config` / `BUGWARDEN_AUDIT_CONFIG` names a
-configuration file; a commented example ships in
-[`examples/audit.toml`](examples/audit.toml). Over the http transport,
-starting without one logs a warning. Parsing is strict — unknown keys are a
-startup error, so a typo cannot silently disable a setting.
+Auditing is off until at least one sink is configured.
+`--audit-config` / `BUGWARDEN_AUDIT_CONFIG` names a file configuration; the
+exact value `none` disables the file so a collector can be the only sink.
+An OTLP endpoint without a file decision is a startup error — say `none` or
+point at a file — and so is `none` with no endpoint. A commented file
+example ships in [`examples/audit.toml`](examples/audit.toml). Over the http
+transport, starting with no sink at all logs a warning. Parsing is strict —
+unknown keys are a startup error, so a typo cannot silently disable a
+setting. Getting the records off the host — which is what makes them
+tamper-evident — is covered under [OpenTelemetry export](#opentelemetry-export)
+below.
 
 ### Audit configuration reference
 
@@ -860,6 +878,91 @@ presence and size but never its content.
 A reader of the file should skip empty lines and tolerate at most one
 unparsable line per outage: a failed write can leave a partial line, and the
 stream heals itself on the next successful record.
+
+### OpenTelemetry export
+
+A configured collector is a load-bearing audit sink, not a copy of the
+file. Bugwarden exports every persisted record to it, and sends its own
+diagnostics along the same connection. Off until
+`OTEL_EXPORTER_OTLP_ENDPOINT` names one — and that endpoint must be paired
+with a file decision (`--audit-config` / `BUGWARDEN_AUDIT_CONFIG` pointing
+at a file, or set to `none` for collector-only):
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+export OTEL_EXPORTER_OTLP_HEADERS='authorization=Bearer <collector token>'
+```
+
+[`examples/otel-collector.yaml`](examples/otel-collector.yaml) is a working
+collector configuration for this, with both receivers: `otlp` for the
+native export and `filelog` tailing the JSONL file. Run both — they carry
+the same records, and they answer different questions. The export is live
+and correlated with the client's traces; the tail is what puts the log
+beyond the reach of the host that wrote it, which is what makes it
+tamper-evident — at the price of re-reading what it already read if the
+collector restarts without a `file_storage` extension, so a consumer
+collapses the two copies on `session` plus `seq`.
+
+What goes over the wire:
+
+- **One log record per audit record**, tagged `bugwarden.stream=audit`. The
+  body is the audit line *verbatim* — the same bytes the file holds when
+  there is one, or the line the file would have carried on an OTLP-only
+  sink — so nothing extra is added.
+  Attributes lift the fields worth querying on out of the body:
+  `bugwarden.event`, `.seq`, `.transport`, `.session.id` and, on a tool
+  call, `.tool`, `.verdict` and `.rule`. The record's `trace_id` and
+  `span_id` are the ones the client sent in its `traceparent`, so a guard
+  decision joins the client trace that caused it. Severity follows the
+  record *kind*: `audit_gap` is an error, everything else is info — the
+  verdict is an attribute to filter on, not a severity.
+- **The server's diagnostics**, tagged `bugwarden.stream=diagnostics`,
+  under the same `RUST_LOG` filter stderr uses. Nearly the same events:
+  stderr additionally keeps whatever is emitted before the exporter starts
+  and everything from the export's own machinery — this module and the
+  HTTP stack it posts through — which is never exported, because a flush
+  that logs would otherwise be the reason for the next one.
+
+What it costs when the collector is not there: the same as a full disk.
+Delivery is probed at startup (the server refuses to start if the collector
+will not take a record) and watched while serving. A collector that is
+down, slow or refusing marks the audit sink failing and the configured
+`fail_mode` decides what happens to tool calls — `open` keeps serving and
+accounts the window with `audit_gap`; `closed_all` (the http default)
+refuses with the tool's usual failure text. The record still reaches the
+file first, when there is one, and the exporter only afterwards. Diagnostics
+stay best-effort on a separate queue: a dropped log line is counted (a
+warning at 1, 2, 4, 8 … drops) and never stops the guard. A served call's
+response is byte-identical with export on, off or failing. The stream is
+reachable through no MCP surface either way.
+
+Two things to know before pointing this anywhere:
+
+- **The exported stream is as sensitive as the file**, because it *is* the
+  file: verdicts, rule names and withheld bug ids included. Its destination
+  is a policy decision. `suppressed_ids = false` in the audit configuration
+  drops the ids and keeps the counts if the collector cannot be trusted
+  with them.
+- **`OTEL_EXPORTER_OTLP_HEADERS` is a credential**, and it is handled like
+  the bearer tokens: environment only — no command-line option exists, so
+  it never reaches `ps` — and it is never logged, never in an error, never
+  in a record. That one is absolute: nothing formats it, and reqwest's
+  byte-level connection tracing, which would dump the header, stays off.
+  The endpoint is a weaker promise and worth stating plainly: bugwarden
+  never logs it — the drop warning carries a count and one of
+  `queue_full`, `network`, `http_status` or `shutdown`, and nothing else —
+  and it never reaches the exported stream or an audit record. But at
+  `RUST_LOG=debug` the HTTP client underneath prints the collector's host
+  and port as any HTTP client does. That is left alone deliberately: it is
+  what you read when the collector will not answer.
+
+`http/protobuf` is the only transport (`OTEL_EXPORTER_OTLP_PROTOCOL`); gRPC
+is deliberately absent, which is what keeps the export on the same rustls
+stack the Bugzilla client uses and adds no dependency to the binary. The
+logs-specific `OTEL_EXPORTER_OTLP_LOGS_*` variables override their general
+counterparts, as the OTLP specification requires — so a fleet that names
+only `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` gets its logs exported rather than
+silently nothing.
 
 ## Tool reference
 

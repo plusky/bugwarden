@@ -5,13 +5,15 @@
 //! live in the `bugwarden` library crate (`config`, `server`) so integration
 //! tests can drive the tools without a process boundary.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Context;
 use bugwarden::audit::{
-    policy_hash_of, AuditConfig, AuditSink, AuditState, FailMode, TransportKind,
+    policy_hash_of, select_sinks, AuditConfig, AuditSink, AuditState, FailMode, SinkSelection,
+    TransportKind,
 };
 use bugwarden::http_auth::{self, HttpEnv};
+use bugwarden::otel::{self, OtelEnv, Pipeline};
 use bugwarden::{config, server};
 use bugwarden_core::{guard::Guard, policy::Policy};
 use clap::Parser;
@@ -22,6 +24,8 @@ use rmcp::{
     },
     ServiceExt,
 };
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::EnvFilter;
 
 use config::{Cli, Transport};
@@ -30,14 +34,33 @@ use config::{Cli, Transport};
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // OTLP export configuration, resolved before anything is installed:
+    // parsing the environment starts no task and opens no socket, but a
+    // protocol this build cannot speak has to be a startup error rather
+    // than a surprise once records exist. Unset or empty
+    // OTEL_EXPORTER_OTLP_ENDPOINT means the whole feature stays off.
+    let otel_config = otel::resolve(&OtelEnv::from_env())?;
+    // Filled in below, once the audit sink has opened; the diagnostics
+    // layer reads it and does nothing while it is empty.
+    let otel_slot: Arc<OnceLock<Arc<Pipeline>>> = Arc::new(OnceLock::new());
+
     // Tracing always goes to stderr: stdout belongs to the stdio transport.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .init();
+    // The OTLP layer, when export is on, sits beside the stderr one under
+    // the same filter, so both carry the same events.
+    let registry = tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false),
+        );
+    if otel_config.is_some() {
+        registry
+            .with(Pipeline::diagnostics_layer(otel_slot.clone()))
+            .init();
+    } else {
+        registry.init();
+    }
 
     // The http bearer gate, resolved before anything else runs: over http
     // the port is the access boundary, and a half-configured credential must
@@ -52,6 +75,14 @@ async fn main() -> anyhow::Result<()> {
     if let Some(auth) = &http_auth {
         auth.log_startup_mode();
     }
+
+    // Which audit sinks this deployment runs (issue #31, revised
+    // 2026-08-18): file, OTLP, both, or none. Resolved here — pure
+    // configuration, no file touched — so the two ambiguous spellings
+    // (an endpoint with no file decision, `none` with no endpoint) refuse
+    // startup before any network or filesystem work. The sinks themselves
+    // open after the preflight, below, exactly as before.
+    let sinks = select_sinks(cli.audit_config.as_deref(), otel_config.is_some())?;
 
     // Guard policy comes ONLY from the TOML file given at startup (I1);
     // without one the built-in default policy applies.
@@ -81,12 +112,53 @@ async fn main() -> anyhow::Result<()> {
     // file (the same ordering rationale as key custody resolution above).
     server.preflight().await?;
 
-    // Audit stream, when configured. The fail mode falls back to the
-    // transport-derived default; the policy digest ties every record to
-    // the policy document in force.
-    let audit = match &cfg.audit_config {
-        Some(path) => {
-            let audit_cfg = AuditConfig::load(path)?;
+    // OTLP export, started AFTER the identity preflight and BEFORE the
+    // audit file is created: a collector that will not take records must
+    // refuse to start without leaving a file behind, the same ordering
+    // the preflight already keeps. Off entirely when no endpoint is
+    // configured: no task, no thread, no layer.
+    let otel = match otel_config {
+        Some(otel_cfg) => Some(Arc::new(Pipeline::start(otel_cfg)?)),
+        None => None,
+    };
+    if let Some(pipeline) = &otel {
+        // Fills the slot the diagnostics layer installed above reads.
+        let _ = otel_slot.set(pipeline.clone());
+        // The delivery probe, mirroring the identity preflight: audit
+        // records are load-bearing on this collector, so a deployment
+        // that cannot deliver them refuses to start — a startup failure
+        // now beats a wave of fail-mode refusals under load. Bounded
+        // retry inside, because a collector starting alongside us is
+        // allowed to lose the race by a few seconds.
+        pipeline.probe().await?;
+        tracing::info!(
+            "OTLP export enabled: audit records are exported to the configured \
+             collector and gate serving when delivery fails; diagnostics are \
+             copied best-effort"
+        );
+    }
+
+    // Audit sinks, per the selection above. The fail mode falls back to
+    // the transport-derived default — an OTLP-only sink has no document
+    // to say otherwise, so it always derives — and the policy digest ties
+    // every record to the policy document in force.
+    let audit_sink = match sinks {
+        SinkSelection::NoAudit => None,
+        SinkSelection::FileOnly | SinkSelection::Both | SinkSelection::OtlpOnly => {
+            let audit_cfg = match sinks {
+                SinkSelection::FileOnly | SinkSelection::Both => {
+                    match cfg.audit_config.as_deref() {
+                        Some(path) => AuditConfig::load(path)?,
+                        // Unreachable: `select_sinks` returns a file-bearing
+                        // selection only for a real path. Refuse rather than
+                        // panic, like the http bearer gate below.
+                        None => anyhow::bail!(
+                            "internal error: a file-bearing sink selection has no path"
+                        ),
+                    }
+                }
+                _ => AuditConfig::fileless(),
+            };
             let transport = match cfg.transport {
                 Transport::Stdio => TransportKind::Stdio,
                 Transport::Http => TransportKind::Http,
@@ -111,14 +183,23 @@ async fn main() -> anyhow::Result<()> {
                 None => None,
             };
             let sink = AuditSink::open(audit_cfg).context("failed to open the audit sink")?;
-            Some(Arc::new(AuditState::new(sink, fail_mode, policy_hash)))
+            Some((sink, fail_mode, policy_hash))
         }
-        None => None,
     };
+
+    let audit = audit_sink.map(|(sink, fail_mode, policy_hash)| {
+        let sink = match &otel {
+            Some(pipeline) => sink.with_export(pipeline.audit_exporter()),
+            None => sink,
+        };
+        Arc::new(AuditState::new(sink, fail_mode, policy_hash))
+    });
     if audit.is_none() && cfg.transport == Transport::Http {
         tracing::warn!(
             "auditing is OFF: remote tool calls over http will leave no audit \
-             record — pass --audit-config / BUGWARDEN_AUDIT_CONFIG to enable it"
+             record — pass --audit-config / BUGWARDEN_AUDIT_CONFIG for a file, \
+             or set OTEL_EXPORTER_OTLP_ENDPOINT with BUGWARDEN_AUDIT_CONFIG=none \
+             for a collector-only trail"
         );
     }
 
@@ -132,88 +213,118 @@ async fn main() -> anyhow::Result<()> {
     let server =
         server.with_scope_enforcement(http_auth.as_ref().is_some_and(|auth| !auth.is_insecure()));
 
-    match cfg.transport {
-        Transport::Stdio => {
-            // Two stages: an unused stdio container sits in `serve`
-            // (handshake). After initialize it sits in `waiting`.
-            // Handlers register on the first poll of `shutdown`, which
-            // is this `select!` immediately after the startup line.
-            let shutdown = shutdown_signal();
-            tokio::pin!(shutdown);
-            tracing::info!("Starting Bugzilla MCP server on stdio");
-            let service = tokio::select! {
-                result = server.serve(stdio()) => {
-                    result.inspect_err(|e| {
-                        tracing::error!("serving error: {:?}", e);
-                    })?
-                }
-                () = &mut shutdown => {
-                    tracing::info!("received shutdown signal");
-                    // serve() is already blocked in tokio::io::stdin()'s
-                    // uncancellable read. Returning from main drops the
-                    // runtime onto that blocking thread.
-                    std::process::exit(0);
-                }
-            };
-            let cancel = service.cancellation_token();
-            tokio::select! {
-                result = service.waiting() => {
-                    result?;
-                }
-                () = shutdown => {
-                    tracing::info!("received shutdown signal");
-                    cancel.cancel();
-                    // Same blocking stdin read as the handshake arm.
-                    std::process::exit(0);
+    // Cloned into the serve future so a stdio SIGTERM can flush before
+    // `process::exit`. The original stays here for the HTTP / peer-close
+    // path, which returns from the future instead of exiting.
+    let otel_on_signal = otel.clone();
+    // The result is held rather than propagated so the OTLP flush below
+    // runs on every exit path, a transport error included.
+    let served: anyhow::Result<()> = async move {
+        match cfg.transport {
+            Transport::Stdio => {
+                // Two stages: an unused stdio container sits in `serve`
+                // (handshake). After initialize it sits in `waiting`.
+                // Handlers register on the first poll of `shutdown`, which
+                // is this `select!` immediately after the startup line.
+                let shutdown = shutdown_signal();
+                tokio::pin!(shutdown);
+                tracing::info!("Starting Bugzilla MCP server on stdio");
+                let service = tokio::select! {
+                    result = server.serve(stdio()) => {
+                        result.inspect_err(|e| {
+                            tracing::error!("serving error: {:?}", e);
+                        })?
+                    }
+                    () = &mut shutdown => {
+                        tracing::info!("received shutdown signal");
+                        // serve() is already blocked in tokio::io::stdin()'s
+                        // uncancellable read. Returning from main drops the
+                        // runtime onto that blocking thread. Flush first:
+                        // process::exit would otherwise skip the tail of a
+                        // load-bearing OTLP-only sink.
+                        flush_otel_and_exit(otel_on_signal.as_deref()).await;
+                    }
+                };
+                let cancel = service.cancellation_token();
+                tokio::select! {
+                    result = service.waiting() => {
+                        result?;
+                    }
+                    () = shutdown => {
+                        tracing::info!("received shutdown signal");
+                        cancel.cancel();
+                        flush_otel_and_exit(otel_on_signal.as_deref()).await;
+                    }
                 }
             }
-        }
-        Transport::Http => {
-            let ct = tokio_util::sync::CancellationToken::new();
+            Transport::Http => {
+                let ct = tokio_util::sync::CancellationToken::new();
 
-            // Derived from the server's own guard policy (the POST body cap
-            // follows `global.max_attachment_bytes`, issue #52), so it is
-            // built while `server` can still be borrowed.
-            let config = server
-                .http_server_config()?
-                .with_cancellation_token(ct.child_token());
-            let service = StreamableHttpService::new(
-                move || Ok(server.clone()),
-                LocalSessionManager::default().into(),
-                config,
-            );
-            // `resolve_for` returns the gate for every http start, so the
-            // bail below is unreachable — it exists so a future refactor
-            // that lost the gate fails to serve rather than serving open.
-            let Some(auth) = http_auth else {
-                anyhow::bail!("internal error: the http transport has no resolved bearer gate");
-            };
-            let router =
-                http_auth::guard_router(axum::Router::new().nest_service("/mcp", service), auth);
-            let addr = format!("{}:{}", cfg.host, cfg.port);
-            tracing::info!("Starting Bugzilla MCP server on {addr}");
-            let tcp_listener = tokio::net::TcpListener::bind(&addr)
-                .await
-                .with_context(|| format!("failed to bind {addr}"))?;
-            // Connect-info makes the remote peer address available in the
-            // request extensions, where the audit session info reads it.
-            axum::serve(
-                tcp_listener,
-                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move {
-                shutdown_signal().await;
-                tracing::info!("received shutdown signal");
-                // Tear the live streamable-HTTP transport down with the
-                // listener: axum's graceful shutdown alone waits for
-                // in-flight connections, and an open MCP session is one.
-                ct.cancel();
-            })
-            .await?;
+                // Derived from the server's own guard policy (the POST body cap
+                // follows `global.max_attachment_bytes`, issue #52), so it is
+                // built while `server` can still be borrowed.
+                let config = server
+                    .http_server_config()?
+                    .with_cancellation_token(ct.child_token());
+                let service = StreamableHttpService::new(
+                    move || Ok(server.clone()),
+                    LocalSessionManager::default().into(),
+                    config,
+                );
+                // `resolve_for` returns the gate for every http start, so the
+                // bail below is unreachable — it exists so a future refactor
+                // that lost the gate fails to serve rather than serving open.
+                let Some(auth) = http_auth else {
+                    anyhow::bail!("internal error: the http transport has no resolved bearer gate");
+                };
+                let router = http_auth::guard_router(
+                    axum::Router::new().nest_service("/mcp", service),
+                    auth,
+                );
+                let addr = format!("{}:{}", cfg.host, cfg.port);
+                tracing::info!("Starting Bugzilla MCP server on {addr}");
+                let tcp_listener = tokio::net::TcpListener::bind(&addr)
+                    .await
+                    .with_context(|| format!("failed to bind {addr}"))?;
+                // Connect-info makes the remote peer address available in the
+                // request extensions, where the audit session info reads it.
+                axum::serve(
+                    tcp_listener,
+                    router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move {
+                    shutdown_signal().await;
+                    tracing::info!("received shutdown signal");
+                    // Tear the live streamable-HTTP transport down with the
+                    // listener: axum's graceful shutdown alone waits for
+                    // in-flight connections, and an open MCP session is one.
+                    ct.cancel();
+                })
+                .await?;
+            }
         }
+        Ok(())
+    }
+    .await;
+
+    // Best-effort, bounded flush of whatever is still queued. On http this
+    // runs after graceful shutdown, i.e. after the SIGINT that cancelled
+    // it; on stdio after the peer closed the session.
+    if let Some(pipeline) = &otel {
+        pipeline.shutdown().await;
     }
 
-    Ok(())
+    served
+}
+
+/// Bounded OTLP flush, then `_exit`. Used on the stdio signal arms: those
+/// cannot return from `main` (rmcp's stdin read is uncancellable) and
+/// must not skip a load-bearing collector either.
+async fn flush_otel_and_exit(otel: Option<&Pipeline>) -> ! {
+    if let Some(pipeline) = otel {
+        pipeline.shutdown().await;
+    }
+    std::process::exit(0);
 }
 
 /// Wait until the process should stop serving.

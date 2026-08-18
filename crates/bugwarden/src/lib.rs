@@ -13,6 +13,9 @@ pub mod audit;
 pub mod config;
 /// Bearer authentication for the streamable-HTTP transport.
 pub mod http_auth;
+/// OTLP export of the audit stream (load-bearing) and of the server's
+/// own diagnostics (best-effort).
+pub mod otel;
 pub mod server;
 
 #[cfg(test)]

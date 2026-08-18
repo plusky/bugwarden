@@ -55,7 +55,7 @@ async fn audited_client_with(
     let dir = tempfile::tempdir().expect("tempdir");
     let audit_path = dir.path().join("audit.jsonl");
     let sink = AuditSink::open(AuditConfig {
-        path: audit_path.clone(),
+        path: Some(audit_path.clone()),
         fsync: false,
         fail_mode: None,
         rotate_max_bytes: 0,

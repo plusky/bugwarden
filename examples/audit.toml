@@ -7,8 +7,9 @@
 # configures the other half of that bargain — the operator's own record of
 # what was asked and what the guard decided. Audit records carry exactly
 # the facts the client must never see (guard verdicts, matched rule names,
-# suppressed bug ids), which is why they go only to a local file you
-# control: the stream is never exposed through any MCP surface, and it is
+# suppressed bug ids). This document configures the FILE sink. Records
+# may also go to a load-bearing OTLP collector (see README "OpenTelemetry
+# export"); the stream is never exposed through any MCP surface, and it is
 # never mixed into the diagnostic stderr stream.
 #
 # Format: one JSON object per line (JSONL), schema version 1. Three record
@@ -24,8 +25,11 @@
 # call site; nothing fetched FROM Bugzilla is ever written here.
 #
 # bugwarden loads this file via --audit-config or the
-# BUGWARDEN_AUDIT_CONFIG environment variable; without that flag no audit
-# stream is written.
+# BUGWARDEN_AUDIT_CONFIG environment variable. The exact value `none`
+# disables the file so a collector can be the only sink. An OTLP
+# endpoint with no file decision is a startup error — point here or set
+# `none` — and so is `none` with no endpoint. Leaving both knobs unset
+# writes no stream.
 #
 # Parsing is strict: unknown keys anywhere in this file are a startup
 # error, so a typo cannot silently disable a setting.
