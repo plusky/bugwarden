@@ -38,9 +38,10 @@ MSRV policy. CI and reproducible local checks use the committed
 
 ## Security guard rules
 
-The security guards are defined in `docs/DESIGN.md` as invariants
-**I1–I13**. They are normative: reviewers verify them, and CI failures are
-never a reason to relax them.
+The security guards are defined in `docs/DESIGN.md` as invariants numbered
+**I1 onward**. DESIGN.md holds the authoritative list — read it there rather
+than assuming an upper bound here. They are normative: reviewers verify every
+one of them, and CI failures are never a reason to relax them.
 
 - **NEVER weaken a guard to fix a build or test.** In particular, do not
   turn fail-closed behavior into fail-open (I4), do not vary the uniform
@@ -60,6 +61,18 @@ never a reason to relax them.
 - In read-only mode, and for `global.disabled_tools`, write tools are
   removed from the tool listing (`ToolRouter::remove_route`), not merely
   made to error (I13).
+- A bug id the policy would deny must not appear inside something the client
+  IS shown — dependency/duplicate/`see_also` fields, history entries naming
+  other bugs, and duplicate-marker comments are scrubbed at the
+  `Capability::Summary` bar (I14), subject to the known limits DESIGN.md
+  records. A new field that can carry a bug id extends the scrub.
+- **The audit stream is never reachable through any MCP surface** (I15) — no
+  tool, resource, or prompt may read, list, or replay it.
+- The discovery tools `bugzilla_products` and `bug_fields` return Bugzilla
+  instance metadata exactly as Bugzilla returned it — **NEVER filtered
+  against the guard policy**, because a policy-filtered catalog would itself
+  be a policy-enumeration oracle. They are gated behind
+  `global.allow_discovery` (default `false`), never filtered (I16).
 
 ## DESIGN.md Records Deliberate Decisions
 
@@ -94,12 +107,13 @@ are never a justification for undoing them.
 
 - Add focused unit tests alongside changed modules (`policy.rs`,
   `guard.rs`); use wiremock for HTTP-level integration tests in
-  `crates/bugwarden-core/tests/`. The guard test list in DESIGN.md
+  `crates/bugwarden-core/tests/` and, for server- and transport-level
+  behavior, `crates/bugwarden/tests/`. The guard test list in DESIGN.md
   ("Testing") is the minimum bar, not a ceiling.
 - A dependency change must update `Cargo.lock`, preserve the MSRV, and pass
   `cargo deny check`. Prefer the smallest compatible version change; do not
   run a broad `cargo update` as part of an unrelated change.
-- `typos` runs as its own workflow and is not part of the four verification
+- `typos` runs as its own workflow and is not part of the five verification
   commands; `typos.toml` is an allowlist of deliberate spellings, never a
   mask for a real typo.
 
@@ -110,13 +124,15 @@ are never a justification for undoing them.
   reformatting and behavior changes — are separate PRs, even when they were
   developed together. A reviewer should be able to hold the whole PR in their
   head.
-- Commit subjects follow Conventional Commits (repose practice):
+- Commit subjects follow Conventional Commits (repo's practice):
   `type(scope): imperative lowercase subject`, no trailing period, at most
   ~72 characters. Types in use: `feat`, `fix`, `docs`, `test`, `refactor`,
-  `chore`, `ci`; Dependabot owns `build(deps)`. The scope is the crate or
-  area (`core` for bugwarden-core, `server` for the binary crate, `policy`,
-  `release`, …) and is omitted for cross-cutting changes. The body explains
-  what and why, wrapped at ~72 columns.
+  `chore`, `ci`, `build`. Dependabot's automated bumps land as
+  `build(deps)`, but that type is not reserved to it — humans use `build`
+  and `build(deps)` for dependency, lockfile and packaging changes. The
+  scope is the crate or area (`core` for bugwarden-core, `server` for the
+  binary crate, `policy`, `release`, …) and is omitted for cross-cutting
+  changes. The body explains what and why, wrapped at ~72 columns.
 - `main` takes rebase merges only, so every commit in a PR lands on `main`
   verbatim: each commit must build and pass the workspace verification
   commands on its own (bisectability). Squash fixup noise before pushing;
