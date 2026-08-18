@@ -75,6 +75,13 @@ const AMBIENT_VARS: &[&str] = &[
     "MCP_READ_ONLY",
     "MCP_API_KEY_HEADER",
     "RUST_LOG",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_SERVICE_NAME",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+    "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
 ];
 
 /// The scrub list is only as good as its coverage of `Cli`; a flag added
@@ -101,6 +108,15 @@ fn the_scrub_list_covers_every_environment_fallback() {
     ] {
         assert!(AMBIENT_VARS.contains(&var), "{var} must be scrubbed");
     }
+    let unscrubbed_otel: Vec<&str> = bugwarden::otel::ENV_VARS
+        .iter()
+        .copied()
+        .filter(|var| !AMBIENT_VARS.contains(var))
+        .collect();
+    assert!(
+        unscrubbed_otel.is_empty(),
+        "these OTLP variables reach the spawned binary: {unscrubbed_otel:?}"
+    );
 }
 
 // ---------- wire-level harness ----------

@@ -16,6 +16,14 @@ services:
       # Bugzilla key in the ApiKey header instead.
       BUGZILLA_API_KEY_FILE: /run/secrets/bugzilla-key
       # BUGWARDEN_AUDIT_CONFIG: /etc/bugwarden/audit.toml
+      # OTLP export to the sidecar below. A configured collector is
+      # load-bearing: delivery is probed at startup and an outage engages
+      # fail_mode. Pair it with BUGWARDEN_AUDIT_CONFIG (a file, or `none`
+      # for collector-only); an endpoint with no file decision is a
+      # startup error. The service name resolves on compose's network,
+      # which is why the collector must not bind loopback — see the note
+      # on its own receiver in examples/otel-collector.yaml.
+      # OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
     # Deny-by-default: without a token the server refuses to start. Kept in a
     # file rather than the shell environment so the value stays out of argv.
     env_file:
@@ -41,3 +49,32 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+
+  # Sidecar collector, commented out because its destination is a policy
+  # decision (see examples/otel-collector.yaml): the stream carries guard
+  # verdicts, rule names and withheld bug ids, so it is at least as
+  # sensitive as the bugs it describes.
+  #
+  # Two ways records reach it, and the example config takes both: the OTLP
+  # endpoint above, and the filelog receiver tailing the shared audit
+  # volume. The tail is the tamper-evidence path — once the lines are off
+  # the host, the host cannot rewrite its own history.
+  #
+  # bugwarden writes the audit file 0600 and its directory 0700 as uid
+  # 65532, so the collector has to run as the SAME uid to read it. Do not
+  # loosen the file, and do not run the collector as root: that would swap
+  # a permission problem for a collector that can rewrite the record it
+  # exists to preserve.
+  # otel-collector:
+  #   image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:latest
+  #   user: "65532:65532"
+  #   command: ["--config=/etc/otelcol/config.yaml"]
+  #   volumes:
+  #     - ./examples/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+  #     # The same directory bugwarden writes, read-only on this side.
+  #     - ./audit:/var/log/bugwarden:ro
+  #   read_only: true
+  #   cap_drop:
+  #     - ALL
+  #   security_opt:
+  #     - no-new-privileges:true

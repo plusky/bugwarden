@@ -45,8 +45,12 @@ rmcp = { version = "3.1", features = [
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 # Same crate rmcp uses to parse Host authorities (`parse_allowed_authority`).
 http = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
 tokio-util = "0.7"
+# OTLP/HTTP export (issue #31) posts protobuf with the same rustls stack
+# bugwarden-core already resolves for Bugzilla, so this adds no crate to the
+# lock file and no second TLS implementation.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

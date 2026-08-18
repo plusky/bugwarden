@@ -4725,7 +4725,7 @@ mod tests {
     ) -> (Arc<AuditState>, std::path::PathBuf) {
         let path = dir.join("audit.jsonl");
         let sink = AuditSink::open(AuditConfig {
-            path: path.clone(),
+            path: Some(path.clone()),
             fsync: false,
             fail_mode: None,
             rotate_max_bytes: 0,

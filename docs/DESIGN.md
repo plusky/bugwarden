@@ -96,14 +96,20 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
   least `summary` on `duplicate_of`.
 - **I12** The Bugzilla API key must never appear in logs, error messages, or
   tool results. Sanitize reqwest errors with `.without_url()` — the key may be
-  a URL query parameter.
+  a URL query parameter. The rule covers every secret the process holds, and
+  since 2026-08-18 that includes the OTLP export credential
+  (`OTEL_EXPORTER_OTLP_HEADERS`). The collector endpoint is held to a
+  weaker bar (never in an error, audit record, or a line this crate
+  writes; the HTTP stack may print the authority at `RUST_LOG=debug`):
+  see "OTLP export".
 - **I13** In read-only mode (policy or CLI) write tools are removed from the
   tool listing via `ToolRouter::remove_route`, not merely erroring. Same for
   `global.disabled_tools`.
 - **I15** The audit stream is never reachable through any MCP surface.
   When auditing is enabled, every tool call produces exactly one audit
-  record, persisted before the response is returned. The API key and
-  free-text bug content are unrepresentable in the audit event type.
+  record, accepted by every configured sink before the response is
+  returned (a file write, an export-queue accept, or both). The API key
+  and free-text bug content are unrepresentable in the audit event type.
   Client-visible responses are byte-identical with auditing on, off, or
   failing — except the scoped fail-closed refusals, which reuse the tools'
   existing uniform failure texts and never vary with the guard's verdict.
@@ -1115,7 +1121,7 @@ clap derive `Cli`, with env fallbacks:
 | --use-auth-header | BUGZILLA_USE_AUTH_HEADER | false | Bearer to Bugzilla instead of api_key query param |
 | --read-only | MCP_READ_ONLY | false | tighten-only (I9) |
 | --policy | BUGWARDEN_POLICY | — | path to guard policy TOML; the container image presets it to /etc/bugwarden/policy.toml, so that one artifact fails closed on a missing mount instead of defaulting to allow-all (tightening only, I9) |
-| --audit-config | BUGWARDEN_AUDIT_CONFIG | — | path to audit configuration TOML; without it no audit stream is written |
+| --audit-config | BUGWARDEN_AUDIT_CONFIG | — | path to audit configuration TOML, or the exact value `none` to disable the file (OTLP-only when an endpoint is set). Unset with no OTLP endpoint writes no stream; an endpoint with no file decision, or `none` with no endpoint, is a startup error |
 | --insecure-no-auth | — (deliberately) | false | serve http with no bearer gate; refuses to start together with a token (see HTTP bearer authentication) |
 | — | BUGWARDEN_HTTP_TOKEN | — | bearer token, write scope; environment only, never a flag |
 | — | BUGWARDEN_HTTP_READ_TOKEN | — | bearer token, read scope; environment only, never a flag |
@@ -1130,8 +1136,10 @@ is not a hostname or `host:port` and emits one info line stating whether
 Host validation is on or off (the list, when on — hosts only, I12).
 main.rs adds: the http bearer gate, resolved FIRST of all (see HTTP
 bearer authentication) so a token misconfiguration precedes every other
-startup effect; and http without audit_config => tracing::warn (remote
-tool calls leave no audit record).
+startup effect; `select_sinks` (file path, `none`, OTLP endpoint) so the
+two ambiguous spellings refuse before any file or task exists; and http
+with no sink at all (`NoAudit`) => tracing::warn (remote tool calls leave
+no audit record).
 
 ## Audit stream (crates/bugwarden/src/audit.rs + the server.rs wrapper)
 
@@ -1144,13 +1152,18 @@ Decisions, all deliberate:
   extensions (verdict worst-wins merged, suppressed ids unioned). An
   unknown tool, a protocol error, or a missed enrichment still yields
   exactly one record — a poorer record is possible, an audit gap is not.
-  The record is persisted (sink is synchronous) before the response is
-  returned. `initialize` is always recorded, with no configuration knob
-  to turn it off; `list_tools` is not recorded in schema v1 — no event
-  kind exists for a listing, deliberately.
-- **Boundary.** Records go only to the operator's JSONL file (0600,
-  parent 0700) — never stderr, never any MCP surface. The schema has no
-  field that could carry the API key or free-text bug content; client
+  The record is accepted by every configured sink before the response is
+  returned (the file write is synchronous; the OTLP hand-off only queues).
+  `initialize` is always recorded, with no configuration knob to turn it
+  off; `list_tools` is not recorded in schema v1 — no event kind exists
+  for a listing, deliberately.
+- **Boundary.** Records go to the sinks the operator named
+  (`select_sinks`): the JSONL file (0600, parent 0700), an OTLP
+  collector, both, or neither. Never stderr, never any MCP surface. When
+  both run, the file write precedes the export, so the file never lacks a
+  record the collector has. A configured collector is load-bearing, not a
+  copy ("OTLP export", below). The schema has no field that could carry
+  the API key or free-text bug content; client
   parameters pass a key allowlist (identifiers and routing/vocabulary
   fields by value, strings capped at 1024 chars) and every other key is
   recorded as `{"_len": N}` — presence and size, never content.
@@ -1345,6 +1358,216 @@ Decisions, all deliberate:
   alternative, namespacing the synthetics in the record (a `rule_kind`
   field, or a prefix), was rejected here: it is a record-schema change and
   belongs to #34.
+
+## OTLP export (crates/bugwarden/src/otel.rs)
+
+Added 2026-08-18 (issue #31). Revised the same day: a configured collector
+is a load-bearing audit sink, not a best-effort copy. Until then the audit
+boundary read "the guard does not speak OTLP, does not export anything
+itself"; that sentence is SUPERSEDED. The operator chooses the sinks
+(`select_sinks`): the JSONL file, an OTLP collector, both, or neither.
+Every configured sink is load-bearing — a failed export puts the sink into
+failure exactly as a failed file write does, and the operator's
+`fail_mode` decides what the server then does about tool calls. Only the
+diagnostics stream stays best-effort. Off entirely unless an operator
+names an endpoint.
+
+- **Decision: export natively, do not only document it.** The original
+  issue proposed a collector example alone, on the reasoning that shipping
+  the file off-host is what makes it tamper-evident and that shipping is an
+  operator task. Tailing still ships (`examples/otel-collector.yaml` carries
+  both receivers) and is still the tamper-evidence path; native export
+  answers the other half, which tailing cannot: a live stream, correlated
+  with the client's trace ids (#28), from a process that already knows the
+  verdict, the rule and the session. The two are complementary and the
+  example runs both — the exported body IS the file line (or the line the
+  file would have carried), so a consumer deduplicates on `session` plus
+  `seq`.
+- **Sink selection.** Turning the FILE off is an explicit act
+  (`BUGWARDEN_AUDIT_CONFIG=none`, compared by exact bytes so `./none` is
+  still a path), never an inference from absence. The four deployments
+  are: both knobs unset → no audit trail and no audit gate; a file path
+  alone → every pre-#31 deployment; a file path and an endpoint → both
+  sinks, file first; `none` and an endpoint → OTLP-only, no filesystem
+  touch. The two cells that could confuse absence with a choice are
+  startup errors: an endpoint with no file decision, and `none` with no
+  endpoint. An OTLP-only sink has no document, so `fail_mode` always
+  derives from the transport.
+- **What is exported.** One OTel log record per `AuditEvent` the sink
+  persisted, plus the server's own `tracing` diagnostics; the two are told
+  apart by the `bugwarden.stream` attribute (`audit` / `diagnostics`). An
+  audit record's body is the audit line VERBATIM — when a file is
+  configured, the same bytes it holds, without the terminating newline and
+  without the leading one a torn-line repair may have prefixed; a fileless
+  sink exports the line it would have written — and its attributes are
+  `bugwarden.event`, `.seq`, `.transport`, `.session.id`, and, on a
+  `tool_call`, `.tool`, `.verdict` and `.rule`. Severity follows the KIND,
+  not the verdict: `tool_call` and `initialize` are INFO, `audit_gap` is
+  ERROR, because a gap is a loss of the record stream itself while a denial
+  is the guard working. The verdict rides an attribute, where a consumer
+  can filter on it. `trace_id`/`span_id` come from the record's `trace`
+  field when the client sent a valid `traceparent`, so a guard decision
+  joins the client trace that caused it; they are the same unauthenticated
+  client claims the audit schema documents, correlation hints and never
+  evidence.
+- **Byte equality (I12).** `AuditSink::write_event` hands the exporter the
+  exact slice it wrote (or would have written), after the file write and
+  `sync_data` (when a file is configured) and while the sink lock is still
+  held. That ordering is the whole design: when a file exists it is
+  authoritative, so a record it never took exists nowhere else; export
+  order equals `seq` order; the exported payload cannot drift from the
+  file's because it is not re-serialized. `AuditExport` implementors must
+  not block — the call is under the sink lock — and the OTLP one only
+  queues. A record the queue will not take is REFUSED, never dropped.
+- **Failure semantics: every configured sink is load-bearing.** A
+  collector that is down, slow, or answering 503 marks
+  `AuditExport::delivery_failing`, which `AuditSink::failing()` feeds into
+  the same `FailMode` gate a failed file write does. Records accepted and
+  then not delivered are counted in `take_lost` and surface as an
+  `audit_gap` (reason `write_error`); a full queue or a shut-down pipeline
+  refuses `accept` and the request path treats that as `AuditError::Export`.
+  Delivery health is a latch — false from the first failed request until
+  a successful AUDIT flush; a successful diagnostics flush does not
+  reopen it — so the gate does not flap once per batch for the whole
+  outage, and a log line getting through is not proof the audit sink
+  works. Two queues keep the streams apart (2048 each): a log storm must
+  not fill the audit queue and take the server down, and a dropped
+  diagnostic must not stop the guard. The batch is bounded (512 records,
+  500 ms, a 10 s request timeout); a failed AUDIT batch is lost rather
+  than retried (a retry queue is a second unbounded buffer in front of a
+  collector that is already not answering) but never silently. Diagnostic
+  drops are counted and the counter is logged when the total crosses a
+  power of two — the diagnostic has to survive an outage that lasts, and
+  one line per lost record would be its own denial of service. On a
+  fileless sink the persist bar is acceptance onto the audit queue, not a
+  durable write: a crash before the next flush, or a shutdown that hits
+  the 5 s bound, loses the tail. That is the cost of turning the file
+  off. A served call's response is still byte-identical with export on,
+  off, or failing (I15); the refusals a closed fail mode produces are the
+  audit machinery's own, uniform per tool. I9 is untouched: nothing here
+  reaches the guard or loosens policy.
+- **The drop line carries a count and a reason and nothing else.** The
+  reason is a closed vocabulary (`queue_full`, `network`, `http_status`,
+  `shutdown`) for the same purpose `GapReason` is one: a free-text reason
+  built from a transport error is exactly how an endpoint reaches a log
+  line. The `reqwest::Error` of a failed export is discarded rather than
+  logged, since it carries the request URL — the same rule
+  `.without_url()` exists for. Nothing that holds the endpoint or the
+  headers derives `Debug`; `Pipeline`'s is hand-written and content-free
+  because `AuditSink`'s derived one would otherwise print it.
+- **What secrecy this actually buys, stated exactly.** The two claims are
+  not the same and were once written as if they were.
+  - The HEADERS never reach anything but the wire. No code path formats
+    them, no type prints them, no error names them (a malformed entry is
+    refused by position), and reqwest's byte-level tracing — the one thing
+    that would dump an `authorization:` header — is behind
+    `ClientBuilder::connection_verbose`, which defaults to false and which
+    this module never sets.
+  - The ENDPOINT is not secret to stderr, and claiming otherwise was
+    false. bugwarden itself never logs it, but at `RUST_LOG=debug` the
+    HTTP stack does: `hyper_util`'s pool logs "pooling idle connection for
+    <authority>" and `reqwest::connect` logs "starting new connection",
+    each carrying scheme, host and port. Suppressing those from stderr was
+    rejected — an operator debugging a collector that will not answer
+    needs exactly those lines, and the Bugzilla endpoint is already
+    printed at startup, so the authority is not the kind of thing this
+    project hides. What IS guaranteed is that the endpoint never reaches
+    the EXPORT, an audit record, or any line bugwarden writes itself.
+- **Nothing the export emits is exported (the loop).** The diagnostics
+  layer drops events whose target begins with `bugwarden::otel`,
+  `reqwest`, `hyper` (which covers `hyper_util`), `rustls`, `h2` or
+  `tower`. Without this, at debug level, one flush's pool and connect
+  lines become records in the next batch, whose flush logs again: an idle
+  server exports forever at the batch interval, and the authority above
+  goes on the wire with it. Measured, not theorised — the test asserts
+  that an idle server's export count stops moving.
+  Two subtleties make this more than a target list. First, `reqwest` and
+  `hyper` log through the `log` crate, and `tracing-log`'s bridge (which
+  `SubscriberInitExt::init` installs) gives those events the literal
+  target `"log"` and demotes the real one to a `log.target` FIELD — so the
+  check reads that field where it exists, and a check on metadata alone
+  silently catches nothing. Second, the cost is accepted rather than
+  avoided: those same targets carry the BUGZILLA client's HTTP
+  diagnostics, which therefore stop being exported too. They still reach
+  stderr, and no filter available at the layer can tell one client's
+  events from the other's — they are the same crates on the same targets.
+- **Configuration: the standard variables, and only those.** Endpoint,
+  headers, protocol and service name come from
+  `OTEL_EXPORTER_OTLP_ENDPOINT`, `_HEADERS`, `_PROTOCOL` and
+  `OTEL_SERVICE_NAME`. No command-line option exists, which matches the
+  container env-first convention (#104/#32) and, for `_HEADERS`, is the
+  same reasoning as the http bearer tokens: an option would publish the
+  credential through `ps` (I12). An unset OR EMPTY endpoint turns the
+  feature off completely — no task, no thread, no layer, no request — and
+  the protocol is therefore validated only once an endpoint exists, so a
+  fleet-wide `OTEL_*` environment cannot refuse to start a deployment that
+  exports nothing. `http/protobuf` is the one accepted protocol and every
+  other value is a startup error naming the variable; gRPC is deliberately
+  absent, which is what keeps the export on the rustls/reqwest stack the
+  Bugzilla client already resolves. The export client follows no HTTP
+  redirects: a 3xx would forward the audit body and any non-Authorization
+  collector credential to a host the operator did not name. `_HEADERS`
+  values are taken VERBATIM:
+  the OTLP specification describes them as percent-encoded, and decoding
+  would silently rewrite any credential containing a `%`, which is worse
+  than not implementing an encoding no collector requires. A malformed
+  entry is refused by POSITION, never by content, because a mispasted
+  credential is precisely what lands in the wrong position.
+- **Startup and shutdown ordering.** The environment is resolved before the
+  subscriber is installed (parsing starts nothing, and an unusable protocol
+  must abort before records exist). `select_sinks` runs next, still before
+  any network or filesystem work, so the two ambiguous spellings refuse
+  without opening a file or spawning a task. The exporter task and its
+  delivery probe run AFTER the identity preflight and BEFORE the audit
+  file is created: a collector that will not take records refuses to start
+  without leaving a file behind (five attempts, `n × 500 ms` backoff,
+  posting one real diagnostics record — not an empty request some
+  collectors accept blindly, and not a fake audit event the schema does
+  not have). The diagnostics layer is installed at subscriber time but
+  reads an empty slot until the pipeline starts, so events emitted during
+  startup reach stderr and not the collector. At shutdown the queue is
+  flushed best-effort under a 5 s bound; over http that runs after
+  graceful shutdown, i.e. after the SIGINT/SIGTERM that triggered it, and
+  the flush is reached even when the transport returned an error. Over
+  stdio a signal cannot return from `main` (the stdin read is
+  uncancellable, issue #114), so those arms flush and then
+  `process::exit(0)` rather than skipping a load-bearing collector.
+- **Dependency decision: hand-written encoder over the OpenTelemetry SDK.**
+  The SDK route (`opentelemetry` + `opentelemetry_sdk` +
+  `opentelemetry-otlp` + `opentelemetry-appender-tracing`, 0.32) was
+  resolved, built and run before being rejected. Three findings, in order
+  of weight. (1) Its `BatchLogProcessor` drives the export from a dedicated
+  OS thread with `futures_executor::block_on`, so the async reqwest client
+  panics on the first export with "there is no reactor running, must be
+  called from the context of a Tokio 1.x runtime" and the processor is dead
+  for the process lifetime; the supported combination is
+  `reqwest-blocking-client`, i.e. a SECOND internal Tokio runtime and
+  thread inside a process that already has one. (2)
+  `opentelemetry-appender-tracing` 0.32 does not honour the telemetry
+  suppression the SDK sets around its own export path, so the SDK's
+  internal `otel_error!` diagnostics — emitted through `tracing` on every
+  failed batch — are picked up by the appender and queued for export,
+  making a failing exporter its own source of records to export. (3) It
+  cannot produce the drop accounting this design asks for: `on_emit`
+  returns nothing, so a full queue is invisible to the caller, and the
+  processor logs the transport error itself, with the endpoint URL at debug
+  level. Against that, the whole OTLP logs schema this module needs is one
+  request message, four nested messages and a varint writer, and going
+  without adds ZERO crates to the lock file for a security-guard product —
+  the SDK route added 17 (`prost` and `prost-derive`,
+  `opentelemetry-proto`, and their own transitive tail), proc macros among
+  them. `cargo deny` therefore has nothing new to judge, and `Cargo.lock`
+  is unchanged by this feature. The cost is owned protobuf encoding, which the
+  unit tests pin field by field and the integration tests decode off the
+  wire.
+- **Invariants.** I15 is untouched: the pipeline is reachable through no
+  MCP tool, resource or prompt, and no client can turn it on, off, or
+  inspect it. I9 is untouched: nothing here reaches the guard or loosens
+  policy. A served call's response is byte-identical with export on, off,
+  or failing (I15); the refusals a closed fail mode produces are the audit
+  gate's, uniform per tool. I12 gains the export headers as secret material
+  of the kind the invariant already names; the endpoint is the weaker bar
+  stated under "What secrecy this actually buys".
 
 ## rmcp 3.1 usage notes
 
@@ -1629,7 +1852,7 @@ wired, `server.rs` and `main.rs` are the reference.
   update_bug_fields, update_bug_dependencies, add_cc_to_bug, mark_as_duplicate,
   create_bug, add_attachment.
 - API key resolution: a match on `key_custody` (resolved once at startup, see Key custody — never re-read per request): `Server(key)` => the server's key, without touching the request at all; `PerRequest` => `ctx.extensions.get::<axum::http::request::Parts>()`, then `parts.headers.get(lowercased_header_name)`.
-- HTTP serving: `let config = server.http_server_config()?.with_cancellation_token(ct.child_token());` — built while `server` can still be borrowed, since the body cap comes from its own guard policy; errors on an unparsable `--allowed-hosts` entry and logs the effective Host-validation state — then `StreamableHttpService::new(move || Ok(server.clone()), LocalSessionManager::default().into(), config)`, never a bare `StreamableHttpServerConfig::default()`, see the field table above — then `axum::Router::new().nest_service("/mcp", service)`, `tokio::net::TcpListener::bind`, graceful shutdown on SIGINT or SIGTERM cancelling `ct` (`shutdown_signal` in main.rs; issue #114). Stdio uses the same waiter across `serve` (the handshake wait an unused stdio container sits in) and `waiting`; a signal at either stage `process::exit(0)`s, because rmcp's stdio transport reads stdin via `spawn_blocking` and that read does not unblock while the client holds the pipe — returning from `main` drops the runtime onto that thread.
+- HTTP serving: `let config = server.http_server_config()?.with_cancellation_token(ct.child_token());` — built while `server` can still be borrowed, since the body cap comes from its own guard policy; errors on an unparsable `--allowed-hosts` entry and logs the effective Host-validation state — then `StreamableHttpService::new(move || Ok(server.clone()), LocalSessionManager::default().into(), config)`, never a bare `StreamableHttpServerConfig::default()`, see the field table above — then `axum::Router::new().nest_service("/mcp", service)`, `tokio::net::TcpListener::bind`, graceful shutdown on SIGINT or SIGTERM cancelling `ct` (`shutdown_signal` in main.rs; issue #114). Stdio uses the same waiter across `serve` (the handshake wait an unused stdio container sits in) and `waiting`; a signal at either stage flushes the OTLP queue (when export is on) then `process::exit(0)`s, because rmcp's stdio transport reads stdin via `spawn_blocking` and that read does not unblock while the client holds the pipe — returning from `main` drops the runtime onto that thread.
 - Request `_meta` (SEP-414, e.g. `traceparent`): over every serialized
   transport the wire `params._meta` does NOT arrive in the params struct
   (`CallToolRequestParams.meta` stays `None`) — the SDK's custom
@@ -2104,5 +2327,79 @@ wired, `server.rs` and `main.rs` are the reference.
   the child's stdin still held, so wrapping only `serve` or only `waiting`
   fails, and a handshake arm that only `return Ok(())` cannot go green
   via `wait_with_output` dropping the pipe.
+- Unit tests (#[cfg(test)] in crates/bugwarden/src/otel.rs): configuration
+  resolution — an unset, emptied or blank endpoint resolves to NO
+  configuration and a bad protocol beside it is therefore not an error,
+  `http/protobuf` and an absent protocol are the only accepted transports
+  and every other value names the variable and the accepted spelling, the
+  logs path is appended once whether or not the endpoint ends in a slash,
+  `OTEL_SERVICE_NAME` is trimmed and defaults to `bugwarden`, headers parse
+  into pairs and are taken VERBATIM (percent-encoding is not decoded), and
+  a malformed entry — no separator, an empty or whitespace-carrying name,
+  an empty value, a newline in a value — is refused by POSITION with the
+  pasted credential absent from the error (I12) while a trailing or
+  doubled comma names no header and is not an error, and the logs-specific
+  variables override their general twins, turn export on when set alone,
+  fall back when emptied, and name themselves in a refusal; record
+  shaping — the body
+  is the given line unchanged, the documented attributes are all present,
+  severity follows the kind (`audit_gap` ERROR, the rest INFO), a valid
+  traceparent's ids reach the record as raw bytes and hex of the wrong
+  width or alphabet reaches it as nothing; protobuf encoding — varints
+  round-trip (including the canonical `300 = ac 02`), a request nests
+  resource, scope and records with the OTLP field numbers, a batch is one
+  request with one record each, and the trace ids land in the fixed-width
+  byte fields, with both timestamps pinned BY FIELD NUMBER (1 and 11, and
+  the reserved field 4 empty) and every severity pinned to its OTLP number
+  and text — a stamp or a severity written where no reader looks for it is
+  invisible to any assertion on the decoded value alone; drop accounting —
+  sixteen single drops log exactly five
+  lines (1, 2, 4, 8, 16), one 300-record batch crosses nine of them
+  (1 through 256) and still logs once with the threshold moved to 512, and
+  the line carries no endpoint and no header material; and `Pipeline`'s
+  hand-written `Debug`
+  carries neither, since `AuditSink`'s derived one would print it;
+  the startup probe refuses a dead collector without naming the endpoint
+  (I12) and leaves delivery marked failing.
+- Sink-selection tests (#[cfg(test)] in crates/bugwarden/src/audit.rs):
+  the four deployments resolve, the two ambiguous spellings refuse naming
+  both ways out, and `none` is exact bytes (`None` and `./none` are
+  files). Exporter-as-sink: a fileless sink records through the exporter
+  alone; a refused hand-off fails the record while the file still keeps
+  it; delivery failure alone puts the sink in failure; undelivered losses
+  surface as an `audit_gap`; and the file write precedes the hand-off.
+- Integration tests (crates/bugwarden/tests/otel_wiremock.rs, a wiremock
+  OTLP collector beside the wiremock Bugzilla): a real tool call over a
+  real MCP session arrives at `POST /v1/logs` as
+  `application/x-protobuf`, decoded off the wire rather than through the
+  encoder, carrying the documented attributes, `service.name`, INFO
+  severity and the client's traceparent ids as bytes, with the
+  `initialize` record exported beside it; the exported body is
+  byte-identical to the file's line and appears exactly once (I12); a
+  dead collector under `open` keeps serving, puts the sink in failure,
+  and accounts the window with `audit_gap` (audit losses never ride the
+  diagnostics drop counter), and the shutdown flush returns bounded; a
+  mid-serve collector death under `closed_all` refuses with the tool's
+  uniform failure text and recovery reopens the gate; an OTLP-only server
+  serves, exports initialize and the tool call, and touches no
+  filesystem; the startup probe retries through 503s until a racing
+  collector answers; and with no endpoint configured `resolve` yields
+  nothing, no exporter is attached, the file still gets the record and a
+  listening collector is never contacted. `otel_diagnostics.rs` is one
+  test in a binary of its own
+  (the layer only works through the one process-wide subscriber): a
+  diagnostic reaches the collector with its FIELDS as well as its message
+  and the `bugwarden.stream`/`log.target` attributes, an event emitted
+  before the pipeline existed is dropped rather than exported, and nothing
+  the export itself emits is exported: not this module's own target, and
+  not its HTTP stack's, checked both by marker and by the `log.target` of
+  every record that arrived, so the LIVE client's events are covered and
+  not only the synthetic ones. That test runs the subscriber at `debug`,
+  where the stack is loud enough to feed itself, and it finishes by
+  asserting an idle server's export count stops moving — the difference
+  between "the leak is plugged" and "the loop is dead". Its collector is a
+  hand-rolled socket rather than a `MockServer` precisely because wiremock
+  runs in-process and logs a line per request, which would feed the very
+  loop under test.
 - CI: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace --locked`, `cargo deny check`.

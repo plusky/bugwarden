@@ -5,11 +5,22 @@
 //! never named. The audit stream is the other half of that bargain — the
 //! operator's own record of what was asked and what the guard decided. Its
 //! records carry exactly the facts the client must never see (guard
-//! verdicts, matched rule names, suppressed bug ids), so the stream is
-//! written only to an operator-controlled local file: it is never exposed
-//! through any MCP surface, and it is never mixed into the diagnostic
-//! stderr stream. Diagnostics about the sink itself (a full disk, a failed
-//! rotation) go to `tracing` as usual, but carry no event content.
+//! verdicts, matched rule names, suppressed bug ids), so the stream goes
+//! only to the sinks the operator named: it is never exposed through any
+//! MCP surface, and it is never mixed into the diagnostic stderr stream.
+//! Diagnostics about the sink itself (a full disk, a failed rotation) go
+//! to `tracing` as usual, but carry no event content.
+//!
+//! A deployment CHOOSES its sinks (revised 2026-08-18, issue #31;
+//! [`select_sinks`]): the JSONL file, an OTLP collector ([`AuditExport`],
+//! `crate::otel`), both, or none at all. Every configured sink is
+//! load-bearing — a failed export puts the sink into failure exactly as a
+//! failed write does, and the operator's [`FailMode`] decides what the
+//! server then does about tool calls. With both configured the record
+//! reaches the file first and the exporter afterwards, so the file never
+//! lacks a record the collector has. With neither configured the server
+//! serves with no audit trail and no audit gate — a deployment choice,
+//! made only by leaving BOTH knobs unset.
 //!
 //! # File format
 //!
@@ -140,10 +151,13 @@ fn default_suppressed_ids() -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuditConfig {
-    /// The JSONL audit file. Required. The parent directory is created
-    /// (mode 0700) if missing; the file itself is created mode 0600 and
-    /// only ever appended to.
-    pub path: PathBuf,
+    /// The JSONL audit file. Still REQUIRED in a configuration file —
+    /// this is `Option` only so a deployment that has no configuration
+    /// file can construct a fileless sink ([`AuditConfig::fileless`]),
+    /// and a TOML document that omits `path` is a load error as before.
+    /// The parent directory is created (mode 0700) if missing; the file
+    /// itself is created mode 0600 and only ever appended to.
+    pub path: Option<PathBuf>,
     /// `sync_data()` after every record. The default `false` still
     /// survives a killed process — `write(2)` puts the record in the page
     /// cache before [`AuditSink::record`] returns — but only `true`
@@ -178,6 +192,25 @@ pub struct AuditConfig {
 }
 
 impl AuditConfig {
+    /// The configuration of a deployment that keeps no audit file, for
+    /// `BUGWARDEN_AUDIT_CONFIG=none`.
+    ///
+    /// There is no document to carry the other knobs, so they take their
+    /// defaults and [`AuditConfig::fail_mode`] is left for the caller to
+    /// resolve. Such a deployment MUST have another sink; `main` enforces
+    /// that before it gets here.
+    #[must_use]
+    pub fn fileless() -> AuditConfig {
+        AuditConfig {
+            path: None,
+            fsync: false,
+            fail_mode: None,
+            rotate_max_bytes: default_rotate_max_bytes(),
+            rotate_keep: default_rotate_keep(),
+            suppressed_ids: default_suppressed_ids(),
+        }
+    }
+
     /// Strict parse + validation of an audit configuration document.
     ///
     /// Rejects unknown keys everywhere (`deny_unknown_fields`), then
@@ -187,6 +220,12 @@ impl AuditConfig {
     pub fn from_toml_str(s: &str) -> anyhow::Result<AuditConfig> {
         let cfg: AuditConfig =
             toml::from_str(s).context("failed to parse audit configuration TOML")?;
+        // `path` is `Option` only for the fileless constructor; a DOCUMENT
+        // without one is a load error as it always was — the audit file is
+        // turned off by BUGWARDEN_AUDIT_CONFIG=none, never by omission.
+        if cfg.path.is_none() {
+            anyhow::bail!("audit configuration names no `path`");
+        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -219,6 +258,80 @@ impl AuditConfig {
             );
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sink selection
+// ---------------------------------------------------------------------------
+
+/// The `--audit-config` / `BUGWARDEN_AUDIT_CONFIG` value that disables
+/// the audit FILE by name. Compared by exact bytes, like a rule name: a
+/// real file that happens to be called `none` is reachable as `./none`.
+pub const AUDIT_CONFIG_NONE: &str = "none";
+
+/// Which audit sinks this deployment runs (issue #31, revised 2026-08-18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkSelection {
+    /// No sink at all: the server serves normally with NO audit trail and
+    /// no audit gate. Expressible only by leaving both knobs unset.
+    NoAudit,
+    /// The JSONL file alone — every pre-#31 deployment, unchanged.
+    FileOnly,
+    /// File and OTLP: the write precedes the export, and either sink
+    /// failing gates serving under the one [`FailMode`].
+    Both,
+    /// OTLP alone, on a fileless sink (`BUGWARDEN_AUDIT_CONFIG=none`).
+    OtlpOnly,
+}
+
+/// Resolve the two knobs — the audit-config path and whether an OTLP
+/// endpoint is configured — into the deployment's sink selection.
+///
+/// The rule that shapes the matrix: turning the FILE off is an explicit
+/// act (`BUGWARDEN_AUDIT_CONFIG=none`), never an inference from absence.
+/// A typo that unsets one variable must fail the start, not silently
+/// reshape the audit trail — so the two cells where absence and an
+/// explicit choice could be confused are startup errors:
+///
+/// - An OTLP endpoint with NO audit-config value could mean "OTLP-only"
+///   or "I mistyped the file configuration"; the server refuses to guess.
+/// - `none` with no OTLP endpoint would leave zero sinks on an explicit
+///   request for one; running without an audit trail is legitimate but is
+///   asked for by leaving both knobs unset, not by this.
+///
+/// # Errors
+///
+/// The two ambiguous cells above, each naming the variables and the two
+/// ways to resolve it.
+pub fn select_sinks(
+    audit_config: Option<&Path>,
+    otlp_configured: bool,
+) -> anyhow::Result<SinkSelection> {
+    let file = match audit_config {
+        None => None,
+        Some(path) if path.as_os_str() == AUDIT_CONFIG_NONE => Some(false),
+        Some(_) => Some(true),
+    };
+    match (file, otlp_configured) {
+        (None, false) => Ok(SinkSelection::NoAudit),
+        (Some(true), false) => Ok(SinkSelection::FileOnly),
+        (Some(true), true) => Ok(SinkSelection::Both),
+        (Some(false), true) => Ok(SinkSelection::OtlpOnly),
+        (Some(false), false) => anyhow::bail!(
+            "--audit-config/BUGWARDEN_AUDIT_CONFIG is `{AUDIT_CONFIG_NONE}` but no OTLP \
+             endpoint is configured, which would leave no audit sink at all; set \
+             OTEL_EXPORTER_OTLP_ENDPOINT for OTLP-only auditing, or unset \
+             BUGWARDEN_AUDIT_CONFIG entirely if this deployment is meant to run \
+             without an audit trail"
+        ),
+        (None, true) => anyhow::bail!(
+            "OTEL_EXPORTER_OTLP_ENDPOINT is set, so audit records are exported and \
+             their delivery gates serving — but no audit file is configured; point \
+             --audit-config/BUGWARDEN_AUDIT_CONFIG at an audit configuration to run \
+             file and OTLP together, or set it to `{AUDIT_CONFIG_NONE}` for OTLP-only \
+             auditing"
+        ),
     }
 }
 
@@ -657,12 +770,26 @@ pub enum AuditError {
     /// Rotating the audit file failed.
     #[error("audit rotation failed")]
     Rotation(#[source] std::io::Error),
+    /// The export sink would not take the record — its queue is full, or
+    /// it has shut down. Content-free like its siblings, and deliberately
+    /// carrying no transport detail: the endpoint may not reach a
+    /// diagnostic (I12).
+    #[error("audit export refused the record")]
+    Export,
 }
 
 impl AuditError {
     fn gap_reason(&self) -> GapReason {
         match self {
-            AuditError::Serialize(_) | AuditError::Write(_) => GapReason::WriteError,
+            // `Export` reports as a write error on purpose: schema v1's
+            // vocabulary has no spelling for a delivery failure, and
+            // adding one would fork every reader of a v1 corpus over a
+            // record whose shape is unchanged. The DIAGNOSTIC says which
+            // sink failed; the record says only that records were lost.
+            // #34 owns the v2 vocabulary.
+            AuditError::Serialize(_) | AuditError::Write(_) | AuditError::Export => {
+                GapReason::WriteError
+            }
             AuditError::Rotation(_) => GapReason::RotationError,
         }
     }
@@ -672,9 +799,75 @@ impl AuditError {
 // Sink
 // ---------------------------------------------------------------------------
 
+/// A second, LOAD-BEARING destination for records, beside (or instead of)
+/// the file.
+///
+/// Revised 2026-08-18 (#31). Export was a best-effort copy the sink
+/// ignored; it is now a sink in its own right. Every configured sink is
+/// load-bearing: a record this one will not deliver puts the whole sink
+/// into failure ([`AuditSink::failing`]) exactly as a failed file write
+/// does, and the operator's [`FailMode`] decides what the server then does
+/// about tool calls. `crate::otel` is the one implementation; the trait
+/// exists so this module keeps no knowledge of OTLP.
+///
+/// Ordering is unchanged and still matters: when a file is configured, the
+/// record reaches it FIRST and the exporter only afterwards, so the file
+/// never lacks a record the collector has.
+///
+/// Obligations on an implementor:
+///
+/// - **Never block.** Every call happens with the sink's write lock held,
+///   so a blocking exporter would serialize behind every audit write and
+///   stall the request path. [`AuditExport::accept`] takes custody and
+///   returns; delivery is reported later through
+///   [`AuditExport::delivery_failing`] and [`AuditExport::take_lost`].
+/// - **Never drop an audit record silently.** A record that cannot be
+///   accepted must be REFUSED (so the call is gated) rather than dropped,
+///   and one accepted but not delivered must be counted in
+///   [`AuditExport::take_lost`] so it reaches an `audit_gap`.
+/// - **`Debug` must be content-free.** [`AuditSink`] derives `Debug` and
+///   would print an exporter through it, so an exporter holding
+///   configuration (an endpoint, credentials) must hide it (I12).
+pub trait AuditExport: Send + Sync + std::fmt::Debug {
+    /// Take custody of one record, or refuse it.
+    ///
+    /// `event` is the record, `line` the exact bytes the file carries for
+    /// it — without the terminating newline and without the leading one a
+    /// torn-line repair may have prefixed. Exporting `line` verbatim is
+    /// what makes the exported payload byte-equal to the file's (I12).
+    ///
+    /// # Errors
+    ///
+    /// [`ExportRefused`] when custody cannot be taken — a full queue, a
+    /// shut-down pipeline. The sink turns that into [`AuditError::Export`],
+    /// which the request path treats exactly like a failed write.
+    fn accept(&self, event: &AuditEvent, line: &[u8]) -> Result<(), ExportRefused>;
+
+    /// Whether delivery is currently known not to work.
+    ///
+    /// True from the first failed attempt until one succeeds. This is what
+    /// keeps the gate closed across the whole outage rather than only at
+    /// the instants a record happens to be refused.
+    fn delivery_failing(&self) -> bool;
+
+    /// Take, and reset, the count of accepted records that were never
+    /// delivered. The sink folds it into its own loss accounting, so the
+    /// `audit_gap` a reader sees covers both sinks.
+    fn take_lost(&self) -> u64;
+}
+
+/// Why [`AuditExport::accept`] refused custody.
+///
+/// The reason is not distinguished on the wire: a full queue and a
+/// shut-down pipeline are the same failure as far as the fail-mode gate
+/// is concerned. The type exists so the refusal is not `Result<(), ()>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportRefused;
+
 #[derive(Debug)]
 struct SinkState {
-    file: File,
+    /// The open live file, or `None` for a fileless (OTLP-only) sink.
+    file: Option<File>,
     /// Current size of the live file, maintained across writes so
     /// rotation needs no `stat` per record.
     size: u64,
@@ -711,6 +904,9 @@ struct SinkState {
 pub struct AuditSink {
     cfg: AuditConfig,
     state: Mutex<SinkState>,
+    /// Load-bearing exporter attached by [`AuditSink::with_export`].
+    /// See [`AuditExport`].
+    export: Option<std::sync::Arc<dyn AuditExport>>,
     /// Test-only fault injection: when set, the write step fails without
     /// touching the file. Lets the gap-marker path be exercised without
     /// weakening the production API.
@@ -746,37 +942,47 @@ impl AuditSink {
         // A hand-constructed config could bypass load-time validation, so
         // re-validate here; the check is free.
         cfg.validate()?;
-        if let Ok(meta) = std::fs::symlink_metadata(&cfg.path) {
-            if meta.file_type().is_symlink() {
-                anyhow::bail!(
-                    "audit file {} is a symlink; refusing to follow it — point `path` \
-                     at a regular file in an operator-owned directory",
-                    cfg.path.display()
-                );
-            }
-        }
-        if let Some(parent) = cfg.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                let mut builder = std::fs::DirBuilder::new();
-                builder.recursive(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::DirBuilderExt as _;
-                    builder.mode(0o700);
+        // A fileless sink touches no filesystem at all: no symlink probe,
+        // no directory creation, no open. That is what lets a container
+        // run OTLP-only with nothing writable mounted.
+        let (file, size) = match &cfg.path {
+            None => (None, 0),
+            Some(path) => {
+                if let Ok(meta) = std::fs::symlink_metadata(path) {
+                    if meta.file_type().is_symlink() {
+                        anyhow::bail!(
+                            "audit file {} is a symlink; refusing to follow it — point \
+                             `path` at a regular file in an operator-owned directory",
+                            path.display()
+                        );
+                    }
                 }
-                builder.create(parent).with_context(|| {
-                    format!("failed to create audit directory {}", parent.display())
-                })?;
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        let mut builder = std::fs::DirBuilder::new();
+                        builder.recursive(true);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::DirBuilderExt as _;
+                            builder.mode(0o700);
+                        }
+                        builder.create(parent).with_context(|| {
+                            format!("failed to create audit directory {}", parent.display())
+                        })?;
+                    }
+                }
+                let file = open_live_file(path)
+                    .with_context(|| format!("failed to open audit file {}", path.display()))?;
+                let size = file
+                    .metadata()
+                    .with_context(|| format!("failed to stat audit file {}", path.display()))?
+                    .len();
+                (Some(file), size)
             }
-        }
-        let file = open_live_file(&cfg.path)
-            .with_context(|| format!("failed to open audit file {}", cfg.path.display()))?;
-        let size = file
-            .metadata()
-            .with_context(|| format!("failed to stat audit file {}", cfg.path.display()))?
-            .len();
+        };
         Ok(AuditSink {
             cfg,
+            export: None,
             state: Mutex::new(SinkState {
                 file,
                 size,
@@ -793,6 +999,20 @@ impl AuditSink {
             #[cfg(test)]
             fail_rotation: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Attach the load-bearing exporter that receives every record this
+    /// sink persists; see [`AuditExport`]. A fileless sink MUST have one —
+    /// without it records would vanish silently — and `main`'s sink
+    /// selection is what guarantees that pairing.
+    ///
+    /// Consuming, so the exporter can only be attached while the sink is
+    /// still being built at startup — a running sink's export side never
+    /// changes, and the request path cannot reach it.
+    #[must_use]
+    pub fn with_export(mut self, export: std::sync::Arc<dyn AuditExport>) -> AuditSink {
+        self.export = Some(export);
+        self
     }
 
     /// Persist one record; returns its assigned `seq`.
@@ -814,6 +1034,10 @@ impl AuditSink {
     /// over-report the loss. Over-reporting, never under-reporting, is
     /// the chosen direction.
     pub fn record(&self, kind: AuditEventKind, session: SessionInfo) -> Result<u64, AuditError> {
+        debug_assert!(
+            self.cfg.path.is_some() || self.export.is_some(),
+            "a fileless audit sink must have an exporter; records would vanish"
+        );
         // A poisoned mutex means a writer panicked; the size/seq state is
         // still usable (worst case an early rotation), so keep going —
         // dropping audit coverage over a bookkeeping wobble would be the
@@ -822,6 +1046,12 @@ impl AuditSink {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Records the exporter accepted and then failed to deliver are
+        // losses of this sink like any other, so they join the same
+        // counter and surface through the same `audit_gap`. Folded before
+        // the gap check below, so an export outage is reported in the very
+        // next record rather than one later.
+        self.absorb_export_losses(&mut state);
         if state.dropped > 0 {
             let gap = AuditEventKind::AuditGap(AuditGapEvent {
                 dropped: state.dropped,
@@ -872,7 +1102,8 @@ impl AuditSink {
         // end of the file; a leading newline terminates it so the stream
         // self-heals (worst case one empty line, which parsers skip —
         // see the module docs).
-        if state.torn {
+        let healed = state.torn;
+        if healed {
             line.push(b'\n');
         }
         serde_json::to_writer(&mut line, &event).map_err(AuditError::Serialize)?;
@@ -900,32 +1131,57 @@ impl AuditSink {
         {
             // Write roughly half the line, then fail: a deterministic
             // stand-in for ENOSPC tearing a line mid-write.
-            state
-                .file
-                .write_all(&line[..line.len() / 2])
-                .map_err(AuditError::Write)?;
+            if let Some(file) = state.file.as_mut() {
+                file.write_all(&line[..line.len() / 2])
+                    .map_err(AuditError::Write)?;
+            }
             state.torn = true;
             return Err(AuditError::Write(std::io::Error::other(
                 "injected partial write failure (test)",
             )));
         }
-        state.file.write_all(&line).map_err(|e| {
-            // An unknown number of bytes made it out: assume a torn line.
-            state.torn = true;
-            AuditError::Write(e)
-        })?;
-        if self.cfg.fsync {
-            state.file.sync_data().map_err(|e| {
-                // The line is complete in the page cache but may not have
-                // reached the disk; treat it as torn so the next record
-                // re-terminates whatever survives.
+        if let Some(file) = state.file.as_mut() {
+            file.write_all(&line).map_err(|e| {
+                // An unknown number of bytes made it out: assume a torn
+                // line.
                 state.torn = true;
                 AuditError::Write(e)
             })?;
+            if self.cfg.fsync {
+                file.sync_data().map_err(|e| {
+                    // The line is complete in the page cache but may not
+                    // have reached the disk; treat it as torn so the next
+                    // record re-terminates whatever survives.
+                    state.torn = true;
+                    AuditError::Write(e)
+                })?;
+            }
+            state.size += len;
         }
         state.torn = false;
-        state.size += len;
+        // The file has the record and its `seq` is spent, whatever the
+        // export does next: a `seq` reused after a rejected export would
+        // put two different records on one number in the file.
         state.seq = seq;
+        if let Some(export) = &self.export {
+            // AFTER the write, never before: the file, when there is one,
+            // is authoritative, and a record it never took must not exist
+            // anywhere else. The slice strips the repair newline this
+            // record may have been prefixed with and the one terminating
+            // it, so what the exporter gets is byte-for-byte the record
+            // line the file holds. Still under the state lock, so export
+            // order equals `seq` order — accepting only queues.
+            let start = usize::from(healed);
+            // Load-bearing since 2026-08-18 (#31): a record the exporter
+            // cannot even accept is a record that will not be delivered,
+            // and saying so here is what puts the call in front of the
+            // same fail-mode gate a failed file write does. The file, if
+            // any, keeps the record — the loss accounting over-reports
+            // rather than under-reports, as it does under `fsync`.
+            export
+                .accept(&event, &line[start..line.len() - 1])
+                .map_err(|ExportRefused| AuditError::Export)?;
+        }
         Ok(seq)
     }
 
@@ -941,7 +1197,11 @@ impl AuditSink {
         {
             return Err(std::io::Error::other("injected rotation failure (test)"));
         }
-        let live = &self.cfg.path;
+        // Unreachable for a fileless sink: `write_event` only rotates when
+        // it holds a file, and `size` never leaves 0 without one.
+        let Some(live) = &self.cfg.path else {
+            return Ok(());
+        };
         // The oldest kept slot would shift past the cap: delete it.
         match std::fs::remove_file(rotated_path(live, self.cfg.rotate_keep)) {
             Ok(()) => {}
@@ -963,7 +1223,7 @@ impl AuditSink {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        state.file = open_live_file(live)?;
+        state.file = Some(open_live_file(live)?);
         state.size = 0;
         #[cfg(unix)]
         if let Some(parent) = live.parent() {
@@ -989,23 +1249,54 @@ impl AuditSink {
             tracing::error!(
                 error = ?err,
                 dropped = state.dropped,
-                path = %self.cfg.path.display(),
+                path = self.cfg.path.as_ref().map(|p| p.display().to_string()),
                 "audit record could not be persisted; records are being dropped"
             );
         }
     }
 
     /// Whether the sink is currently in failure: at least one record has
-    /// been dropped since the last successful write. The request path
+    /// been lost since the last success on ANY configured destination, or
+    /// export delivery is known not to be working. The request path
     /// consults this before dispatching a tool call, so a sink that is
     /// already down can hold back further unaudited work under the closed
     /// fail modes instead of discovering the outage one record at a time.
+    ///
+    /// The second condition is what makes an export outage as visible as a
+    /// full disk. Loss counters clear as soon as their `audit_gap` is
+    /// written, and for the exporter "written" means "accepted for
+    /// delivery" — so a sink judged only by its counters would report
+    /// healthy the instant it queued the gap record, and flap once per
+    /// batch for the whole outage. Delivery health does not clear until a
+    /// request actually succeeds.
     pub fn failing(&self) -> bool {
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .dropped
-            > 0
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Also here, not only in `record`: the pre-dispatch gate asks this
+        // question far more often than it writes, and an outage that only
+        // became visible between two records must close the gate at the
+        // first ask.
+        self.absorb_export_losses(&mut state);
+        state.dropped > 0
+            || self
+                .export
+                .as_ref()
+                .is_some_and(|export| export.delivery_failing())
+    }
+
+    /// Move any undelivered-record count out of the exporter and into this
+    /// sink's own loss accounting. Called with the state lock held.
+    fn absorb_export_losses(&self, state: &mut SinkState) {
+        let Some(export) = &self.export else {
+            return;
+        };
+        let lost = export.take_lost();
+        if lost > 0 {
+            state.dropped = state.dropped.saturating_add(lost);
+            state.gap_reason = GapReason::WriteError;
+        }
     }
 
     /// Whether records may carry suppressed bug ids
@@ -1423,13 +1714,19 @@ mod tests {
 
     fn test_cfg(path: PathBuf) -> AuditConfig {
         AuditConfig {
-            path,
+            path: Some(path),
             fsync: false,
             fail_mode: None,
             rotate_max_bytes: 0,
             rotate_keep: 8,
             suppressed_ids: true,
         }
+    }
+
+    /// The live file of a config built by [`test_cfg`], which always
+    /// names one.
+    fn live_path(cfg: &AuditConfig) -> &Path {
+        cfg.path.as_deref().expect("test config names a file")
     }
 
     /// Parse every line of an audit file. Empty lines are skipped, as
@@ -1448,8 +1745,8 @@ mod tests {
     /// limit is a hard bound (a single oversized record is the one
     /// documented exception, tested separately).
     fn assert_files_within_rotate_limit(cfg: &AuditConfig) {
-        let mut paths = vec![cfg.path.clone()];
-        paths.extend((1..=cfg.rotate_keep).map(|n| rotated_path(&cfg.path, n)));
+        let mut paths = vec![live_path(cfg).to_path_buf()];
+        paths.extend((1..=cfg.rotate_keep).map(|n| rotated_path(live_path(cfg), n)));
         for p in paths {
             if let Ok(meta) = std::fs::metadata(&p) {
                 assert!(
@@ -1728,7 +2025,10 @@ mod tests {
     #[test]
     fn config_minimal_file_applies_defaults() {
         let cfg = AuditConfig::from_toml_str("path = \"/var/log/bugwarden/audit.jsonl\"").unwrap();
-        assert_eq!(cfg.path, PathBuf::from("/var/log/bugwarden/audit.jsonl"));
+        assert_eq!(
+            cfg.path.as_deref(),
+            Some(Path::new("/var/log/bugwarden/audit.jsonl"))
+        );
         assert!(!cfg.fsync);
         assert_eq!(cfg.fail_mode, None);
         assert_eq!(cfg.rotate_max_bytes, 64 * 1024 * 1024);
@@ -1854,7 +2154,7 @@ mod tests {
             second.record(sample_initialize(), session_stdio()).unwrap(),
             1
         );
-        let seqs: Vec<u64> = read_events(&cfg.path).iter().map(|e| e.seq).collect();
+        let seqs: Vec<u64> = read_events(live_path(&cfg)).iter().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![1, 2, 1]);
     }
 
@@ -1887,13 +2187,13 @@ mod tests {
         let mut seqs: Vec<u64> = Vec::new();
         let mut rotated = 0;
         for n in (1..=cfg.rotate_keep).rev() {
-            let p = rotated_path(&cfg.path, n);
+            let p = rotated_path(live_path(&cfg), n);
             if p.exists() {
                 rotated += 1;
                 seqs.extend(read_events(&p).iter().map(|e| e.seq));
             }
         }
-        seqs.extend(read_events(&cfg.path).iter().map(|e| e.seq));
+        seqs.extend(read_events(live_path(&cfg)).iter().map(|e| e.seq));
         assert!(rotated >= 2, "expected multiple rotations, saw {rotated}");
         assert!(
             rotated <= cfg.rotate_keep,
@@ -1908,7 +2208,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&cfg.path).unwrap().permissions().mode();
+            let mode = std::fs::metadata(live_path(&cfg))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600, "recreated live file must be 0600");
         }
     }
@@ -1923,15 +2226,15 @@ mod tests {
         for _ in 0..8 {
             sink.record(sample_initialize(), session_stdio()).unwrap();
         }
-        assert!(rotated_path(&cfg.path, 1).exists());
+        assert!(rotated_path(live_path(&cfg), 1).exists());
         assert!(
-            !rotated_path(&cfg.path, 2).exists(),
+            !rotated_path(live_path(&cfg), 2).exists(),
             "rotation must not keep more than rotate_keep files"
         );
         // What survives still parses and stays in order (deletion loses
         // the oldest records — that is the operator's configured trade).
-        let mut events = read_events(&rotated_path(&cfg.path, 1));
-        events.extend(read_events(&cfg.path));
+        let mut events = read_events(&rotated_path(live_path(&cfg), 1));
+        events.extend(read_events(live_path(&cfg)));
         let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
         assert!(
             seqs.len() < 8,
@@ -1962,19 +2265,19 @@ mod tests {
         // The oversized record went into the empty live file as-is —
         // the one documented exception to the size bound.
         assert!(
-            std::fs::metadata(&cfg.path).unwrap().len() > cfg.rotate_max_bytes,
+            std::fs::metadata(live_path(&cfg)).unwrap().len() > cfg.rotate_max_bytes,
             "a single oversized record must be written despite the limit"
         );
-        assert!(!rotated_path(&cfg.path, 1).exists());
+        assert!(!rotated_path(live_path(&cfg), 1).exists());
         // The next record must rotate the oversized live file out first.
         assert_eq!(
             sink.record(sample_initialize(), session_stdio()).unwrap(),
             2
         );
-        let rotated = read_events(&rotated_path(&cfg.path, 1));
+        let rotated = read_events(&rotated_path(live_path(&cfg), 1));
         assert_eq!(rotated.len(), 1, "rotated file holds the first record");
         assert_eq!(rotated[0].seq, 1);
-        let live = read_events(&cfg.path);
+        let live = read_events(live_path(&cfg));
         assert_eq!(live.len(), 1, "live file holds only the new record");
         assert_eq!(live[0].seq, 2);
     }
@@ -1993,13 +2296,13 @@ mod tests {
         let second = AuditSink::open(cfg.clone()).unwrap();
         second.record(sample_initialize(), session_stdio()).unwrap();
         assert!(
-            rotated_path(&cfg.path, 1).exists(),
+            rotated_path(live_path(&cfg), 1).exists(),
             "reopen must count existing bytes toward the rotation limit"
         );
-        let live = read_events(&cfg.path);
+        let live = read_events(live_path(&cfg));
         assert_eq!(live.len(), 1, "live file holds only the new record");
         assert_eq!(live[0].seq, 1, "a fresh sink assigns seq from 1");
-        assert_eq!(read_events(&rotated_path(&cfg.path, 1)).len(), 1);
+        assert_eq!(read_events(&rotated_path(live_path(&cfg), 1)).len(), 1);
     }
 
     #[test]
@@ -2017,7 +2320,7 @@ mod tests {
                 });
             }
         });
-        let seqs: Vec<u64> = read_events(&cfg.path).iter().map(|e| e.seq).collect();
+        let seqs: Vec<u64> = read_events(live_path(&cfg)).iter().map(|e| e.seq).collect();
         // Unique, contiguous from 1, and file order equals seq order —
         // all three in one assertion.
         assert_eq!(seqs, (1..=100).collect::<Vec<u64>>());
@@ -2046,7 +2349,7 @@ mod tests {
             sink.record(sample_initialize(), session_stdio()).unwrap(),
             3
         );
-        let events = read_events(&cfg.path);
+        let events = read_events(live_path(&cfg));
         assert_eq!(events.len(), 3);
         assert_eq!(events[1].seq, 2);
         match &events[1].kind {
@@ -2089,14 +2392,14 @@ mod tests {
         let mut raw = String::new();
         let mut events = Vec::new();
         for n in (1..=cfg.rotate_keep).rev() {
-            let p = rotated_path(&cfg.path, n);
+            let p = rotated_path(live_path(&cfg), n);
             if p.exists() {
                 raw.push_str(&std::fs::read_to_string(&p).unwrap());
                 events.extend(read_events(&p));
             }
         }
-        raw.push_str(&std::fs::read_to_string(&cfg.path).unwrap());
-        events.extend(read_events(&cfg.path));
+        raw.push_str(&std::fs::read_to_string(live_path(&cfg)).unwrap());
+        events.extend(read_events(live_path(&cfg)));
         let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![1, 2, 3]);
         match &events[1].kind {
@@ -2127,7 +2430,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, AuditError::Write(_)));
         sink.set_fail_writes_partial(false);
-        let raw = std::fs::read_to_string(&cfg.path).unwrap();
+        let raw = std::fs::read_to_string(live_path(&cfg)).unwrap();
         assert!(
             !raw.ends_with('\n'),
             "the partial write must have left a torn, unterminated line"
@@ -2138,7 +2441,7 @@ mod tests {
             sink.record(sample_initialize(), session_stdio()).unwrap(),
             3
         );
-        let raw = std::fs::read_to_string(&cfg.path).unwrap();
+        let raw = std::fs::read_to_string(live_path(&cfg)).unwrap();
         let mut torn_lines = 0;
         let mut events: Vec<AuditEvent> = Vec::new();
         for line in raw.lines().filter(|l| !l.is_empty()) {
@@ -2165,7 +2468,7 @@ mod tests {
         let cfg = test_cfg(dir.path().join("audit.jsonl"));
         let sink = AuditSink::open(cfg.clone()).unwrap();
         sink.record(sample_initialize(), session_stdio()).unwrap();
-        let events = read_events(&cfg.path);
+        let events = read_events(live_path(&cfg));
         let ts = &events[0].ts;
         // ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$, spelled out
         // positionally ('d' = ASCII digit) to avoid a regex dependency.
@@ -2195,7 +2498,7 @@ mod tests {
         sink.record(sample_tool_call(), session_http()).unwrap();
         sink.record(sample_initialize(), session_stdio()).unwrap();
         sink.record(sample_gap(), session_stdio()).unwrap();
-        let contents = std::fs::read_to_string(&cfg.path).unwrap();
+        let contents = std::fs::read_to_string(live_path(&cfg)).unwrap();
         assert_eq!(contents.lines().count(), 3);
         assert!(
             !contents.contains(CANARY),
@@ -2437,6 +2740,260 @@ mod tests {
         assert_eq!(
             policy_hash_of(b"abc"),
             "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    // ---------- sink selection (issue #31, revised 2026-08-18) ----------
+
+    #[test]
+    fn select_sinks_resolves_the_four_deployments() {
+        assert_eq!(select_sinks(None, false).unwrap(), SinkSelection::NoAudit);
+        assert_eq!(
+            select_sinks(Some(Path::new("/etc/bugwarden/audit.toml")), false).unwrap(),
+            SinkSelection::FileOnly
+        );
+        assert_eq!(
+            select_sinks(Some(Path::new("/etc/bugwarden/audit.toml")), true).unwrap(),
+            SinkSelection::Both
+        );
+        assert_eq!(
+            select_sinks(Some(Path::new(AUDIT_CONFIG_NONE)), true).unwrap(),
+            SinkSelection::OtlpOnly
+        );
+    }
+
+    #[test]
+    fn select_sinks_refuses_the_two_ambiguous_spellings() {
+        // `none` with no OTLP endpoint: an explicit request for a sink
+        // that leaves zero of them.
+        let err = format!(
+            "{}",
+            select_sinks(Some(Path::new("none")), false).unwrap_err()
+        );
+        assert!(
+            err.contains("no audit sink") && err.contains("OTEL_EXPORTER_OTLP_ENDPOINT"),
+            "the refusal must explain both ways out: {err}"
+        );
+        // An endpoint with no file decision: OTLP-only must be said, not
+        // inferred, or a typo'd BUGWARDEN_AUDIT_CONFIG silently drops the
+        // file from a deployment that meant to run both.
+        let err = format!("{}", select_sinks(None, true).unwrap_err());
+        assert!(
+            err.contains("BUGWARDEN_AUDIT_CONFIG") && err.contains("`none`"),
+            "the refusal must name the explicit spellings: {err}"
+        );
+    }
+
+    #[test]
+    fn the_none_sentinel_is_exact_bytes() {
+        // Anything else is a path: `None` and `./none` are files an
+        // operator can really have, and over-matching would disable
+        // auditing on a spelling nobody wrote.
+        assert_eq!(
+            select_sinks(Some(Path::new("None")), true).unwrap(),
+            SinkSelection::Both
+        );
+        assert_eq!(
+            select_sinks(Some(Path::new("./none")), true).unwrap(),
+            SinkSelection::Both
+        );
+    }
+
+    // ---------- the exporter as a load-bearing sink ----------
+
+    /// A scriptable exporter for sink-side tests.
+    #[derive(Debug, Default)]
+    struct StubExport {
+        refuse: std::sync::atomic::AtomicBool,
+        failing: std::sync::atomic::AtomicBool,
+        lost: std::sync::atomic::AtomicU64,
+        accepted: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl AuditExport for StubExport {
+        fn accept(&self, _event: &AuditEvent, line: &[u8]) -> Result<(), ExportRefused> {
+            if self.refuse.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(ExportRefused);
+            }
+            self.accepted.lock().expect("stub lock").push(line.to_vec());
+            Ok(())
+        }
+
+        fn delivery_failing(&self) -> bool {
+            self.failing.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn take_lost(&self) -> u64 {
+            self.lost.swap(0, std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[test]
+    fn a_fileless_sink_records_through_the_exporter_alone() {
+        let cfg = AuditConfig::fileless();
+        assert!(cfg.path.is_none(), "fileless names no file");
+        let export = std::sync::Arc::new(StubExport::default());
+        let sink = AuditSink::open(cfg).unwrap().with_export(export.clone());
+        assert_eq!(
+            sink.record(sample_initialize(), session_stdio()).unwrap(),
+            1
+        );
+        assert_eq!(sink.record(sample_tool_call(), session_http()).unwrap(), 2);
+        let accepted = export.accepted.lock().expect("stub lock").clone();
+        assert_eq!(accepted.len(), 2, "every record reaches the exporter");
+        // The handed-over line is the record, parseable and in seq order —
+        // the same bytes a file would have carried.
+        let events: Vec<AuditEvent> = accepted
+            .iter()
+            .map(|line| serde_json::from_slice(line).expect("a parseable record line"))
+            .collect();
+        assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(!sink.failing());
+    }
+
+    #[test]
+    fn an_export_refusal_fails_the_record_and_the_file_still_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path().join("audit.jsonl"));
+        let export = std::sync::Arc::new(StubExport::default());
+        let sink = AuditSink::open(cfg.clone())
+            .unwrap()
+            .with_export(export.clone());
+        export
+            .refuse
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let err = sink
+            .record(sample_initialize(), session_stdio())
+            .unwrap_err();
+        assert!(
+            matches!(err, AuditError::Export),
+            "a refused hand-off is an export failure: {err:?}"
+        );
+        // The FILE write preceded the refusal and stands, its seq spent:
+        // the loss accounting over-reports rather than under-reports,
+        // exactly as a failed fsync does.
+        let events = read_events(live_path(&cfg));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].seq, 1);
+        assert!(sink.failing(), "a refused record puts the sink in failure");
+        // Recovery: the next record is preceded by the gap accounting it.
+        export
+            .refuse
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            sink.record(sample_initialize(), session_stdio()).unwrap(),
+            3
+        );
+        let events = read_events(live_path(&cfg));
+        assert_eq!(events.len(), 3);
+        match &events[1].kind {
+            AuditEventKind::AuditGap(gap) => {
+                assert_eq!(gap.dropped, 1);
+                assert_eq!(gap.reason, GapReason::WriteError);
+            }
+            other => panic!("expected audit_gap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_delivery_failure_alone_puts_the_sink_in_failure() {
+        // The gate condition: delivery health, not only a counter — a
+        // counter clears the moment its gap is queued, and a gate read
+        // off it alone would flap once per batch for the whole outage.
+        let export = std::sync::Arc::new(StubExport::default());
+        let sink = AuditSink::open(AuditConfig::fileless())
+            .unwrap()
+            .with_export(export.clone());
+        assert!(!sink.failing());
+        export
+            .failing
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            sink.failing(),
+            "failing delivery must gate even with nothing dropped"
+        );
+        export
+            .failing
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!sink.failing(), "recovered delivery must clear the gate");
+    }
+
+    #[test]
+    fn undelivered_export_losses_surface_as_an_audit_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path().join("audit.jsonl"));
+        let export = std::sync::Arc::new(StubExport::default());
+        let sink = AuditSink::open(cfg.clone())
+            .unwrap()
+            .with_export(export.clone());
+        // Three records accepted earlier were never delivered.
+        export.lost.store(3, std::sync::atomic::Ordering::Relaxed);
+        assert!(sink.failing(), "known losses put the sink in failure");
+        assert_eq!(
+            sink.record(sample_initialize(), session_stdio()).unwrap(),
+            2
+        );
+        let events = read_events(live_path(&cfg));
+        assert_eq!(events.len(), 2);
+        match &events[0].kind {
+            AuditEventKind::AuditGap(gap) => {
+                assert_eq!(gap.dropped, 3, "the gap carries the loss count");
+                assert_eq!(gap.reason, GapReason::WriteError);
+            }
+            other => panic!("expected audit_gap, got {other:?}"),
+        }
+        // The gap record itself is exported too: the collector sees its
+        // own outage accounted in the stream it lost records from.
+        let accepted = export.accepted.lock().expect("stub lock").clone();
+        assert_eq!(accepted.len(), 2, "gap and record both reach the exporter");
+    }
+
+    /// An exporter that proves the file write PRECEDES the hand-off: at
+    /// accept time the line must already be on disk.
+    #[derive(Debug)]
+    struct FileCheckingExport {
+        path: PathBuf,
+        checked: std::sync::atomic::AtomicU64,
+    }
+
+    impl AuditExport for FileCheckingExport {
+        fn accept(&self, _event: &AuditEvent, line: &[u8]) -> Result<(), ExportRefused> {
+            let contents = std::fs::read(&self.path).expect("the audit file exists at accept");
+            assert!(
+                contents.windows(line.len()).any(|window| window == line),
+                "the file must already hold the record when the exporter sees it"
+            );
+            self.checked
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn delivery_failing(&self) -> bool {
+            false
+        }
+
+        fn take_lost(&self) -> u64 {
+            0
+        }
+    }
+
+    #[test]
+    fn with_both_sinks_the_file_write_precedes_the_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path().join("audit.jsonl"));
+        let export = std::sync::Arc::new(FileCheckingExport {
+            path: live_path(&cfg).to_path_buf(),
+            checked: std::sync::atomic::AtomicU64::new(0),
+        });
+        let sink = AuditSink::open(cfg.clone())
+            .unwrap()
+            .with_export(export.clone());
+        sink.record(sample_initialize(), session_stdio()).unwrap();
+        sink.record(sample_tool_call(), session_http()).unwrap();
+        assert_eq!(
+            export.checked.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the ordering assertion must actually have run"
         );
     }
 

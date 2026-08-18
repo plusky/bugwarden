@@ -1,0 +1,257 @@
+# OpenTelemetry Collector configuration for a bugwarden audit stream.
+#
+# Two receivers, because there are two ways the records can reach a
+# collector and they answer different questions:
+#
+#   otlp     — bugwarden's own export (OTEL_EXPORTER_OTLP_ENDPOINT). Live,
+#              structured, and correlated with client traces. Load-bearing:
+#              a collector that will not take records refuses startup, and
+#              an outage after that engages the same fail_mode a failed
+#              file write does.
+#   filelog  — tailing the JSONL file bugwarden writes. Lossless as far as
+#              the file goes — a collector that was down re-reads what it
+#              missed, at the price of re-reading what it did not (see
+#              `start_at` below) — and it is what turns the log into a
+#              tamper-evident record: once the lines are off the host, the
+#              host can no longer rewrite its own history. Slower, and
+#              blind to whatever the file has already rotated away.
+#
+# Run both. They carry the same records — the exported body IS the file
+# line — so a consumer collapses the two copies on `session` plus `seq`,
+# and the pair gives you live visibility plus an off-host copy. Treat that
+# as near-exact rather than a key: with `fsync = true` a record whose write
+# succeeded and whose sync did not is counted as dropped, so its `seq` can
+# be reused by the next record and one (session, seq) can name two
+# different records. Compare the bodies before collapsing, and the case
+# resolves itself.
+#
+# Written against opentelemetry-collector-contrib 0.110+ (the `filelog`
+# receiver lives in -contrib, not in the core distribution, and
+# `on_error: send_quiet` needs a collector of at least that vintage).
+# Validate it against your own build — `otelcol-contrib validate
+# --config=...` — before deploying: this file ships checked for YAML
+# well-formedness, not run against a live collector.
+#
+# ---------------------------------------------------------------------------
+# BEFORE YOU DEPLOY THIS: what is in the stream
+# ---------------------------------------------------------------------------
+#
+# The audit stream carries exactly the facts bugwarden refuses to tell an
+# MCP client: guard verdicts, the NAMES of the policy rules that decided
+# them, and the bug ids that were withheld (`guard.suppressed_ids`, on by
+# default). That makes the stream at least as sensitive as the bugs it
+# describes — anyone who can read it can enumerate the hidden ones — and
+# its destination a policy decision, not a deployment detail.
+#
+#   * Treat the collector, its queue, and every backend behind it as
+#     systems holding embargoed bug numbers.
+#   * `suppressed_ids = false` in audit.toml drops the ids and keeps the
+#     counts, if the destination cannot be trusted with them.
+#   * Nothing here is a substitute for the file's own permissions.
+#
+# ---------------------------------------------------------------------------
+# BEFORE YOU DEPLOY THIS: permissions
+# ---------------------------------------------------------------------------
+#
+# bugwarden creates the audit file mode 0600 and its parent directory 0700,
+# owned by the user bugwarden runs as. A collector running as anybody else
+# cannot read it, and the fix is never to loosen the file:
+#
+#   * Run the collector as the SAME uid as bugwarden (in the container
+#     image that is 65532), or
+#   * put both in one supplementary group, `chgrp` the directory, and set
+#     it 0750 with the file 0640 — bugwarden re-creates the file mode 0600
+#     on every rotation, so this needs a `umask`/`setgid` arrangement on
+#     the directory and is the more fragile of the two, or
+#   * give the collector a read-only bind mount of the directory and run it
+#     as the same uid.
+#
+# Do NOT make the directory world-readable. Do NOT run the collector as
+# root to work around the mode: that swaps a permission problem for a
+# collector process that can rewrite the record it is supposed to preserve.
+#
+# ---------------------------------------------------------------------------
+# BEFORE YOU DEPLOY THIS: rotation
+# ---------------------------------------------------------------------------
+#
+# bugwarden rotates by rename (`audit.jsonl` -> `audit.jsonl.1` -> …,
+# `rotate_keep` files) and creates a fresh live file. The `include` glob
+# below therefore matches the rotated files too: if the collector is behind
+# when a rotation happens, the tail it has not read yet is in
+# `audit.jsonl.1`, not in the new live file. The receiver identifies files
+# by content fingerprint rather than by name, so a file it has already read
+# is not re-read under its new name — that is what keeps this from
+# duplicating records.
+#
+# Two things to keep true:
+#   * `rotate_keep` must be large enough that a file cannot be deleted
+#     before the collector has read it. The default (8 x 64 MiB) is
+#     generous; a collector down for a week is not.
+#   * Never let logrotate and bugwarden both rotate the file. If logrotate
+#     owns it, set `rotate_max_bytes = 0` and give logrotate `copytruncate`
+#     — bugwarden holds the file open and keeps appending to the same
+#     inode, which after a plain rename is the ROTATED file, so new records
+#     land in what everything else now treats as history (and vanish
+#     outright once logrotate finally unlinks it).
+
+receivers:
+  # bugwarden's native export. It speaks OTLP/HTTP with protobuf payloads
+  # and nothing else, so the grpc endpoint is deliberately absent.
+  otlp:
+    protocols:
+      http:
+        # 0.0.0.0 because the sidecar in compose.yaml is the documented
+        # deployment and bugwarden reaches it from ANOTHER container: a
+        # loopback bind there listens only inside the collector's own
+        # network namespace, so every record would be refused and counted
+        # dropped forever. This is the same reasoning the image applies to
+        # MCP_HOST — a container necessity, not a widening of trust — and
+        # it carries the same obligation: do NOT publish this port to the
+        # host, since the OTLP receiver has no authentication of its own.
+        #
+        # Running the collector on the host instead, beside a bugwarden
+        # that is not containerised? Then use 127.0.0.1:4318 here.
+        endpoint: 0.0.0.0:4318
+        # Point OTEL_EXPORTER_OTLP_ENDPOINT at the collector's base URL —
+        # http://otel-collector:4318 in compose, http://127.0.0.1:4318 on
+        # the host. bugwarden appends /v1/logs itself.
+
+  filelog/bugwarden-audit:
+    include:
+      - /var/log/bugwarden/audit.jsonl
+      - /var/log/bugwarden/audit.jsonl.[0-9]*
+    # From the beginning: the point of tailing is to lose nothing. The
+    # cost, and it is a real one: the receiver's read offsets live in
+    # memory unless a `file_storage` extension persists them, so a
+    # restarted collector replays every file it can still see and the
+    # backend gets duplicates — bounded by `rotate_keep`, but large.
+    # Deduplicate on `session` plus `seq` (see the caveat at the top), or
+    # add `file_storage` and point `service.extensions` at it. Note that
+    # the compose sidecar runs `read_only: true`, so file_storage is not a
+    # drop-in there: it needs a writable volume of its own.
+    start_at: beginning
+    poll_interval: 1s
+    # Big enough to tell two audit files apart by their first line, which
+    # carries a distinct `ts`/`seq` pair.
+    fingerprint_size: 1kb
+    # A failed write leaves at most ONE unparsable line per outage: either
+    # a torn line — the PREFIX of a record, so it starts with `{` and no
+    # cheap shape test can tell it from a whole one — or an empty line,
+    # where the failed write got no bytes out at all and the next record
+    # carried the healing newline alone. The `^\{` test therefore skips
+    # only the empty case, and the torn case is handled where it has to be:
+    # `on_error: send_quiet` passes an entry the parser could not read
+    # downstream with its body intact and without logging, instead of
+    # dropping it or filling the collector's own log with errors. Every
+    # operator after this one is guarded on the field it needs, so debris
+    # travels as a plain body and nothing errors on it.
+    operators:
+      - id: audit-json
+        type: json_parser
+        if: 'body matches "^\\{"'
+        on_error: send_quiet
+        parse_from: body
+        parse_to: attributes
+        timestamp:
+          parse_from: attributes.ts
+          layout_type: gotime
+          layout: "2006-01-02T15:04:05.999Z07:00"
+
+      # Lift the fields worth querying on into the same attribute names the
+      # native OTLP export uses, so both paths land in one schema.
+      - type: move
+        if: 'attributes?.event != nil'
+        from: attributes.event
+        to: attributes["bugwarden.event"]
+      - type: move
+        if: 'attributes?.seq != nil'
+        from: attributes.seq
+        to: attributes["bugwarden.seq"]
+      - type: move
+        if: 'attributes?.session?.transport != nil'
+        from: attributes.session.transport
+        to: attributes["bugwarden.transport"]
+      - type: move
+        if: 'attributes?.session?.id != nil'
+        from: attributes.session.id
+        to: attributes["bugwarden.session.id"]
+      - type: move
+        if: 'attributes?.request?.tool != nil'
+        from: attributes.request.tool
+        to: attributes["bugwarden.tool"]
+      - type: move
+        if: 'attributes?.guard?.verdict != nil'
+        from: attributes.guard.verdict
+        to: attributes["bugwarden.verdict"]
+      - type: move
+        if: 'attributes?.guard?.rule != nil'
+        from: attributes.guard.rule
+        to: attributes["bugwarden.rule"]
+
+      # The W3C ids the client stamped on the call (issue #28). Promoting
+      # them to the record's own trace context is what makes a guard
+      # decision line up with the client trace that caused it. They are
+      # UNAUTHENTICATED client claims — correlation hints, never evidence
+      # of who did what; attribution rests on the session and client
+      # fields, which stay in the body.
+      - type: trace_parser
+        if: 'attributes?.trace?.trace_id != nil'
+        trace_id:
+          parse_from: attributes.trace.trace_id
+        span_id:
+          parse_from: attributes.trace.span_id
+
+      # A record stream that lost records is not an info line.
+      - type: severity_parser
+        if: 'attributes?["bugwarden.event"] != nil'
+        parse_from: attributes["bugwarden.event"]
+        mapping:
+          error: audit_gap
+          info:
+            - tool_call
+            - initialize
+
+      # Everything else stays in the body exactly as the file holds it —
+      # suppressed ids, policy hash, scan counts — so a query can reach it
+      # without a schema migration here.
+      - type: add
+        field: attributes["bugwarden.stream"]
+        value: audit
+      - type: add
+        field: resource["service.name"]
+        value: bugwarden
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+  # Bound the memory a collector that cannot reach its backend will take
+  # before it starts refusing data, so this process cannot become the
+  # reason the host runs out of memory.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+
+exporters:
+  # Replace with the backend you actually run. Keep the destination inside
+  # the same trust boundary as the bugs — see the sensitivity note above.
+  debug:
+    verbosity: normal
+  # Example of a real one; delete or replace.
+  # otlphttp/backend:
+  #   endpoint: https://logs.internal.example.org
+  #   headers:
+  #     authorization: ${env:BACKEND_TOKEN}
+  #   sending_queue:
+  #     storage: file_storage/queue
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp, filelog/bugwarden-audit]
+      processors: [memory_limiter, batch]
+      exporters: [debug]
+  telemetry:
+    logs:
+      level: info

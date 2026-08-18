@@ -142,6 +142,7 @@ fn render_environment(cmd: &clap::Command, buf: &mut Vec<u8>) -> std::io::Result
     // environment-only, because argv is world-readable — so the loop above
     // cannot see them.
     buf.write_all(HTTP_TOKEN_ENV.as_bytes())?;
+    buf.write_all(OTLP_ENV.as_bytes())?;
     Ok(())
 }
 
@@ -162,6 +163,37 @@ unless
 is given.
 ";
 
+const OTLP_ENV: &str = r".TP
+.B OTEL_EXPORTER_OTLP_ENDPOINT
+Base URL of an OpenTelemetry collector (bugwarden appends /v1/logs).
+Environment only. Unset or empty turns export off. Must be paired with
+.B \-\-audit\-config
+/ BUGWARDEN_AUDIT_CONFIG (a file, or the exact value
+.BR none ).
+An endpoint with no file decision is a startup error.
+.TP
+.B OTEL_EXPORTER_OTLP_HEADERS
+Headers added to every export request, key=value separated by commas.
+Credential material (I12): environment only, never logged.
+.TP
+.B OTEL_EXPORTER_OTLP_PROTOCOL
+The one accepted value is http/protobuf; anything else is a startup
+error. Not consulted while export is off.
+.TP
+.B OTEL_SERVICE_NAME
+service.name on exported records. Defaults to bugwarden.
+.TP
+.B OTEL_EXPORTER_OTLP_LOGS_ENDPOINT
+Logs-specific endpoint; overrides OTEL_EXPORTER_OTLP_ENDPOINT and is
+used as given (write the whole URL including /v1/logs).
+.TP
+.B OTEL_EXPORTER_OTLP_LOGS_HEADERS
+Logs-specific headers; overrides OTEL_EXPORTER_OTLP_HEADERS. Same secrecy.
+.TP
+.B OTEL_EXPORTER_OTLP_LOGS_PROTOCOL
+Logs-specific protocol; overrides OTEL_EXPORTER_OTLP_PROTOCOL.
+";
+
 const EXIT_STATUS: &str = r".SH EXIT STATUS
 .TP
 .B 0
@@ -170,7 +202,8 @@ Clean shutdown.
 .B 1
 Startup or runtime failure: a missing or malformed http bearer token, an
 unreadable policy or audit configuration, a key misconfiguration, an
-unparsable \-\-allowed\-hosts list, a Bugzilla client or transport error.
+unparsable \-\-allowed\-hosts list, an OTLP collector that will not take
+records, a Bugzilla client or transport error.
 .TP
 .B 2
 Command\-line usage error.
@@ -195,7 +228,9 @@ Without
 .B \-\-audit\-config
 or
 .B BUGWARDEN_AUDIT_CONFIG
-no audit stream is written.
+and with no OTLP endpoint, no audit stream is written. The exact value
+.B none
+disables the file so a collector can be the only sink.
 ";
 
 const EXAMPLES: &str = r#".SH EXAMPLES

@@ -9,17 +9,34 @@
 //! - dropping `env = "MCP_ALLOWED_HOSTS"` or `env = "BUGZILLA_USE_AUTH_HEADER"`;
 //! - keeping the empty entry `MCP_ALLOWED_HOSTS=` produces, which would turn
 //!   Host validation ON with nothing matchable and refuse every request;
-//! - splitting `MCP_ALLOWED_HOSTS=a b.example` on whitespace into two hosts;
-//! - letting the environment override the command line.
+//! - not splitting `MCP_ALLOWED_HOSTS=a b.example` on whitespace (a space is part of the authority);
+//! - letting the environment override the command line;
+//! - reading an OTLP variable from anywhere but the process environment, or
+//!   letting an emptied `OTEL_EXPORTER_OTLP_ENDPOINT` leave export on;
+//! - dropping `env = "BUGWARDEN_AUDIT_CONFIG"`, widening the exact-bytes
+//!   `none` sentinel, or letting mere absence of the variable select
+//!   OTLP-only auditing (the file may only be disabled explicitly).
 
+use std::path::Path;
+
+use bugwarden::audit::{select_sinks, SinkSelection};
 use bugwarden::config::Cli;
+use bugwarden::otel::{self, OtelEnv};
 use clap::error::ErrorKind;
 use clap::Parser as _;
 
-const VARS: [&str; 3] = [
+const VARS: [&str; 11] = [
     "MCP_ALLOWED_HOSTS",
     "BUGZILLA_USE_AUTH_HEADER",
     "MCP_READ_ONLY",
+    "BUGWARDEN_AUDIT_CONFIG",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_SERVICE_NAME",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+    "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
 ];
 
 fn clear() {
@@ -127,6 +144,122 @@ fn every_flag_is_settable_from_the_environment() {
             "BUGZILLA_USE_AUTH_HEADER={value:?} must be read exactly like MCP_READ_ONLY"
         );
     }
+
+    // The OTLP export knobs are read by `bugwarden::otel`, never by clap,
+    // so nothing above would notice if `OtelEnv::from_env` stopped reading
+    // one. They live in this test because it owns process-environment
+    // mutation for the whole crate.
+    clear();
+    assert!(
+        otel::resolve(&OtelEnv::from_env())
+            .expect("an environment with no endpoint resolves")
+            .is_none(),
+        "with no OTEL_EXPORTER_OTLP_ENDPOINT the export must be off"
+    );
+
+    std::env::set_var(
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "http://collector.example:4318",
+    );
+    std::env::set_var("OTEL_SERVICE_NAME", "bugwarden-edge");
+    let cfg = otel::resolve(&OtelEnv::from_env())
+        .expect("an endpoint resolves")
+        .expect("an endpoint means export is on");
+    assert_eq!(
+        cfg.service_name(),
+        "bugwarden-edge",
+        "OTEL_SERVICE_NAME must reach the exported resource"
+    );
+
+    // The set-but-empty "unset" idiom again, and here it is the off switch
+    // for the whole feature.
+    std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "");
+    assert!(
+        otel::resolve(&OtelEnv::from_env())
+            .expect("an emptied endpoint resolves")
+            .is_none(),
+        "OTEL_EXPORTER_OTLP_ENDPOINT= must read as unset, leaving export off"
+    );
+
+    // A protocol this build cannot speak is a startup error — but only
+    // once an endpoint makes the transport matter.
+    std::env::set_var("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc");
+    assert!(
+        otel::resolve(&OtelEnv::from_env())
+            .expect("no endpoint decides everything")
+            .is_none(),
+        "with export off the protocol is not consulted"
+    );
+    std::env::set_var(
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "http://collector.example:4318",
+    );
+    let err = otel::resolve(&OtelEnv::from_env())
+        .err()
+        .expect("grpc must be refused");
+    assert!(
+        format!("{err}").contains("OTEL_EXPORTER_OTLP_PROTOCOL"),
+        "the refusal must name the variable: {err}"
+    );
+
+    // Sink selection (issue #31, revised 2026-08-18). The variable reaches
+    // the selection, and the literal `none` — exact bytes — is the ONLY
+    // spelling that disables the audit file; absence beside an OTLP
+    // endpoint refuses startup rather than silently going fileless.
+    clear();
+    std::env::set_var("BUGWARDEN_AUDIT_CONFIG", "/etc/bugwarden/audit.toml");
+    let cli = parse(&[]).expect("a config path parses");
+    assert_eq!(
+        select_sinks(cli.audit_config.as_deref(), false).expect("file only"),
+        SinkSelection::FileOnly,
+        "BUGWARDEN_AUDIT_CONFIG must reach the sink selection"
+    );
+    assert_eq!(
+        select_sinks(cli.audit_config.as_deref(), true).expect("both sinks"),
+        SinkSelection::Both
+    );
+    std::env::set_var("BUGWARDEN_AUDIT_CONFIG", "none");
+    let cli = parse(&[]).expect("the sentinel parses");
+    assert_eq!(
+        select_sinks(cli.audit_config.as_deref(), true).expect("otlp only"),
+        SinkSelection::OtlpOnly,
+        "BUGWARDEN_AUDIT_CONFIG=none must select the fileless sink"
+    );
+    assert!(
+        select_sinks(cli.audit_config.as_deref(), false).is_err(),
+        "`none` with no OTLP endpoint must refuse startup, never run sinkless"
+    );
+    // The command line wins over the environment, as everywhere.
+    let cli = parse(&["--audit-config", "/from/cli.toml"]).expect("the flag parses");
+    assert_eq!(
+        cli.audit_config.as_deref(),
+        Some(Path::new("/from/cli.toml"))
+    );
+    // Absence is not `none`: with an endpoint configured the server
+    // demands an explicit file decision, and with none it audits nothing.
+    clear();
+    let cli = parse(&[]).expect("no variable parses");
+    assert!(
+        select_sinks(cli.audit_config.as_deref(), true).is_err(),
+        "an OTLP endpoint without a file decision must refuse startup"
+    );
+    assert_eq!(
+        select_sinks(cli.audit_config.as_deref(), false).expect("no audit"),
+        SinkSelection::NoAudit
+    );
+
+    // The logs-specific endpoint alone turns export on, and is used as
+    // given: a fleet that names only this variable expects logs exported,
+    // and reading only the general one would leave it silently off.
+    clear();
+    std::env::set_var(
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        "http://collector.example:4318/otlp/v1/logs",
+    );
+    let cfg = otel::resolve(&OtelEnv::from_env())
+        .expect("a logs endpoint resolves")
+        .expect("a logs endpoint alone means export is on");
+    assert_eq!(cfg.service_name(), "bugwarden");
 
     clear();
 }

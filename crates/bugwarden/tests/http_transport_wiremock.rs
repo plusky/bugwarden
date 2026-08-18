@@ -547,7 +547,7 @@ async fn a_handshake_free_call_is_refused_and_never_names_a_client() {
     let dir = tempfile::tempdir().expect("audit temp dir");
     let audit_path = dir.path().join("audit.jsonl");
     let sink = AuditSink::open(AuditConfig {
-        path: audit_path.clone(),
+        path: Some(audit_path.clone()),
         fsync: false,
         fail_mode: None,
         rotate_max_bytes: 0,
@@ -700,7 +700,7 @@ async fn traceparent_over_http_lands_in_the_audit_record() {
     let dir = tempfile::tempdir().expect("audit temp dir");
     let audit_path = dir.path().join("audit.jsonl");
     let sink = AuditSink::open(AuditConfig {
-        path: audit_path.clone(),
+        path: Some(audit_path.clone()),
         fsync: false,
         fail_mode: None,
         rotate_max_bytes: 0,

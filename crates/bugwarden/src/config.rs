@@ -109,8 +109,11 @@ pub struct Cli {
     pub policy: Option<PathBuf>,
 
     /// Path to the audit configuration TOML file (see examples/audit.toml).
-    /// Environment variable BUGWARDEN_AUDIT_CONFIG can also be used.
-    /// Without it no audit stream is written.
+    /// Environment variable BUGWARDEN_AUDIT_CONFIG can also be used. The
+    /// exact value `none` disables the audit file (OTLP-only when an
+    /// endpoint is set). Without it, and with no OTLP endpoint, no audit
+    /// stream is written. An endpoint with no file decision, or `none`
+    /// with no endpoint, is a startup error.
     #[arg(long, env = "BUGWARDEN_AUDIT_CONFIG", value_hint = clap::ValueHint::FilePath)]
     pub audit_config: Option<PathBuf>,
 
