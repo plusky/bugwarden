@@ -10,6 +10,7 @@ use bugwarden_core::client::BugzillaClient;
 use bugwarden_core::guard::{Guard, SearchRequest};
 use bugwarden_core::policy::{Access, Capability, Policy};
 use serde_json::{json, Value};
+use wiremock::http::Method;
 use wiremock::matchers::{method, path, query_param, query_param_contains};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -472,8 +473,33 @@ async fn client_create_bug_posts_the_payload_to_rest_bug() {
     assert_eq!(v["id"], json!(42));
 
     // The payload travels as the POST body, untouched.
+    //
+    // Select the request by method and path rather than by position (#93).
+    // wiremock hands out mock servers from a process-wide pool of listeners,
+    // and the I12 transport-error tests in this binary deliberately aim a
+    // request at a just-freed ephemeral port; when that port has meanwhile
+    // been taken by a pooled listener, their bodyless GET is recorded here
+    // too. `[0]` would then assert against that request instead.
     let reqs = server.received_requests().await.expect("recording enabled");
-    let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).expect("json body");
+    let posts: Vec<&Request> = reqs
+        .iter()
+        .filter(|r| r.method == Method::POST && r.url.path() == "/rest/bug")
+        .collect();
+    let [post] = posts[..] else {
+        panic!(
+            "expected exactly one recorded POST /rest/bug, found {} among {} request(s)",
+            posts.len(),
+            reqs.len()
+        )
+    };
+    // Name a missing body as a missing body: parsing an empty slice would
+    // otherwise surface as "EOF while parsing a value" and point at the
+    // payload rather than at the recording.
+    assert!(
+        !post.body.is_empty(),
+        "the recorded POST /rest/bug carries no body"
+    );
+    let body: Value = serde_json::from_slice(&post.body).expect("POST /rest/bug body must be JSON");
     assert_eq!(body, payload);
 }
 
