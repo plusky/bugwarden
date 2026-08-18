@@ -502,10 +502,16 @@ Gotchas specific to the image:
   which `--rm` throws away; with one that uid 65532 cannot write, startup
   fails outright, and over HTTP the default fail mode is `closed_all`, so a
   directory that becomes unwritable later stops the server serving.
-- **Use an init process.** bugwarden installs no `SIGTERM` handler, and PID 1
-  does not get the default terminate action, so without `--init` (or
-  `init: true` in compose) `docker stop` waits out its full timeout and ends
-  in `SIGKILL`.
+- **Signals.** The process handles `SIGINT` and `SIGTERM`. Over HTTP both
+  cancel the transport token and let axum drain. Over stdio both end the
+  process immediately (status 0): rmcp reads stdin on a blocking thread
+  that cannot be cancelled while a client still holds the pipe, so
+  returning from `main` would hang the runtime the same way the missing
+  handler did. As container PID 1 this is what makes `docker stop` /
+  `podman stop` / a Kubernetes SIGTERM a clean exit instead of waiting
+  out the runtime grace period and ending in SIGKILL (137). `--init` /
+  `init: true` remains useful as defense in depth — it reaps any
+  unexpected child — but it is no longer required for a timely stop.
 
 There is no `HEALTHCHECK`: `/bin` and `/usr/bin` are empty in this base, so
 there is no binary to run one with. Use a TCP check on the port, or an

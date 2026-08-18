@@ -32,8 +32,9 @@ services:
       # Run `mkdir -p ./audit && chown 65532:65532 ./audit` first.
       # - ./audit.toml:/etc/bugwarden/audit.toml:ro
       # - ./audit:/var/log/bugwarden
-    # PID 1 does not get SIGTERM's default terminate action and bugwarden
-    # installs no handler, so without an init `compose down` ends in SIGKILL.
+    # Defense in depth: bugwarden handles SIGTERM itself, so compose down
+    # without an init is a graceful stop. An init process still reaps
+    # unexpected children if the runtime ever grows any.
     init: true
     read_only: true
     cap_drop:

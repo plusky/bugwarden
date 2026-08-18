@@ -1492,7 +1492,8 @@ impl BugWarden {
     /// decide this one too rather than leave it behind. The remaining
     /// fields, and why each stays inherited, are inventoried in DESIGN.md
     /// under "rmcp 3.1 usage notes"; the caller in `main` adds
-    /// `cancellation_token` so shutdown reaches the live transport.
+    /// `cancellation_token` so a SIGINT or SIGTERM reaches the live
+    /// transport (issue #114).
     pub fn http_server_config(&self) -> StreamableHttpServerConfig {
         let config = StreamableHttpServerConfig::default()
             .disable_allowed_hosts()

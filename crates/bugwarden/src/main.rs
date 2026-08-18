@@ -134,11 +134,39 @@ async fn main() -> anyhow::Result<()> {
 
     match cfg.transport {
         Transport::Stdio => {
+            // Two stages: an unused stdio container sits in `serve`
+            // (handshake). After initialize it sits in `waiting`.
+            // Handlers register on the first poll of `shutdown`, which
+            // is this `select!` immediately after the startup line.
+            let shutdown = shutdown_signal();
+            tokio::pin!(shutdown);
             tracing::info!("Starting Bugzilla MCP server on stdio");
-            let service = server.serve(stdio()).await.inspect_err(|e| {
-                tracing::error!("serving error: {:?}", e);
-            })?;
-            service.waiting().await?;
+            let service = tokio::select! {
+                result = server.serve(stdio()) => {
+                    result.inspect_err(|e| {
+                        tracing::error!("serving error: {:?}", e);
+                    })?
+                }
+                () = &mut shutdown => {
+                    tracing::info!("received shutdown signal");
+                    // serve() is already blocked in tokio::io::stdin()'s
+                    // uncancellable read. Returning from main drops the
+                    // runtime onto that blocking thread.
+                    std::process::exit(0);
+                }
+            };
+            let cancel = service.cancellation_token();
+            tokio::select! {
+                result = service.waiting() => {
+                    result?;
+                }
+                () = shutdown => {
+                    tracing::info!("received shutdown signal");
+                    cancel.cancel();
+                    // Same blocking stdin read as the handshake arm.
+                    std::process::exit(0);
+                }
+            }
         }
         Transport::Http => {
             let ct = tokio_util::sync::CancellationToken::new();
@@ -174,7 +202,11 @@ async fn main() -> anyhow::Result<()> {
                 router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .with_graceful_shutdown(async move {
-                let _ = tokio::signal::ctrl_c().await;
+                shutdown_signal().await;
+                tracing::info!("received shutdown signal");
+                // Tear the live streamable-HTTP transport down with the
+                // listener: axum's graceful shutdown alone waits for
+                // in-flight connections, and an open MCP session is one.
                 ct.cancel();
             })
             .await?;
@@ -182,4 +214,40 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Wait until the process should stop serving.
+///
+/// `SIGINT` (`ctrl_c`) and, on Unix, `SIGTERM`. As container PID 1 the
+/// kernel does not apply SIGTERM's default terminate action, so without
+/// this waiter `docker stop` / `podman stop` wait out the runtime grace
+/// period and SIGKILL (issue #114). Both signals take the same path: the
+/// caller then cancels whatever is serving (the HTTP transport token, or
+/// the stdio `select!`). A failed SIGTERM install is logged and the
+/// waiter falls back to SIGINT only — refusing to start would be worse
+/// than a container that still needs `--init`.
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "failed to install SIGTERM handler; only SIGINT will stop the process"
+                );
+                let _ = ctrl_c.await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c.await;
+    }
 }

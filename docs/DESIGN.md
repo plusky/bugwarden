@@ -1538,9 +1538,9 @@ wired, `server.rs` and `main.rs` are the reference.
   is someone the operator issued a token to. `--insecure-no-auth` restores
   the older, wider exposure to everyone — one more thing that flag hands
   out. If a per-caller identity (#32) changes this calculus, revisit here
-  and at the add_attachment row together. The `cancellation_token` is named so ctrl_c
-  tears the live transport down with the process instead of leaving it to
-  outlive the shutdown.
+  and at the add_attachment row together. The `cancellation_token` is named so
+  SIGINT and SIGTERM tear the live transport down with the process instead of
+  leaving it to outlive the shutdown.
 
   An operator who does know the authorities their deployment answers to names
   them with a repeated `--allowed-hosts`, or with `MCP_ALLOWED_HOSTS` as one
@@ -1606,7 +1606,7 @@ wired, `server.rs` and `main.rs` are the reference.
   update_bug_fields, update_bug_dependencies, add_cc_to_bug, mark_as_duplicate,
   create_bug, add_attachment.
 - API key resolution: a match on `key_custody` (resolved once at startup, see Key custody — never re-read per request): `Server(key)` => the server's key, without touching the request at all; `PerRequest` => `ctx.extensions.get::<axum::http::request::Parts>()`, then `parts.headers.get(lowercased_header_name)`.
-- HTTP serving: `let config = server.http_server_config().with_cancellation_token(ct.child_token());` — built while `server` can still be borrowed, since the body cap comes from its own guard policy — then `StreamableHttpService::new(move || Ok(server.clone()), LocalSessionManager::default().into(), config)`, never a bare `StreamableHttpServerConfig::default()`, see the field table above — then `axum::Router::new().nest_service("/mcp", service)`, `tokio::net::TcpListener::bind`, graceful shutdown on ctrl_c cancelling `ct`.
+- HTTP serving: `let config = server.http_server_config().with_cancellation_token(ct.child_token());` — built while `server` can still be borrowed, since the body cap comes from its own guard policy — then `StreamableHttpService::new(move || Ok(server.clone()), LocalSessionManager::default().into(), config)`, never a bare `StreamableHttpServerConfig::default()`, see the field table above — then `axum::Router::new().nest_service("/mcp", service)`, `tokio::net::TcpListener::bind`, graceful shutdown on SIGINT or SIGTERM cancelling `ct` (`shutdown_signal` in main.rs; issue #114). Stdio uses the same waiter across `serve` (the handshake wait an unused stdio container sits in) and `waiting`; a signal at either stage `process::exit(0)`s, because rmcp's stdio transport reads stdin via `spawn_blocking` and that read does not unblock while the client holds the pipe — returning from `main` drops the runtime onto that thread.
 - Request `_meta` (SEP-414, e.g. `traceparent`): over every serialized
   transport the wire `params._meta` does NOT arrive in the params struct
   (`CallToolRequestParams.meta` stays `None`) — the SDK's custom
@@ -2063,5 +2063,17 @@ wired, `server.rs` and `main.rs` are the reference.
   `WRITE_TOOLS` is additionally pinned against every tool's own
   `read_only_hint` annotation, so the read scope cannot drift from what
   clients are told.
+- Process-shutdown tests (crates/bugwarden/tests/binary_shutdown.rs, the
+  SHIPPED BINARY, Unix only): SIGTERM and SIGINT on an idle HTTP listener
+  both exit `0` within 5s and log `received shutdown signal` — an unhandled
+  SIGTERM still kills a non-PID-1 child, but with `code() == None`, so
+  requiring `Some(0)` is what makes a missing handler fail; SIGTERM with a
+  live streamable-HTTP session still exits `0` in the same bound, which is
+  what `ct.cancel()` is for (axum's graceful shutdown alone waits for that
+  connection); stdio SIGTERM during the initialize wait (where an unused
+  stdio container sits) and after a completed handshake both exit `0` with
+  the child's stdin still held, so wrapping only `serve` or only `waiting`
+  fails, and a handshake arm that only `return Ok(())` cannot go green
+  via `wait_with_output` dropping the pipe.
 - CI: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace --locked`, `cargo deny check`.
