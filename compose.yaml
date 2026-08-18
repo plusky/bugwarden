@@ -1,0 +1,42 @@
+# ./bugwarden.env must exist or compose refuses to start. ./policy.toml and
+# ./bugzilla-key must exist as FILES: docker creates a directory for a missing
+# bind source and the container then fails to start on what looks like a parse
+# error (podman refuses the mount outright).
+services:
+  bugwarden:
+    image: ghcr.io/plusky/bugwarden:latest
+    # build: .
+    ports:
+      # Loopback only: the bearer token authenticates callers, it does not
+      # make the endpoint safe to expose to the internet.
+      - "127.0.0.1:8000:8000"
+    environment:
+      BUGZILLA_SERVER: https://bugzilla.example.org
+      # Server-held key mode; drop this to have each client send its own
+      # Bugzilla key in the ApiKey header instead.
+      BUGZILLA_API_KEY_FILE: /run/secrets/bugzilla-key
+      # BUGWARDEN_AUDIT_CONFIG: /etc/bugwarden/audit.toml
+    # Deny-by-default: without a token the server refuses to start. Kept in a
+    # file rather than the shell environment so the value stays out of argv.
+    env_file:
+      - ./bugwarden.env
+    volumes:
+      # The image presets BUGWARDEN_POLICY, so a missing mount is a startup
+      # error; read-only because the guard reads it once and nothing may
+      # reach it afterwards (I1).
+      - ./policy.toml:/etc/bugwarden/policy.toml:ro
+      # Must be readable by uid 65532: `chown 65532 ./bugzilla-key`.
+      - ./bugzilla-key:/run/secrets/bugzilla-key:ro
+      # Audit stream. A bind mount, not a named volume: docker creates those
+      # root:root 0755, which uid 65532 cannot write, and startup then fails.
+      # Run `mkdir -p ./audit && chown 65532:65532 ./audit` first.
+      # - ./audit.toml:/etc/bugwarden/audit.toml:ro
+      # - ./audit:/var/log/bugwarden
+    # PID 1 does not get SIGTERM's default terminate action and bugwarden
+    # installs no handler, so without an init `compose down` ends in SIGKILL.
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

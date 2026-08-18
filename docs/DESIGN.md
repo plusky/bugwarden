@@ -577,13 +577,14 @@ Bugzilla instance behind a corporate or internal CA, and an accepted,
 operator-visible change from the previous release. The crypto provider is
 `aws-lc-rs`, reqwest 0.13's default (0.12 used `ring`); `aws-lc-sys` needs a C
 toolchain at build time, which the release workflow's `ubuntu-latest` and
-`macos-latest` runners provide. `system-proxy` keeps `HTTPS_PROXY` /
-`HTTP_PROXY` / `NO_PROXY` honored exactly as 0.12 did unconditionally —
-without this feature the 0.13 default is to ignore them, which would be a
-silent regression for the corporate deployments this server targets. `query`
-is likewise required, not cosmetic: `apply_auth`'s `?api_key=` mode and
-`quicksearch_syntax_html` both call `.query(...)`, a compile error without
-the feature in 0.13.
+`macos-latest` runners provide and which the `Dockerfile`'s alpine build stage
+adds as `cmake` + `make` on top of the base image's own gcc. `system-proxy`
+keeps `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` honored exactly as 0.12 did
+unconditionally — without this feature the 0.13 default is to ignore them,
+which would be a silent regression for the corporate deployments this server
+targets. `query` is likewise required, not cosmetic: `apply_auth`'s
+`?api_key=` mode and `quicksearch_syntax_html` both call `.query(...)`, a
+compile error without the feature in 0.13.
 
 The operator cost of that switch (issue #65): a deployment with no OS trust
 store fails every HTTPS request at first contact with Bugzilla, where the
@@ -591,16 +592,21 @@ previous release succeeded from bundled `webpki-roots`, and the symptom is a
 TLS handshake error that does not name the missing CA bundle — nothing in
 the error points at `ca-certificates`. The fix is the operator's to make:
 install `ca-certificates` in the image, or mount the host's bundle into it;
-the project ships tarballs, not container images, so containerizing the
-binary is a choice made downstream of this repo, without the person making
-it necessarily knowing the trust-store dependency exists. The rejected
-alternative is keeping the bundled Mozilla roots: rejected because a
-distro-packaged tool has to follow the system CA bundle — an admin adding or
-revoking a root must take effect without a bugwarden rebuild — and because
-bundled roots cannot see the internal CA that the target Bugzilla
+containerizing a tarball is a choice made downstream of this repo, without
+the person making it necessarily knowing the trust-store dependency exists.
+The rejected alternative is keeping the bundled Mozilla roots: rejected
+because a distro-packaged tool has to follow the system CA bundle — an admin
+adding or revoking a root must take effect without a bugwarden rebuild — and
+because bundled roots cannot see the internal CA that the target Bugzilla
 deployments sit behind. Re-evaluate only if this project ever ships its own
 container image, where the bundle would be under our control instead of the
-operator's.
+operator's. That trigger fired: **RE-EVALUATED 2026-08-18, when this
+repository started shipping its own container image.** The answer is
+unchanged. The `gcr.io/distroless/static-debian13` base carries the
+`ca-certificates` bundle, so the image works unconfigured, and an operator
+behind an internal CA can still mount over the bundle's path — roots baked
+into the binary would take that away and make the image the one deployment
+shape that cannot follow its own trust store.
 
 **Caller identity on the wire (issue #55).** Every request carries a
 `User-Agent`, set once on the shared `reqwest::Client` so it reaches the
@@ -1108,7 +1114,7 @@ clap derive `Cli`, with env fallbacks:
 | --api-key-file | BUGZILLA_API_KEY_FILE | — | file holding the key (container secret / systemd LoadCredential path); mutually exclusive with --api-key; over http selects server-held key mode (see Key custody) |
 | --use-auth-header | BUGZILLA_USE_AUTH_HEADER | false | Bearer to Bugzilla instead of api_key query param |
 | --read-only | MCP_READ_ONLY | false | tighten-only (I9) |
-| --policy | BUGWARDEN_POLICY | — | path to guard policy TOML |
+| --policy | BUGWARDEN_POLICY | — | path to guard policy TOML; the container image presets it to /etc/bugwarden/policy.toml, so that one artifact fails closed on a missing mount instead of defaulting to allow-all (tightening only, I9) |
 | --audit-config | BUGWARDEN_AUDIT_CONFIG | — | path to audit configuration TOML; without it no audit stream is written |
 | --insecure-no-auth | — (deliberately) | false | serve http with no bearer gate; refuses to start together with a token (see HTTP bearer authentication) |
 | — | BUGWARDEN_HTTP_TOKEN | — | bearer token, write scope; environment only, never a flag |

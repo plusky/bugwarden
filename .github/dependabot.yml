@@ -34,3 +34,11 @@ updates:
         update-types:
           - "minor"
           - "patch"
+
+  # Base images in the Dockerfile. Both FROMs are digest-pinned, so without
+  # this they would never be updated at all.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

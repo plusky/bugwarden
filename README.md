@@ -133,6 +133,15 @@ one is named via `--policy` / `BUGWARDEN_POLICY`, and an audit configuration
 only via `--audit-config` / `BUGWARDEN_AUDIT_CONFIG`, so installing the
 package does not by itself activate anything.
 
+### Container image
+
+```bash
+podman pull ghcr.io/plusky/bugwarden
+```
+
+A multi-architecture (amd64/arm64) image for HTTP-transport deployments — no
+Rust toolchain needed. See [Container](#container) for the run contract.
+
 ### crates.io (cargo)
 
 ```bash
@@ -196,18 +205,11 @@ bugwarden validates the Bugzilla server's certificate against the **OS
 trust store**, not a bundled root set. A Bugzilla instance behind a
 corporate or internal CA works as soon as that CA is installed
 system-wide — no bugwarden-side configuration is needed. The corollary: an
-environment with no CA bundle at all — a `scratch` or `distroless` image,
-some minimal base images — fails every HTTPS request to Bugzilla with a TLS
-handshake error. Install `ca-certificates` in the image, or mount the
-host's bundle into it:
-
-```dockerfile
-FROM debian:stable-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-COPY bugwarden /usr/local/bin/bugwarden
-ENTRYPOINT ["/usr/local/bin/bugwarden"]
-```
+environment with no CA bundle at all — a `scratch` image, some minimal base
+images — fails every HTTPS request to Bugzilla with a TLS handshake error.
+Install `ca-certificates` in the image, or mount the host's bundle into it.
+The [published image](#container) needs neither: its
+`gcr.io/distroless/static-debian13` base ships the `ca-certificates` bundle.
 
 `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` from the environment are honored
 for outbound Bugzilla traffic. Every request to Bugzilla — authenticated
@@ -412,6 +414,102 @@ MCP client configuration:
   }
 }
 ```
+
+### Container
+
+`ghcr.io/plusky/bugwarden` runs the HTTP transport on a distroless base with
+no shell, as `nonroot` (uid 65532), built from the [`Dockerfile`](Dockerfile)
+in this repository. It presets `MCP_TRANSPORT=http`, `MCP_HOST=0.0.0.0`,
+`MCP_PORT=8000` and `BUGWARDEN_POLICY=/etc/bugwarden/policy.toml`; everything
+else comes from the environment variables in the
+[CLI reference](#cli-reference) below. The bearer tokens are environment-only
+by design, and `--insecure-no-auth` is the one setting with no environment
+variable at all — see
+[Authentication and scopes](#authentication-and-scopes), which applies here
+unchanged.
+
+Mint the token once into a file — generating it inline would start a server
+nobody can talk to — and hand the file to the runtime, so the value never
+reaches argv or a shell history:
+
+```bash
+umask 077
+printf 'BUGWARDEN_HTTP_TOKEN=%s\n' "$(openssl rand -hex 32)" > ./bugwarden.env
+```
+
+```bash
+podman run --init --rm \
+  --env-file ./bugwarden.env \
+  -v "$PWD/policy.toml:/etc/bugwarden/policy.toml:ro" \
+  -v "$PWD/bugzilla-key:/run/secrets/bugzilla-key:ro" \
+  -e BUGZILLA_SERVER=https://bugzilla.opensuse.org \
+  -e BUGZILLA_API_KEY_FILE=/run/secrets/bugzilla-key \
+  -p 127.0.0.1:8000:8000 \
+  ghcr.io/plusky/bugwarden
+```
+
+`docker run` takes the same arguments. Use `BUGWARDEN_HTTP_READ_TOKEN`
+instead to hand out a read-scope credential. Drop `BUGZILLA_API_KEY_FILE` and
+its mount to serve each client with the key it sends in the `ApiKey` header
+instead (the two modes never fall back to each other — see
+[server-held key mode](#server-held-key-mode-fleet-deployments)). Or use the
+bundled [`compose.yaml`](compose.yaml), which reads the same `bugwarden.env`
+and adds a read-only root filesystem, `cap_drop: ALL` and
+`no-new-privileges`:
+
+```bash
+docker compose up
+```
+
+Gotchas specific to the image:
+
+- **The policy mount is mandatory.** Run without `--policy` and the bare
+  binary falls back to a built-in allow-all policy; the image instead
+  presets `BUGWARDEN_POLICY`, so a missing mount is a startup error and the
+  container never binds a port. Mount it `:ro` — the guard reads it at
+  startup and nothing, least of all an MCP client, may reach it afterwards
+  (I1). Start from
+  [`examples/policy.toml`](examples/policy.toml), which is not baked into
+  the image precisely so it cannot be mistaken for a default.
+- **The token is the container's, not the caller's.** Delivering it by
+  environment puts its custody in the runtime: anyone who can
+  `docker inspect` the container or read `/proc/<pid>/environ` holds it, and
+  `--env-file` keeps it out of argv but not out of either of those. It
+  authenticates the deployment, so one token is shared by every client that
+  talks to this container; rotate by rewriting the file and restarting.
+- **`0.0.0.0` is a container necessity, not a widening of trust.** The
+  binary's own default is `127.0.0.1`; the image widens it only because a
+  bind inside the container's network namespace is unreachable from
+  anywhere else. It grants no `Host` authority — that is
+  `MCP_ALLOWED_HOSTS` / `--allowed-hosts`, and without it any `Host` header
+  is served:
+
+  ```sh
+  -e MCP_ALLOWED_HOSTS=mcp.example.org:8000
+  ```
+- **The Bugzilla key is a mounted file.** `BUGZILLA_API_KEY_FILE` reads it
+  once at startup from a bind mount or a container secret, and nothing is
+  baked into the image. (Do not also set `BUGZILLA_API_KEY` here: alone over
+  http it is ignored with a warning — it never silently becomes a
+  server-held key — but alongside `BUGZILLA_API_KEY_FILE` the two are
+  mutually exclusive and the container exits at startup.) The mounted file
+  has to be readable by uid 65532 — a host-side `0600` file owned by your
+  account is not, so `chown 65532` it or run with `podman --userns=keep-id`.
+- **The audit stream needs a persistent volume.** With
+  `BUGWARDEN_AUDIT_CONFIG` set, the guard writes JSONL files itself — it
+  exports nothing — so the directory in `path` must be a volume writable by
+  uid 65532. Without one the records live in the container's writable layer,
+  which `--rm` throws away; with one that uid 65532 cannot write, startup
+  fails outright, and over HTTP the default fail mode is `closed_all`, so a
+  directory that becomes unwritable later stops the server serving.
+- **Use an init process.** bugwarden installs no `SIGTERM` handler, and PID 1
+  does not get the default terminate action, so without `--init` (or
+  `init: true` in compose) `docker stop` waits out its full timeout and ends
+  in `SIGKILL`.
+
+There is no `HEALTHCHECK`: `/bin` and `/usr/bin` are empty in this base, so
+there is no binary to run one with. Use a TCP check on the port, or an
+authenticated `initialize` request from outside the container.
 
 ### MCP protocol revisions
 

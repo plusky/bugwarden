@@ -1,0 +1,16 @@
+# Keep the build context to what `cargo build --locked -p bugwarden` reads.
+# Nothing here copies README.md or LICENSE, so the crates/*/ symlinks to them
+# land dangling in the build stage; cargo never reads `readme =`, so the build
+# is unaffected.
+target
+.git
+.github
+docs
+assets
+examples
+# Local run artifacts from the README/compose examples. No COPY reaches them,
+# but a token file has no business in a build context.
+bugwarden.env
+policy.toml
+bugzilla-key
+audit/
