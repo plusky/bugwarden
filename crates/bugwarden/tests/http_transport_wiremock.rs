@@ -25,6 +25,8 @@
 //! - keeping the empty entry `MCP_ALLOWED_HOSTS=` produces instead of
 //!   dropping it, which turns Host validation on with nothing rmcp can
 //!   match and refuses every request;
+//! - handing an unparsable `--allowed-hosts` entry (`*`, a URL) to rmcp
+//!   instead of refusing it at `http_server_config`;
 //! - the POST body cap going back to a fixed value, which refuses uploads
 //!   the operator's `global.max_attachment_bytes` permits, or losing its
 //!   4 MiB floor, which would let a policy shrink the transport's memory
@@ -100,7 +102,9 @@ async fn serve_http(
     // main derives it: the server reads its OWN policy for the POST body
     // cap, so this harness cannot agree with a deployment that reads a
     // different field or a constant.
-    let config = server.http_server_config();
+    let config = server
+        .http_server_config()
+        .expect("the test Host list must be matchable");
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
@@ -502,6 +506,29 @@ async fn an_allowed_hosts_entry_naming_no_host_leaves_validation_off() {
         status.is_success(),
         "an entry naming no host must leave every Host served, got {status}: {body}"
     );
+}
+
+#[tokio::test]
+async fn an_unparsable_allowed_hosts_entry_is_a_startup_error() {
+    // The same path `serve_http` and `main` take: rmcp 3.1.2 would store
+    // `*` as a host that matches only `Host: *`, turning validation on as
+    // a silent deny-all. Refusing here is what the operator sees instead
+    // of one 403 at a time.
+    let mock = MockServer::start().await;
+    let file = key_file("srv-key\n");
+    let mut cli = Arc::into_inner(http_cli(&mock, Some(file.path()))).expect("the sole owner");
+    cli.allowed_hosts = vec!["*".into()];
+    let guard = Arc::new(Guard {
+        policy: Policy::default(),
+    });
+    let bz =
+        Arc::new(BugzillaClient::new(&mock.uri(), false, USER_AGENT).expect("client must build"));
+    let server = BugWarden::new(Arc::new(cli), guard, bz).expect("server must build");
+    let err = server
+        .http_server_config()
+        .expect_err("unparsable Host authorities are a startup error");
+    let msg = format!("{err:#}");
+    assert!(msg.contains('*'), "the error must name the entry: {msg}");
 }
 
 #[tokio::test]

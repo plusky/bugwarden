@@ -1108,7 +1108,7 @@ clap derive `Cli`, with env fallbacks:
 | --transport | MCP_TRANSPORT | http | http \| stdio (clap ValueEnum) |
 | --host | MCP_HOST | 127.0.0.1 | http only |
 | --port | MCP_PORT | 8000 | http only |
-| --allowed-hosts | MCP_ALLOWED_HOSTS | — | http only; Host authorities served, comma/whitespace-separated and repeatable, empty entries dropped so an empty value reads as unset (see rmcp usage notes) |
+| --allowed-hosts | MCP_ALLOWED_HOSTS | — | http only; Host authorities served, comma-separated and repeatable (whitespace around commas trimmed), empty entries dropped so an empty value reads as unset; an unparsable entry is a startup error (see rmcp usage notes) |
 | --api-key-header | MCP_API_KEY_HEADER | ApiKey | http per-request key header |
 | --api-key | BUGZILLA_API_KEY | — | required for stdio unless --api-key-file provides it; warn-and-ignore for http (never a silent upgrade to server-held) |
 | --api-key-file | BUGZILLA_API_KEY_FILE | — | file holding the key (container secret / systemd LoadCredential path); mutually exclusive with --api-key; over http selects server-held key mode (see Key custody) |
@@ -1124,11 +1124,14 @@ Startup validation: key custody is resolved by `Cli::resolve_key_custody`
 inside `BugWarden::new` (see Key custody) — --api-key together with
 --api-key-file, stdio without any key source, and an empty or unreadable
 key file all exit with an error (the key-file errors name the path only,
-I12); http with api_key => tracing::warn (ignored). main.rs adds: the http
-bearer gate, resolved FIRST of all (see HTTP bearer authentication) so a
-token misconfiguration precedes every other startup effect; and http
-without audit_config => tracing::warn (remote tool calls leave no audit
-record).
+I12); http with api_key => tracing::warn (ignored). `BugWarden::http_server_config`
+(http only) refuses an `--allowed-hosts` / `MCP_ALLOWED_HOSTS` entry that
+is not a hostname or `host:port` and emits one info line stating whether
+Host validation is on or off (the list, when on — hosts only, I12).
+main.rs adds: the http bearer gate, resolved FIRST of all (see HTTP
+bearer authentication) so a token misconfiguration precedes every other
+startup effect; and http without audit_config => tracing::warn (remote
+tool calls leave no audit record).
 
 ## Audit stream (crates/bugwarden/src/audit.rs + the server.rs wrapper)
 
@@ -1551,17 +1554,30 @@ wired, `server.rs` and `main.rs` are the reference.
 
   An operator who does know the authorities their deployment answers to names
   them with a repeated `--allowed-hosts`, or with `MCP_ALLOWED_HOSTS` as one
-  comma- and/or whitespace-separated list, which turns that validation back on
-  for exactly that list. Tighten-only like every other CLI knob (I9), since
-  the disabled state serves every `Host`. **SUPERSEDED 2026-08-18:** the flag
-  was command line only, on the argument that the hosts are a per-deployment
-  network fact stated where the bind address is stated — the #31/#32 decision
-  that a container configures bugwarden entirely through the environment
-  overrides that, and `--host`/`--port` state the bind address from the
-  environment too. Empty entries are dropped in `Cli::resolved_allowed_hosts`,
-  so `MCP_ALLOWED_HOSTS=` reads as unset (the `BUGZILLA_API_KEY_FILE=`
-  convention) rather than as a list of one authority `host_is_allowed` skips,
-  which would refuse every `Host`.
+  comma-separated list (whitespace around commas is trimmed), which turns that
+  validation back on for exactly that list. Tighten-only like every other CLI
+  knob (I9), since the disabled state serves every `Host`. **SUPERSEDED
+  2026-08-18:** the flag was command line only, on the argument that the hosts
+  are a per-deployment network fact stated where the bind address is stated —
+  the #31/#32 decision that a container configures bugwarden entirely through
+  the environment overrides that, and `--host`/`--port` state the bind address
+  from the environment too. Empty entries are dropped in
+  `Cli::resolved_allowed_hosts`, so `MCP_ALLOWED_HOSTS=` reads as unset (the
+  `BUGZILLA_API_KEY_FILE=` convention) rather than as a list of one authority
+  `host_is_allowed` skips, which would refuse every `Host`. **SUPERSEDED
+  2026-08-18 (issue #117):** a single value was also split on whitespace, so
+  `MCP_ALLOWED_HOSTS=a.example b.example` was two hosts. That made
+  `a b.example` (a missing-dot typo) two authorities, one of them a
+  single-label name that is meaningful in a k8s namespace. Splitting is
+  comma-only now. An entry that is not a hostname or `host:port` — `*`, a
+  scheme-carrying URL, `a;b`, a percent-encoded comma, zero-width unicode, a
+  space-containing typo — is a startup error (`Cli::checked_allowed_hosts`);
+  rmcp 3.1.2's `parse_allowed_authority` would otherwise keep validation on
+  and store (or skip) a host no inbound `Host` matches, a silent deny-all
+  discovered one 403 at a time. HTTP start logs one info line stating
+  whether Host validation is on or off and, when on, the resolved list
+  (hosts only, never key material — I12). Stdio never builds the http
+  config, so it has no Host check.
 
   `allowed_origins` is the browser-facing sibling of `allowed_hosts`, and the
   bearer-gate argument covers it identically — including the lapse: under
@@ -1613,7 +1629,7 @@ wired, `server.rs` and `main.rs` are the reference.
   update_bug_fields, update_bug_dependencies, add_cc_to_bug, mark_as_duplicate,
   create_bug, add_attachment.
 - API key resolution: a match on `key_custody` (resolved once at startup, see Key custody — never re-read per request): `Server(key)` => the server's key, without touching the request at all; `PerRequest` => `ctx.extensions.get::<axum::http::request::Parts>()`, then `parts.headers.get(lowercased_header_name)`.
-- HTTP serving: `let config = server.http_server_config().with_cancellation_token(ct.child_token());` — built while `server` can still be borrowed, since the body cap comes from its own guard policy — then `StreamableHttpService::new(move || Ok(server.clone()), LocalSessionManager::default().into(), config)`, never a bare `StreamableHttpServerConfig::default()`, see the field table above — then `axum::Router::new().nest_service("/mcp", service)`, `tokio::net::TcpListener::bind`, graceful shutdown on SIGINT or SIGTERM cancelling `ct` (`shutdown_signal` in main.rs; issue #114). Stdio uses the same waiter across `serve` (the handshake wait an unused stdio container sits in) and `waiting`; a signal at either stage `process::exit(0)`s, because rmcp's stdio transport reads stdin via `spawn_blocking` and that read does not unblock while the client holds the pipe — returning from `main` drops the runtime onto that thread.
+- HTTP serving: `let config = server.http_server_config()?.with_cancellation_token(ct.child_token());` — built while `server` can still be borrowed, since the body cap comes from its own guard policy; errors on an unparsable `--allowed-hosts` entry and logs the effective Host-validation state — then `StreamableHttpService::new(move || Ok(server.clone()), LocalSessionManager::default().into(), config)`, never a bare `StreamableHttpServerConfig::default()`, see the field table above — then `axum::Router::new().nest_service("/mcp", service)`, `tokio::net::TcpListener::bind`, graceful shutdown on SIGINT or SIGTERM cancelling `ct` (`shutdown_signal` in main.rs; issue #114). Stdio uses the same waiter across `serve` (the handshake wait an unused stdio container sits in) and `waiting`; a signal at either stage `process::exit(0)`s, because rmcp's stdio transport reads stdin via `spawn_blocking` and that read does not unblock while the client holds the pipe — returning from `main` drops the runtime onto that thread.
 - Request `_meta` (SEP-414, e.g. `traceparent`): over every serialized
   transport the wire `params._meta` does NOT arrive in the params struct
   (`CallToolRequestParams.meta` stays `None`) — the SDK's custom
@@ -1871,14 +1887,20 @@ wired, `server.rs` and `main.rs` are the reference.
   the encoded size UP, which a truncating division would not; 47.25 MiB
   decoded lands exactly on the 64 MiB ceiling, one quantum below it still
   derives and one above clamps; and `u64::MAX` clamps to the ceiling rather
-  than panicking, wrapping, or saturating into an unbounded body.
+  than panicking, wrapping, or saturating into an unbounded body. Host
+  validation (#117): an unparsable `--allowed-hosts` entry (`*`) is a
+  startup error from `http_server_config` — the same call `serve_http` and
+  `main` take — so it cannot reach rmcp as a silent deny-all. The info
+  line and the unparsable refusal are also pinned in server.rs / config.rs
+  unit tests (deleting either fails a test).
 - Configuration tests (crates/bugwarden/tests/env_config.rs, the REAL
   process environment): every flag is settable from the environment, which
   is what a container deployment configures through (#31/#32). ONE test by
   construction — it mutates process-global state, which is safe only while
   no other thread reads it, so the file holds exactly one and says so. It
-  pins `MCP_ALLOWED_HOSTS` carrying a comma- and/or whitespace-separated
-  list into separate trimmed entries, an empty value reading as unset
+  pins `MCP_ALLOWED_HOSTS` carrying a comma-separated list into separate
+  trimmed entries, a space-containing value (`a b.example`) staying one
+  unparsable entry rather than two hosts, an empty value reading as unset
   (validation off, not a list of one authority `host_is_allowed` skips,
   which would refuse every `Host`), `--allowed-hosts` beating the variable
   since clap takes one source and not the union, and

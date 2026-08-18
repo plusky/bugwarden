@@ -9,6 +9,7 @@
 //! - dropping `env = "MCP_ALLOWED_HOSTS"` or `env = "BUGZILLA_USE_AUTH_HEADER"`;
 //! - keeping the empty entry `MCP_ALLOWED_HOSTS=` produces, which would turn
 //!   Host validation ON with nothing matchable and refuse every request;
+//! - splitting `MCP_ALLOWED_HOSTS=a b.example` on whitespace into two hosts;
 //! - letting the environment override the command line.
 
 use bugwarden::config::Cli;
@@ -52,14 +53,28 @@ fn outcome(var: &str, value: &str, read: fn(&Cli) -> bool) -> Result<bool, Error
 fn every_flag_is_settable_from_the_environment() {
     clear();
 
-    // One variable carries the whole allowed-hosts list, comma- and/or
-    // whitespace-separated, trimmed.
+    // One variable carries the whole allowed-hosts list, comma-separated,
+    // with whitespace around commas trimmed.
     std::env::set_var("MCP_ALLOWED_HOSTS", "a.example:8000, b.example");
     let cli = parse(&[]).expect("a host list parses");
     assert_eq!(
         cli.resolved_allowed_hosts(),
         ["a.example:8000", "b.example"],
         "MCP_ALLOWED_HOSTS must reach --allowed-hosts as separate entries"
+    );
+
+    // A missing-comma typo stays one entry and is refused. Splitting on
+    // whitespace would manufacture `a` and `b.example`.
+    std::env::set_var("MCP_ALLOWED_HOSTS", "a b.example");
+    let cli = parse(&[]).expect("a space-containing value parses");
+    assert_eq!(
+        cli.resolved_allowed_hosts(),
+        ["a b.example"],
+        "MCP_ALLOWED_HOSTS must not split a single entry on whitespace"
+    );
+    assert!(
+        cli.checked_allowed_hosts().is_err(),
+        "a space-containing typo is a startup error, not two authorities"
     );
 
     // `MCP_ALLOWED_HOSTS=` is the set-but-empty "unset" idiom of unit files
@@ -71,6 +86,12 @@ fn every_flag_is_settable_from_the_environment() {
     assert!(
         cli.resolved_allowed_hosts().is_empty(),
         "MCP_ALLOWED_HOSTS= must read as unset, leaving Host validation off"
+    );
+    assert!(
+        cli.checked_allowed_hosts()
+            .expect("empty is unset, not an error")
+            .is_none(),
+        "MCP_ALLOWED_HOSTS= must leave Host validation off"
     );
 
     // Precedence: the command line wins over the environment (I9 is not at

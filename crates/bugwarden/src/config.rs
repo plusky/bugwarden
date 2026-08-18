@@ -53,10 +53,12 @@ pub struct Cli {
 
     /// Hostname or 'host:port' authority accepted in an inbound Host header
     /// (http transport only). Repeat the flag, or separate entries with
-    /// commas or whitespace; environment variable MCP_ALLOWED_HOSTS can also
-    /// be used. Empty entries are dropped, so `MCP_ALLOWED_HOSTS=` is an unset
-    /// (like `BUGZILLA_API_KEY_FILE=`); without a host, Host validation stays
-    /// off and any Host header is served.
+    /// commas; environment variable MCP_ALLOWED_HOSTS can also be used.
+    /// Empty entries are dropped, so `MCP_ALLOWED_HOSTS=` is an unset (like
+    /// `BUGZILLA_API_KEY_FILE=`); without a host, Host validation stays off
+    /// and any Host header is served. An entry that is not a hostname or
+    /// host:port (for example '*', a URL, or a space-containing typo) is a
+    /// startup error.
     #[arg(long, env = "MCP_ALLOWED_HOSTS", value_name = "HOST")]
     pub allowed_hosts: Vec<String>,
 
@@ -168,22 +170,56 @@ pub enum KeyCustody {
 impl Cli {
     /// The Host authorities this deployment answers to: every
     /// `--allowed-hosts` occurrence, or `MCP_ALLOWED_HOSTS` when the flag is
-    /// absent — clap takes one source, not both — split on commas and
-    /// whitespace so one variable can carry a list, with empty entries
-    /// dropped.
+    /// absent — clap takes one source, not both — split on commas so one
+    /// variable can carry a list, with surrounding whitespace trimmed and
+    /// empty entries dropped.
     ///
     /// Dropping them is what makes `MCP_ALLOWED_HOSTS=` read as unset (the
     /// `BUGZILLA_API_KEY_FILE=` convention) instead of naming one unmatchable
     /// authority: rmcp validates against a non-empty list, and an entry it
-    /// cannot parse is skipped, so a lone empty entry would refuse every
-    /// Host. Naming a host only ever narrows what the disabled state serves
-    /// (I9); dropping an empty one restores exactly the documented default.
+    /// cannot parse as a Host is stored but never matches, so a lone empty
+    /// entry would refuse every Host. Naming a host only ever narrows what
+    /// the disabled state serves (I9); dropping an empty one restores
+    /// exactly the documented default.
+    ///
+    /// Whitespace is not a separator. A missing-comma typo (`a b.example`)
+    /// stays one entry so [`Self::checked_allowed_hosts`] can refuse it,
+    /// instead of becoming a single-label host (`a`) plus `b.example`.
     pub fn resolved_allowed_hosts(&self) -> Vec<&str> {
         self.allowed_hosts
             .iter()
-            .flat_map(|entry| entry.split(|c: char| c == ',' || c.is_whitespace()))
+            .flat_map(|entry| entry.split(','))
+            .map(str::trim)
             .filter(|host| !host.is_empty())
             .collect()
+    }
+
+    /// The Host list the http transport will enforce, or `None` if
+    /// validation is off.
+    ///
+    /// A non-empty list in which any entry is not a matchable Host
+    /// authority (`*`, a scheme-carrying URL, `a;b`, a percent-encoded
+    /// comma, zero-width unicode, a space-containing typo) is a startup
+    /// error. rmcp 3.1.2's `parse_allowed_authority` would otherwise keep
+    /// the list (validation on) and either drop the entry or store a host
+    /// no inbound `Host` header will ever equal — a silent deny-all.
+    pub fn checked_allowed_hosts(&self) -> anyhow::Result<Option<Vec<&str>>> {
+        let hosts = self.resolved_allowed_hosts();
+        if hosts.is_empty() {
+            return Ok(None);
+        }
+        let bad: Vec<&str> = hosts
+            .iter()
+            .copied()
+            .filter(|host| !is_matchable_host_authority(host))
+            .collect();
+        if !bad.is_empty() {
+            anyhow::bail!(
+                "--allowed-hosts / MCP_ALLOWED_HOSTS contains entries that are \
+                 not a hostname or host:port authority: {bad:?}"
+            );
+        }
+        Ok(Some(hosts))
     }
 
     /// Resolve who holds the Bugzilla API key — the whole table, once, at
@@ -256,6 +292,51 @@ impl Cli {
             }
         }
     }
+}
+
+/// True when `entry` is a hostname or `host:port` a client could send as
+/// `Host` — stricter than rmcp 3.1.2's `parse_allowed_authority`, which
+/// accepts `*` and `a;b` as authorities and falls back to treating anything
+/// `http::uri::Authority` rejects (a URL, encoded commas, zero-width
+/// unicode) as a raw host that never matches.
+fn is_matchable_host_authority(entry: &str) -> bool {
+    if let Some(rest) = entry.strip_prefix('[') {
+        let Some((addr, after)) = rest.split_once(']') else {
+            return false;
+        };
+        if addr.is_empty()
+            || !addr
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.'))
+        {
+            return false;
+        }
+        return match after.strip_prefix(':') {
+            Some(port) => is_tcp_port(port),
+            None => after.is_empty(),
+        };
+    }
+
+    // A colon is only a port separator when the suffix is a TCP port, so
+    // `a:b` is refused rather than treated as host `a`.
+    match entry.rsplit_once(':') {
+        Some((host, port)) if is_tcp_port(port) => is_dns_or_ipv4_host(host),
+        Some((_, _)) => false,
+        None => is_dns_or_ipv4_host(entry),
+    }
+}
+
+fn is_tcp_port(port: &str) -> bool {
+    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
+}
+
+fn is_dns_or_ipv4_host(host: &str) -> bool {
+    !host.is_empty()
+        && host != "*"
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        && host.bytes().any(|b| b.is_ascii_alphanumeric())
 }
 
 /// Read and trim the API key file. Errors name the path only, never the
@@ -512,10 +593,11 @@ mod tests {
     }
 
     #[test]
-    fn allowed_hosts_split_on_commas_and_whitespace_dropping_empties() {
+    fn allowed_hosts_split_on_commas_dropping_empties() {
         // One environment variable has to be able to carry the whole list,
         // and both sources feed the one field — so the normalization the
-        // environment needs is proven here, on the flag.
+        // environment needs is proven here, on the flag. Whitespace around
+        // commas is trimmed; whitespace is not itself a separator.
         let cli = Cli::parse_from([
             "bugwarden",
             "--bugzilla-server",
@@ -523,13 +605,13 @@ mod tests {
             "--allowed-hosts",
             "a.example:8000, b.example",
             "--allowed-hosts",
-            "  c.example\td.example  ",
+            "  c.example  ",
             "--allowed-hosts",
             "",
         ]);
         assert_eq!(
             cli.resolved_allowed_hosts(),
-            ["a.example:8000", "b.example", "c.example", "d.example"]
+            ["a.example:8000", "b.example", "c.example"]
         );
 
         // An entry naming no host leaves validation off — `MCP_ALLOWED_HOSTS=`
@@ -544,6 +626,93 @@ mod tests {
         assert!(
             cli.resolved_allowed_hosts().is_empty(),
             "an entry naming no host must leave Host validation off"
+        );
+        assert!(
+            cli.checked_allowed_hosts()
+                .expect("empty is unset, not an error")
+                .is_none(),
+            "MCP_ALLOWED_HOSTS= must leave Host validation off"
+        );
+    }
+
+    #[test]
+    fn a_space_containing_allowed_hosts_entry_stays_one_unparsable_authority() {
+        // `a b.example` is a missing-dot typo, not two hosts. Splitting on
+        // whitespace would manufacture a single-label `a` (meaningful in a
+        // k8s namespace) and hide the typo.
+        let cli = Cli::parse_from([
+            "bugwarden",
+            "--bugzilla-server",
+            "https://bugzilla.example.com",
+            "--allowed-hosts",
+            "a b.example",
+        ]);
+        assert_eq!(cli.resolved_allowed_hosts(), ["a b.example"]);
+        let err = cli
+            .checked_allowed_hosts()
+            .expect_err("a space-containing typo is a startup error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("a b.example"),
+            "the error must name the entry: {msg}"
+        );
+    }
+
+    #[test]
+    fn unparsable_allowed_hosts_are_a_startup_error_named_in_the_message() {
+        // Each of these is what rmcp 3.1.2 would store (or skip) without
+        // matching any inbound Host — validation on, deny-all. Refusing
+        // them here is what makes that fail at startup instead of one 403
+        // at a time. Deleting the refusal, or warning and continuing, must
+        // fail this test.
+        for entry in [
+            "*",
+            "http://a.example",
+            "a;b",
+            "foo%2cbar",
+            "\u{200b}example.com",
+            "a b.example",
+        ] {
+            let mut cli = base_cli("http");
+            cli.allowed_hosts = vec![entry.to_owned()];
+            let err = cli
+                .checked_allowed_hosts()
+                .expect_err("unparsable Host authorities are a startup error");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("--allowed-hosts"),
+                "the error must name the flag: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("{entry:?}")) || msg.contains(entry),
+                "the error must name the entry {entry:?}: {msg}"
+            );
+        }
+
+        // A bad entry next to a good one is still a refusal: we do not
+        // silently drop the typo and serve the rest.
+        let mut cli = base_cli("http");
+        cli.allowed_hosts = vec!["good.example".into(), "*".into()];
+        let err = cli
+            .checked_allowed_hosts()
+            .expect_err("a mixed list must not drop the unparsable entry");
+        assert!(format!("{err:#}").contains('*'), "{err:#}");
+
+        let mut cli = base_cli("http");
+        cli.allowed_hosts = vec![
+            "localhost".into(),
+            "127.0.0.1:8000".into(),
+            "[::1]:8000".into(),
+            "mcp.example.org".into(),
+        ];
+        assert_eq!(
+            cli.checked_allowed_hosts().expect("matchable hosts"),
+            Some(vec![
+                "localhost",
+                "127.0.0.1:8000",
+                "[::1]:8000",
+                "mcp.example.org",
+            ])
         );
     }
 

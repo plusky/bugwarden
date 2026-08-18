@@ -175,7 +175,7 @@ async fn main() -> anyhow::Result<()> {
             // follows `global.max_attachment_bytes`, issue #52), so it is
             // built while `server` can still be borrowed.
             let config = server
-                .http_server_config()
+                .http_server_config()?
                 .with_cancellation_token(ct.child_token());
             let service = StreamableHttpService::new(
                 move || Ok(server.clone()),
