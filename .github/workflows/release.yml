@@ -36,7 +36,7 @@ jobs:
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
         with:
           # Keep in sync with rust-toolchain.toml.
-          toolchain: "1.97.0"
+          toolchain: "1.97.1"
       # No cargo cache here: releases are built hermetically so restored
       # build state can never influence published artifacts.
 
@@ -228,7 +228,7 @@ jobs:
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
         with:
           # Keep in sync with rust-toolchain.toml.
-          toolchain: "1.97.0"
+          toolchain: "1.97.1"
 
       - name: Authenticate to crates.io
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18  # v1.0.5
