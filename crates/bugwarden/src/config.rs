@@ -571,13 +571,7 @@ mod tests {
         drop(custody.expect("key file resolves"));
         crate::testlog::assert_logged(&logs, "server-held");
         crate::testlog::assert_logged(&logs, &file.path().display().to_string());
-        // The I12 check below is a negative: on its own an empty capture would
-        // satisfy it. It is evidence only because the positive assertions above
-        // run first and fail loudly on one — keep them ahead of it.
-        assert!(
-            !logs.contains("hush-key"),
-            "the log must never carry key material (I12): {logs}"
-        );
+        logs.assert_not_contains("hush-key");
 
         let cli = base_cli("http");
         let (custody, logs) = crate::testlog::capture_logs(|| cli.resolve_key_custody());
