@@ -32,6 +32,52 @@ fn client(server: &MockServer) -> BugzillaClient {
     BugzillaClient::new(&server.uri(), false, TEST_USER_AGENT).expect("client must build")
 }
 
+/// Connect-time failure that wiremock's 127.0.0.1 pool cannot serve (#115).
+///
+/// 127.0.0.2 is still loopback (`127.0.0.0/8`); port 1 is a system port.
+/// A bounded probe refuses to return an address that accepted or timed out,
+/// so the 30s client cannot hang on an unroutable extra-loopback. The URL
+/// is built from the probed socket so the two cannot drift, and 127.0.0.1
+/// is rejected so a bind-then-drop mutation fails this helper.
+fn refused_base_url() -> String {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 2], 1));
+    assert_ne!(
+        addr.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        "I12 transport tests must not target 127.0.0.1; wiremock's pool binds there (#115)"
+    );
+    match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500)) {
+        Ok(_) => panic!(
+            "{addr} accepted a connection; I12 tests need a refused address \
+             that wiremock's 127.0.0.1 pool cannot occupy (#115)"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => panic!(
+            "{addr} timed out; refusing to point the 30s client at an address \
+             that would hang the test (#115)"
+        ),
+        Err(_) => format!("http://{addr}"),
+    }
+}
+
+/// Bound on the I12 client calls. Loopback refuse is immediate; a hang
+/// here is a proxy or routing defect, not a 30s client timeout.
+const REFUSED_CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// I12: the error must be a real reqwest transport failure, and neither
+/// Display nor Debug may carry the API key. An empty or HTTP-status error
+/// would pass a bare `!contains(KEY)` without exercising sanitization.
+fn assert_key_absent_from_transport_error(err: &anyhow::Error) {
+    let full = format!("{err:#} {err:?}");
+    assert!(
+        full.contains("error sending request"),
+        "expected a reqwest transport error (I12), got: {full}"
+    );
+    assert!(
+        !full.contains(KEY),
+        "API key leaked into transport error: {full}"
+    );
+}
+
 fn bug(id: u64, groups: &[&str], creation_time: &str) -> serde_json::Value {
     json!({
         "id": id,
@@ -408,20 +454,16 @@ async fn api_key_reaches_server_but_never_error_text_i12() {
 
 #[tokio::test]
 async fn api_key_absent_from_transport_error_i12() {
-    // Point at a closed port: reqwest yields a connect error whose URL would
-    // contain the api_key query parameter — sanitize must strip it.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    drop(listener); // free the port so the connection is refused
-    let bz =
-        BugzillaClient::new(&format!("http://{addr}"), false, TEST_USER_AGENT).expect("client");
+    // Point at an address the wiremock pool can never occupy: reqwest
+    // yields a connect error whose URL would contain the api_key query
+    // parameter — sanitize must strip it.
+    let bz = BugzillaClient::new(&refused_base_url(), false, TEST_USER_AGENT).expect("client");
 
-    let err = bz.get_bugs(KEY, &[1], None).await.unwrap_err();
-    let full = format!("{err:#} {err:?}");
-    assert!(
-        !full.contains(KEY),
-        "API key leaked into transport error: {full}"
-    );
+    let err = tokio::time::timeout(REFUSED_CONNECT_BUDGET, bz.get_bugs(KEY, &[1], None))
+        .await
+        .expect("connect to the refused extra-loopback must not hang")
+        .unwrap_err();
+    assert_key_absent_from_transport_error(&err);
 }
 
 #[tokio::test]
@@ -475,11 +517,8 @@ async fn client_create_bug_posts_the_payload_to_rest_bug() {
     // The payload travels as the POST body, untouched.
     //
     // Select the request by method and path rather than by position (#93).
-    // wiremock hands out mock servers from a process-wide pool of listeners,
-    // and the I12 transport-error tests in this binary deliberately aim a
-    // request at a just-freed ephemeral port; when that port has meanwhile
-    // been taken by a pooled listener, their bodyless GET is recorded here
-    // too. `[0]` would then assert against that request instead.
+    // The recording can contain more than the create POST — `[0]` would
+    // then assert against the wrong request.
     let reqs = server.received_requests().await.expect("recording enabled");
     let posts: Vec<&Request> = reqs
         .iter()
@@ -1138,18 +1177,13 @@ async fn client_whoami_missing_non_string_or_blank_name_is_a_failure() {
 async fn whoami_api_key_absent_from_transport_error_i12() {
     // Same pattern as api_key_absent_from_transport_error_i12: a connect
     // error's URL would carry api_key=... — sanitize must strip it.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    drop(listener); // free the port so the connection is refused
-    let bz =
-        BugzillaClient::new(&format!("http://{addr}"), false, TEST_USER_AGENT).expect("client");
+    let bz = BugzillaClient::new(&refused_base_url(), false, TEST_USER_AGENT).expect("client");
 
-    let err = bz.whoami(KEY).await.unwrap_err();
-    let full = format!("{err:#} {err:?}");
-    assert!(
-        !full.contains(KEY),
-        "API key leaked into whoami transport error: {full}"
-    );
+    let err = tokio::time::timeout(REFUSED_CONNECT_BUDGET, bz.whoami(KEY))
+        .await
+        .expect("connect to the refused extra-loopback must not hang")
+        .unwrap_err();
+    assert_key_absent_from_transport_error(&err);
 }
 
 // ---------------------------------------------------------------------------
@@ -1218,18 +1252,16 @@ async fn client_valid_login_unusable_shape_is_an_error_never_false() {
 
 #[tokio::test]
 async fn valid_login_api_key_absent_from_transport_error_i12() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    drop(listener); // free the port so the connection is refused
-    let bz =
-        BugzillaClient::new(&format!("http://{addr}"), false, TEST_USER_AGENT).expect("client");
+    let bz = BugzillaClient::new(&refused_base_url(), false, TEST_USER_AGENT).expect("client");
 
-    let err = bz.valid_login(KEY, "svc@example.com").await.unwrap_err();
-    let full = format!("{err:#} {err:?}");
-    assert!(
-        !full.contains(KEY),
-        "API key leaked into valid_login transport error: {full}"
-    );
+    let err = tokio::time::timeout(
+        REFUSED_CONNECT_BUDGET,
+        bz.valid_login(KEY, "svc@example.com"),
+    )
+    .await
+    .expect("connect to the refused extra-loopback must not hang")
+    .unwrap_err();
+    assert_key_absent_from_transport_error(&err);
 }
 
 #[tokio::test]

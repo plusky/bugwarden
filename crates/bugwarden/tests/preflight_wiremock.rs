@@ -19,6 +19,8 @@
 
 use std::sync::Arc;
 
+mod common;
+
 use bugwarden::config::Cli;
 use bugwarden::server::{BugWarden, USER_AGENT};
 use bugwarden_core::client::BugzillaClient;
@@ -262,18 +264,16 @@ async fn preflight_declared_login_transport_error_names_the_endpoint() {
 
 #[tokio::test]
 async fn preflight_transport_error_does_not_leak_the_api_key_i12() {
-    // Point the server at a closed port: the whoami lookup fails at the
-    // transport level, where the unsanitized error would carry the
-    // request URL with api_key=... in it. Nothing in the preflight error
-    // text may contain the key.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    drop(listener); // free the port so every connection is refused
+    // Point the server at an address the wiremock pool can never occupy:
+    // the whoami lookup fails at the transport level, where the
+    // unsanitized error would carry the request URL with api_key=... in
+    // it. Nothing in the preflight error text may contain the key.
+    let base = common::refused_base_url();
 
     let mut cli = Cli::parse_from([
         "bugwarden",
         "--bugzilla-server",
-        &format!("http://{addr}"),
+        &base,
         "--transport",
         "stdio",
         "--api-key",
@@ -284,17 +284,18 @@ async fn preflight_transport_error_does_not_leak_the_api_key_i12() {
     let guard = Arc::new(Guard {
         policy: Policy::from_toml_str(IDENTITY_POLICY).expect("test policy must parse"),
     });
-    let bz = Arc::new(
-        BugzillaClient::new(&format!("http://{addr}"), false, USER_AGENT)
-            .expect("client must build"),
-    );
+    let bz = Arc::new(BugzillaClient::new(&base, false, USER_AGENT).expect("client must build"));
     let server = BugWarden::new(cfg, guard, bz).expect("server must build");
 
-    let err = server
-        .preflight()
+    let err = tokio::time::timeout(common::REFUSED_CONNECT_BUDGET, server.preflight())
         .await
+        .expect("connect to the refused extra-loopback must not hang")
         .expect_err("an unreachable whoami endpoint must fail preflight");
-    let msg = format!("{err:#}");
+    let msg = format!("{err:#} {err:?}");
+    assert!(
+        msg.contains("error sending request"),
+        "expected a whoami transport error (I12), got: {msg}"
+    );
     assert!(
         !msg.contains("SUPERSECRETKEY123"),
         "API key leaked into a preflight error: {msg}"

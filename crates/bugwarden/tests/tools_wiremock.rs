@@ -21,6 +21,8 @@
 
 use std::sync::Arc;
 
+mod common;
+
 use bugwarden::config::Cli;
 use bugwarden::server::{BugWarden, USER_AGENT, WRITE_TOOLS};
 use bugwarden_core::client::BugzillaClient;
@@ -1642,18 +1644,16 @@ async fn created_by_me_reaches_the_write_gate_add_comment_too() {
 
 #[tokio::test]
 async fn whoami_transport_error_does_not_leak_the_api_key_i12() {
-    // Point the server at a closed port: the whoami lookup (and everything
-    // after it) fails at the transport level, where the unsanitized error
-    // would carry the request URL with api_key=... in it. Nothing the
-    // client sees may contain the key.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    drop(listener); // free the port so every connection is refused
+    // Point the server at an address the wiremock pool can never occupy:
+    // the whoami lookup (and everything after it) fails at the transport
+    // level, where the unsanitized error would carry the request URL with
+    // api_key=... in it. Nothing the client sees may contain the key.
+    let base = common::refused_base_url();
 
     let mut cli = Cli::parse_from([
         "bugwarden",
         "--bugzilla-server",
-        &format!("http://{addr}"),
+        &base,
         "--transport",
         "stdio",
         "--api-key",
@@ -1664,10 +1664,7 @@ async fn whoami_transport_error_does_not_leak_the_api_key_i12() {
     let guard = Arc::new(Guard {
         policy: Policy::from_toml_str(IDENTITY_POLICY).expect("test policy must parse"),
     });
-    let bz = Arc::new(
-        BugzillaClient::new(&format!("http://{addr}"), false, USER_AGENT)
-            .expect("client must build"),
-    );
+    let bz = Arc::new(BugzillaClient::new(&base, false, USER_AGENT).expect("client must build"));
     let server = BugWarden::new(cfg, guard, bz).expect("server must build");
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
     tokio::spawn(async move {
@@ -1680,7 +1677,12 @@ async fn whoami_transport_error_does_not_leak_the_api_key_i12() {
             .await
             .expect("MCP handshake must succeed");
 
-    let result = call(&client, "bug_info", json!({ "bug_ids": [7] })).await;
+    let result = tokio::time::timeout(
+        common::REFUSED_CONNECT_BUDGET,
+        call(&client, "bug_info", json!({ "bug_ids": [7] })),
+    )
+    .await
+    .expect("connect to the refused extra-loopback must not hang");
     let text = serde_json::to_string(&result).unwrap();
     assert!(
         !text.contains("SUPERSECRETKEY123"),
