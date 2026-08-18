@@ -134,7 +134,9 @@ async fn serve_guarded(mock: &MockServer, env: &HttpEnv, insecure: bool) -> Sock
         .expect("server must build")
         .with_scope_enforcement(!auth.is_insecure());
 
-    let config = server.http_server_config();
+    let config = server
+        .http_server_config()
+        .expect("the test Host list must be matchable");
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),

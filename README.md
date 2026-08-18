@@ -547,7 +547,7 @@ Command-line arguments take precedence over environment variables.
 | `--transport <http\|stdio>` | `MCP_TRANSPORT` | `http` | MCP transport. `stdio` is for subprocess launches by an MCP client; `http` exposes a network endpoint at `/mcp` |
 | `--host <ADDRESS>` | `MCP_HOST` | `127.0.0.1` | Listen address (http transport only) |
 | `--port <PORT>` | `MCP_PORT` | `8000` | Listen port (http transport only) |
-| `--allowed-hosts <HOST>` | `MCP_ALLOWED_HOSTS` | — | Hostname or `host:port` authority accepted in an inbound `Host` header (http transport only). Repeatable, and each value may list several hosts separated by commas and/or whitespace. Without any host no `Host` validation happens, so a client may address the server by any name |
+| `--allowed-hosts <HOST>` | `MCP_ALLOWED_HOSTS` | — | Hostname or `host:port` authority accepted in an inbound `Host` header (http transport only). Repeatable, and each value may list several hosts separated by commas (whitespace around commas is trimmed). An entry that is not a hostname or `host:port` is a startup error. Without any host no `Host` validation happens, so a client may address the server by any name |
 | `--api-key-header <NAME>` | `MCP_API_KEY_HEADER` | `ApiKey` | HTTP header name in which clients send the Bugzilla API key (http transport only). Not consulted in server-held key mode |
 | `--api-key <KEY>` | `BUGZILLA_API_KEY` | — | Bugzilla API key. **Required** for `--transport stdio` unless `--api-key-file` provides it; with `http` it is ignored with a warning (clients send the key per request — use `--api-key-file` for a server-held key) |
 | `--api-key-file <PATH>` | `BUGZILLA_API_KEY_FILE` | — | Path to a file holding the Bugzilla API key (container secret, systemd `LoadCredential` path). Mutually exclusive with `--api-key`; an empty value counts as unset. Over `http` this selects server-held key mode: every request is served with this key and the per-request header is not consulted |
@@ -572,8 +572,8 @@ error.
 
 Exit status: `0` on clean shutdown, `1` on a startup or runtime failure (a
 missing or malformed http bearer token, an unreadable policy or audit
-configuration, a key misconfiguration, a Bugzilla client or transport error),
-`2` on a command-line usage error.
+configuration, a key misconfiguration, an unparsable `--allowed-hosts` list,
+a Bugzilla client or transport error), `2` on a command-line usage error.
 
 ## Policy file reference
 

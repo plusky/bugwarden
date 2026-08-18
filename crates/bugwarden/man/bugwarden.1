@@ -51,7 +51,7 @@ Host address for the MCP server to listen on (http transport only). Defaults to 
 Port for the MCP server to listen on (http transport only). Defaults to 8000 or the MCP_PORT environment variable
 .TP
 \fB\-\-allowed\-hosts\fR \fI<HOST>\fR
-Hostname or \*(Aqhost:port\*(Aq authority accepted in an inbound Host header (http transport only). Repeat the flag, or separate entries with commas or whitespace; environment variable MCP_ALLOWED_HOSTS can also be used. Empty entries are dropped, so `MCP_ALLOWED_HOSTS=` is an unset (like `BUGZILLA_API_KEY_FILE=`); without a host, Host validation stays off and any Host header is served
+Hostname or \*(Aqhost:port\*(Aq authority accepted in an inbound Host header (http transport only). Repeat the flag, or separate entries with commas; environment variable MCP_ALLOWED_HOSTS can also be used. Empty entries are dropped, so `MCP_ALLOWED_HOSTS=` is an unset (like `BUGZILLA_API_KEY_FILE=`); without a host, Host validation stays off and any Host header is served. An entry that is not a hostname or host:port (for example \*(Aq*\*(Aq, a URL, or a space\-containing typo) is a startup error
 .TP
 \fB\-\-api\-key\-header\fR \fI<API_KEY_HEADER>\fR [default: ApiKey]
 HTTP header for clients to send the Bugzilla API key. Defaults to \*(AqApiKey\*(Aq or the MCP_API_KEY_HEADER environment variable. Not consulted in server\-held key mode (\-\-api\-key\-file over http)

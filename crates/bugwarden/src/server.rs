@@ -1529,18 +1529,31 @@ impl BugWarden {
     /// under "rmcp 3.1 usage notes"; the caller in `main` adds
     /// `cancellation_token` so a SIGINT or SIGTERM reaches the live
     /// transport (issue #114).
-    pub fn http_server_config(&self) -> StreamableHttpServerConfig {
+    ///
+    /// Errors when `--allowed-hosts` / `MCP_ALLOWED_HOSTS` names an entry
+    /// that is not a matchable Host authority: that is a typo, and rmcp
+    /// would turn validation on with nothing matchable. Emits one info line
+    /// stating whether Host validation is on or off and, when on, the
+    /// resolved list (hosts only, never key material — I12). Stdio never
+    /// calls this, so it has no Host check.
+    pub fn http_server_config(&self) -> anyhow::Result<StreamableHttpServerConfig> {
         let config = StreamableHttpServerConfig::default()
             .disable_allowed_hosts()
             .with_max_request_body_bytes(max_request_body_bytes(
                 self.guard.policy.global.max_attachment_bytes,
             ));
-        // `resolved_allowed_hosts` is what decides on/off: an empty list is
-        // the disabled state, and an entry rmcp cannot parse would otherwise
-        // leave validation on with nothing matchable (see config.rs).
-        match self.cfg.resolved_allowed_hosts().as_slice() {
-            [] => config,
-            hosts => config.with_allowed_hosts(hosts.iter().copied()),
+        // `checked_allowed_hosts` is what decides on/off: an empty list is
+        // the disabled state; an unparsable entry is a startup error so it
+        // cannot leave validation on with nothing matchable (see config.rs).
+        match self.cfg.checked_allowed_hosts()? {
+            None => {
+                tracing::info!("Host validation: off");
+                Ok(config)
+            }
+            Some(hosts) => {
+                tracing::info!("Host validation: on; allowed hosts: {}", hosts.join(", "));
+                Ok(config.with_allowed_hosts(hosts.iter().copied()))
+            }
         }
     }
 
@@ -5782,5 +5795,106 @@ mod tests {
             MAX_REQUEST_BODY_CEILING
         );
         assert_eq!(max_request_body_bytes(u64::MAX), MAX_REQUEST_BODY_CEILING);
+    }
+
+    fn http_server_with_hosts(hosts: Vec<String>) -> BugWarden {
+        http_server_with(hosts, None)
+    }
+
+    fn http_server_with(hosts: Vec<String>, api_key: Option<String>) -> BugWarden {
+        use clap::Parser as _;
+        let mut cli = Cli::parse_from([
+            "bugwarden",
+            "--bugzilla-server",
+            "https://bugzilla.example.com",
+            "--transport",
+            "http",
+        ]);
+        cli.api_key = api_key;
+        cli.api_key_file = None;
+        cli.allowed_hosts = hosts;
+        let guard = Arc::new(Guard {
+            policy: Policy::default(),
+        });
+        let bz = Arc::new(
+            BugzillaClient::new("https://bugzilla.example.com", false, USER_AGENT)
+                .expect("client must build"),
+        );
+        BugWarden::new(Arc::new(cli), guard, bz).expect("server must build")
+    }
+
+    fn host_validation_line(logs: &crate::testlog::Captured) -> &str {
+        logs.as_str()
+            .lines()
+            .find(|line| line.contains("Host validation:"))
+            .unwrap_or_else(|| panic!("no Host validation startup line in: {}", logs.as_str()))
+    }
+
+    #[test]
+    fn http_server_config_logs_host_validation_off_when_the_list_is_empty() {
+        // Deleting this info line is the #117 regression: a typo'd
+        // MCP_ALLOWED_HOSTS left validation silently off. The level is
+        // pinned so a debug/trace rewrite would hide it from the default
+        // subscriber.
+        let server = http_server_with_hosts(Vec::new());
+        let (config, logs) = crate::testlog::capture_logs(|| server.http_server_config());
+        let config = config.expect("empty is unset, not an error");
+        assert!(
+            config.allowed_hosts.is_empty(),
+            "validation off means rmcp's list is empty, got {:?}",
+            config.allowed_hosts
+        );
+        let line = host_validation_line(&logs);
+        assert!(
+            line.contains("INFO"),
+            "Host validation must be logged at info: {line}"
+        );
+        assert!(
+            line.contains("Host validation: off"),
+            "the off state must be named: {line}"
+        );
+        assert!(
+            !line.contains("allowed hosts:"),
+            "off must not print a list: {line}"
+        );
+    }
+
+    #[test]
+    fn http_server_config_logs_the_resolved_list_and_never_key_material_i12() {
+        // A canary in the config so logging the key itself fails this test.
+        // Debug of Cli redacts it; the raw value must not appear (I12).
+        let server = http_server_with(
+            vec!["mcp.example.org:8000".into(), "backup.example".into()],
+            Some("hush-key-i12".into()),
+        );
+        let (config, logs) = crate::testlog::capture_logs(|| server.http_server_config());
+        let config = config.expect("matchable hosts");
+        assert_eq!(
+            config.allowed_hosts,
+            ["mcp.example.org:8000", "backup.example"]
+        );
+        let line = host_validation_line(&logs);
+        assert!(
+            line.contains("INFO"),
+            "Host validation must be logged at info: {line}"
+        );
+        crate::testlog::assert_logged(&logs, "Host validation: on");
+        crate::testlog::assert_logged(&logs, "mcp.example.org:8000");
+        crate::testlog::assert_logged(&logs, "backup.example");
+        logs.assert_not_contains("hush-key-i12");
+    }
+
+    #[test]
+    fn http_server_config_refuses_an_unparsable_allowed_hosts_entry() {
+        // The library path main.rs and the wiremock harness both call:
+        // deleting this refusal, or warning and handing the list to rmcp,
+        // must fail here.
+        let server = http_server_with_hosts(vec!["*".into()]);
+        let (result, _logs) = crate::testlog::capture_logs(|| server.http_server_config());
+        let err = result.expect_err("unparsable entries are a startup error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains('*'), "the error must name the entry: {msg}");
+        // Refusal is before the info line, so the capture may be empty;
+        // asserting a negative on it would be the #97 vacuous form.
     }
 }
