@@ -1431,22 +1431,29 @@ wired, `server.rs` and `main.rs` are the reference.
   `SchemaSettings::draft2020_12()` (`handler/server/common.rs`) runs zero
   transforms, so whatever schemars 1.x emits for a `#[tool]` param struct is
   exactly what `list_tools` / `get_tool` serve. schemars renders `Option<T>`
-  as `"type": [T, "null"]` plus a stray `"default": null`, and a Rust integer
-  width as `format: "uint64"` / `"uint32"` — neither is portable: a
-  Gemini/Vertex client rewrites the type union into `anyOf: [{...},
-  {"type":"null"}]` while leaving `description` / `format` / `default` as
-  *siblings* of it, a shape Vertex itself then refuses ("when using any_of,
-  it must be the only field set"). `BugWarden::new` runs `portable_schema`
-  (server.rs) over every route's `input_schema` once, at construction —
-  before the `disabled_tools` check — collapsing the union to a plain type,
-  dropping the resulting `"default": null`, and dropping any `format` not in
-  `PORTABLE_FORMATS` (`date-time`, `int32`, `int64`, `float`, `double`,
-  `enum`; `uint64`/`uint32` are schemars' own annotations for a constraint
-  `type: integer` + `minimum: 0` already carries, enforced by the
-  deserializer regardless of what the schema advertises). serde still accepts
-  an explicit `null` for every `Option<T>` field — only the advertisement got
-  stricter — so no tool's accepted input changed and no invariant (I1–I16) is
-  involved. `ToolRouter::map` and `ToolRoute::attr` are public fields of
+  as `"type": [T, "null"]`, a field carrying `#[serde(default)]` as a stray
+  `"default": null`, and a Rust integer width as `format: "uint64"` /
+  `"uint32"` — none of those is portable: a Gemini/Vertex client rewrites
+  the type union into `anyOf: [{...}, {"type":"null"}]` while leaving
+  `description` / `format` / `default` as *siblings* of it, a shape Vertex
+  itself then refuses ("when using any_of, it must be the only field set").
+  `BugWarden::new` runs `portable_schema` (server.rs) over every route's
+  `input_schema` once, at construction — before the `disabled_tools` check
+  — collapsing the union to a plain type, dropping `"default": null`, and
+  dropping any `format` not in `PORTABLE_FORMATS` (`date-time`, `int32`,
+  `int64`, `float`, `double`; `enum` is a dead keep-list entry — no served
+  schema emits it and Vertex's `Schema.format` does not document it — and
+  is not load-bearing; `uint64`/`uint32` are schemars' own annotations
+  for a constraint `type: integer` + `minimum: 0` already carries, enforced
+  by the deserializer regardless of what the schema advertises). The pass
+  recurses into `properties`, `items` (object or array), object-form
+  `additionalProperties`, `patternProperties` values, and `prefixItems`;
+  boolean `additionalProperties` is not a subschema and is skipped. Other
+  draft 2020-12 applicator keywords are absent from served schemas — the
+  mirror test fails if one appears. serde still accepts an explicit `null`
+  for every `Option<T>` field — only the advertisement got stricter — so
+  no tool's accepted input changed and no invariant (I1–I16) is involved.
+  `ToolRouter::map` and `ToolRoute::attr` are public fields of
   `#[non_exhaustive]` structs; an rmcp upgrade that reshapes either breaks
   the build loudly rather than silently skipping the pass.
 - **Every `StreamableHttpServerConfig` field is accounted for below** — set by

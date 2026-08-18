@@ -1243,20 +1243,29 @@ pub struct BugFieldsParams {
 /// no constraint the deserializer doesn't already enforce — `type: integer`
 /// plus `minimum: 0` carries the non-negativity, and the actual width is
 /// enforced by serde at deserialization, never by the advertised schema.
+/// `enum` is a dead keep-list entry: no served schema emits it, and it is
+/// absent from Vertex's `Schema.format` documentation. It is not
+/// load-bearing.
 const PORTABLE_FORMATS: &[&str] = &["date-time", "int32", "int64", "float", "double", "enum"];
 
 /// Rewrites a schemars-generated `inputSchema` node in place so a
 /// Gemini/Vertex client accepts it.
 ///
-/// schemars renders `Option<T>` as `"type": [T, "null"]` plus a stray
-/// `"default": null`. Vertex's client rewrites that union into
+/// schemars renders `Option<T>` as `"type": [T, "null"]`. A field that
+/// also carries `#[serde(default)]` gets a stray `"default": null`.
+/// Vertex's client rewrites that union into
 /// `anyOf: [{...}, {"type": "null"}]` while keeping `description` /
 /// `format` / `default` as *siblings* of `anyOf` — a shape Vertex itself
 /// then refuses ("when using any_of, it must be the only field set").
 /// Collapsing the union to a plain type before it ever reaches the client
-/// starves that rewrite of its input. Recurses into `properties` and
-/// `items` because the same union can appear nested (for example inside an
-/// array parameter's `items`).
+/// starves that rewrite of its input.
+///
+/// Recurses into every draft 2020-12 subschema position a `#[tool]` param
+/// struct can emit: `properties`, `items` (object or array form),
+/// object-form `additionalProperties`, `patternProperties` values, and
+/// `prefixItems`. Boolean `additionalProperties` is not a subschema and is
+/// left alone. Keep the walk in lockstep with the test helper
+/// `schema_portability_error`.
 fn portable_schema(node: &mut Value) {
     let Value::Object(obj) = node else {
         return;
@@ -1276,13 +1285,39 @@ fn portable_schema(node: &mut Value) {
             obj.remove("format");
         }
     }
+    // Recursion arms: keep in lockstep with `schema_portability_error`.
     if let Some(properties) = obj.get_mut("properties").and_then(Value::as_object_mut) {
         for prop in properties.values_mut() {
             portable_schema(prop);
         }
     }
     if let Some(items) = obj.get_mut("items") {
-        portable_schema(items);
+        match items {
+            Value::Array(elems) => {
+                for item in elems {
+                    portable_schema(item);
+                }
+            }
+            other => portable_schema(other),
+        }
+    }
+    if let Some(additional) = obj.get_mut("additionalProperties") {
+        if additional.is_object() {
+            portable_schema(additional);
+        }
+    }
+    if let Some(patterns) = obj
+        .get_mut("patternProperties")
+        .and_then(Value::as_object_mut)
+    {
+        for schema in patterns.values_mut() {
+            portable_schema(schema);
+        }
+    }
+    if let Some(Value::Array(prefix)) = obj.get_mut("prefixItems") {
+        for item in prefix {
+            portable_schema(item);
+        }
     }
 }
 
@@ -4277,40 +4312,110 @@ mod tests {
         );
     }
 
+    /// Draft 2020-12 (and leftover draft-07) keywords that hold a subschema
+    /// and that [`portable_schema`] does not recurse into. Their presence in
+    /// a served schema fails this walk, proving they do not occur today.
+    const UNVISITED_SUBSCHEMA_KEYWORDS: &[&str] = &[
+        "anyOf",
+        "oneOf",
+        "allOf",
+        "$ref",
+        "$defs",
+        "definitions",
+        "not",
+        "if",
+        "then",
+        "else",
+        "contains",
+        "propertyNames",
+        "dependentSchemas",
+        "additionalItems",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "contentSchema",
+        "$dynamicRef",
+    ];
+
     /// Recursive walk mirroring [`portable_schema`]'s own recursion, so the
     /// assertion covers the same nodes the normalization pass touches.
-    fn assert_schema_is_client_portable(node: &Value, tool: &str) {
+    ///
+    /// Returns the first portability error instead of panicking so a canary
+    /// can assert that a planted dirty node is visited.
+    fn schema_portability_error(node: &Value, tool: &str) -> Option<String> {
         let Value::Object(obj) = node else {
-            return;
+            return None;
         };
-        assert!(
-            !matches!(obj.get("type"), Some(Value::Array(_))),
-            "{tool}: schema still has a type union: {obj:?}"
-        );
-        assert_ne!(
-            obj.get("default"),
-            Some(&Value::Null),
-            "{tool}: schema still advertises \"default\": null: {obj:?}"
-        );
+        if matches!(obj.get("type"), Some(Value::Array(_))) {
+            return Some(format!("{tool}: schema still has a type union: {obj:?}"));
+        }
+        if obj.get("default") == Some(&Value::Null) {
+            return Some(format!(
+                "{tool}: schema still advertises \"default\": null: {obj:?}"
+            ));
+        }
         if let Some(format) = obj.get("format").and_then(Value::as_str) {
-            assert!(
-                PORTABLE_FORMATS.contains(&format),
-                "{tool}: schema advertises non-portable format {format:?}: {obj:?}"
-            );
+            if !PORTABLE_FORMATS.contains(&format) {
+                return Some(format!(
+                    "{tool}: schema advertises non-portable format {format:?}: {obj:?}"
+                ));
+            }
         }
-        for key in ["anyOf", "oneOf", "allOf", "$ref", "$defs"] {
-            assert!(
-                !obj.contains_key(key),
-                "{tool}: schema uses unsupported {key}: {obj:?}"
-            );
+        for key in UNVISITED_SUBSCHEMA_KEYWORDS {
+            if obj.contains_key(*key) {
+                return Some(format!("{tool}: schema uses unsupported {key}: {obj:?}"));
+            }
         }
+        // Recursion arms: keep in lockstep with `portable_schema`.
         if let Some(properties) = obj.get("properties").and_then(Value::as_object) {
             for prop in properties.values() {
-                assert_schema_is_client_portable(prop, tool);
+                if let Some(err) = schema_portability_error(prop, tool) {
+                    return Some(err);
+                }
             }
         }
         if let Some(items) = obj.get("items") {
-            assert_schema_is_client_portable(items, tool);
+            match items {
+                Value::Array(elems) => {
+                    for item in elems {
+                        if let Some(err) = schema_portability_error(item, tool) {
+                            return Some(err);
+                        }
+                    }
+                }
+                other => {
+                    if let Some(err) = schema_portability_error(other, tool) {
+                        return Some(err);
+                    }
+                }
+            }
+        }
+        if let Some(additional) = obj.get("additionalProperties") {
+            if additional.is_object() {
+                if let Some(err) = schema_portability_error(additional, tool) {
+                    return Some(err);
+                }
+            }
+        }
+        if let Some(patterns) = obj.get("patternProperties").and_then(Value::as_object) {
+            for schema in patterns.values() {
+                if let Some(err) = schema_portability_error(schema, tool) {
+                    return Some(err);
+                }
+            }
+        }
+        if let Some(Value::Array(prefix)) = obj.get("prefixItems") {
+            for item in prefix {
+                if let Some(err) = schema_portability_error(item, tool) {
+                    return Some(err);
+                }
+            }
+        }
+        None
+    }
+
+    fn assert_schema_is_client_portable(node: &Value, tool: &str) {
+        if let Some(err) = schema_portability_error(node, tool) {
+            panic!("{err}");
         }
     }
 
@@ -4324,6 +4429,126 @@ mod tests {
                 &tool.name,
             );
         }
+    }
+
+    /// Non-portable node planted under each newly covered keyword. Live
+    /// `#[tool]` structs do not emit these positions today (the only
+    /// `additionalProperties` in served schemas is boolean `true`), so a
+    /// deleted recursion arm would not fail `served_tool_schemas_are_client_portable`.
+    fn planted_nonportable() -> Value {
+        json!({
+            "type": ["integer", "null"],
+            "default": null,
+            "format": "uint64",
+        })
+    }
+
+    struct SchemaCanary {
+        label: &'static str,
+        schema: Value,
+        child: fn(&Value) -> &Value,
+    }
+
+    fn new_position_canaries() -> [SchemaCanary; 4] {
+        [
+            SchemaCanary {
+                label: "additionalProperties",
+                schema: json!({ "additionalProperties": planted_nonportable() }),
+                child: |s| &s["additionalProperties"],
+            },
+            SchemaCanary {
+                label: "patternProperties",
+                schema: json!({ "patternProperties": { "^cf_": planted_nonportable() } }),
+                child: |s| &s["patternProperties"]["^cf_"],
+            },
+            SchemaCanary {
+                label: "prefixItems",
+                schema: json!({ "prefixItems": [planted_nonportable()] }),
+                child: |s| &s["prefixItems"][0],
+            },
+            SchemaCanary {
+                label: "array-form items",
+                schema: json!({ "items": [planted_nonportable()] }),
+                child: |s| &s["items"][0],
+            },
+        ]
+    }
+
+    fn assert_node_normalized(label: &str, node: &Value) {
+        assert_eq!(
+            node.get("type"),
+            Some(&json!("integer")),
+            "{label}: type union was not collapsed: {node:?}"
+        );
+        assert_ne!(
+            node.get("default"),
+            Some(&Value::Null),
+            "{label}: default null was not dropped: {node:?}"
+        );
+        assert!(
+            node.get("format").is_none(),
+            "{label}: non-portable format was not dropped: {node:?}"
+        );
+    }
+
+    fn canary(label: &'static str) -> SchemaCanary {
+        new_position_canaries()
+            .into_iter()
+            .find(|c| c.label == label)
+            .unwrap_or_else(|| panic!("missing canary {label}"))
+    }
+
+    fn assert_portable_schema_normalizes(label: &'static str) {
+        let canary = canary(label);
+        let mut schema = canary.schema;
+        portable_schema(&mut schema);
+        assert_node_normalized(canary.label, (canary.child)(&schema));
+    }
+
+    #[test]
+    fn portable_schema_normalizes_additional_properties() {
+        assert_portable_schema_normalizes("additionalProperties");
+    }
+
+    #[test]
+    fn portable_schema_normalizes_pattern_properties() {
+        assert_portable_schema_normalizes("patternProperties");
+    }
+
+    #[test]
+    fn portable_schema_normalizes_prefix_items() {
+        assert_portable_schema_normalizes("prefixItems");
+    }
+
+    #[test]
+    fn portable_schema_normalizes_array_form_items() {
+        assert_portable_schema_normalizes("array-form items");
+    }
+
+    #[test]
+    fn mirror_walk_rejects_a_dirty_node_under_every_new_draft_position() {
+        let missed: Vec<_> = new_position_canaries()
+            .into_iter()
+            .filter(|c| schema_portability_error(&c.schema, c.label).is_none())
+            .map(|c| c.label)
+            .collect();
+        assert!(
+            missed.is_empty(),
+            "schema_portability_error must visit {}; \
+             the planted non-portable node was not rejected",
+            missed.join(", ")
+        );
+    }
+
+    #[test]
+    fn boolean_additional_properties_is_not_a_subschema() {
+        let mut schema = json!({
+            "type": "object",
+            "additionalProperties": true,
+        });
+        portable_schema(&mut schema);
+        assert_eq!(schema["additionalProperties"], true);
+        assert_schema_is_client_portable(&schema, "boolean-additionalProperties");
     }
 
     #[test]
