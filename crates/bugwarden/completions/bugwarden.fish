@@ -11,5 +11,6 @@ complete -c bugwarden -l policy -d 'Path to the guard policy TOML file. Environm
 complete -c bugwarden -l audit-config -d 'Path to the audit configuration TOML file (see examples/audit.toml). Environment variable BUGWARDEN_AUDIT_CONFIG can also be used. Without it no audit stream is written' -r -F
 complete -c bugwarden -l use-auth-header -d 'Use \'Authorization: Bearer\' header instead of the api_key query parameter (required for some Bugzilla instances). Environment variable BUGZILLA_USE_AUTH_HEADER=true can also be used'
 complete -c bugwarden -l read-only -d 'Disables all tools which modify the state of a bug. Environment variable MCP_READ_ONLY=true can also be used. Can only tighten the guard policy, never loosen it'
+complete -c bugwarden -l insecure-no-auth -d 'Serve the http transport without bearer authentication. Only for a trusted, isolated network: every caller that reaches the port gets the full write scope. Command line only, with no environment variable, so no ambient value can turn authentication off. Tokens are never taken from the command line either (argv is world-readable): set BUGWARDEN_HTTP_TOKEN / BUGWARDEN_HTTP_READ_TOKEN in the environment'
 complete -c bugwarden -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c bugwarden -s V -l version -d 'Print version'

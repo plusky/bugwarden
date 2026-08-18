@@ -11,6 +11,8 @@
 /// Operator-facing audit event stream: record schema and JSONL file sink.
 pub mod audit;
 pub mod config;
+/// Bearer authentication for the streamable-HTTP transport.
+pub mod http_auth;
 pub mod server;
 
 #[cfg(test)]

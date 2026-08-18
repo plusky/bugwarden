@@ -111,6 +111,15 @@ pub struct Cli {
     /// Without it no audit stream is written.
     #[arg(long, env = "BUGWARDEN_AUDIT_CONFIG", value_hint = clap::ValueHint::FilePath)]
     pub audit_config: Option<PathBuf>,
+
+    /// Serve the http transport without bearer authentication. Only for a
+    /// trusted, isolated network: every caller that reaches the port gets the
+    /// full write scope. Command line only, with no environment variable, so
+    /// no ambient value can turn authentication off. Tokens are never taken
+    /// from the command line either (argv is world-readable): set
+    /// BUGWARDEN_HTTP_TOKEN / BUGWARDEN_HTTP_READ_TOKEN in the environment.
+    #[arg(long)]
+    pub insecure_no_auth: bool,
 }
 
 /// Manual impl so the startup key can never reach a log or error through a
@@ -130,6 +139,7 @@ impl std::fmt::Debug for Cli {
             .field("read_only", &self.read_only)
             .field("policy", &self.policy)
             .field("audit_config", &self.audit_config)
+            .field("insecure_no_auth", &self.insecure_no_auth)
             .finish()
     }
 }
@@ -446,16 +456,26 @@ mod tests {
         assert!(msg.contains("--transport stdio requires"), "{msg}");
     }
 
+    /// The one flag that deliberately has no environment fallback. Every
+    /// other knob tightens or is neutral, so an ambient value can only ever
+    /// narrow what is served; `--insecure-no-auth` is the only one that
+    /// LOOSENS — it turns the http bearer gate off — and an environment
+    /// variable able to do that is exactly the loosening default I9 forbids.
+    /// It stays a decision someone typed on the command line.
+    const ENV_LESS_BY_DESIGN: &[&str] = &["insecure_no_auth"];
+
     #[test]
     fn every_flag_declares_an_environment_fallback() {
         // Container deployments configure bugwarden entirely through the
         // environment (issues #31/#32), so a flag without an `env` fallback
-        // is a hole in that contract — this fails the moment one appears.
+        // is a hole in that contract — this fails the moment one appears
+        // that is not the documented exception above.
         let mut cmd = command();
         cmd.build();
         let env_less: Vec<String> = cmd
             .get_arguments()
             .filter(|arg| !matches!(arg.get_id().as_str(), "help" | "version"))
+            .filter(|arg| !ENV_LESS_BY_DESIGN.contains(&arg.get_id().as_str()))
             .filter(|arg| arg.get_env().is_none())
             .map(|arg| arg.get_id().to_string())
             .collect();
@@ -463,6 +483,18 @@ mod tests {
             env_less.is_empty(),
             "every flag needs an environment fallback, these have none: {env_less:?}"
         );
+        // The exception list is not a place to park new flags: every entry
+        // must still name a real, env-less argument.
+        for id in ENV_LESS_BY_DESIGN {
+            let arg = cmd
+                .get_arguments()
+                .find(|arg| arg.get_id().as_str() == *id)
+                .unwrap_or_else(|| panic!("{id} is exempted but does not exist"));
+            assert!(
+                arg.get_env().is_none(),
+                "{id} has an environment fallback and must leave the exception list"
+            );
+        }
         let env_of = |id: &str| {
             cmd.get_arguments()
                 .find(|arg| arg.get_id().as_str() == id)

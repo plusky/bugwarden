@@ -832,6 +832,124 @@ units and container specs). Decisions, all deliberate:
   file's write-bit warning). The startup log line states mode and source
   only — never key material (I12).
 
+### HTTP bearer authentication (crates/bugwarden/src/http_auth.rs)
+
+Key custody above answers "who authenticates to Bugzilla". This answers the
+other half — who authenticates to bugwarden — for the http transport only.
+Partial delivery of issue #32, deliberately scoped: it authenticates a
+DEPLOYMENT, not a caller, so `ClientInfo.principal` stays `None` and #32 stays
+open until a verified caller identity fills it.
+
+Over stdio the client launched the process and is its only principal. Over http
+the port was the whole access control, and under server-held key custody that
+means anyone reaching the port is served with the deployment's Bugzilla
+credential. So http is **deny-by-default**: two tokens, read from the
+environment only.
+
+The *contract* — the two variable names, the 32-character printable-ASCII
+floor, the five startup refusals, the `Authorization: Bearer` wire shape and
+the read/write scope split — is deliberately the one `ruoqa-mcp` serves, so a
+fleet configures both from one set of variables (#32). That is an agreement
+about the interface; the implementation is this repository's own.
+
+| variable | scope | reaches |
+|---|---|---|
+| `BUGWARDEN_HTTP_TOKEN` | write | every tool the policy serves |
+| `BUGWARDEN_HTTP_READ_TOKEN` | read | the non-`WRITE_TOOLS` tools only |
+
+`main` calls `http_auth::resolve_for`, which delegates to `HttpAuth::resolve`
+for the http transport and returns `None` for stdio. That call comes BEFORE
+the policy load, the Bugzilla client, the identity preflight and the audit
+sink — so a misconfiguration binds no port, opens no socket and neither
+creates nor rotates an audit file, the same ordering rationale key custody
+already has. It refuses to start on five conditions:
+
+- http with neither token set and no `--insecure-no-auth` — including the bare
+  `bugwarden --bugzilla-server …` that worked before this landed, since http is
+  the DEFAULT transport. Breaking, and chosen: the alternative is a port that
+  keeps serving a Bugzilla credential to anyone who can reach it;
+- `--insecure-no-auth` together with either token (contradictory intent);
+- a token shorter than 32 characters;
+- a token containing anything but printable non-space ASCII (it has to survive
+  an HTTP header, and whitespace hides transcription errors);
+- the read token equal to the write token, which would make the scopes
+  meaningless.
+
+Decisions, all deliberate:
+
+- **Environment only, no flag.** argv is world-readable through `ps`, so no CLI
+  option carries token material. The value never enters `Cli` at all, so I12's
+  "never in a log or error" is structural here rather than a redacting `Debug`
+  impl: there is nothing to redact. `HttpEnv` and `HttpAuth` have no `Debug`
+  impl for the same reason `KeyCustody` has none. An empty value counts as
+  unset, matching `--api-key` / `--api-key-file`.
+- **`--insecure-no-auth` has no environment variable**, and is the only flag
+  that has none — every other one gained a fallback with #31/#32, and a unit
+  test holds them to it with this single named exception. It is also the only
+  flag that LOOSENS: I9 says CLI and env may only tighten, and an ambient
+  `BUGWARDEN_*` able to switch authentication off is precisely the loosening
+  default I9 exists to forbid. On the command line it stays a per-run decision
+  someone typed. It warns at startup.
+- **The gate is an axum layer wrapping the WHOLE router**, not the `/mcp`
+  route, and it runs before rmcp sees the request. So an unauthenticated
+  caller reaches no MCP handling at all, and an unrouted path is refused
+  identically instead of answering `404` — the refusal discloses no path
+  knowledge, no tool, no policy and no bug (I2). One response for every
+  failure: empty `401` with `WWW-Authenticate: Bearer`, byte-identical whether
+  the header was missing, wrong-schemed, or carried a wrong token.
+- **Constant-time comparison** (`subtle::ConstantTimeEq`), and BOTH tokens are
+  always compared: returning early on a write-token match would leak by timing
+  which credential a guess matched.
+- **The read scope is the complement of `WRITE_TOOLS`** — the same constant
+  read-only mode removes from the router (I13) — so the per-caller split cannot
+  drift from the per-deployment one. A unit test additionally pins
+  `WRITE_TOOLS` against every tool's own `read_only_hint` annotation, so a tool
+  added to one and forgotten in the other fails to build a passing test run.
+- **A read-scope caller is served a FILTERED listing, not a listing plus
+  errors** — I13's shape applied to the credential instead of the deployment.
+  Calling a hidden write tool anyway is answered with `ToolRouter`'s own
+  unknown-tool error, byte for byte, so a write tool is indistinguishable from
+  a tool that does not exist: nothing tells a read credential whether the
+  deployment even serves writes. No Bugzilla request is made, because the
+  refusal is decided before dispatch.
+- **Fail closed on a missing scope.** With enforcement on, a request carrying
+  no scope reaches nothing — an empty listing and the same unknown-tool
+  refusal for every name. Unreachable through `main` (the layer wraps the
+  router), so it is defense in depth against a future rewiring, and it logs
+  once per process rather than per request.
+- **Refusals are logged, not audited.** Rejection happens in the layer, before
+  `call_tool`, which is where audit records are written — so #32's "refusals
+  must be recorded" cannot be met by the audit stream without a new event kind,
+  and the schema's event set is #34's to decide. What lands instead is a
+  counter logged on the first refusal and then at every power of two: bounded,
+  so an unauthenticated client cannot drive log volume, and carrying no token,
+  header, path or peer, so it is no oracle. A read-scope caller's refused write
+  call IS audited, as one ordinary `tool_call` record with no guard verdict and
+  no upstream leg — the same shape an unknown tool name produces.
+- **Scope enforcement is a transport property, not a policy one.**
+  `BugWarden::with_scope_enforcement` is switched on by `main` for an
+  authenticated http listener only: stdio issues no per-request credential and
+  `--insecure-no-auth` issues none by definition. It never widens what the
+  guard policy allows — a write token reaches exactly the router the policy
+  already pruned (I1, I9).
+- **`server/discover` closes with everything else.** #32 listed it open —
+  whether a mandatory *unauthenticated* pre-request surface should survive the
+  arrival of auth. It does not: the gate wraps the whole router, so
+  `server/discover` needs a token like any other request. Decided rather than
+  inherited, and the cheap direction — no revision this build serves defines
+  that surface (`2026-07-28` is unadopted, #34), so nothing needs it today,
+  and opening a pre-request identity surface ahead of the revision that gives
+  it a purpose would hand out the deployed version to strangers for nothing.
+  Reopening it is a one-line route exemption if #34 ever needs one.
+- **What this deliberately does NOT do.** No caller identity: `principal` stays
+  `None`, and a deployment credential must never fill it (#32). No per-caller
+  policy: one operator policy per process (I1) is unchanged, and a token
+  narrows the tool surface without touching a single guard decision. No RRID or
+  work-context binding. No token rotation without a restart, and no revocation
+  list. The wire shape — `Authorization: Bearer <token>` — is the one #32's end
+  state uses, so what changes when per-caller tokens arrive is the validator,
+  not the request shape, the refusal path or the audit fields.
+
 ### Identity preflight (`BugWarden::preflight`)
 
 `Guard::resolve_caller` maps every `whoami` failure to `None`, and I4 then
@@ -992,12 +1110,17 @@ clap derive `Cli`, with env fallbacks:
 | --read-only | MCP_READ_ONLY | false | tighten-only (I9) |
 | --policy | BUGWARDEN_POLICY | — | path to guard policy TOML |
 | --audit-config | BUGWARDEN_AUDIT_CONFIG | — | path to audit configuration TOML; without it no audit stream is written |
+| --insecure-no-auth | — (deliberately) | false | serve http with no bearer gate; refuses to start together with a token (see HTTP bearer authentication) |
+| — | BUGWARDEN_HTTP_TOKEN | — | bearer token, write scope; environment only, never a flag |
+| — | BUGWARDEN_HTTP_READ_TOKEN | — | bearer token, read scope; environment only, never a flag |
 
 Startup validation: key custody is resolved by `Cli::resolve_key_custody`
 inside `BugWarden::new` (see Key custody) — --api-key together with
 --api-key-file, stdio without any key source, and an empty or unreadable
 key file all exit with an error (the key-file errors name the path only,
-I12); http with api_key => tracing::warn (ignored). main.rs adds: http
+I12); http with api_key => tracing::warn (ignored). main.rs adds: the http
+bearer gate, resolved FIRST of all (see HTTP bearer authentication) so a
+token misconfiguration precedes every other startup effect; and http
 without audit_config => tracing::warn (remote tool calls leave no audit
 record).
 
@@ -1265,10 +1388,12 @@ wired, `server.rs` and `main.rs` are the reference.
   placeholder `client_info` in the `_meta`-shape trap below, in the other
   direction: the SDK's build environment is not this build's identity
   (issue #53). `server/discover` is the second place a peer reads it, and
-  it is answered with no handshake — so until #32 lands, anything that can
-  open the port learns the exact deployed version, unauthenticated and
-  unrecorded. Accepted deliberately: `serverInfo` is a required field of
-  `InitializeResult`, so withholding it is not protocol-legal, and the
+  it is answered with no handshake — so anything that gets past the http
+  bearer gate learns the exact deployed version without a handshake and
+  without an audit record, and over stdio or behind `--insecure-no-auth`
+  anything that reaches the process at all does. Accepted deliberately:
+  `serverInfo` is a required field of `InitializeResult`, so withholding it
+  is not protocol-legal, and the
   value being replaced was rmcp's own exact release — a dependency
   fingerprint, which is not the smaller disclosure. The same trap has a
   non-MCP twin, and it is not rmcp's: the `User-Agent` sent to Bugzilla
@@ -1319,8 +1444,16 @@ wired, `server.rs` and `main.rs` are the reference.
   `allowed_hosts` is a DNS-rebinding defence for MCP servers a browser can
   reach on localhost, and its default would refuse every deployment not
   addressed as `localhost`, containers included; bugwarden disables it
-  deliberately, since its access control is the network boundary and, when it
-  lands, per-caller authentication (#32). `max_request_body_bytes` is a POST
+  deliberately, because with the gate on the rebinding attack is already
+  answered a layer earlier — the rebound browser carries no bearer token and
+  is turned away with the same `401` as any other stranger, whatever `Host`
+  it sent (see "HTTP bearer authentication"). That argument lapses under
+  `--insecure-no-auth`, which admits every caller by design: there
+  `--allowed-hosts` / `MCP_ALLOWED_HOSTS` is how the operator puts the `Host`
+  check back, and a deployment that turns the gate off should name its
+  authorities. ruoqa-mcp keeps its `Host` allowlist alongside its own gate for
+  the same reason — the two defences are independent, and only one of them is
+  optional here. `max_request_body_bytes` is a POST
   cap with no rmcp 2.2 equivalent: kept as a memory bound, but it also
   ceilings `add_attachment`, so a fixed value silently overrides the
   operator's `global.max_attachment_bytes` — at the SDK's 4 MiB, base64
@@ -1349,9 +1482,10 @@ wired, `server.rs` and `main.rs` are the reference.
   decoded is not honored over HTTP. A body over the cap is refused by rmcp's
   tower layer with a bare `413` that reaches neither `call_tool` nor the
   guard, so it is **unrecordable** in the audit stream — the same class as a
-  pre-handler auth refusal (#32), and accepted on the same terms; an operator
-  diagnosing a 413 compares the body size against the derived cap, because
-  nothing server-side recorded the attempt.
+  bearer refusal, which the layer in front of the service turns away and
+  which is likewise only counted in the log, and accepted on the same terms;
+  an operator diagnosing a 413 compares the body size against the derived
+  cap, because nothing server-side recorded the attempt.
 
   That boundary is also observable to an unauthenticated client, which is
   **ACCEPTED**: whenever the derivation exceeds the floor (a decoded cap above
@@ -1365,13 +1499,20 @@ wired, `server.rs` and `main.rs` are the reference.
   bug's existence or content, so I1's "the policy file is never readable
   through MCP" and I2/I3 are untouched — this is the one policy-derived
   number a transport-level limit inherently exposes, in exchange for the
-  operator's configured limit actually working. And the probing itself needs
-  network reach, which is the access control until per-caller authentication
-  lands (#32); a caller who can binary-search POST sizes can already call
-  tools. If #32 changes that calculus, revisit here and at the add_attachment
-  row together. The `cancellation_token` is named so ctrl_c tears the live
-  transport down with the process instead of leaving it to outlive the
-  shutdown.
+  operator's configured limit actually working. And the probing itself now
+  needs a valid bearer token, since the gate turns an unauthenticated caller
+  away before rmcp measures the body at all: whoever can binary-search POST
+  sizes can already call tools. The audience did narrow rather than vanish —
+  a READ-scope caller still reaches the 413 boundary, because the cap is a
+  transport limit and the scope gate sits above it in the handler, so the
+  figure is legible to a credential that may not upload at all. Accepted on
+  the same terms: it is a memory-tuning number, not bug data, and the holder
+  is someone the operator issued a token to. `--insecure-no-auth` restores
+  the older, wider exposure to everyone — one more thing that flag hands
+  out. If a per-caller identity (#32) changes this calculus, revisit here
+  and at the add_attachment row together. The `cancellation_token` is named so ctrl_c
+  tears the live transport down with the process instead of leaving it to
+  outlive the shutdown.
 
   An operator who does know the authorities their deployment answers to names
   them with a repeated `--allowed-hosts`, or with `MCP_ALLOWED_HOSTS` as one
@@ -1388,10 +1529,14 @@ wired, `server.rs` and `main.rs` are the reference.
   which would refuse every `Host`.
 
   `allowed_origins` is the browser-facing sibling of `allowed_hosts`, and the
-  #32 argument covers it identically. It is inherited rather than named because
-  the empty default IS the disabled state — `origin_is_allowed` returns true on
-  an empty list, exactly what `disable_allowed_origins()` would produce — so
-  naming it would assert nothing the default does not already say. The
+  bearer-gate argument covers it identically — including the lapse: under
+  `--insecure-no-auth` nothing stands in front of a browser-originated
+  request, and rmcp offers no operator-facing knob here the way
+  `--allowed-hosts` covers the other row. It is inherited rather than named
+  because the empty default IS the disabled state — `origin_is_allowed`
+  returns true on an empty list, exactly what `disable_allowed_origins()`
+  would produce — so naming it would assert nothing the default does not
+  already say. The
   asymmetry with `allowed_hosts` is real and not an oversight: the host default
   refuses ordinary requests from this build's clients, whereas Origin is only
   checked when the header is present and a non-browser MCP client does not send
@@ -1828,5 +1973,40 @@ wired, `server.rs` and `main.rs` are the reference.
   constructor, so a per-mode identity would send nothing at all in the
   other — and a blank or non-header-value identity fails at construction
   rather than going out anonymously.
+- HTTP bearer tests (#[cfg(test)] in crates/bugwarden/src/http_auth.rs and
+  crates/bugwarden/src/server.rs; crates/bugwarden/tests/
+  http_auth_wiremock.rs): resolution — each of the five startup refusals,
+  the 31/32-character boundary either side, each token alone and both
+  together, and the error naming the VARIABLE and never its value; the wire —
+  a request with no header, the wrong token, a token prefix, a non-Bearer
+  scheme, a bare scheme and an unrouted path all get one BYTE-IDENTICAL empty
+  `401`, compared as (status, `WWW-Authenticate`, body) against the
+  no-header baseline, while the same paths with a valid token get the
+  router's own answer; the scopes — the write token is offered and reaches
+  every `WRITE_TOOLS` entry, the read listing is exactly the write listing
+  minus them (so a mutation that empties it fails too), a read-scope write
+  call is refused with the router's OWN unknown-tool error (read back from
+  the live router rather than pinned as a literal, so an rmcp bump cannot
+  make the two diverge silently) while a wiremock catch-all proves nothing
+  was POSTed, and a read tool on the same session still serves; an oversized
+  POST from a stranger is answered `401` by the gate and `413` only for a
+  credentialed caller, which is what the 413-observability argument under
+  "rmcp 3.1 usage notes" rests on; a scope-refused call leaves exactly ONE
+  audit record, with no guard verdict, no upstream leg and no `principal`;
+  scopes
+  enforced with NO scope on the request serves an empty listing and refuses
+  every name, the fail-closed branch `main` cannot reach; the constant-time
+  comparison is pinned by source, since `ct_eq` and `==` are behaviorally
+  identical and only the instruction sequence differs; refusal logging is
+  bounded (five refusals, three lines) and carries no token; and the SHIPPED
+  BINARY is spawned for the startup half, on a port this test already holds,
+  so a `main` that bound before checking its credentials would fail with a
+  bind error instead of the token error each case asserts, and a refused start
+  with an `--audit-config` leaves no audit file on disk, pinning the other half
+  of the ordering — with the same spawn proving a stdio start ignores tokens
+  that would refuse an http one.
+  `WRITE_TOOLS` is additionally pinned against every tool's own
+  `read_only_hint` annotation, so the read scope cannot drift from what
+  clients are told.
 - CI: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace --locked`, `cargo deny check`.

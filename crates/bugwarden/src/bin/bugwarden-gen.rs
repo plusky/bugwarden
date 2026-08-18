@@ -110,13 +110,21 @@ fn render_environment(cmd: &clap::Command, buf: &mut Vec<u8>) -> std::io::Result
     writeln!(buf, ".SH ENVIRONMENT")?;
     writeln!(
         buf,
-        "Each variable is the fallback for one option; a command\\-line argument"
+        "Most variables are the fallback for one option; a command\\-line argument"
     )?;
     writeln!(
         buf,
         "always wins over the environment, and the built\\-in default applies when"
     )?;
-    writeln!(buf, "neither is given.")?;
+    writeln!(
+        buf,
+        "neither is given. The two bearer tokens are the exception: they have no"
+    )?;
+    writeln!(
+        buf,
+        "option at all and are read from the environment only, because argv is"
+    )?;
+    writeln!(buf, "world\\-readable.")?;
     for arg in cmd.get_arguments() {
         let Some(env) = arg.get_env() else { continue };
         let long = arg
@@ -130,8 +138,29 @@ fn render_environment(cmd: &clap::Command, buf: &mut Vec<u8>) -> std::io::Result
             long.replace('-', "\\-")
         )?;
     }
+    // The bearer tokens have no option to be the fallback for — they are
+    // environment-only, because argv is world-readable — so the loop above
+    // cannot see them.
+    buf.write_all(HTTP_TOKEN_ENV.as_bytes())?;
     Ok(())
 }
+
+const HTTP_TOKEN_ENV: &str = r".TP
+.B BUGWARDEN_HTTP_TOKEN
+Bearer token granting the write scope over the http transport: every tool the
+guard policy serves. Environment only \- there is no command\-line flag,
+because argv is world\-readable. At least 32 printable non\-space ASCII
+characters.
+.TP
+.B BUGWARDEN_HTTP_READ_TOKEN
+Bearer token granting the read scope over the http transport: the read tools
+only. Same rules, and it must differ from
+.BR BUGWARDEN_HTTP_TOKEN .
+Either token may be set alone; over http, setting neither is a startup error
+unless
+.B \-\-insecure\-no\-auth
+is given.
+";
 
 const EXIT_STATUS: &str = r".SH EXIT STATUS
 .TP
@@ -139,8 +168,9 @@ const EXIT_STATUS: &str = r".SH EXIT STATUS
 Clean shutdown.
 .TP
 .B 1
-Startup or runtime failure: an unreadable policy or audit configuration, a
-key misconfiguration, a Bugzilla client or transport error.
+Startup or runtime failure: a missing or malformed http bearer token, an
+unreadable policy or audit configuration, a key misconfiguration, a Bugzilla
+client or transport error.
 .TP
 .B 2
 Command\-line usage error.
@@ -168,7 +198,7 @@ or
 no audit stream is written.
 ";
 
-const EXAMPLES: &str = r".SH EXAMPLES
+const EXAMPLES: &str = r#".SH EXAMPLES
 Serve a local MCP client over stdio, the server reading the Bugzilla API
 key from a file:
 .PP
@@ -182,10 +212,13 @@ bugwarden \-\-transport stdio \e
 .RE
 .PP
 Listen on HTTP (the default transport, 127.0.0.1:8000), each client
-presenting its own key in the API key header:
+presenting a bearer token to this server and its own key in the API key
+header. The token is minted once and kept \- a value generated inline would
+start a server no client could present a credential to:
 .PP
 .RS 4
 .nf
+export BUGWARDEN_HTTP_TOKEN="$(cat /etc/bugwarden/http\-token)"
 bugwarden \-\-bugzilla\-server https://bugzilla.example.com \e
     \-\-policy /etc/bugwarden/policy.toml
 .fi
@@ -193,13 +226,15 @@ bugwarden \-\-bugzilla\-server https://bugzilla.example.com \e
 .PP
 Listen on HTTP with a server\-held key (container secret, systemd
 LoadCredential): every request is served with this key and the per\-request
-key header is not consulted:
+key header is not consulted, so the bearer token is the only thing a client
+presents:
 .PP
 .RS 4
 .nf
+export BUGWARDEN_HTTP_TOKEN="$(cat /etc/bugwarden/http\-token)"
 bugwarden \-\-bugzilla\-server https://bugzilla.example.com \e
     \-\-api\-key\-file /run/secrets/bugzilla\-api\-key \e
     \-\-policy /etc/bugwarden/policy.toml
 .fi
 .RE
-";
+"#;

@@ -51,6 +51,9 @@ serde_json = "1"
 schemars = { version = "1", features = ["chrono04"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.11"
+# Constant-time byte comparison for the HTTP bearer tokens. Already in the
+# lock file through rustls; this makes the dependency the one it is used as.
+subtle = "2.6"
 thiserror = "2"
 toml = "1.1"
 

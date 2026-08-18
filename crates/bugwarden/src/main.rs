@@ -11,6 +11,7 @@ use anyhow::Context;
 use bugwarden::audit::{
     policy_hash_of, AuditConfig, AuditSink, AuditState, FailMode, TransportKind,
 };
+use bugwarden::http_auth::{self, HttpEnv};
 use bugwarden::{config, server};
 use bugwarden_core::{guard::Guard, policy::Policy};
 use clap::Parser;
@@ -37,6 +38,20 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .init();
+
+    // The http bearer gate, resolved before anything else runs: over http
+    // the port is the access boundary, and a half-configured credential must
+    // never degrade into open access. Ahead of the policy load, the Bugzilla
+    // client, the identity preflight and the audit sink alike, so a token
+    // misconfiguration aborts startup without binding a port, opening a
+    // socket to Bugzilla, or creating or rotating an audit file. `None` for
+    // stdio, where the client owns the process and the tokens are ignored.
+    let http_auth =
+        http_auth::resolve_for(cli.transport, &HttpEnv::from_env(), cli.insecure_no_auth)
+            .map(|auth| auth.map(Arc::new))?;
+    if let Some(auth) = &http_auth {
+        auth.log_startup_mode();
+    }
 
     // Guard policy comes ONLY from the TOML file given at startup (I1);
     // without one the built-in default policy applies.
@@ -111,6 +126,11 @@ async fn main() -> anyhow::Result<()> {
         Some(audit) => server.with_audit(audit),
         None => server,
     };
+    // Per-request scopes exist only where a per-request credential does:
+    // authenticated http. stdio issues none, and --insecure-no-auth issues
+    // none by definition.
+    let server =
+        server.with_scope_enforcement(http_auth.as_ref().is_some_and(|auth| !auth.is_insecure()));
 
     match cfg.transport {
         Transport::Stdio => {
@@ -134,7 +154,14 @@ async fn main() -> anyhow::Result<()> {
                 LocalSessionManager::default().into(),
                 config,
             );
-            let router = axum::Router::new().nest_service("/mcp", service);
+            // `resolve_for` returns the gate for every http start, so the
+            // bail below is unreachable — it exists so a future refactor
+            // that lost the gate fails to serve rather than serving open.
+            let Some(auth) = http_auth else {
+                anyhow::bail!("internal error: the http transport has no resolved bearer gate");
+            };
+            let router =
+                http_auth::guard_router(axum::Router::new().nest_service("/mcp", service), auth);
             let addr = format!("{}:{}", cfg.host, cfg.port);
             tracing::info!("Starting Bugzilla MCP server on {addr}");
             let tcp_listener = tokio::net::TcpListener::bind(&addr)

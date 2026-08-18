@@ -23,7 +23,7 @@ _bugwarden() {
 
     case "${cmd}" in
         bugwarden)
-            opts="-h -V --bugzilla-server --transport --host --port --allowed-hosts --api-key-header --api-key --api-key-file --use-auth-header --read-only --policy --audit-config --help --version"
+            opts="-h -V --bugzilla-server --transport --host --port --allowed-hosts --api-key-header --api-key --api-key-file --use-auth-header --read-only --policy --audit-config --insecure-no-auth --help --version"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

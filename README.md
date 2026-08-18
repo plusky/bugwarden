@@ -107,6 +107,9 @@ is `bug_url`, which computes a URL string locally and contacts nothing.
   them.
 - **`update_bug_fields` and `create_bug` custom fields are restricted** to
   `cf_*` keys as described above.
+- **HTTP is deny-by-default.** The http transport refuses to start without a
+  bearer token unless `--insecure-no-auth` says so explicitly; see
+  [Authentication and scopes](#authentication-and-scopes).
 
 ## Installation
 
@@ -224,18 +227,98 @@ no host.
 
 ### HTTP transport (default)
 
-The server listens on `http://<host>:<port>/mcp`. Each client request carries
-the Bugzilla API key in an HTTP header (default header name: `ApiKey`), so one
-server can serve multiple users with their own keys:
+The server listens on `http://<host>:<port>/mcp`.
+
+#### Authentication and scopes
+
+Unlike stdio — where the client already owns the process it launched — HTTP
+serves anyone who can reach the port, and in [server-held key
+mode](#server-held-key-mode-fleet-deployments) that means serving them with the
+deployment's own Bugzilla credential. Authentication is therefore **mandatory
+and deny-by-default**. Two tokens define two scopes:
+
+| Variable | Scope | Tools |
+| --- | --- | --- |
+| `BUGWARDEN_HTTP_TOKEN` | write | every tool this deployment's policy serves |
+| `BUGWARDEN_HTTP_READ_TOKEN` | read | the read tools only |
+
+Either may be set alone. A caller presents its token as `Authorization: Bearer
+<token>`, which is compared in constant time; anything else — no header, the
+wrong token, another scheme, an unrouted path — gets the same empty `401` with
+`WWW-Authenticate: Bearer`, so probing tells a stranger nothing.
+
+A read-scope caller is offered only the read tools in `tools/list`, and calling
+a write tool anyway is answered exactly as calling a tool that does not exist,
+with no Bugzilla request made. The split is the same set `--read-only` removes
+from the tool router, so the two cannot drift. Because the advertised tool set
+depends on the credential, a client that caches `tools/list` across tokens will
+show a stale list.
+
+Tokens are never accepted as command-line flags — argv is world-readable via
+`ps` — so they come from the environment only. bugwarden reads no `.env` file:
+supply them through the container runtime, or through a systemd unit's
+`EnvironmentFile=` written with a restrictive umask.
+
+Mint one token and keep it: the clients have to present the same value, so a
+token generated inline on the command line (`BUGWARDEN_HTTP_TOKEN=$(openssl
+rand -hex 32) bugwarden …`) starts a server nobody can talk to.
 
 ```bash
+umask 077
+openssl rand -hex 32 > /etc/bugwarden/http-token
+```
+
+```bash
+export BUGWARDEN_HTTP_TOKEN="$(cat /etc/bugwarden/http-token)"
+
 bugwarden \
   --bugzilla-server https://bugzilla.opensuse.org \
   --policy /etc/bugwarden/policy.toml \
   --host 127.0.0.1 --port 8000
 ```
 
-MCP client configuration (exact format varies by client):
+Under systemd, name the file in an `EnvironmentFile=` instead — one
+`BUGWARDEN_HTTP_TOKEN=<value>` line, mode 0600 — so the value never reaches a
+shell history or a `ps` listing.
+
+The server refuses to start — before the port is bound, exit status `1` — when:
+
+- the http transport is in use (it is the default) with no token and no
+  `--insecure-no-auth`;
+- `--insecure-no-auth` is combined with either token;
+- a token is shorter than 32 characters, or contains anything but printable
+  non-space ASCII;
+- the read token equals the write token.
+
+Tokens set while running over stdio are ignored, and so is `--insecure-no-auth`
+— there is no network principal to authenticate there.
+
+`--insecure-no-auth` serves the endpoint with no authentication at all: every
+caller reaching the port gets the full write scope. It is a command-line flag
+with no environment variable, so no ambient value can turn authentication off,
+and the server says so loudly at startup.
+
+> **The transport is plaintext HTTP.** A bearer token sent over it is readable
+> by anything on the path, so do not expose the port beyond a trusted network
+> without terminating TLS in front of it (reverse proxy, service mesh, or an
+> SSH tunnel).
+>
+> **A static bearer token is not MCP's OAuth 2.1 authorization flow.** A client
+> that only implements the spec's `401` → resource-metadata → OAuth dance will
+> not authenticate; use one that lets you set a header. And the token
+> authenticates a *deployment*, not a caller: audit records carry no
+> `principal`, which stays [issue #32](https://github.com/plusky/bugwarden/issues/32)'s
+> job.
+
+#### Bugzilla credentials
+
+Each client request carries the Bugzilla API key in an HTTP header (default
+header name: `ApiKey`), so one server can serve multiple users with their own
+keys. This is independent of the bearer gate above: bearer authenticates the
+caller to bugwarden, the API key authenticates bugwarden's request to Bugzilla.
+
+MCP client configuration (exact format varies by client) — both headers are
+required over http, one for each hop:
 
 ```json
 {
@@ -243,12 +326,17 @@ MCP client configuration (exact format varies by client):
     "bugzilla": {
       "url": "http://127.0.0.1:8000/mcp",
       "headers": {
+        "Authorization": "Bearer YOUR_BUGWARDEN_HTTP_TOKEN",
         "ApiKey": "YOUR_BUGZILLA_API_KEY"
       }
     }
   }
 }
 ```
+
+In [server-held key mode](#server-held-key-mode-fleet-deployments) drop the
+`ApiKey` line: the server supplies the Bugzilla key, so `Authorization` is the
+only credential a client holds — which is the point of that mode.
 
 The header name is configurable with `--api-key-header`. For Bugzilla
 instances that reject the `api_key` query parameter and require
@@ -270,6 +358,8 @@ provisioned as a container secret or a systemd credential
 `--api-key-file ${CREDENTIALS_DIRECTORY}/bugzilla-key`):
 
 ```bash
+export BUGWARDEN_HTTP_TOKEN="$(cat /etc/bugwarden/http-token)"
+
 bugwarden \
   --bugzilla-server https://bugzilla.opensuse.org \
   --policy /etc/bugwarden/policy.toml \
@@ -358,21 +448,28 @@ Command-line arguments take precedence over environment variables.
 | `--api-key <KEY>` | `BUGZILLA_API_KEY` | — | Bugzilla API key. **Required** for `--transport stdio` unless `--api-key-file` provides it; with `http` it is ignored with a warning (clients send the key per request — use `--api-key-file` for a server-held key) |
 | `--api-key-file <PATH>` | `BUGZILLA_API_KEY_FILE` | — | Path to a file holding the Bugzilla API key (container secret, systemd `LoadCredential` path). Mutually exclusive with `--api-key`; an empty value counts as unset. Over `http` this selects server-held key mode: every request is served with this key and the per-request header is not consulted |
 | `--use-auth-header` | `BUGZILLA_USE_AUTH_HEADER` | `false` | Authenticate to Bugzilla with `Authorization: Bearer <key>` instead of the `api_key` query parameter. As an environment variable it takes the literal `true` or `false`, exactly like `MCP_READ_ONLY` |
+| `--insecure-no-auth` | — | `false` | Serve the http endpoint with no bearer authentication: every caller reaching the port gets the full write scope. Command line only — no environment variable can turn authentication off. Refuses to start if a token is also set |
+| — | `BUGWARDEN_HTTP_TOKEN` | — | Bearer token granting the **write** scope over http: every tool the policy serves. Environment only (argv is world-readable); at least 32 printable non-space ASCII characters |
+| — | `BUGWARDEN_HTTP_READ_TOKEN` | — | Bearer token granting the **read** scope over http: the read tools only. Same rules, and it must differ from the write token. Either token may be set alone |
 | `--read-only` | `MCP_READ_ONLY` | `false` | Disable all write tools. Tighten-only: ORed with the policy's `global.read_only`; cannot re-enable writes a policy forbids. As an environment variable it takes the literal `true` or `false` — `1`, `yes` and an empty value are a usage error, not a synonym |
 | `--policy <PATH>` | `BUGWARDEN_POLICY` | — | Path to the guard policy TOML. Without it, an allow-all policy applies (with private comments off and the 2 MiB attachment cap still in force) |
 | `--audit-config <PATH>` | `BUGWARDEN_AUDIT_CONFIG` | — | Path to the audit stream configuration TOML (worked example in [`examples/audit.toml`](examples/audit.toml)). Without it, no audit stream is written. Records carry W3C trace ids when the client sends a `traceparent` in the request's `_meta`, enabling correlation with client-side traces |
 | — | `RUST_LOG` | `info` | Tracing filter for the diagnostic log, which always goes to **stderr** — stdout belongs to the stdio transport. An unparsable value falls back to `info` |
 
-An empty value counts as unset for `--api-key`, `--api-key-file` and
-`--allowed-hosts`, so `BUGZILLA_API_KEY_FILE=` in a unit file leaves the two
-key modes unaffected rather than erroring (under stdio it then leaves no key
-source at all, which is a startup error of its own), and `MCP_ALLOWED_HOSTS=`
-names no host, leaving `Host` validation off as if it were never set. An empty
-`BUGWARDEN_POLICY` or `BUGWARDEN_AUDIT_CONFIG` is a usage error.
+An empty value counts as unset for `--api-key`, `--api-key-file`,
+`--allowed-hosts`, `BUGWARDEN_HTTP_TOKEN` and `BUGWARDEN_HTTP_READ_TOKEN`, so
+`BUGZILLA_API_KEY_FILE=` in a unit file leaves the two key modes unaffected
+rather than erroring (under stdio it then leaves no key source at all, which
+is a startup error of its own), `MCP_ALLOWED_HOSTS=` names no host, leaving
+`Host` validation off as if it were never set, and an emptied token variable
+is an unset one — which over http means the deny-by-default refusal, not an
+open port. An empty `BUGWARDEN_POLICY` or `BUGWARDEN_AUDIT_CONFIG` is a usage
+error.
 
-Exit status: `0` on clean shutdown, `1` on a startup or runtime failure (an
-unreadable policy or audit configuration, a key misconfiguration, a Bugzilla
-client or transport error), `2` on a command-line usage error.
+Exit status: `0` on clean shutdown, `1` on a startup or runtime failure (a
+missing or malformed http bearer token, an unreadable policy or audit
+configuration, a key misconfiguration, a Bugzilla client or transport error),
+`2` on a command-line usage error.
 
 ## Policy file reference
 

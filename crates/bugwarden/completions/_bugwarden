@@ -28,6 +28,7 @@ stdio\:"Stdio transport. The API key comes from \`--api-key\` / \`BUGZILLA_API_K
 '--audit-config=[Path to the audit configuration TOML file (see examples/audit.toml). Environment variable BUGWARDEN_AUDIT_CONFIG can also be used. Without it no audit stream is written]:AUDIT_CONFIG:_files' \
 '--use-auth-header[Use '\''Authorization\: Bearer'\'' header instead of the api_key query parameter (required for some Bugzilla instances). Environment variable BUGZILLA_USE_AUTH_HEADER=true can also be used]' \
 '--read-only[Disables all tools which modify the state of a bug. Environment variable MCP_READ_ONLY=true can also be used. Can only tighten the guard policy, never loosen it]' \
+'--insecure-no-auth[Serve the http transport without bearer authentication. Only for a trusted, isolated network\: every caller that reaches the port gets the full write scope. Command line only, with no environment variable, so no ambient value can turn authentication off. Tokens are never taken from the command line either (argv is world-readable)\: set BUGWARDEN_HTTP_TOKEN / BUGWARDEN_HTTP_READ_TOKEN in the environment]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 '-V[Print version]' \

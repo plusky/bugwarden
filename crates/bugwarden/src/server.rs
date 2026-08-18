@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 
 use crate::audit::{self, AuditCell, AuditState, FailMode, TransportKind, Verdict};
 use crate::config::{Cli, KeyCustody, Transport};
+use crate::http_auth::{self, Scope};
 
 /// The MCP revisions this build actually implements, newest last.
 ///
@@ -432,6 +433,36 @@ fn handshake_required() -> McpError {
         "this server requires the initialize handshake; per-request protocol negotiation is not served",
         None,
     )
+}
+
+/// How much of the tool surface one request's bearer credential reaches.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Reach {
+    /// Every routed tool: scope enforcement is off, or the write scope.
+    Everything,
+    /// The read tools only — the complement of [`WRITE_TOOLS`], which is the
+    /// same set read-only mode removes from the router (I13), so the bearer
+    /// split cannot drift from the policy one.
+    ReadOnly,
+    /// Nothing at all. Only reachable when scopes are enforced and a request
+    /// still carries none, i.e. the gate did not run.
+    Nothing,
+}
+
+/// Whether a read-scope credential reaches `tool`.
+fn read_scope_serves(tool: &str) -> bool {
+    !WRITE_TOOLS.contains(&tool)
+}
+
+/// The refusal for a tool this request's credential does not reach.
+///
+/// Byte-identical to what `ToolRouter` answers for a name it does not route
+/// (rmcp 3.1 `handler/server/router/tool.rs`), so a scope-hidden tool is
+/// indistinguishable from one that does not exist — the same
+/// indistinguishability read-only mode already gives every caller (I13), and
+/// no oracle about which tools the deployment serves (I2).
+fn tool_not_found() -> McpError {
+    McpError::invalid_params("tool not found", None)
 }
 
 /// Total elapsed milliseconds since `started`, saturating.
@@ -1220,6 +1251,10 @@ pub struct BugWarden {
     key_custody: KeyCustody,
     /// Audit wiring; `None` runs the exact pre-audit request path.
     audit: Option<Arc<AuditState>>,
+    /// Whether every request must carry a bearer [`Scope`]. On for
+    /// authenticated http only: stdio has no per-request credential, and
+    /// `--insecure-no-auth` issues none.
+    enforce_scopes: bool,
 }
 
 impl BugWarden {
@@ -1312,6 +1347,7 @@ impl BugWarden {
             tool_router,
             key_custody,
             audit: None,
+            enforce_scopes: false,
         })
     }
 
@@ -1320,6 +1356,20 @@ impl BugWarden {
     /// with auditing off.
     pub fn with_audit(mut self, audit: Arc<AuditState>) -> Self {
         self.audit = Some(audit);
+        self
+    }
+
+    /// Require every request to carry a bearer [`Scope`], and serve a
+    /// read-scope caller the read tools only.
+    ///
+    /// Separate from [`BugWarden::new`] for the same reason
+    /// [`BugWarden::with_audit`] is: whether a request carries a credential
+    /// is a property of the transport it arrives on, not of the policy the
+    /// server enforces. `main` turns it on for an authenticated http
+    /// listener and leaves it off for stdio and for `--insecure-no-auth`.
+    #[must_use]
+    pub fn with_scope_enforcement(mut self, enforce: bool) -> Self {
+        self.enforce_scopes = enforce;
         self
     }
 
@@ -1343,10 +1393,13 @@ impl BugWarden {
     ///   operator bound and named, so that default would refuse every
     ///   deployment not addressed as `localhost`, containers included.
     ///   Disabled deliberately when the operator names no host: the access
-    ///   control here is the network boundary, and per-caller
-    ///   authentication when it lands (issue #32). `--allowed-hosts` /
-    ///   `MCP_ALLOWED_HOSTS` names the authorities this deployment answers
-    ///   to, which only ever narrows what the disabled state serves (I9).
+    ///   control is the bearer gate in front of this service
+    ///   ([`crate::http_auth`]): a rebound browser reaches it with no
+    ///   token and is turned away there, whatever `Host` it sent. That
+    ///   argument lapses under `--insecure-no-auth`, which admits every
+    ///   caller — there `--allowed-hosts` / `MCP_ALLOWED_HOSTS` is how the
+    ///   operator puts the `Host` check back. Naming an authority only
+    ///   ever narrows what the disabled state serves (I9).
     /// * `max_request_body_bytes` is a POST cap with no rmcp 2.2
     ///   equivalent, worth keeping as a memory bound — but it also ceilings
     ///   `add_attachment`, so a fixed value silently overrides the
@@ -1364,7 +1417,8 @@ impl BugWarden {
     /// A body over that cap is refused by rmcp's tower layer with a bare
     /// `413`, which reaches neither `call_tool` nor the guard — so it
     /// leaves NO audit record and names neither the tool nor the caller,
-    /// the same unrecordability as a pre-handler auth refusal (issue #32).
+    /// the same unrecordability as a bearer refusal, which is turned away
+    /// by the layer in front of this service ([`crate::http_auth`]).
     /// An operator diagnosing a 413 therefore has to compare the request
     /// body's size with the cap derived here from
     /// `global.max_attachment_bytes`, since nothing on the server side will
@@ -1521,6 +1575,44 @@ impl BugWarden {
                     )),
                 }
             }
+        }
+    }
+
+    /// What this request's bearer credential reaches.
+    ///
+    /// Fails closed on a missing scope: the gate wraps the whole router, so
+    /// a served request always carries one, and its absence means the
+    /// listener was not wired the way this server was configured. Logged
+    /// once per process rather than per request — the branch is unreachable
+    /// through `main`, and a per-request line would be a log-volume lever if
+    /// it ever became reachable.
+    fn reach(&self, ctx: &RequestContext<RoleServer>) -> Reach {
+        if !self.enforce_scopes {
+            return Reach::Everything;
+        }
+        match http_auth::scope_of(ctx) {
+            Some(Scope::Write) => Reach::Everything,
+            Some(Scope::Read) => Reach::ReadOnly,
+            None => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::error!(
+                        "a request reached the handler with no bearer scope while scope \
+                         enforcement is on; serving nothing. The http listener is not \
+                         wired through the authentication layer"
+                    );
+                });
+                Reach::Nothing
+            }
+        }
+    }
+
+    /// Whether this request's credential reaches `tool` at all.
+    fn reaches(&self, tool: &str, ctx: &RequestContext<RoleServer>) -> bool {
+        match self.reach(ctx) {
+            Reach::Everything => true,
+            Reach::ReadOnly => read_scope_serves(tool),
+            Reach::Nothing => false,
         }
     }
 
@@ -3255,8 +3347,17 @@ impl ServerHandler for BugWarden {
             }
             return Err(handshake_required());
         }
+        // Bearer scope gate (issue #32): a tool this credential does not
+        // reach is refused as unrouted, so the read scope hides the write
+        // tools exactly the way read-only mode hides them (I13). Decided
+        // here, before dispatch and before any upstream request.
+        let reachable = self.reaches(&request.name, &context);
+
         // Auditing off: byte-identical to the macro-generated dispatch.
         let Some(audit) = self.audit.clone() else {
+            if !reachable {
+                return Err(tool_not_found());
+            }
             return self
                 .tool_router
                 .call(ToolCallContext::new(self, request, context))
@@ -3297,7 +3398,20 @@ impl ServerHandler for BugWarden {
         // the gate exists to stop unaudited work, not to retry its way
         // open. The refusal depends on the tool name alone, never on
         // anything the guard decided (the guard never ran).
-        if audit.sink.failing() && gate_applies(audit.fail_mode, &tool) {
+        // Both guards keep the gate off names the router would not have
+        // dispatched anyway. Without them the gate answers a name with its
+        // own text where a healthy sink answers "tool not found", so sink
+        // health — and, through it, whether the deployment serves a tool at
+        // all — is readable off which refusal comes back: `reachable` covers
+        // a write tool the caller's scope hides, `has_route` an unknown name
+        // and a tool this policy removed (read-only, disabled_tools,
+        // allow_discovery). A name the gate never sees is refused as
+        // unrouted below, identically under every fail mode.
+        if reachable
+            && self.tool_router.has_route(&tool)
+            && audit.sink.failing()
+            && gate_applies(audit.fail_mode, &tool)
+        {
             let event = audit::AuditEventKind::ToolCall(Box::new(audit::ToolCallEvent {
                 client,
                 trace: trace.clone(),
@@ -3328,10 +3442,16 @@ impl ServerHandler for BugWarden {
 
         let cell = Arc::new(AuditCell::default());
         context.extensions.insert(Arc::clone(&cell));
-        let result = self
-            .tool_router
-            .call(ToolCallContext::new(self, request, context))
-            .await;
+        // Recorded like any other call, refused or not: exactly one record,
+        // with no guard verdict and no upstream leg, the same shape an
+        // unknown tool name produces.
+        let result = if reachable {
+            self.tool_router
+                .call(ToolCallContext::new(self, request, context))
+                .await
+        } else {
+            Err(tool_not_found())
+        };
 
         // Exactly one record per call, whatever `result` is — including
         // an unknown tool or another protocol error from the router.
@@ -3409,8 +3529,17 @@ impl ServerHandler for BugWarden {
         if skips_the_handshake(&context) {
             return Err(handshake_required());
         }
+        // Filtered, not listed-then-refused: the write tools are simply not
+        // there for a read-scope credential, which is I13's shape applied to
+        // the caller instead of the deployment.
+        let mut tools = self.tool_router.list_all();
+        match self.reach(&context) {
+            Reach::Everything => {}
+            Reach::ReadOnly => tools.retain(|tool| read_scope_serves(&tool.name)),
+            Reach::Nothing => tools.clear(),
+        }
         Ok(ListToolsResult {
-            tools: self.tool_router.list_all(),
+            tools,
             result_type: Some(ResultType::COMPLETE),
             meta: None,
             next_cursor: None,
@@ -3420,9 +3549,11 @@ impl ServerHandler for BugWarden {
             // add fields to responses no peer asked for. When the
             // revision is adopted, `cache_scope` is `Private` — the
             // listing is pruned per deployment by policy and by
-            // read-only mode (I13), so a shared cache must never serve
-            // one deployment's list to another. `CacheScope::default()`
-            // is `Public`; this field is always written by name.
+            // read-only mode (I13), and per CREDENTIAL by the bearer
+            // scope above, so a shared cache must never serve one
+            // deployment's list to another, nor a write list to a read
+            // token. `CacheScope::default()` is `Public`; this field is
+            // always written by name.
             ttl_ms: None,
             cache_scope: None,
         })
@@ -3997,6 +4128,43 @@ mod tests {
     }
 
     #[test]
+    fn write_tools_agrees_with_every_tool_read_only_hint() {
+        // Two descriptions of the same fact live in this file: `WRITE_TOOLS`,
+        // which read-only mode removes from the router (I13) and which the
+        // bearer read scope hides from one caller (#32), and each tool's own
+        // `read_only_hint` annotation, which is what an MCP client is told.
+        // They must agree tool for tool, or a tool added to one and forgotten
+        // in the other would be advertised read-only while the read scope
+        // still refuses it — or, worse, hidden from the annotation and served
+        // to a read token.
+        let (cfg, guard, bz) = parts("[global]\nallow_discovery = true\n");
+        let server = BugWarden::new(cfg, guard, bz).expect("server builds");
+        for tool in server.tool_router.list_all() {
+            let hinted_read_only = tool
+                .annotations
+                .as_ref()
+                .and_then(|a| a.read_only_hint)
+                .unwrap_or(false);
+            assert_eq!(
+                read_scope_serves(&tool.name),
+                hinted_read_only,
+                "{} is in WRITE_TOOLS xor annotated read_only_hint = true",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn read_scope_serves_exactly_the_non_write_tools() {
+        for name in WRITE_TOOLS {
+            assert!(!read_scope_serves(name), "{name}");
+        }
+        for name in ["bug_info", "bugs_quicksearch", "bug_url", "mcp_server_info"] {
+            assert!(read_scope_serves(name), "{name}");
+        }
+    }
+
+    #[test]
     fn discovery_tools_absent_by_default_present_when_enabled_i16() {
         let (cfg, guard, bz) = parts("");
         let server = BugWarden::new(cfg, guard, bz).expect("server builds");
@@ -4532,6 +4700,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scope_enforcement_without_a_scope_serves_nothing() {
+        // Defense in depth for the one branch `main` cannot reach: scopes
+        // enforced, but the request carries none because it arrived over a
+        // transport with no HTTP request behind it. Fail closed — an empty
+        // listing and no reachable tool — rather than assume the listener was
+        // wired the way this server was configured.
+        // No upstream fixture: nothing may reach Bugzilla, and the call
+        // below is refused before any tool body runs.
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz)
+            .expect("server must build")
+            .with_scope_enforcement(true);
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            if let Ok(running) = server.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let client: RunningService<RoleClient, ()> =
+            ().serve(client_io)
+                .await
+                .expect("MCP handshake must succeed");
+
+        assert!(
+            client
+                .list_all_tools()
+                .await
+                .expect("tools/list must succeed")
+                .is_empty(),
+            "a request with no scope must be offered nothing"
+        );
+        let refused = client
+            .call_tool(
+                CallToolRequestParams::new("bug_info".to_string()).with_arguments(
+                    json!({ "bug_ids": [7] })
+                        .as_object()
+                        .expect("object")
+                        .clone(),
+                ),
+            )
+            .await
+            .expect_err("a request with no scope must reach no tool");
+        let unknown = client
+            .call_tool(CallToolRequestParams::new(
+                "no_such_tool_at_all".to_string(),
+            ))
+            .await
+            .expect_err("an unknown tool is an error");
+        assert_eq!(refused.to_string(), unknown.to_string());
+    }
+
+    #[tokio::test]
+    async fn a_scope_refused_call_is_recorded_like_an_unknown_tool() {
+        // Rejection at the transport layer cannot be audited (issue #32
+        // constraint 5), but a scope refusal happens inside `call_tool` and
+        // therefore can be: exactly ONE record, no guard verdict, no upstream
+        // leg — the same shape an unknown tool name produces.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz)
+            .expect("server must build")
+            .with_audit(audit)
+            .with_scope_enforcement(true);
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            if let Ok(running) = server.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let client: RunningService<RoleClient, ()> =
+            ().serve(client_io)
+                .await
+                .expect("MCP handshake must succeed");
+
+        client
+            .call_tool(CallToolRequestParams::new("add_comment".to_string()))
+            .await
+            .expect_err("the call must be refused");
+        drop(client);
+
+        let events = read_audit_events(&audit_path);
+        let calls = tool_calls(&events);
+        assert_eq!(calls.len(), 1, "exactly one record: {events:?}");
+        assert_eq!(calls[0].request.tool, "add_comment");
+        assert_eq!(calls[0].guard, None, "the guard never ran");
+        assert_eq!(calls[0].upstream, None, "Bugzilla was never contacted");
+        assert_eq!(calls[0].outcome.class, audit::OutcomeClass::Error);
+        assert_eq!(
+            calls[0].client.principal, None,
+            "a deployment credential is not a caller (#32)"
+        );
+    }
+
+    #[tokio::test]
     async fn traceparent_in_meta_lands_in_the_tool_record() {
         let mock = MockServer::start().await;
         mount_bug7(&mock).await;
@@ -4664,6 +4927,105 @@ mod tests {
         let guard = calls[0].guard.as_ref().expect("the gate records a guard");
         assert_eq!(guard.verdict, Verdict::Refused);
         assert_trace_is_canonical(calls[0].trace.as_ref());
+    }
+
+    /// A `RequestContext` carrying the HTTP request parts a served request
+    /// would carry, with `scope` attached the way the bearer layer attaches
+    /// it. The only way to reach [`Reach::ReadOnly`] without a live listener.
+    fn context_with_scope(
+        peer: rmcp::service::Peer<RoleServer>,
+        scope: Option<Scope>,
+    ) -> RequestContext<RoleServer> {
+        let (mut parts, ()) = axum::http::Request::new(()).into_parts();
+        if let Some(scope) = scope {
+            parts.extensions.insert(scope);
+        }
+        let mut context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer);
+        context.extensions.insert(parts);
+        context
+    }
+
+    /// A peer for a hand-built context, minted by serving a clone over a
+    /// duplex (the SDK exposes no other constructor). No tool call flows
+    /// through that session.
+    async fn peer_of(server: &BugWarden) -> rmcp::service::Peer<RoleServer> {
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let serving = server.clone();
+        let task = tokio::spawn(async move { serving.serve(server_io).await });
+        let _client = ().serve(client_io).await.expect("MCP handshake must succeed");
+        task.await
+            .expect("serve task must not panic")
+            .expect("server must serve")
+            .peer()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn a_failing_sink_never_tells_a_read_scope_which_names_this_build_routes() {
+        // The audit gate answers a refused call with that TOOL's own failure
+        // text. Reached for a name the router would not have dispatched, it
+        // becomes an existence oracle that opens only while the sink is
+        // failing: a scope-hidden write tool, an unrouted-by-policy tool and
+        // an unknown name must all answer exactly as they do with a healthy
+        // sink. Driven under ClosedAll, which gates everything and is the
+        // http transport's default fail mode.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, _path) = audit_state(dir.path(), FailMode::ClosedAll);
+        // Discovery off (the default), so `bugzilla_products` is a KNOWN
+        // name this deployment does not route — the sibling of the scope
+        // case, and reachable by the read scope.
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz)
+            .expect("server must build")
+            .with_audit(Arc::clone(&audit))
+            .with_scope_enforcement(true);
+        let peer = peer_of(&server).await;
+
+        let answer = |name: &'static str| {
+            let server = server.clone();
+            let peer = peer.clone();
+            async move {
+                let context = context_with_scope(peer, Some(Scope::Read));
+                let params = CallToolRequestParams::new(name.to_string());
+                match ServerHandler::call_tool(&server, params, context).await {
+                    Ok(ok) => format!("ok {ok:?}"),
+                    Err(e) => format!("err {e}"),
+                }
+            }
+        };
+
+        let healthy = (
+            answer("add_comment").await,
+            answer("bugzilla_products").await,
+            answer("no_such_tool_at_all").await,
+        );
+        assert_eq!(healthy.0, healthy.1, "healthy sink: {healthy:?}");
+        assert_eq!(healthy.1, healthy.2, "healthy sink: {healthy:?}");
+
+        audit.sink.set_fail_writes(true);
+        // `failing()` turns true only after a record is actually dropped, so
+        // prime it: without this the first probe below still meets a
+        // not-yet-failing sink and the gate is skipped for the wrong reason.
+        let _ = answer("bug_url").await;
+        assert!(audit.sink.failing(), "the sink must be in failure");
+        let failing = (
+            answer("add_comment").await,
+            answer("bugzilla_products").await,
+            answer("no_such_tool_at_all").await,
+        );
+        assert_eq!(
+            failing.0, failing.2,
+            "a scope-hidden write tool must answer like an unknown name whatever \
+             the sink is doing"
+        );
+        assert_eq!(
+            failing.1, failing.2,
+            "a tool this policy does not route must answer like an unknown name too"
+        );
+        assert_eq!(
+            healthy, failing,
+            "sink health must not be readable off any of the three refusals"
+        );
     }
 
     #[tokio::test]
