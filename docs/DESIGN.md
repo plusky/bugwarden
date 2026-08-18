@@ -1953,7 +1953,34 @@ wired, `server.rs` and `main.rs` are the reference.
   not "there was nothing to withhold". The remaining note sites —
   `bug_history`'s and `bug_comments`' id sets, `bugs_quicksearch`'s two
   id sets and its redaction note — already fail on a clean-call record
-  above, but over fixtures with nothing to weigh.
+  above, but over fixtures with nothing to weigh; and the OPPOSITE
+  direction at the two `note_redacted` sites (issue #94), where the guard
+  condition is correct and the hazard is the note never running at all.
+  `if redacted` in `bug_info` and its `_redacted` equivalent in
+  `bugs_quicksearch` could each be turned into `if false` with the whole
+  suite green, because no test observed a non-empty `redacted_fields`
+  produced by a TOOL CALL: the ones reached from a call were `is_empty()`
+  checks a dead note satisfies trivially, and the non-empty ones drove
+  the cell directly or serialised a hand-built `GuardInfo`. A `restrict`
+  rule granting `summary` alone now drives a real summary view through
+  each tool, and both records name `summary_view`. Neither fixture
+  withholds anything else — `suppressed_count == 0`, no id, and for the
+  search `scan.dropped == 0` — so the projection is the only thing the
+  `served_filtered` verdict can have come from; and a field outside
+  `SUMMARY_FIELDS` (a whiteboard, an `assigned_to` from the tool's default projection)
+  is asserted ABSENT from the envelope, so a policy that stopped
+  restricting fails before any record is read. `bug_info` computes its
+  verdict independently of the note, so a dead note there costs the field
+  alone; the search's verdict comes from the note, so it costs the
+  verdict too. The same blind spot elsewhere in the record: `request.id`
+  and the handshake identity on a TOOL-CALL record had been read only off
+  the hand-built schema fixtures, and are now asserted for every routed
+  tool. Two fields are asserted absent deliberately — `client.principal`
+  because nothing self-declared is ever promoted into it, and the
+  `upstream` block because `note_upstream` has no production caller, so
+  no real record carries one; each is pinned with a value only over the
+  hand-built golden. The http `session` block (its id and remote peer)
+  is observed only over a hand-built value; the stdio arm is pinned.
 - Identity tests (#[cfg(test)] in crates/bugwarden/src/server.rs and
   crates/bugwarden-core/src/client.rs; crates/bugwarden/tests/
   http_transport_wiremock.rs, crates/bugwarden/tests/binary_user_agent.rs
