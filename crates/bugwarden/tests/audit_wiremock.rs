@@ -365,7 +365,30 @@ async fn every_routed_tool_writes_exactly_one_record_per_call() {
             "calling {} must grow the file by exactly one record",
             tool.name
         );
-        assert_eq!(last_tool_call(&events).request.tool, tool.name);
+        // Issue #94's fourth criterion, at the two record fields the same
+        // blind spot covered: `request.id` and the handshake identity on a
+        // TOOL-CALL record were read only off a hand-built `RequestInfo` /
+        // `ClientInfo` in the schema fixtures, so both could be dropped to
+        // `None` on every real call with the suite green. Checked here
+        // because this is the one test that walks the whole router.
+        let tc = last_tool_call(&events);
+        assert_eq!(tc.request.tool, tool.name);
+        assert!(
+            tc.request.id.as_deref().is_some_and(|id| !id.is_empty()),
+            "calling {} must record the JSON-RPC id the transport exposed: {:?}",
+            tool.name,
+            tc.request
+        );
+        assert!(
+            tc.client.name.as_deref().is_some_and(|n| !n.is_empty()),
+            "and the client that introduced itself in the handshake: {:?}",
+            tc.client
+        );
+        assert!(
+            tc.client.version.as_deref().is_some_and(|v| !v.is_empty()),
+            "version too: {:?}",
+            tc.client
+        );
     }
 }
 
@@ -1034,6 +1057,92 @@ async fn bug_info_with_every_link_disclosable_stays_served_and_redacts_nothing()
     );
 }
 
+/// Policy granting `summary` and nothing else over the world product, so
+/// every bug it matches is served as the [`Guard::summary_view`]
+/// projection rather than whole — the one way a tool call reaches
+/// `note_redacted`.
+const SUMMARY_ONLY_POLICY: &str = concat!(
+    "[[rule]]\nname = \"summaries-only\"\naction = \"restrict\"\n",
+    "capabilities = [\"summary\"]\n",
+    "[rule.match]\nproducts = [\"openSUSE\"]\n",
+);
+
+/// Bug 7 as [`SUMMARY_ONLY_POLICY`] sees it. The classification fetch is
+/// the ONLY body bug_info gets — a summary grant earns no second fetch —
+/// and the id=0 row answers the constant-cost link-disclosure padding a
+/// projection with no link fields still pays (I2).
+///
+/// The whiteboard canary is what makes the fixture non-vacuous: it is not
+/// a `SUMMARY_FIELDS` member, so a bug served whole and a bug served as a
+/// projection are told apart by the envelope alone, and a policy that
+/// stopped restricting would fail here before any record was read.
+async fn mount_summary_only_bug(mock: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .mount(mock)
+        .await;
+    let mut bug = world_bug(7);
+    bug["whiteboard"] = json!("canary-whole-body-4d21");
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [bug] })))
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn bug_info_over_a_summary_view_records_the_redaction_it_applied() {
+    // Issue #94, the opposite direction from #88 at the same note: the
+    // `if redacted` guard is CORRECT, and the hazard is the note never
+    // running at all. Nothing observed a non-empty `redacted_fields`
+    // produced by a tool call — the assertions reached from one are
+    // `is_empty()` checks a dead note satisfies trivially, and the
+    // non-empty ones drive the cell directly or serialise a hand-built
+    // `GuardInfo`. The verdict beside the note is computed independently,
+    // so a dead note still leaves the record reading `served_filtered`;
+    // it just no longer says WHICH projection filtered the serve.
+    let mock = MockServer::start().await;
+    mount_summary_only_bug(&mock).await;
+    let audited = audited_client_for(SUMMARY_ONLY_POLICY, &mock, "test-key").await;
+
+    let result = call(&audited.client, "bug_info", json!({ "bug_ids": [7] })).await;
+    assert_ne!(result.is_error, Some(true), "the summary view is served");
+    let envelope = serde_json::to_string(&result).unwrap();
+    assert!(
+        envelope.contains("_redacted"),
+        "the policy serves bug 7 as a summary view, not whole: {envelope}"
+    );
+    assert!(
+        !envelope.contains("canary-whole-body-4d21"),
+        "and the projection keeps no field outside SUMMARY_FIELDS: {envelope}"
+    );
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.request.tool, "bug_info");
+    let guard = tc.guard.as_ref().expect("guard info recorded");
+    assert_eq!(
+        guard.redacted_fields,
+        vec!["summary_view".to_string()],
+        "the record names the projection that produced the verdict: {guard:?}"
+    );
+    assert_eq!(guard.verdict, Verdict::ServedFiltered);
+    assert_eq!(
+        guard.rule.as_deref(),
+        Some("summaries-only"),
+        "and the restrict rule that granted the summary decided the call"
+    );
+    assert_eq!(
+        guard.suppressed_count, 0,
+        "nothing else was withheld, so the summary view is the ONLY thing \
+         the filtered verdict can have come from: {guard:?}"
+    );
+    assert!(guard.suppressed_ids.is_empty());
+}
+
 /// One row of bug 7's attachment metadata, as Bugzilla serves it with the
 /// content excluded.
 fn attachment(id: u64, is_private: bool, file_name: &str) -> Value {
@@ -1336,6 +1445,71 @@ async fn quicksearch_clean_scan_records_zero_drops_and_stays_served() {
     assert_eq!(guard.verdict, Verdict::Served, "a clean scan stays served");
     assert!(guard.suppressed_ids.is_empty());
     assert_eq!(guard.suppressed_count, 0);
+}
+
+#[tokio::test]
+async fn quicksearch_over_summary_views_records_the_redaction_it_applied() {
+    // Issue #94 at the second `note_redacted` site. Every row the scan
+    // kept was projected down to a summary view, and NOTHING was dropped:
+    // `scan.dropped == 0` and an empty suppression leave the redaction
+    // note as the sole reason this window is a filtered serve, so a note
+    // that never fires fails on the verdict as well as on the field.
+    //
+    // `assigned_to` is in the tool's default projection and is not a
+    // `SUMMARY_FIELDS` member, so it reaches the envelope only from a row
+    // served whole — the fixture cannot pass by serving full bugs.
+    let mock = MockServer::start().await;
+    mount_search_corpus(
+        &mock,
+        (1..=3)
+            .map(|id| {
+                let mut bug = world_bug(id);
+                bug["assigned_to"] = json!("canary-assignee-9e73@example.org");
+                bug
+            })
+            .collect(),
+    )
+    .await;
+    let audited = audited_client_for(SUMMARY_ONLY_POLICY, &mock, "test-key").await;
+
+    let result = call(&audited.client, "bugs_quicksearch", json!({ "query": "q" })).await;
+    assert_ne!(result.is_error, Some(true), "the search is served");
+    let envelope = serde_json::to_string(&result).unwrap();
+    assert!(
+        envelope.contains("_redacted"),
+        "every row the policy kept is a summary view: {envelope}"
+    );
+    assert!(
+        !envelope.contains("canary-assignee-9e73"),
+        "and a projected row carries no field outside SUMMARY_FIELDS, \
+         whatever the client asked for: {envelope}"
+    );
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.request.tool, "bugs_quicksearch");
+    let guard = tc.guard.as_ref().expect("guard info recorded");
+    assert_eq!(
+        guard.redacted_fields,
+        vec!["summary_view".to_string()],
+        "the record names the projection every served row went through, \
+         once for the window however many rows it covers: {guard:?}"
+    );
+    assert_eq!(
+        guard.verdict,
+        Verdict::ServedFiltered,
+        "a window of projections is a filtered serve: {guard:?}"
+    );
+    assert_eq!(
+        guard.scan,
+        Some(bugwarden::audit::ScanInfo {
+            scanned: 3,
+            dropped: 0
+        }),
+        "and it is not the scan that filtered it — every row was kept"
+    );
+    assert_eq!(guard.suppressed_count, 0);
+    assert!(guard.suppressed_ids.is_empty());
 }
 
 #[tokio::test]
