@@ -3,7 +3,7 @@
 # Pinned to the channel in rust-toolchain.toml, which this stage never COPYs —
 # so a floating `rust:1` would silently build releases with an unpinned
 # compiler. Bump this tag and rust-toolchain.toml together.
-FROM rust:1.97.0-alpine@sha256:ec9c91e77119ce498cd1e87d96d77e0f75b2cee21655a29bc2bf75a51a2b20a4 AS build
+FROM rust:1.97.1-alpine@sha256:3c38f3f82c2f3d73da3b38e18d279393a04cb43ddded0e35088a8c3324d40900 AS build
 # gcc and musl-dev are already in the base; aws-lc-sys (the rustls crypto
 # provider) compiles C from source and needs cmake plus a make generator.
 RUN apk add --no-cache cmake make
