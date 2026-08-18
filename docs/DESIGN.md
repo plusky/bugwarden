@@ -984,10 +984,11 @@ clap derive `Cli`, with env fallbacks:
 | --transport | MCP_TRANSPORT | http | http \| stdio (clap ValueEnum) |
 | --host | MCP_HOST | 127.0.0.1 | http only |
 | --port | MCP_PORT | 8000 | http only |
+| --allowed-hosts | MCP_ALLOWED_HOSTS | — | http only; Host authorities served, comma/whitespace-separated and repeatable, empty entries dropped so an empty value reads as unset (see rmcp usage notes) |
 | --api-key-header | MCP_API_KEY_HEADER | ApiKey | http per-request key header |
 | --api-key | BUGZILLA_API_KEY | — | required for stdio unless --api-key-file provides it; warn-and-ignore for http (never a silent upgrade to server-held) |
 | --api-key-file | BUGZILLA_API_KEY_FILE | — | file holding the key (container secret / systemd LoadCredential path); mutually exclusive with --api-key; over http selects server-held key mode (see Key custody) |
-| --use-auth-header | — | false | Bearer to Bugzilla instead of api_key query param |
+| --use-auth-header | BUGZILLA_USE_AUTH_HEADER | false | Bearer to Bugzilla instead of api_key query param |
 | --read-only | MCP_READ_ONLY | false | tighten-only (I9) |
 | --policy | BUGWARDEN_POLICY | — | path to guard policy TOML |
 | --audit-config | BUGWARDEN_AUDIT_CONFIG | — | path to audit configuration TOML; without it no audit stream is written |
@@ -1305,7 +1306,7 @@ wired, `server.rs` and `main.rs` are the reference.
 
   | field | rmcp 3.1 default | this build |
   |---|---|---|
-  | `allowed_hosts` | `localhost`, `127.0.0.1`, `::1` | **set** — `disable_allowed_hosts()`, or the operator's `--allowed-hosts` list when given |
+  | `allowed_hosts` | `localhost`, `127.0.0.1`, `::1` | **set** — `disable_allowed_hosts()`, or the operator's `--allowed-hosts` / `MCP_ALLOWED_HOSTS` list when given |
   | `max_request_body_bytes` | 4 MiB | **set** — derived from `global.max_attachment_bytes`, floored at that same 4 MiB (see below) |
   | `cancellation_token` | fresh token | **set** (main.rs) — a child of the process token |
   | `allowed_origins` | `[]`, i.e. validation off | inherited, deliberately |
@@ -1373,11 +1374,18 @@ wired, `server.rs` and `main.rs` are the reference.
   shutdown.
 
   An operator who does know the authorities their deployment answers to names
-  them with a repeated `--allowed-hosts`, which turns that validation back on
+  them with a repeated `--allowed-hosts`, or with `MCP_ALLOWED_HOSTS` as one
+  comma- and/or whitespace-separated list, which turns that validation back on
   for exactly that list. Tighten-only like every other CLI knob (I9), since
-  the disabled state serves every `Host`; command line only, and deliberately
-  without an environment variable, because it is a per-deployment network fact
-  stated where the bind address is stated.
+  the disabled state serves every `Host`. **SUPERSEDED 2026-08-18:** the flag
+  was command line only, on the argument that the hosts are a per-deployment
+  network fact stated where the bind address is stated — the #31/#32 decision
+  that a container configures bugwarden entirely through the environment
+  overrides that, and `--host`/`--port` state the bind address from the
+  environment too. Empty entries are dropped in `Cli::resolved_allowed_hosts`,
+  so `MCP_ALLOWED_HOSTS=` reads as unset (the `BUGZILLA_API_KEY_FILE=`
+  convention) rather than as a list of one authority `host_is_allowed` skips,
+  which would refuse every `Host`.
 
   `allowed_origins` is the browser-facing sibling of `allowed_hosts`, and the
   #32 argument covers it identically. It is inherited rather than named because
@@ -1684,6 +1692,23 @@ wired, `server.rs` and `main.rs` are the reference.
   decoded lands exactly on the 64 MiB ceiling, one quantum below it still
   derives and one above clamps; and `u64::MAX` clamps to the ceiling rather
   than panicking, wrapping, or saturating into an unbounded body.
+- Configuration tests (crates/bugwarden/tests/env_config.rs, the REAL
+  process environment): every flag is settable from the environment, which
+  is what a container deployment configures through (#31/#32). ONE test by
+  construction — it mutates process-global state, which is safe only while
+  no other thread reads it, so the file holds exactly one and says so. It
+  pins `MCP_ALLOWED_HOSTS` carrying a comma- and/or whitespace-separated
+  list into separate trimmed entries, an empty value reading as unset
+  (validation off, not a list of one authority `host_is_allowed` skips,
+  which would refuse every `Host`), `--allowed-hosts` beating the variable
+  since clap takes one source and not the union, and
+  `BUGZILLA_USE_AUTH_HEADER` being read exactly as `MCP_READ_ONLY` is —
+  compared value for value over `true`/`false` and the nine spellings clap
+  refuses, with `Ok(true)`/`Ok(false)` anchors so the parity assertion
+  cannot pass on two flags that are both unset. Two structural siblings
+  keep it from rotting: a `config.rs` unit test fails when any argument
+  lacks an `env` fallback, and `binary_user_agent.rs` holds its child-env
+  scrub list to that same set.
 - Audit tests (crates/bugwarden/tests/audit_wiremock.rs + #[cfg(test)] in
   server.rs and audit.rs): one record per call for EVERY routed tool,
   refusal paths and protocol errors included; the refusal map is total

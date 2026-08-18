@@ -22,6 +22,9 @@
 //!   reading only `context.meta`, is behavior-preserving over every
 //!   serialized transport and is killed by the direct in-process call
 //!   test in server.rs instead);
+//! - keeping the empty entry `MCP_ALLOWED_HOSTS=` produces instead of
+//!   dropping it, which turns Host validation on with nothing rmcp can
+//!   match and refuses every request;
 //! - the POST body cap going back to a fixed value, which refuses uploads
 //!   the operator's `global.max_attachment_bytes` permits, or losing its
 //!   4 MiB floor, which would let a policy shrink the transport's memory
@@ -51,9 +54,13 @@ use wiremock::matchers::{any, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Build the http-transport `Cli` against `mock`, with `key_file` when the
-/// test runs in server-held mode. Both key fields are then set explicitly,
-/// so the ambient environment (`BUGZILLA_API_KEY`, `BUGZILLA_API_KEY_FILE`)
-/// cannot leak into what a test resolves.
+/// test runs in server-held mode. Every field an ambient environment
+/// variable could set behind the fixed arguments below is then assigned
+/// explicitly — the two key sources (`BUGZILLA_API_KEY`,
+/// `BUGZILLA_API_KEY_FILE`) and the Host allowlist (`MCP_ALLOWED_HOSTS`,
+/// which would otherwise refuse the loopback authority the harness dials).
+/// A new environment-backed flag that changes what a test resolves belongs
+/// here too.
 fn http_cli(mock: &MockServer, key_file: Option<&std::path::Path>) -> Arc<Cli> {
     let mut cli = Cli::parse_from([
         "bugwarden",
@@ -66,6 +73,7 @@ fn http_cli(mock: &MockServer, key_file: Option<&std::path::Path>) -> Arc<Cli> {
     ]);
     cli.api_key = None;
     cli.api_key_file = key_file.map(std::path::Path::to_path_buf);
+    cli.allowed_hosts = Vec::new();
     Arc::new(cli)
 }
 
@@ -455,6 +463,45 @@ async fn allowed_hosts_serve_the_named_authority_and_refuse_the_others() {
             if served { "" } else { "not" }
         );
     }
+}
+
+#[tokio::test]
+async fn an_allowed_hosts_entry_naming_no_host_leaves_validation_off() {
+    // `MCP_ALLOWED_HOSTS=` (the set-but-empty "unset" idiom of unit files and
+    // container specs) reaches the server as one empty entry. rmcp validates
+    // against a non-empty list and silently skips the entries it cannot
+    // parse, so carrying that entry through would refuse EVERY Host and brick
+    // the deployment; dropping it restores the documented default instead.
+    let mock = MockServer::start().await;
+    let file = key_file("srv-key\n");
+    let mut cli = Arc::into_inner(http_cli(&mock, Some(file.path()))).expect("the sole owner");
+    cli.allowed_hosts = vec![String::new()];
+    let addr = serve_http(Arc::new(cli), "", &mock, None).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("Host", "bugwarden.example:8080")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "host-probe", "version": "1" }
+            }
+        }))
+        .send()
+        .await
+        .expect("the request must reach the server");
+    let status = response.status();
+    let body = response.text().await.expect("a body");
+    assert!(
+        status.is_success(),
+        "an entry naming no host must leave every Host served, got {status}: {body}"
+    );
 }
 
 #[tokio::test]

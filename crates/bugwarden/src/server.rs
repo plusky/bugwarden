@@ -1344,9 +1344,9 @@ impl BugWarden {
     ///   deployment not addressed as `localhost`, containers included.
     ///   Disabled deliberately when the operator names no host: the access
     ///   control here is the network boundary, and per-caller
-    ///   authentication when it lands (issue #32). `--allowed-hosts` names
-    ///   the authorities this deployment answers to, which only ever
-    ///   narrows what the disabled state serves (I9).
+    ///   authentication when it lands (issue #32). `--allowed-hosts` /
+    ///   `MCP_ALLOWED_HOSTS` names the authorities this deployment answers
+    ///   to, which only ever narrows what the disabled state serves (I9).
     /// * `max_request_body_bytes` is a POST cap with no rmcp 2.2
     ///   equivalent, worth keeping as a memory bound — but it also ceilings
     ///   `add_attachment`, so a fixed value silently overrides the
@@ -1386,9 +1386,12 @@ impl BugWarden {
             .with_max_request_body_bytes(max_request_body_bytes(
                 self.guard.policy.global.max_attachment_bytes,
             ));
-        match self.cfg.allowed_hosts.as_slice() {
+        // `resolved_allowed_hosts` is what decides on/off: an empty list is
+        // the disabled state, and an entry rmcp cannot parse would otherwise
+        // leave validation on with nothing matchable (see config.rs).
+        match self.cfg.resolved_allowed_hosts().as_slice() {
             [] => config,
-            hosts => config.with_allowed_hosts(hosts.iter().map(String::as_str)),
+            hosts => config.with_allowed_hosts(hosts.iter().copied()),
         }
     }
 

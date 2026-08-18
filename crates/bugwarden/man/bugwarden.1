@@ -50,7 +50,7 @@ Host address for the MCP server to listen on (http transport only). Defaults to 
 Port for the MCP server to listen on (http transport only). Defaults to 8000 or the MCP_PORT environment variable
 .TP
 \fB\-\-allowed\-hosts\fR \fI<HOST>\fR
-Hostname or \*(Aqhost:port\*(Aq authority accepted in an inbound Host header (http transport only). Repeat the flag to allow further hosts. Command line only, no environment variable; without it Host validation stays off and any Host header is served
+Hostname or \*(Aqhost:port\*(Aq authority accepted in an inbound Host header (http transport only). Repeat the flag, or separate entries with commas or whitespace; environment variable MCP_ALLOWED_HOSTS can also be used. Empty entries are dropped, so `MCP_ALLOWED_HOSTS=` is an unset (like `BUGZILLA_API_KEY_FILE=`); without a host, Host validation stays off and any Host header is served
 .TP
 \fB\-\-api\-key\-header\fR \fI<API_KEY_HEADER>\fR [default: ApiKey]
 HTTP header for clients to send the Bugzilla API key. Defaults to \*(AqApiKey\*(Aq or the MCP_API_KEY_HEADER environment variable. Not consulted in server\-held key mode (\-\-api\-key\-file over http)
@@ -62,7 +62,7 @@ Bugzilla API key. Required for \-\-transport stdio (no HTTP headers exist there)
 Path to a file holding the Bugzilla API key (e.g. a container secret or systemd LoadCredential path). Mutually exclusive with \-\-api\-key. Over http this selects server\-held key mode: every request is served with this key and the per\-request API key header is not consulted. An empty value counts as absent, like \-\-api\-key (so `BUGZILLA_API_KEY_FILE=` is an unset, not an error)
 .TP
 \fB\-\-use\-auth\-header\fR
-Use \*(AqAuthorization: Bearer\*(Aq header instead of the api_key query parameter (required for some Bugzilla instances)
+Use \*(AqAuthorization: Bearer\*(Aq header instead of the api_key query parameter (required for some Bugzilla instances). Environment variable BUGZILLA_USE_AUTH_HEADER=true can also be used
 .TP
 \fB\-\-read\-only\fR
 Disables all tools which modify the state of a bug. Environment variable MCP_READ_ONLY=true can also be used. Can only tighten the guard policy, never loosen it
@@ -106,6 +106,9 @@ Fallback for \fB\-\-host\fR.
 .B MCP_PORT
 Fallback for \fB\-\-port\fR.
 .TP
+.B MCP_ALLOWED_HOSTS
+Fallback for \fB\-\-allowed\-hosts\fR.
+.TP
 .B MCP_API_KEY_HEADER
 Fallback for \fB\-\-api\-key\-header\fR.
 .TP
@@ -114,6 +117,9 @@ Fallback for \fB\-\-api\-key\fR.
 .TP
 .B BUGZILLA_API_KEY_FILE
 Fallback for \fB\-\-api\-key\-file\fR.
+.TP
+.B BUGZILLA_USE_AUTH_HEADER
+Fallback for \fB\-\-use\-auth\-header\fR.
 .TP
 .B MCP_READ_ONLY
 Fallback for \fB\-\-read\-only\fR.

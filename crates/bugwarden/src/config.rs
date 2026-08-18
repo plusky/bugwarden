@@ -52,10 +52,12 @@ pub struct Cli {
     pub port: u16,
 
     /// Hostname or 'host:port' authority accepted in an inbound Host header
-    /// (http transport only). Repeat the flag to allow further hosts. Command
-    /// line only, no environment variable; without it Host validation stays
+    /// (http transport only). Repeat the flag, or separate entries with
+    /// commas or whitespace; environment variable MCP_ALLOWED_HOSTS can also
+    /// be used. Empty entries are dropped, so `MCP_ALLOWED_HOSTS=` is an unset
+    /// (like `BUGZILLA_API_KEY_FILE=`); without a host, Host validation stays
     /// off and any Host header is served.
-    #[arg(long, value_name = "HOST")]
+    #[arg(long, env = "MCP_ALLOWED_HOSTS", value_name = "HOST")]
     pub allowed_hosts: Vec<String>,
 
     /// HTTP header for clients to send the Bugzilla API key. Defaults to
@@ -87,8 +89,9 @@ pub struct Cli {
     pub api_key_file: Option<PathBuf>,
 
     /// Use 'Authorization: Bearer' header instead of the api_key query
-    /// parameter (required for some Bugzilla instances).
-    #[arg(long)]
+    /// parameter (required for some Bugzilla instances). Environment
+    /// variable BUGZILLA_USE_AUTH_HEADER=true can also be used.
+    #[arg(long, env = "BUGZILLA_USE_AUTH_HEADER")]
     pub use_auth_header: bool,
 
     /// Disables all tools which modify the state of a bug. Environment
@@ -153,6 +156,26 @@ pub enum KeyCustody {
 }
 
 impl Cli {
+    /// The Host authorities this deployment answers to: every
+    /// `--allowed-hosts` occurrence, or `MCP_ALLOWED_HOSTS` when the flag is
+    /// absent — clap takes one source, not both — split on commas and
+    /// whitespace so one variable can carry a list, with empty entries
+    /// dropped.
+    ///
+    /// Dropping them is what makes `MCP_ALLOWED_HOSTS=` read as unset (the
+    /// `BUGZILLA_API_KEY_FILE=` convention) instead of naming one unmatchable
+    /// authority: rmcp validates against a non-empty list, and an entry it
+    /// cannot parse is skipped, so a lone empty entry would refuse every
+    /// Host. Naming a host only ever narrows what the disabled state serves
+    /// (I9); dropping an empty one restores exactly the documented default.
+    pub fn resolved_allowed_hosts(&self) -> Vec<&str> {
+        self.allowed_hosts
+            .iter()
+            .flat_map(|entry| entry.split(|c: char| c == ',' || c.is_whitespace()))
+            .filter(|host| !host.is_empty())
+            .collect()
+    }
+
     /// Resolve who holds the Bugzilla API key — the whole table, once, at
     /// startup.
     ///
@@ -421,6 +444,75 @@ mod tests {
         cli.api_key_file = Some(PathBuf::new());
         let msg = format!("{:#}", resolve_err(&cli));
         assert!(msg.contains("--transport stdio requires"), "{msg}");
+    }
+
+    #[test]
+    fn every_flag_declares_an_environment_fallback() {
+        // Container deployments configure bugwarden entirely through the
+        // environment (issues #31/#32), so a flag without an `env` fallback
+        // is a hole in that contract — this fails the moment one appears.
+        let mut cmd = command();
+        cmd.build();
+        let env_less: Vec<String> = cmd
+            .get_arguments()
+            .filter(|arg| !matches!(arg.get_id().as_str(), "help" | "version"))
+            .filter(|arg| arg.get_env().is_none())
+            .map(|arg| arg.get_id().to_string())
+            .collect();
+        assert!(
+            env_less.is_empty(),
+            "every flag needs an environment fallback, these have none: {env_less:?}"
+        );
+        let env_of = |id: &str| {
+            cmd.get_arguments()
+                .find(|arg| arg.get_id().as_str() == id)
+                .and_then(clap::Arg::get_env)
+                .map(|env| env.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            env_of("allowed_hosts").as_deref(),
+            Some("MCP_ALLOWED_HOSTS")
+        );
+        assert_eq!(
+            env_of("use_auth_header").as_deref(),
+            Some("BUGZILLA_USE_AUTH_HEADER")
+        );
+    }
+
+    #[test]
+    fn allowed_hosts_split_on_commas_and_whitespace_dropping_empties() {
+        // One environment variable has to be able to carry the whole list,
+        // and both sources feed the one field — so the normalization the
+        // environment needs is proven here, on the flag.
+        let cli = Cli::parse_from([
+            "bugwarden",
+            "--bugzilla-server",
+            "https://bugzilla.example.com",
+            "--allowed-hosts",
+            "a.example:8000, b.example",
+            "--allowed-hosts",
+            "  c.example\td.example  ",
+            "--allowed-hosts",
+            "",
+        ]);
+        assert_eq!(
+            cli.resolved_allowed_hosts(),
+            ["a.example:8000", "b.example", "c.example", "d.example"]
+        );
+
+        // An entry naming no host leaves validation off — `MCP_ALLOWED_HOSTS=`
+        // is unset, not "allow nothing" (see `resolved_allowed_hosts`).
+        let cli = Cli::parse_from([
+            "bugwarden",
+            "--bugzilla-server",
+            "https://bugzilla.example.com",
+            "--allowed-hosts",
+            " ,, ",
+        ]);
+        assert!(
+            cli.resolved_allowed_hosts().is_empty(),
+            "an entry naming no host must leave Host validation off"
+        );
     }
 
     #[test]

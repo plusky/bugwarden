@@ -353,21 +353,22 @@ Command-line arguments take precedence over environment variables.
 | `--transport <http\|stdio>` | `MCP_TRANSPORT` | `http` | MCP transport. `stdio` is for subprocess launches by an MCP client; `http` exposes a network endpoint at `/mcp` |
 | `--host <ADDRESS>` | `MCP_HOST` | `127.0.0.1` | Listen address (http transport only) |
 | `--port <PORT>` | `MCP_PORT` | `8000` | Listen port (http transport only) |
-| `--allowed-hosts <HOST>` | — | — | Hostname or `host:port` authority accepted in an inbound `Host` header (http transport only). Repeatable; each occurrence adds one host. Without it no `Host` validation happens, so a client may address the server by any name |
+| `--allowed-hosts <HOST>` | `MCP_ALLOWED_HOSTS` | — | Hostname or `host:port` authority accepted in an inbound `Host` header (http transport only). Repeatable, and each value may list several hosts separated by commas and/or whitespace. Without any host no `Host` validation happens, so a client may address the server by any name |
 | `--api-key-header <NAME>` | `MCP_API_KEY_HEADER` | `ApiKey` | HTTP header name in which clients send the Bugzilla API key (http transport only). Not consulted in server-held key mode |
 | `--api-key <KEY>` | `BUGZILLA_API_KEY` | — | Bugzilla API key. **Required** for `--transport stdio` unless `--api-key-file` provides it; with `http` it is ignored with a warning (clients send the key per request — use `--api-key-file` for a server-held key) |
 | `--api-key-file <PATH>` | `BUGZILLA_API_KEY_FILE` | — | Path to a file holding the Bugzilla API key (container secret, systemd `LoadCredential` path). Mutually exclusive with `--api-key`; an empty value counts as unset. Over `http` this selects server-held key mode: every request is served with this key and the per-request header is not consulted |
-| `--use-auth-header` | — | `false` | Authenticate to Bugzilla with `Authorization: Bearer <key>` instead of the `api_key` query parameter |
+| `--use-auth-header` | `BUGZILLA_USE_AUTH_HEADER` | `false` | Authenticate to Bugzilla with `Authorization: Bearer <key>` instead of the `api_key` query parameter. As an environment variable it takes the literal `true` or `false`, exactly like `MCP_READ_ONLY` |
 | `--read-only` | `MCP_READ_ONLY` | `false` | Disable all write tools. Tighten-only: ORed with the policy's `global.read_only`; cannot re-enable writes a policy forbids. As an environment variable it takes the literal `true` or `false` — `1`, `yes` and an empty value are a usage error, not a synonym |
 | `--policy <PATH>` | `BUGWARDEN_POLICY` | — | Path to the guard policy TOML. Without it, an allow-all policy applies (with private comments off and the 2 MiB attachment cap still in force) |
 | `--audit-config <PATH>` | `BUGWARDEN_AUDIT_CONFIG` | — | Path to the audit stream configuration TOML (worked example in [`examples/audit.toml`](examples/audit.toml)). Without it, no audit stream is written. Records carry W3C trace ids when the client sends a `traceparent` in the request's `_meta`, enabling correlation with client-side traces |
 | — | `RUST_LOG` | `info` | Tracing filter for the diagnostic log, which always goes to **stderr** — stdout belongs to the stdio transport. An unparsable value falls back to `info` |
 
-An empty value counts as unset for `--api-key` and `--api-key-file` only, so
-`BUGZILLA_API_KEY_FILE=` in a unit file leaves the two key modes unaffected
-rather than erroring (under stdio it then leaves no key source at all, which
-is a startup error of its own). An empty `BUGWARDEN_POLICY` or
-`BUGWARDEN_AUDIT_CONFIG` is a usage error.
+An empty value counts as unset for `--api-key`, `--api-key-file` and
+`--allowed-hosts`, so `BUGZILLA_API_KEY_FILE=` in a unit file leaves the two
+key modes unaffected rather than erroring (under stdio it then leaves no key
+source at all, which is a startup error of its own), and `MCP_ALLOWED_HOSTS=`
+names no host, leaving `Host` validation off as if it were never set. An empty
+`BUGWARDEN_POLICY` or `BUGWARDEN_AUDIT_CONFIG` is a usage error.
 
 Exit status: `0` on clean shutdown, `1` on a startup or runtime failure (an
 unreadable policy or audit configuration, a key misconfiguration, a Bugzilla

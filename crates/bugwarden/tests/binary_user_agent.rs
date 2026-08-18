@@ -20,6 +20,51 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// hanging the suite until CI's own timeout kills it.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The ambient environment must not reach the child: every one of these is
+/// read by `Cli` (`RUST_LOG` only muddies the captured stderr). Scrubbed as
+/// one set rather than per test — the http-only knobs are inert for a stdio
+/// run today, and pruning them is how the list falls behind `Cli` again.
+/// `the_scrub_list_covers_every_environment_fallback` holds it to every
+/// `env`-backed flag, so adding one cannot quietly leave a hole here.
+const SCRUBBED_ENV: [&str; 13] = [
+    "BUGZILLA_SERVER",
+    "BUGZILLA_API_KEY",
+    "BUGZILLA_API_KEY_FILE",
+    "BUGZILLA_USE_AUTH_HEADER",
+    "BUGWARDEN_POLICY",
+    "BUGWARDEN_AUDIT_CONFIG",
+    "MCP_TRANSPORT",
+    "MCP_HOST",
+    "MCP_PORT",
+    "MCP_ALLOWED_HOSTS",
+    "MCP_API_KEY_HEADER",
+    "MCP_READ_ONLY",
+    "RUST_LOG",
+];
+
+/// The scrub list above is only as good as its coverage of `Cli`, and a
+/// flag added with an `env` fallback would otherwise go on reaching the
+/// child from the developer's or the runner's environment.
+#[test]
+fn the_scrub_list_covers_every_environment_fallback() {
+    let mut cmd = bugwarden::config::command();
+    cmd.build();
+    let unscrubbed: Vec<String> = cmd
+        .get_arguments()
+        .filter_map(clap::Arg::get_env)
+        .map(|env| env.to_string_lossy().into_owned())
+        .filter(|env| !SCRUBBED_ENV.contains(&env.as_str()))
+        .collect();
+    assert!(
+        !SCRUBBED_ENV.is_empty() && cmd.get_arguments().any(|arg| arg.get_env().is_some()),
+        "the check is only evidence while both lists are non-empty"
+    );
+    assert!(
+        unscrubbed.is_empty(),
+        "these environment fallbacks reach the spawned binary: {unscrubbed:?}"
+    );
+}
+
 /// The identity this build must present. Spelled out rather than read from
 /// the manifest the code reads: a comparison against `CARGO_PKG_REPOSITORY`
 /// agrees with whatever that field says, including a repository belonging
@@ -54,18 +99,7 @@ async fn upstream_requests_of_a_real_run(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    // The ambient environment must not reach the child: every one of these
-    // is read by `Cli` and would change what is under test.
-    for var in [
-        "BUGZILLA_SERVER",
-        "BUGZILLA_API_KEY",
-        "BUGZILLA_API_KEY_FILE",
-        "BUGWARDEN_POLICY",
-        "BUGWARDEN_AUDIT_CONFIG",
-        "MCP_TRANSPORT",
-        "MCP_READ_ONLY",
-        "RUST_LOG",
-    ] {
+    for var in SCRUBBED_ENV {
         cmd.env_remove(var);
     }
     let mut child = cmd.spawn().expect("the built binary must start");

@@ -20,13 +20,13 @@ _bugwarden() {
 stdio\:"Stdio transport. The API key comes from \`--api-key\` / \`BUGZILLA_API_KEY\` or \`--api-key-file\` at startup"))' \
 '--host=[Host address for the MCP server to listen on (http transport only). Defaults to 127.0.0.1 or the MCP_HOST environment variable]:HOST:_default' \
 '--port=[Port for the MCP server to listen on (http transport only). Defaults to 8000 or the MCP_PORT environment variable]:PORT:_default' \
-'*--allowed-hosts=[Hostname or '\''host\:port'\'' authority accepted in an inbound Host header (http transport only). Repeat the flag to allow further hosts. Command line only, no environment variable; without it Host validation stays off and any Host header is served]:HOST:_default' \
+'*--allowed-hosts=[Hostname or '\''host\:port'\'' authority accepted in an inbound Host header (http transport only). Repeat the flag, or separate entries with commas or whitespace; environment variable MCP_ALLOWED_HOSTS can also be used. Empty entries are dropped, so \`MCP_ALLOWED_HOSTS=\` is an unset (like \`BUGZILLA_API_KEY_FILE=\`); without a host, Host validation stays off and any Host header is served]:HOST:_default' \
 '--api-key-header=[HTTP header for clients to send the Bugzilla API key. Defaults to '\''ApiKey'\'' or the MCP_API_KEY_HEADER environment variable. Not consulted in server-held key mode (--api-key-file over http)]:API_KEY_HEADER:_default' \
 '--api-key=[Bugzilla API key. Required for --transport stdio (no HTTP headers exist there) unless --api-key-file provides it. Environment variable BUGZILLA_API_KEY can also be used. Ignored for --transport http (clients send the key per-request via the API key header; use --api-key-file for a server-held key)]:API_KEY:_default' \
 '--api-key-file=[Path to a file holding the Bugzilla API key (e.g. a container secret or systemd LoadCredential path). Mutually exclusive with --api-key. Over http this selects server-held key mode\: every request is served with this key and the per-request API key header is not consulted. An empty value counts as absent, like --api-key (so \`BUGZILLA_API_KEY_FILE=\` is an unset, not an error)]:API_KEY_FILE:_files' \
 '--policy=[Path to the guard policy TOML file. Environment variable BUGWARDEN_POLICY can also be used. Without it an allow-all default policy is used]:POLICY:_files' \
 '--audit-config=[Path to the audit configuration TOML file (see examples/audit.toml). Environment variable BUGWARDEN_AUDIT_CONFIG can also be used. Without it no audit stream is written]:AUDIT_CONFIG:_files' \
-'--use-auth-header[Use '\''Authorization\: Bearer'\'' header instead of the api_key query parameter (required for some Bugzilla instances)]' \
+'--use-auth-header[Use '\''Authorization\: Bearer'\'' header instead of the api_key query parameter (required for some Bugzilla instances). Environment variable BUGZILLA_USE_AUTH_HEADER=true can also be used]' \
 '--read-only[Disables all tools which modify the state of a bug. Environment variable MCP_READ_ONLY=true can also be used. Can only tighten the guard policy, never loosen it]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
