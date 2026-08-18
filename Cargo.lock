@@ -216,6 +216,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
+ "http",
  "reqwest",
  "rmcp",
  "schemars",

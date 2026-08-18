@@ -200,8 +200,9 @@ impl Cli {
     /// A non-empty list in which any entry is not a matchable Host
     /// authority (`*`, a scheme-carrying URL, `a;b`, a percent-encoded
     /// comma, zero-width unicode, a space-containing typo) is a startup
-    /// error. rmcp 3.1.2's `parse_allowed_authority` would otherwise keep
-    /// the list (validation on) and either drop the entry or store a host
+    /// error. Bare IPv6 (`::1`) is matchable: it is rmcp's default
+    /// loopback spelling. rmcp 3.1.2's `parse_allowed_authority` would
+    /// otherwise keep an unparsable list (validation on) and store a host
     /// no inbound `Host` header will ever equal — a silent deny-all.
     pub fn checked_allowed_hosts(&self) -> anyhow::Result<Option<Vec<&str>>> {
         let hosts = self.resolved_allowed_hosts();
@@ -294,40 +295,46 @@ impl Cli {
     }
 }
 
-/// True when `entry` is a hostname or `host:port` a client could send as
-/// `Host` — stricter than rmcp 3.1.2's `parse_allowed_authority`, which
-/// accepts `*` and `a;b` as authorities and falls back to treating anything
-/// `http::uri::Authority` rejects (a URL, encoded commas, zero-width
-/// unicode) as a raw host that never matches.
+/// True when `entry` is a Host authority rmcp 3.1.2 would compare to a
+/// successfully parsed inbound `Host`.
+///
+/// `http::uri::Authority` is the same parser rmcp uses. A bare IPv6
+/// literal (`::1`) fails that parse (too many colons); rmcp then falls
+/// back to `normalize_host("::1")`, which equals inbound `Host: [::1]`
+/// after the same bracket strip. We accept that form by wrapping it and
+/// re-parsing — `std::net::Ipv6Addr` is the gate so we do not wrap junk
+/// (`foo%2cbar` becomes a valid Authority inside `[]`). `*` and
+/// sub-delim hosts (`a;b`) parse as an authority but no MCP client
+/// sends them as `Host`, so they stay refused.
 fn is_matchable_host_authority(entry: &str) -> bool {
-    if let Some(rest) = entry.strip_prefix('[') {
-        let Some((addr, after)) = rest.split_once(']') else {
-            return false;
-        };
-        if addr.is_empty()
-            || !addr
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.'))
-        {
-            return false;
-        }
-        return match after.strip_prefix(':') {
-            Some(port) => is_tcp_port(port),
-            None => after.is_empty(),
-        };
+    if let Ok(auth) = http::uri::Authority::try_from(entry) {
+        return is_matchable_parsed_authority(entry, &auth);
     }
-
-    // A colon is only a port separator when the suffix is a TCP port, so
-    // `a:b` is refused rather than treated as host `a`.
-    match entry.rsplit_once(':') {
-        Some((host, port)) if is_tcp_port(port) => is_dns_or_ipv4_host(host),
-        Some((_, _)) => false,
-        None => is_dns_or_ipv4_host(entry),
+    if entry.parse::<std::net::Ipv6Addr>().is_err() {
+        return false;
     }
+    let wrapped = format!("[{entry}]");
+    http::uri::Authority::try_from(wrapped.as_str()).is_ok()
 }
 
-fn is_tcp_port(port: &str) -> bool {
-    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
+fn is_matchable_parsed_authority(entry: &str, auth: &http::uri::Authority) -> bool {
+    if entry.contains('@') {
+        return false;
+    }
+    let host = auth.host();
+    // `host:` and `host:99999` parse with `port_u16() == None` and would
+    // match any port; a written port that is not a u16 is a typo.
+    if entry.len() > host.len()
+        && entry.as_bytes().get(host.len()) == Some(&b':')
+        && auth.port_u16().is_none()
+    {
+        return false;
+    }
+    let host = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse::<std::net::Ipv6Addr>().is_ok() || is_dns_or_ipv4_host(host)
 }
 
 fn is_dns_or_ipv4_host(host: &str) -> bool {
@@ -713,6 +720,32 @@ mod tests {
                 "[::1]:8000",
                 "mcp.example.org",
             ])
+        );
+    }
+
+    #[test]
+    fn unbracketed_ipv6_loopback_is_a_matchable_allowed_host() {
+        // rmcp's default allowlist is `localhost`, `127.0.0.1`, `::1`.
+        // Authority rejects bare `::1`; rmcp then normalize_host's it to
+        // the same string inbound `Host: [::1]` becomes. Refusing it made
+        // the whole comma-list a startup error.
+        for entry in ["::1", "[::1]", "[::1]:8000", "2001:db8::1"] {
+            let mut cli = base_cli("http");
+            cli.allowed_hosts = vec![entry.to_owned()];
+            assert_eq!(
+                cli.checked_allowed_hosts()
+                    .unwrap_or_else(|e| panic!("{entry} must be matchable: {e:#}")),
+                Some(vec![entry]),
+                "{entry}"
+            );
+        }
+
+        let mut cli = base_cli("http");
+        cli.allowed_hosts = vec!["localhost,127.0.0.1,::1".into()];
+        assert_eq!(
+            cli.checked_allowed_hosts()
+                .expect("rmcp's loopback set must stay one valid list"),
+            Some(vec!["localhost", "127.0.0.1", "::1"])
         );
     }
 
