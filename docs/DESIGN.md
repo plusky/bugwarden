@@ -1427,6 +1427,28 @@ wired, `server.rs` and `main.rs` are the reference.
   is unserved. When it is adopted, `cache_scope` is `Private` — the listing is
   pruned per deployment (I13), so a shared cache must never serve one
   deployment's list to another — and `CacheScope::default()` is `Public`.
+- **rmcp trap — `input_schema` is schemars' rendering, unfiltered by rmcp.**
+  `SchemaSettings::draft2020_12()` (`handler/server/common.rs`) runs zero
+  transforms, so whatever schemars 1.x emits for a `#[tool]` param struct is
+  exactly what `list_tools` / `get_tool` serve. schemars renders `Option<T>`
+  as `"type": [T, "null"]` plus a stray `"default": null`, and a Rust integer
+  width as `format: "uint64"` / `"uint32"` — neither is portable: a
+  Gemini/Vertex client rewrites the type union into `anyOf: [{...},
+  {"type":"null"}]` while leaving `description` / `format` / `default` as
+  *siblings* of it, a shape Vertex itself then refuses ("when using any_of,
+  it must be the only field set"). `BugWarden::new` runs `portable_schema`
+  (server.rs) over every route's `input_schema` once, at construction —
+  before the `disabled_tools` check — collapsing the union to a plain type,
+  dropping the resulting `"default": null`, and dropping any `format` not in
+  `PORTABLE_FORMATS` (`date-time`, `int32`, `int64`, `float`, `double`,
+  `enum`; `uint64`/`uint32` are schemars' own annotations for a constraint
+  `type: integer` + `minimum: 0` already carries, enforced by the
+  deserializer regardless of what the schema advertises). serde still accepts
+  an explicit `null` for every `Option<T>` field — only the advertisement got
+  stricter — so no tool's accepted input changed and no invariant (I1–I16) is
+  involved. `ToolRouter::map` and `ToolRoute::attr` are public fields of
+  `#[non_exhaustive]` structs; an rmcp upgrade that reshapes either breaks
+  the build loudly rather than silently skipping the pass.
 - **Every `StreamableHttpServerConfig` field is accounted for below** — set by
   name or inherited for a stated reason. `BugWarden::http_server_config()`
   (server.rs) names two; main.rs adds a third at the call site. The struct is
