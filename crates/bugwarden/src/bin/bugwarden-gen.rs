@@ -169,8 +169,8 @@ Clean shutdown.
 .TP
 .B 1
 Startup or runtime failure: a missing or malformed http bearer token, an
-unreadable policy or audit configuration, a key misconfiguration, a Bugzilla
-client or transport error.
+unreadable policy or audit configuration, a key misconfiguration, an
+unparsable \-\-allowed\-hosts list, a Bugzilla client or transport error.
 .TP
 .B 2
 Command\-line usage error.
