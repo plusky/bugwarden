@@ -772,17 +772,15 @@ mod tests {
         });
         // Five refusals, three lines: 1, 2, 4. A mutation that logged every
         // refusal — an unauthenticated log-volume lever — fails here.
+        let text = logs.as_str();
         assert_eq!(
-            logs.matches("http bearer authentication refused a request")
+            text.matches("http bearer authentication refused a request")
                 .count(),
             3,
-            "{logs}"
+            "{text}"
         );
-        assert!(logs.contains("refused=4"), "{logs}");
-        assert!(
-            !logs.contains(WRITE),
-            "the log must carry no token (I12): {logs}"
-        );
+        crate::testlog::assert_logged(&logs, "refused=4");
+        logs.assert_not_contains(WRITE);
     }
 
     #[test]
@@ -795,14 +793,13 @@ mod tests {
         ] {
             let auth = HttpAuth::resolve(&e, insecure).expect("resolve");
             let ((), logs) = crate::testlog::capture_logs(|| auth.log_startup_mode());
-            // Positive first, so the I12 negative below is evidence and not
-            // just an empty capture passing.
+            let text = logs.as_str();
             assert!(
-                logs.contains("http authentication:") || logs.contains("--insecure-no-auth"),
-                "{logs}"
+                text.contains("http authentication:") || text.contains("--insecure-no-auth"),
+                "{text}"
             );
-            assert!(!logs.contains(WRITE), "{logs}");
-            assert!(!logs.contains(READ), "{logs}");
+            logs.assert_not_contains(WRITE);
+            logs.assert_not_contains(READ);
         }
     }
 
