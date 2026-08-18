@@ -17,6 +17,19 @@ updates:
 
   # GitHub Actions used by the workflows. Keeps the SHA-pinned actions in
   # ci.yml / release.yml current so they cannot silently rot.
+  #
+  # Pin every action to a commit a version tag points at, and name that
+  # release in the trailing `# vX.Y.Z` comment. This file cannot enforce it:
+  # the github-actions ecosystem has no "releases only" setting, and the
+  # property lives in the SHA in the workflow, not here. Dependabot follows
+  # version tags for a SHA pin only while the pinned commit is itself
+  # tagged; for an untagged SHA it falls back to the head of the branch
+  # containing that commit and keeps it there, so one bump onto an untagged
+  # commit converts a release pin into branch-tracking, and preserves it
+  # once there. Swatinem/rust-cache was pinned to an untagged commit from
+  # the start, so it never left branch-tracking (#102). A tagged pin
+  # re-arms release-following on its own; what catches a relapse is
+  # checking a bumped SHA against the `# vX.Y.Z` comment it claims.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
