@@ -1682,7 +1682,7 @@ async fn whoami_transport_error_does_not_leak_the_api_key_i12() {
         call(&client, "bug_info", json!({ "bug_ids": [7] })),
     )
     .await
-    .expect("connect to the refused extra-loopback must not hang");
+    .expect("connect to the refused privileged port must not hang");
     let text = serde_json::to_string(&result).unwrap();
     assert!(
         !text.contains("SUPERSECRETKEY123"),

@@ -289,7 +289,7 @@ async fn preflight_transport_error_does_not_leak_the_api_key_i12() {
 
     let err = tokio::time::timeout(common::REFUSED_CONNECT_BUDGET, server.preflight())
         .await
-        .expect("connect to the refused extra-loopback must not hang")
+        .expect("connect to the refused privileged port must not hang")
         .expect_err("an unreachable whoami endpoint must fail preflight");
     let msg = format!("{err:#} {err:?}");
     assert!(
