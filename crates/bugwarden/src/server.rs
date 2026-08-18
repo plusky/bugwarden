@@ -1236,6 +1236,56 @@ pub struct BugFieldsParams {
     pub on_bug_entry_only: bool,
 }
 
+/// `format` values a Gemini/Vertex client accepts in a tool's `inputSchema`.
+///
+/// A keep-list, not a deny-list: schemars also emits `uint64` / `uint32` for
+/// Rust integer widths, which Vertex does not recognize. Dropping them loses
+/// no constraint the deserializer doesn't already enforce — `type: integer`
+/// plus `minimum: 0` carries the non-negativity, and the actual width is
+/// enforced by serde at deserialization, never by the advertised schema.
+const PORTABLE_FORMATS: &[&str] = &["date-time", "int32", "int64", "float", "double", "enum"];
+
+/// Rewrites a schemars-generated `inputSchema` node in place so a
+/// Gemini/Vertex client accepts it.
+///
+/// schemars renders `Option<T>` as `"type": [T, "null"]` plus a stray
+/// `"default": null`. Vertex's client rewrites that union into
+/// `anyOf: [{...}, {"type": "null"}]` while keeping `description` /
+/// `format` / `default` as *siblings* of `anyOf` — a shape Vertex itself
+/// then refuses ("when using any_of, it must be the only field set").
+/// Collapsing the union to a plain type before it ever reaches the client
+/// starves that rewrite of its input. Recurses into `properties` and
+/// `items` because the same union can appear nested (for example inside an
+/// array parameter's `items`).
+fn portable_schema(node: &mut Value) {
+    let Value::Object(obj) = node else {
+        return;
+    };
+    if let Some(Value::Array(types)) = obj.get_mut("type") {
+        types.retain(|t| t.as_str() != Some("null"));
+        if types.len() == 1 {
+            let only = types.remove(0);
+            obj.insert("type".to_string(), only);
+        }
+    }
+    if obj.get("default") == Some(&Value::Null) {
+        obj.remove("default");
+    }
+    if let Some(format) = obj.get("format").and_then(Value::as_str) {
+        if !PORTABLE_FORMATS.contains(&format) {
+            obj.remove("format");
+        }
+    }
+    if let Some(properties) = obj.get_mut("properties").and_then(Value::as_object_mut) {
+        for prop in properties.values_mut() {
+            portable_schema(prop);
+        }
+    }
+    if let Some(items) = obj.get_mut("items") {
+        portable_schema(items);
+    }
+}
+
 /// The MCP server: guard policy, Bugzilla client, and the pruned tool
 /// router (I13). Construct with [`BugWarden::new`]; serve over any rmcp
 /// transport.
@@ -1307,6 +1357,15 @@ impl BugWarden {
             );
         }
         let mut tool_router = Self::tool_router();
+        // One normalization pass covers both `list_tools` and `get_tool`,
+        // since both read from the same routed `Tool::input_schema`.
+        for route in tool_router.map.values_mut() {
+            let mut schema = Value::Object((*route.attr.input_schema).clone());
+            portable_schema(&mut schema);
+            if let Value::Object(obj) = schema {
+                route.attr.input_schema = Arc::new(obj);
+            }
+        }
         // Validate disabled_tools against the FULL router, before any route
         // removal: a write-tool name stays a valid entry even when read-only
         // mode removes that route first.
@@ -4216,6 +4275,82 @@ mod tests {
             server.get_tool("bug_info").is_some(),
             "a live tool keeps its definition"
         );
+    }
+
+    /// Recursive walk mirroring [`portable_schema`]'s own recursion, so the
+    /// assertion covers the same nodes the normalization pass touches.
+    fn assert_schema_is_client_portable(node: &Value, tool: &str) {
+        let Value::Object(obj) = node else {
+            return;
+        };
+        assert!(
+            !matches!(obj.get("type"), Some(Value::Array(_))),
+            "{tool}: schema still has a type union: {obj:?}"
+        );
+        assert_ne!(
+            obj.get("default"),
+            Some(&Value::Null),
+            "{tool}: schema still advertises \"default\": null: {obj:?}"
+        );
+        if let Some(format) = obj.get("format").and_then(Value::as_str) {
+            assert!(
+                PORTABLE_FORMATS.contains(&format),
+                "{tool}: schema advertises non-portable format {format:?}: {obj:?}"
+            );
+        }
+        for key in ["anyOf", "oneOf", "allOf", "$ref", "$defs"] {
+            assert!(
+                !obj.contains_key(key),
+                "{tool}: schema uses unsupported {key}: {obj:?}"
+            );
+        }
+        if let Some(properties) = obj.get("properties").and_then(Value::as_object) {
+            for prop in properties.values() {
+                assert_schema_is_client_portable(prop, tool);
+            }
+        }
+        if let Some(items) = obj.get("items") {
+            assert_schema_is_client_portable(items, tool);
+        }
+    }
+
+    #[test]
+    fn served_tool_schemas_are_client_portable() {
+        let (cfg, guard, bz) = parts("[global]\nallow_discovery = true\n");
+        let server = BugWarden::new(cfg, guard, bz).expect("server builds");
+        for tool in server.tool_router.list_all() {
+            assert_schema_is_client_portable(
+                &Value::Object((*tool.input_schema).clone()),
+                &tool.name,
+            );
+        }
+    }
+
+    #[test]
+    fn bug_comments_new_since_is_a_plain_date_time() {
+        let (cfg, guard, bz) = parts("[global]\nallow_discovery = true\n");
+        let server = BugWarden::new(cfg, guard, bz).expect("server builds");
+        let tool = server
+            .get_tool("bug_comments")
+            .expect("bug_comments is routed");
+        let new_since = tool.input_schema["properties"]["new_since"].clone();
+        assert_eq!(
+            new_since,
+            json!({
+                "description": "Only return comments newer than this date.",
+                "format": "date-time",
+                "type": "string",
+            }),
+            "new_since must be a plain nullable-free date-time string"
+        );
+    }
+
+    #[test]
+    fn optional_params_still_accept_an_explicit_null() {
+        // The advertised schema got stricter; what serde accepts did not.
+        let value = json!({"id": 1, "new_since": null});
+        serde_json::from_value::<BugCommentsParams>(value)
+            .expect("an explicit null for an Option field must still deserialize");
     }
 
     #[test]
