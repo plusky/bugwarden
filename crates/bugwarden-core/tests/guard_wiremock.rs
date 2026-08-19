@@ -34,13 +34,13 @@ fn client(server: &MockServer) -> BugzillaClient {
 
 /// Connect-time failure that wiremock's 127.0.0.1 pool cannot serve (#115).
 ///
-/// `127.0.0.1:1` is a privileged port: a non-root wiremock listener binds
-/// `127.0.0.1:0` and cannot occupy it. Both Linux and macOS refuse
-/// immediately if nothing is listening (unlike `127.0.0.2`, which is not
-/// aliased on macOS and hangs). A bounded probe refuses to return an
-/// address that accepted or timed out. The URL is built from the probed
-/// socket so the two cannot drift, and the port must stay privileged so
-/// a bind-then-drop of an ephemeral port fails this helper.
+/// The address is `127.0.0.1:1`. Port 1 is privileged: a non-root
+/// wiremock listener binds `127.0.0.1:0` and cannot occupy it, so a
+/// pooled listener from another test cannot answer this request. The
+/// load-bearing assertion is `port() < 1024` — a bind-then-drop of an
+/// ephemeral port fails the helper. A 500 ms TCP probe refuses to
+/// return an address that accepted or timed out; the URL is built from
+/// the probed socket so the two cannot drift.
 fn refused_base_url() -> String {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
     assert!(
