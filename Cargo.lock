@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "bugwarden"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "bugwarden-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
