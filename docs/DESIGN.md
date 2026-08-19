@@ -1997,7 +1997,17 @@ wired, `server.rs` and `main.rs` are the reference.
   id whatever the answer (nonexistent vs withheld cost the same), repeated
   ids fetched once, no batch to poison; per-id
   fallback fail closed; comment privacy; error mapping; API key absent from
-  error text (I12); create_bug and add_attachment endpoint mapping (payload
+  error text (I12) — the I12 transport-error sites connect to
+  `127.0.0.1:1` (a privileged port a non-root wiremock `bind(127.0.0.1:0)`
+  cannot occupy); `assert!(addr.port() < 1024)` is the mutation-kill for a
+  bind-then-drop of an ephemeral port, a 500 ms TCP probe refuses an
+  address that accepted or timed out, the client call is capped at 2 s,
+  and the assertion requires reqwest's `error sending request` so an
+  empty or HTTP-status error cannot pass a bare `!contains(KEY)`
+  (issue #115; known history, issue #127: PR #124 landed as `a0f535f`
+  then `137e552` — the first still describes `127.0.0.2:1` and fails
+  rust-macos; `main` is not rewritten); create_bug and add_attachment
+  endpoint mapping (payload
   travels untouched to POST /rest/bug and /rest/bug/{id}/attachment);
   whoami endpoint mapping (GET /rest/whoami => the `name` login; a missing,
   non-string, or blank — empty/whitespace-only — name is a failure), the
