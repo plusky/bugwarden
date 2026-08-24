@@ -381,8 +381,6 @@ fn read_key_file(path: &Path) -> anyhow::Result<String> {
 mod tests {
     use std::io::Write as _;
 
-    use clap::Parser as _;
-
     use super::*;
 
     /// A `Cli` for `transport` with both key sources explicitly cleared, so

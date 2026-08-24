@@ -17,7 +17,10 @@ cargo deny check
 ```
 
 Use the toolchain pinned in `rust-toolchain.toml` (repo root, currently
-`1.97.0`). The workspace MSRV is declared once in `Cargo.toml`
+`1.98.0`). That pin, the `toolchain:` inputs in `.github/workflows/`, and
+the `FROM rust:` tag in the `Dockerfile` all name the same version and move
+together; the `rust-msrv` and `rust-beta` inputs are deliberate exceptions.
+The workspace MSRV is declared once in `Cargo.toml`
 (`rust-version = "1.88"`); do not introduce APIs or dependencies which
 require a newer compiler without deliberately updating both the pin and the
 MSRV policy. CI and reproducible local checks use the committed
