@@ -181,6 +181,39 @@ jobs:
             exit 1
           fi
 
+  toolchain-drift:
+    # The image build stage never COPYs rust-toolchain.toml, so a base-image
+    # bump can move the container's rustc off the pinned channel with nothing
+    # failing. Deliberately not behind the `changes` paths filter: the check
+    # is two sed calls, and paths-filter would skip it on a tag push.
+    # release.yml is a separate workflow this job cannot hold back, so on a
+    # tag it only reports the mismatch that shipped; the PR run is where it
+    # flags a bump before it lands.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compare Dockerfile rust tags with rust-toolchain.toml channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          tags="$(sed -n 's/^FROM rust:\([0-9][0-9.]*\)-alpine.*/\1/p' Dockerfile)"
+          channel="$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)"
+          if [ -z "$tags" ] || [ -z "$channel" ]; then
+            echo "::error::cannot read the Rust version: Dockerfile FROM tags '$tags', rust-toolchain.toml channel '$channel'"
+            exit 1
+          fi
+          # Check every rust stage, so a second one cannot drift past the guard.
+          while IFS= read -r tag; do
+            if [ "$tag" != "$channel" ]; then
+              echo "::error::toolchain drift: Dockerfile builds on rust:$tag but rust-toolchain.toml pins channel $channel -- bump both together"
+              exit 1
+            fi
+          done <<< "$tags"
+          echo "in sync: Dockerfile rust:$channel == rust-toolchain.toml channel $channel"
+
   changes:
     # Gate for the docker job: a full image build on every PR would be the
     # slowest leg in CI for changes that cannot affect it.

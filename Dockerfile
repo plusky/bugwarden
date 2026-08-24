@@ -2,7 +2,8 @@
 
 # Pinned to the channel in rust-toolchain.toml, which this stage never COPYs —
 # so a floating `rust:1` would silently build releases with an unpinned
-# compiler. Bump this tag and rust-toolchain.toml together.
+# compiler. Bump this tag and rust-toolchain.toml together; ci.yml's
+# toolchain-drift job fails when they disagree.
 FROM rust:1.98.0-alpine@sha256:a10e64dd139b7387337c7fbe8aca31b959b57b2fd4c8ae20a02cf1d6ea424dce AS build
 # gcc and musl-dev are already in the base; aws-lc-sys (the rustls crypto
 # provider) compiles C from source and needs cmake plus a make generator.
