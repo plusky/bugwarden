@@ -2,5 +2,5 @@
 # toolchain input in .github/workflows/ci.yml; the workspace MSRV
 # (rust-version in Cargo.toml) is a separate, lower bound.
 [toolchain]
-channel = "1.97.1"
+channel = "1.98.0"
 components = ["rustfmt", "clippy"]
