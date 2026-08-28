@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+use base64::{engine::general_purpose, Engine as _};
 use bugwarden_core::client::{BugzillaClient, CLASSIFY_FIELDS};
 use bugwarden_core::guard::{Guard, SearchRequest, SearchWindow};
 use bugwarden_core::policy::{Access, Action, Capability, IdentitySource};
@@ -277,6 +278,7 @@ const PARAM_ALLOWLIST: &[&str] = &[
     "file_name",
     "groups",
     "head",
+    "head_lines",
     "id",
     "include_fields",
     "include_private",
@@ -286,6 +288,7 @@ const PARAM_ALLOWLIST: &[&str] = &[
     "keywords_add",
     "keywords_remove",
     "limit",
+    "max_chars",
     "max_comment_length",
     "new_since",
     "offset",
@@ -300,6 +303,7 @@ const PARAM_ALLOWLIST: &[&str] = &[
     "severity",
     "status",
     "tail",
+    "tail_lines",
     "target_milestone",
     "version",
 ];
@@ -1041,6 +1045,129 @@ fn is_inline_image(mime: &str) -> bool {
     )
 }
 
+/// Whether attachment content of this media type may be windowed as text by
+/// `download_attachment`'s head_lines/tail_lines/max_chars parameters.
+///
+/// Same base-type extraction as [`is_inline_image`], and the media type is
+/// just as uploader-chosen: windowing decodes the payload as lossy UTF-8 and
+/// never trusts it to be well-formed text, so a "text/plain" coredump of
+/// near-bytes yields replacement characters in the served output, never a
+/// panic. The `application/*` entries are a fixed allowlist, exactly as
+/// conservative as the raster one.
+fn is_windowable_text(mime: &str) -> bool {
+    let base = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    base.starts_with("text/")
+        || matches!(
+            base.as_str(),
+            "application/json"
+                | "application/xml"
+                | "application/javascript"
+                | "application/x-sh"
+                | "application/x-ndjson"
+                | "application/yaml"
+        )
+}
+
+/// Decode a base64 attachment payload to text for windowing. `None` on
+/// invalid base64 — the caller then serves the payload exactly as the
+/// un-windowed path would; it already passed both attachment gates, so the
+/// fallback gives up nothing.
+///
+/// Whitespace is stripped first (`decoded_len` ignores it for the same
+/// reason: some encoders wrap lines). The decoded bytes are not trusted to
+/// be UTF-8: lossy conversion, never a panic.
+fn decode_attachment_text(blob: &str) -> Option<String> {
+    let cleaned: String = blob.chars().filter(|c| !c.is_whitespace()).collect();
+    let bytes = general_purpose::STANDARD.decode(cleaned).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Unconditional ceiling on the characters a windowed attachment may put in
+/// the model's text channel — it applies with no caller `max_chars` and with
+/// no operator byte cap.
+///
+/// `max_attachment_bytes` bounds DECODED BYTES, but the windowed serve is a
+/// JSON text block: JSON escapes every C0 byte as `\u00XX` (6 chars) and
+/// lossy UTF-8 turns every invalid byte into U+FFFD (3 bytes). `content_type`
+/// is uploader-chosen and never validated, so 2 MiB of `0x01` labelled
+/// `text/plain` is ONE `lines()` line — `head_lines: 1` takes the serve-whole
+/// branch and would emit ~12 MiB of escapes, six times the cap it passed.
+/// 200k chars is well past any payload a model can use and still bounds the
+/// worst case (all-C0) at ~1.2 MiB of JSON.
+const MAX_WINDOW_CHARS: usize = 200_000;
+
+/// Decoded attachment text after windowing, plus the accounting the summary
+/// block's `truncation` object carries.
+struct WindowedText {
+    text: String,
+    total_lines: usize,
+    /// Lines present in the SERVED text — counted AFTER the char cap, so a
+    /// caller computing `total_lines - shown_lines` never reads 0 omitted
+    /// over a payload the cap mostly dropped. A line the cap cut short still
+    /// counts as shown.
+    shown_lines: usize,
+    truncated_chars: bool,
+}
+
+impl WindowedText {
+    /// Whether windowing actually removed content — the bar for the audit
+    /// stream's `attachment_window` redaction note.
+    fn cut_anything(&self) -> bool {
+        self.shown_lines < self.total_lines || self.truncated_chars
+    }
+}
+
+/// Apply `download_attachment`'s windowing to decoded text: `head_lines` /
+/// `tail_lines` select lines of the FULL text, then a character cap — the
+/// smaller of the caller's `max_chars` and [`MAX_WINDOW_CHARS`], which binds
+/// even when the caller named none. Unicode-safe throughout — the line
+/// windows never split a line and the char cap never splits a character.
+fn window_text(
+    full: &str,
+    head_lines: Option<u32>,
+    tail_lines: Option<u32>,
+    max_chars: Option<u32>,
+) -> WindowedText {
+    let total_lines = full.lines().count();
+    let head = head_lines.unwrap_or(0) as usize;
+    let tail = tail_lines.unwrap_or(0) as usize;
+    // No line window asked for, or the two windows already cover the whole
+    // text: serve it whole. Both conditions are needed — a zero-line text
+    // makes the second true for a caller who asked for neither.
+    let windowed = if (head_lines.is_none() && tail_lines.is_none())
+        || head.saturating_add(tail) >= total_lines
+    {
+        full.to_owned()
+    } else {
+        let lines: Vec<&str> = full.lines().collect();
+        let mut out = lines[..head].join("\n");
+        if head > 0 && tail > 0 {
+            out.push('\n');
+        }
+        out.push_str(&lines[total_lines - tail..].join("\n"));
+        out
+    };
+    let cap = max_chars.map_or(MAX_WINDOW_CHARS, |max| (max as usize).min(MAX_WINDOW_CHARS));
+    let (text, truncated_chars) = if windowed.chars().count() > cap {
+        (windowed.chars().take(cap).collect(), true)
+    } else {
+        (windowed, false)
+    };
+    WindowedText {
+        // Counted on the FINAL text: the char cap can drop lines the line
+        // window kept.
+        shown_lines: text.lines().count(),
+        text,
+        total_lines,
+        truncated_chars,
+    }
+}
+
 fn default_status() -> String {
     "ALL".to_string()
 }
@@ -1339,6 +1466,18 @@ pub struct DownloadAttachmentParams {
     /// Allow downloading a private attachment (subject to server policy).
     #[serde(default)]
     pub include_private: bool,
+    /// Text-ish attachments only: return the first this many lines of the
+    /// decoded content.
+    #[serde(default)]
+    pub head_lines: Option<u32>,
+    /// Text-ish attachments only: return the last this many lines of the
+    /// decoded content, appended after the head window.
+    #[serde(default)]
+    pub tail_lines: Option<u32>,
+    /// Text-ish attachments only: cap the returned content at this many
+    /// characters, applied after any line windowing.
+    #[serde(default)]
+    pub max_chars: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -3158,7 +3297,7 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Download the content of a single attachment by its attachment id (see list_attachments). Raster images are returned as image content, everything else as a base64 blob resource. Subject to server policy: a size limit applies, and private attachments must be requested explicitly.",
+        description = "Download the content of a single attachment by its attachment id (see list_attachments). Raster images are returned as image content, everything else as a base64 blob resource. For text-ish content types (any text/* plus a small application/* allowlist: json, xml, javascript, x-sh, x-ndjson, yaml), the optional head_lines / tail_lines / max_chars parameters instead return the decoded content windowed — first and/or last lines of the full text, the result then capped in characters — as a plain text block, with truncation counts added to the JSON summary; on any other content type the parameters are ignored (noted in the summary) and the attachment is served normally. Subject to server policy: a size limit applies, and private attachments must be requested explicitly.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn download_attachment(
@@ -3310,26 +3449,67 @@ impl BugWarden {
             .and_then(Value::as_str)
             .unwrap_or("attachment")
             .to_string();
-        let summary = json!({
+        let mut summary = json!({
             "id": p.attachment_id,
             "bug_id": assess_id,
             "file_name": file_name,
             "content_type": mime,
             "size": attachment.get("size").cloned().unwrap_or(Value::Null),
         });
-        let content = if is_inline_image(&mime) {
-            ContentBlock::image(blob, mime)
+        // Windowing is a presentation concern and runs LAST, on the decoded
+        // text of a payload that already passed both attachment gates and the
+        // size re-check (I8) — it never widens what may be fetched, and it is
+        // never consulted on a denial path (I2). It applies only to text-ish
+        // content the client asked to window: params on an image or binary
+        // payload are noted as ignored rather than errored, and no params at
+        // all is byte-identical to the un-windowed response.
+        let windowed = if p.head_lines.is_some() || p.tail_lines.is_some() || p.max_chars.is_some()
+        {
+            if is_windowable_text(&mime) {
+                match decode_attachment_text(&blob) {
+                    Some(full) => Some(window_text(&full, p.head_lines, p.tail_lines, p.max_chars)),
+                    // Non-canonical base64: the whole payload ships as a blob.
+                    // Say so, or a caller that asked for three lines cannot
+                    // tell its window was dropped on the floor.
+                    None => {
+                        summary["windowing_ignored"] = json!("payload is not valid base64");
+                        None
+                    }
+                }
+            } else {
+                summary["windowing_ignored"] = json!("not a text content type");
+                None
+            }
         } else {
-            // The uri carries only the attachment id: `file_name` is chosen by
-            // whoever uploaded the attachment and may contain `../`, control
-            // characters, or query/fragment syntax. It is reported in the
-            // summary block above, where it is inert.
-            ContentBlock::resource(ResourceContents::BlobResourceContents {
-                uri: format!("bugzilla://attachment/{}", p.attachment_id),
-                mime_type: Some(mime),
-                blob,
-                meta: None,
-            })
+            None
+        };
+        let content = match windowed {
+            Some(window) => {
+                if window.cut_anything() {
+                    if let Some(cell) = audit_cell(&ctx) {
+                        cell.note_redacted("attachment_window");
+                    }
+                }
+                summary["truncation"] = json!({
+                    "total_lines": window.total_lines,
+                    "shown_lines": window.shown_lines,
+                    "truncated_chars": window.truncated_chars,
+                });
+                ContentBlock::text(window.text)
+            }
+            None if is_inline_image(&mime) => ContentBlock::image(blob, mime),
+            None => {
+                // The uri carries only the attachment id: `file_name` is chosen by
+                // whoever uploaded the attachment and may contain `../`, control
+                // characters, or query/fragment syntax. It is reported in the
+                // summary block above, where it is inert.
+                ContentBlock::resource(ResourceContents::BlobResourceContents {
+                    uri: format!("bugzilla://attachment/{}", p.attachment_id),
+                    mime_type: Some(mime),
+                    blob,
+                    meta: None,
+                })
+            }
         };
         Ok(CallToolResult::success(vec![
             ContentBlock::text(serde_json::to_string(&summary).unwrap_or_default()),
@@ -5019,6 +5199,149 @@ mod tests {
         assert!(!is_inline_image("application/octet-stream"));
         assert!(!is_inline_image("image/"));
         assert!(!is_inline_image("imagexpng"));
+    }
+
+    #[test]
+    fn windowable_text_covers_text_prefix_and_the_application_allowlist() {
+        assert!(is_windowable_text("text/plain"));
+        assert!(is_windowable_text("TEXT/PLAIN"));
+        assert!(is_windowable_text("text/html; charset=utf-8"));
+        assert!(is_windowable_text("application/json"));
+        assert!(is_windowable_text("application/xml"));
+        assert!(is_windowable_text("application/javascript"));
+        assert!(is_windowable_text("application/x-sh"));
+        assert!(is_windowable_text("application/x-ndjson"));
+        assert!(is_windowable_text("application/yaml; charset=utf-8"));
+        // Everything else keeps the blob path: near-misses included.
+        assert!(!is_windowable_text("application/octet-stream"));
+        assert!(!is_windowable_text("image/png"));
+        assert!(!is_windowable_text("application/json5"));
+        // Script-bearing (see is_inline_image): a future "allowlist *+xml"
+        // refactor must not sweep svg into the text channel.
+        assert!(!is_windowable_text("image/svg+xml"));
+        assert!(!is_windowable_text("textile"));
+        assert!(!is_windowable_text("text"));
+        assert!(!is_windowable_text(""));
+    }
+
+    #[test]
+    fn decode_attachment_text_tolerates_wrapping_and_lossy_utf8() {
+        assert_eq!(decode_attachment_text("YWJj"), Some("abc".to_string()));
+        // Wrapped base64 decodes exactly as the unwrapped payload.
+        assert_eq!(
+            decode_attachment_text("YWJj\nZGU="),
+            Some("abcde".to_string())
+        );
+        // Invalid UTF-8 becomes replacement characters, never a panic.
+        assert_eq!(decode_attachment_text("gA=="), Some("\u{FFFD}".to_string()));
+        // Invalid base64 falls back to the un-windowed path.
+        assert_eq!(decode_attachment_text("%%%not-base64%%%"), None);
+    }
+
+    #[test]
+    fn window_text_head_plus_tail_selects_lines_of_the_full_text() {
+        let full = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10";
+        let w = window_text(full, Some(2), Some(2), None);
+        assert_eq!(w.text, "l1\nl2\nl9\nl10");
+        assert_eq!(w.total_lines, 10);
+        assert_eq!(w.shown_lines, 4);
+        assert!(!w.truncated_chars);
+        assert!(w.cut_anything(), "lines were dropped");
+        // Head only, tail only.
+        assert_eq!(window_text(full, Some(1), None, None).text, "l1");
+        assert_eq!(window_text(full, None, Some(1), None).text, "l10");
+    }
+
+    #[test]
+    fn window_text_covering_windows_serve_the_text_whole() {
+        let full = "a\nb\nc";
+        for (head, tail) in [(Some(2), Some(1)), (Some(10), None), (None, Some(3))] {
+            let w = window_text(full, head, tail, None);
+            assert_eq!(w.text, full);
+            assert_eq!(w.shown_lines, 3);
+            assert!(!w.cut_anything(), "nothing was cut: no audit note");
+        }
+    }
+
+    #[test]
+    fn window_text_max_chars_alone_caps_the_full_text() {
+        let full = "hello world\nsecond line";
+        let w = window_text(full, None, None, Some(5));
+        assert_eq!(w.text, "hello");
+        assert_eq!(w.total_lines, 2);
+        // Counted on the served fragment, not on the pre-cap text: a caller
+        // subtracting shown from total must not read "nothing omitted".
+        assert_eq!(w.shown_lines, 1);
+        assert!(w.truncated_chars);
+        assert!(w.cut_anything(), "characters were dropped");
+        // A cap beyond the text cuts nothing and stays silent.
+        let w = window_text(full, None, None, Some(1000));
+        assert_eq!(w.text, full);
+        assert!(!w.cut_anything());
+    }
+
+    #[test]
+    fn window_text_max_chars_counts_characters_never_bytes() {
+        // Four 2-byte chars: a byte-oriented cap would split one.
+        let full = "éééé";
+        let w = window_text(full, None, None, Some(2));
+        assert_eq!(w.text, "éé");
+        assert!(w.truncated_chars);
+        // The char cap applies AFTER the line window.
+        let w = window_text("ab\ncd\nef\ngh", Some(1), Some(1), Some(3));
+        assert_eq!(w.text, "ab\n");
+        // The cap ate the tail line the window had selected.
+        assert_eq!(w.shown_lines, 1);
+        assert!(w.truncated_chars);
+    }
+
+    #[test]
+    fn window_text_shown_lines_counts_the_served_text_after_the_cap() {
+        let full = "l1\nl2\nl3\nl4\nl5";
+        // max_chars alone: eight chars is two whole lines plus a fragment.
+        let w = window_text(full, None, None, Some(8));
+        assert_eq!(w.text, "l1\nl2\nl3");
+        assert_eq!(w.total_lines, 5);
+        assert_eq!(w.shown_lines, 3);
+        assert!(w.cut_anything());
+        // A cap landing exactly on a newline drops the empty trailing line.
+        let w = window_text(full, None, None, Some(6));
+        assert_eq!(w.text, "l1\nl2\n");
+        assert_eq!(w.shown_lines, 2);
+    }
+
+    #[test]
+    fn window_text_ceiling_binds_without_and_below_any_caller_cap() {
+        // One line, no caller cap: only MAX_WINDOW_CHARS stands between the
+        // text channel and the whole decoded payload.
+        let full = "x".repeat(MAX_WINDOW_CHARS + 10);
+        let w = window_text(&full, Some(1), None, None);
+        assert_eq!(w.text.chars().count(), MAX_WINDOW_CHARS);
+        assert!(w.truncated_chars);
+        assert!(w.cut_anything(), "the ceiling cut content: audit it");
+        // A caller cap above the ceiling cannot raise it; one below wins.
+        assert_eq!(
+            window_text(&full, None, None, Some(u32::MAX))
+                .text
+                .chars()
+                .count(),
+            MAX_WINDOW_CHARS
+        );
+        let w = window_text(&full, None, None, Some(5));
+        assert_eq!(w.text, "xxxxx");
+        assert!(w.truncated_chars);
+    }
+
+    #[test]
+    fn window_text_handles_empty_and_lineless_text() {
+        let w = window_text("", Some(1), Some(1), Some(10));
+        assert_eq!(w.text, "");
+        assert_eq!(w.total_lines, 0);
+        assert!(!w.cut_anything());
+        // A trailing newline does not invent an eleventh line.
+        let w = window_text("a\nb\n", Some(1), None, None);
+        assert_eq!(w.total_lines, 2);
+        assert_eq!(w.text, "a");
     }
 
     // ---------- audit wiring ----------

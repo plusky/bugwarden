@@ -54,6 +54,9 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Attachment windowing decodes the base64 Bugzilla serves. Already in the
+# lock file through rmcp; this makes the dependency the one it is used as.
+base64 = "0.23.1"
 schemars = { version = "1", features = ["chrono04"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.11"
