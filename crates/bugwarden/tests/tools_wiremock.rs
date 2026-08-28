@@ -404,8 +404,14 @@ async fn create_scoped_rule_files_bugs_without_hiding_reads_issue_26() {
         "search must succeed: {}",
         text_of(&search)
     );
+    // Parse rather than string-match: the wire format is compact JSON, so
+    // `"id": 7` with a space is not the shape to assert on.
+    let search_json: Value = serde_json::from_str(&text_of(&search)).expect("search returns JSON");
     assert!(
-        text_of(&search).contains("\"id\": 7"),
+        search_json
+            .get("bugs")
+            .and_then(Value::as_array)
+            .is_some_and(|bugs| bugs.iter().any(|b| b.get("id") == Some(&json!(7)))),
         "the existing bug must not vanish from search: {}",
         text_of(&search)
     );

@@ -143,9 +143,13 @@ pub const WRITE_TOOLS: &[&str] = &[
 /// from the router unless `global.allow_discovery = true` (I13, I16).
 pub const DISCOVERY_TOOLS: &[&str] = &["bugzilla_products", "bug_fields"];
 
-/// Success result: ONE text block containing pretty-printed JSON.
+/// Success result: ONE text block containing compact JSON.
+///
+/// Compact, not pretty-printed: the block is parsed as JSON by clients, and
+/// the whitespace difference is ~15-25% of a bug payload's size — context
+/// the model pays for on every call.
 fn ok_json(value: Value) -> CallToolResult {
-    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+    let text = serde_json::to_string(&value).unwrap_or_else(|_| value.to_string());
     CallToolResult::success(vec![ContentBlock::text(text)])
 }
 
@@ -3112,7 +3116,7 @@ impl BugWarden {
             })
         };
         Ok(CallToolResult::success(vec![
-            ContentBlock::text(serde_json::to_string_pretty(&summary).unwrap_or_default()),
+            ContentBlock::text(serde_json::to_string(&summary).unwrap_or_default()),
             content,
         ]))
     }
@@ -3332,8 +3336,7 @@ impl BugWarden {
             }
         }
         let comments = Guard::scrub_duplicate_markers(comments, &disclosable);
-        let comments_json =
-            serde_json::to_string_pretty(&comments).unwrap_or_else(|_| "[]".to_string());
+        let comments_json = serde_json::to_string(&comments).unwrap_or_else(|_| "[]".to_string());
         let prompt = format!(
             "You are an expert in summarizing bugzilla comments.\n\
              Rules to follow:\n\
