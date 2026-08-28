@@ -1643,3 +1643,92 @@ async fn initialize_writes_exactly_one_record_with_the_client_identity() {
     assert_eq!(pid, std::process::id().to_string());
     assert_eq!(events[0].session.remote, None);
 }
+
+/// Mount classify + padding for bug 7 and serve `comments` from its
+/// comment endpoint. Deliberately minimal: a windowing call reaching for
+/// an unmounted endpoint must fail, not fall through a catch-all.
+async fn mount_bug7_with_comments(mock: &MockServer, comments: Vec<Value>) {
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [world_bug(7)] })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/7/comment"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": { "7": { "comments": comments } }
+        })))
+        .mount(mock)
+        .await;
+}
+
+fn six_public_comments() -> Vec<Value> {
+    (1..=6)
+        .map(|i| {
+            json!({ "id": i, "bug_id": 7, "is_private": false, "text": format!("comment {i}") })
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn bug_comments_window_records_the_redaction_it_applied() {
+    // The #94 pin at the comments_window note site: windowing that actually
+    // omits must leave its mark in the record — a note that can never fire
+    // would leave the operator unable to tell a complete answer from a
+    // windowed one.
+    let mock = MockServer::start().await;
+    mount_bug7_with_comments(&mock, six_public_comments()).await;
+    let audited = audited_client_for("", &mock, "test-key").await;
+
+    let result = call(
+        &audited.client,
+        "bug_comments",
+        json!({ "id": 7, "head": 1, "tail": 2 }),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "the window is served");
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.request.tool, "bug_comments");
+    let guard = tc.guard.as_ref().expect("guard info recorded");
+    assert_eq!(
+        guard.redacted_fields,
+        vec!["comments_window".to_string()],
+        "the record names the windowing that shaped the response: {guard:?}"
+    );
+}
+
+#[tokio::test]
+async fn bug_comments_window_with_nothing_omitted_records_no_redaction() {
+    // The #87/#88 sibling at the same site: windowing params present but
+    // the window covers everything and nothing is capped — the note must
+    // stay silent, or every call reads served-with-redaction.
+    let mock = MockServer::start().await;
+    mount_bug7_with_comments(&mock, six_public_comments()).await;
+    let audited = audited_client_for("", &mock, "test-key").await;
+
+    let result = call(
+        &audited.client,
+        "bug_comments",
+        json!({ "id": 7, "head": 4, "tail": 4 }),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "the window is served");
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.request.tool, "bug_comments");
+    let guard = tc.guard.as_ref().expect("guard info recorded");
+    assert!(
+        guard.redacted_fields.is_empty(),
+        "nothing omitted, nothing capped: no redaction is recorded: {guard:?}"
+    );
+}

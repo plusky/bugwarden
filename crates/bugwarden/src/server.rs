@@ -276,6 +276,7 @@ const PARAM_ALLOWLIST: &[&str] = &[
     "field_names",
     "file_name",
     "groups",
+    "head",
     "id",
     "include_fields",
     "include_private",
@@ -285,6 +286,7 @@ const PARAM_ALLOWLIST: &[&str] = &[
     "keywords_add",
     "keywords_remove",
     "limit",
+    "max_comment_length",
     "new_since",
     "offset",
     "on_bug_entry_only",
@@ -297,6 +299,7 @@ const PARAM_ALLOWLIST: &[&str] = &[
     "resolution",
     "severity",
     "status",
+    "tail",
     "target_milestone",
     "version",
 ];
@@ -835,6 +838,59 @@ fn strip_detail_fields(bug: &mut Value) {
     }
 }
 
+/// Keep the first `head` and last `tail` comments, dropping the middle.
+/// Returns the kept comments and how many were omitted. An absent side
+/// keeps nothing from that side; overlap keeps everything and omits
+/// nothing (head + tail >= len means no window closed).
+fn window_comments(
+    comments: Vec<Value>,
+    head: Option<u32>,
+    tail: Option<u32>,
+) -> (Vec<Value>, usize) {
+    let total = comments.len();
+    let head = head.unwrap_or(0) as usize;
+    let tail = tail.unwrap_or(0) as usize;
+    let keep = head.saturating_add(tail).min(total);
+    let omitted = total - keep;
+    if omitted == 0 {
+        return (comments, 0);
+    }
+    let mut out = Vec::with_capacity(keep);
+    let mut iter = comments.into_iter();
+    out.extend(iter.by_ref().take(head));
+    out.extend(iter.skip(total - head - tail));
+    (out, omitted)
+}
+
+/// Cap each comment's `text` at `max_chars` CHARACTERS (not bytes —
+/// comment text is unicode). A capped comment gains a sibling
+/// `text_truncated` marker with shown/total counts — never an in-text
+/// marker, which would be mistaken for comment content. Returns whether
+/// any comment was capped.
+fn cap_comment_text(comments: &mut [Value], max_chars: u32) -> bool {
+    let mut any = false;
+    for comment in comments.iter_mut() {
+        let Some(obj) = comment.as_object_mut() else {
+            continue;
+        };
+        let Some(text) = obj.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        let total = text.chars().count();
+        let cap = max_chars as usize;
+        if total > cap {
+            let shown: String = text.chars().take(cap).collect();
+            obj.insert("text".to_string(), Value::String(shown));
+            obj.insert(
+                "text_truncated".to_string(),
+                json!({ "shown_chars": cap, "total_chars": total }),
+            );
+            any = true;
+        }
+    }
+    any
+}
+
 /// Add `"comment": {"body": ...}` to a `Bug.update` payload when a comment is
 /// set. This is the UPDATE shape only — `Bug.add_attachment` takes `comment`
 /// as a plain string and must not use this helper.
@@ -994,6 +1050,17 @@ pub struct BugCommentsParams {
     /// Only return comments newer than this date.
     #[serde(default)]
     pub new_since: Option<DateTime<Utc>>,
+    /// Keep the first N comments (comment 0 is the report — keep it in
+    /// the window on large threads).
+    #[serde(default)]
+    pub head: Option<u32>,
+    /// Keep the last N comments.
+    #[serde(default)]
+    pub tail: Option<u32>,
+    /// Cap each comment's text at this many characters. A capped comment
+    /// carries a `text_truncated` marker with shown/total character counts.
+    #[serde(default)]
+    pub max_comment_length: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -2107,7 +2174,7 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Returns the comments of given bug id. Private comments are not included by default but can be explicitly requested (subject to server policy). new_since allows filtering comments newer than the given date.",
+        description = "Returns the comments of given bug id. Private comments are not included by default but can be explicitly requested (subject to server policy). new_since allows filtering comments newer than the given date. For large threads, window with head (first N — comment 0 is the report) and tail (last N), and/or cap each comment's text with max_comment_length characters; when any of the three is set, the response is an object {comments, truncation: {omitted_comments, shown_comments}} instead of a bare array.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn bug_comments(
@@ -2155,7 +2222,39 @@ impl BugWarden {
                     }
                 }
                 let scrubbed = Guard::scrub_duplicate_markers(filtered, &disclosable);
-                Ok(ok_json(Value::Array(scrubbed)))
+                // Windowing runs LAST, on the post-filter, post-scrub list
+                // (I5/I14): omitted_comments counts only comments the client
+                // may see, so it can never leak that a private comment
+                // exists. Without any windowing param the response stays the
+                // bare array it always was.
+                let windowing =
+                    p.head.is_some() || p.tail.is_some() || p.max_comment_length.is_some();
+                if !windowing {
+                    return Ok(ok_json(Value::Array(scrubbed)));
+                }
+                let (mut comments, omitted) = if p.head.is_some() || p.tail.is_some() {
+                    window_comments(scrubbed, p.head, p.tail)
+                } else {
+                    // max_comment_length alone caps texts; it does not
+                    // open a window.
+                    (scrubbed, 0)
+                };
+                let capped = p
+                    .max_comment_length
+                    .is_some_and(|cap| cap_comment_text(&mut comments, cap));
+                if omitted > 0 || capped {
+                    if let Some(cell) = audit_cell(&ctx) {
+                        cell.note_redacted("comments_window");
+                    }
+                }
+                let shown = comments.len();
+                Ok(ok_json(json!({
+                    "comments": comments,
+                    "truncation": {
+                        "omitted_comments": omitted,
+                        "shown_comments": shown,
+                    },
+                })))
             }
             Err(e) => {
                 tracing::warn!(id = p.id, error = %e, "bug_comments: fetch failed");
@@ -4298,6 +4397,61 @@ mod tests {
         let mut not_an_object = json!("just a string");
         strip_detail_fields(&mut not_an_object);
         assert_eq!(not_an_object, json!("just a string"));
+    }
+
+    #[test]
+    fn window_comments_keeps_first_head_and_last_tail() {
+        let comments: Vec<Value> = (1..=6).map(|i| json!({ "id": i })).collect();
+        let (kept, omitted) = window_comments(comments, Some(1), Some(2));
+        let ids: Vec<u64> = kept.iter().filter_map(|c| c["id"].as_u64()).collect();
+        assert_eq!(ids, vec![1, 5, 6]);
+        assert_eq!(omitted, 3);
+    }
+
+    #[test]
+    fn window_comments_overlap_omits_nothing_and_keeps_order() {
+        let comments: Vec<Value> = (1..=3).map(|i| json!({ "id": i })).collect();
+        let (kept, omitted) = window_comments(comments, Some(3), Some(3));
+        let ids: Vec<u64> = kept.iter().filter_map(|c| c["id"].as_u64()).collect();
+        assert_eq!(ids, vec![1, 2, 3], "no duplicated middle on overlap");
+        assert_eq!(omitted, 0);
+    }
+
+    #[test]
+    fn window_comments_absent_sides_keep_nothing_from_that_side() {
+        let comments: Vec<Value> = (1..=5).map(|i| json!({ "id": i })).collect();
+        let (kept, omitted) = window_comments(comments, None, Some(2));
+        let ids: Vec<u64> = kept.iter().filter_map(|c| c["id"].as_u64()).collect();
+        assert_eq!(ids, vec![4, 5]);
+        assert_eq!(omitted, 3);
+
+        let comments: Vec<Value> = (1..=5).map(|i| json!({ "id": i })).collect();
+        let (kept, omitted) = window_comments(comments, Some(2), None);
+        let ids: Vec<u64> = kept.iter().filter_map(|c| c["id"].as_u64()).collect();
+        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(omitted, 3);
+    }
+
+    #[test]
+    fn cap_comment_text_counts_chars_not_bytes() {
+        let mut comments = vec![json!({ "id": 1, "text": "日本語".repeat(40) })];
+        assert!(cap_comment_text(&mut comments, 100));
+        assert_eq!(comments[0]["text"].as_str().unwrap().chars().count(), 100);
+        assert_eq!(
+            comments[0]["text_truncated"],
+            json!({ "shown_chars": 100, "total_chars": 120 })
+        );
+    }
+
+    #[test]
+    fn cap_comment_text_leaves_short_comments_and_non_objects_alone() {
+        let mut comments = vec![
+            json!({ "id": 1, "text": "short" }),
+            json!("not an object"),
+            json!({ "id": 2 }),
+        ];
+        assert!(!cap_comment_text(&mut comments, 100));
+        assert!(comments[0].get("text_truncated").is_none());
     }
 
     #[test]
