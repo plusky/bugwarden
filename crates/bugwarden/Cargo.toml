@@ -96,3 +96,82 @@ tokio = { version = "1", features = [
     "time",
 ] }
 wiremock = "0.6"
+
+# Distribution packages for the GitHub release (x86_64 Linux only, matching
+# the only Linux tarball target). Layout mirrors the openSUSE spec in
+# devel:tools so the two packagings do not disagree about where things go;
+# the completions are NOT split into subpackages here, which neither tool
+# can express.
+#
+# Neither example config is read implicitly — the server loads a policy only
+# via --policy / BUGWARDEN_POLICY and an audit config only via
+# --audit-config / BUGWARDEN_AUDIT_CONFIG — so installing a package activates
+# nothing. Both are conffiles: an operator's edits survive an upgrade.
+
+[package.metadata.deb]
+maintainer = "Martin Pluskal <martin@pluskal.org>"
+copyright = "2026 Martin Pluskal"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+bugwarden exposes Bugzilla to MCP (Model Context Protocol) clients through a \
+guard policy that the client can neither read nor change. The policy is a \
+TOML file read once at startup and decides, per bug, which capabilities a \
+client is granted, so an operator can expose a Bugzilla instance to an LLM \
+client while keeping undisclosed security bugs, private comments and write \
+access out of reach."""
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/bugwarden", "usr/bin/", "755"],
+    ["../../examples/policy.toml", "etc/bugwarden/policy.toml", "644"],
+    ["../../examples/audit.toml", "etc/bugwarden/audit.toml", "644"],
+    ["man/bugwarden.1", "usr/share/man/man1/", "644"],
+    ["completions/bugwarden.bash", "usr/share/bash-completion/completions/bugwarden", "644"],
+    ["completions/_bugwarden", "usr/share/zsh/site-functions/_bugwarden", "644"],
+    ["completions/bugwarden.fish", "usr/share/fish/vendor_completions.d/bugwarden.fish", "644"],
+    ["README.md", "usr/share/doc/bugwarden/README.md", "644"],
+    ["../../docs/DESIGN.md", "usr/share/doc/bugwarden/DESIGN.md", "644"],
+]
+conf-files = ["/etc/bugwarden/policy.toml", "/etc/bugwarden/audit.toml"]
+
+[package.metadata.generate-rpm]
+summary = "MCP server for Bugzilla with operator-controlled security guards"
+description = """\
+bugwarden exposes Bugzilla to MCP (Model Context Protocol) clients through a \
+guard policy that the client can neither read nor change. The policy is a \
+TOML file read once at startup and decides, per bug, which capabilities a \
+client is granted, so an operator can expose a Bugzilla instance to an LLM \
+client while keeping undisclosed security bugs, private comments and write \
+access out of reach."""
+# NOTE: there is deliberately no `auto-req` key here. cargo-generate-rpm 0.16.1
+# honours only "no"/"disabled" in metadata and silently discards every other
+# value, so `auto-req = "builtin"` would be indistinguishable from a typo and
+# the dependency set would fall back to whatever find-requires the runner
+# happens to have. The workflow passes --auto-req builtin on the CLI instead,
+# where an unrecognised value is a hard error.
+# Sources resolve CWD-first, manifest-dir second (unlike cargo-deb, which is
+# manifest-relative only), so these paths assume CWD == workspace root.
+# LICENSE and README.md here are the workspace-root files; the crate-level ones
+# are symlinks to them, so either resolution order yields the same bytes.
+assets = [
+    { source = "target/release/bugwarden", dest = "/usr/bin/bugwarden", mode = "755" },
+    # rpm owns the directories it creates, matching %dir in the openSUSE spec;
+    # without these, erasing the package orphans them. 40755 = S_IFDIR | 0755,
+    # and the type bits are what make it a directory entry. `source` is ignored
+    # for those but must still name a readable regular file, hence the reuse.
+    { source = "../../examples/policy.toml", dest = "/etc/bugwarden", mode = "40755" },
+    { source = "../../examples/policy.toml", dest = "/usr/share/doc/bugwarden", mode = "40755" },
+    { source = "../../examples/policy.toml", dest = "/usr/share/licenses/bugwarden", mode = "40755" },
+    { source = "../../examples/policy.toml", dest = "/etc/bugwarden/policy.toml", mode = "644", config = "noreplace" },
+    { source = "../../examples/audit.toml", dest = "/etc/bugwarden/audit.toml", mode = "644", config = "noreplace" },
+    { source = "man/bugwarden.1", dest = "/usr/share/man/man1/bugwarden.1", mode = "644", doc = true },
+    { source = "completions/bugwarden.bash", dest = "/usr/share/bash-completion/completions/bugwarden", mode = "644" },
+    { source = "completions/_bugwarden", dest = "/usr/share/zsh/site-functions/_bugwarden", mode = "644" },
+    { source = "completions/bugwarden.fish", dest = "/usr/share/fish/vendor_completions.d/bugwarden.fish", mode = "644" },
+    # doc, not rpm's %license flag: 0.16.1 cannot emit the latter, so
+    # `rpm --excludedocs` drops the licence text. Path is still the one rpm
+    # expects, so a future version only has to change the flag.
+    { source = "LICENSE", dest = "/usr/share/licenses/bugwarden/LICENSE", mode = "644", doc = true },
+    { source = "README.md", dest = "/usr/share/doc/bugwarden/README.md", mode = "644", doc = true },
+    { source = "../../docs/DESIGN.md", dest = "/usr/share/doc/bugwarden/DESIGN.md", mode = "644", doc = true },
+]
