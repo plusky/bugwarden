@@ -1585,6 +1585,276 @@ async fn created_by_me_carves_own_reports_out_for_bug_history_too() {
     );
 }
 
+/// Mount the classify fetch and id=0 padding for bug 7 plus a history
+/// endpoint serving `entries` (issue #142 windowing tests).
+async fn mount_history_window_fixture(mock: &MockServer, entries: Value) {
+    mount_bug_and_padding(mock, world_readable_bug(7)).await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/7/history"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": [{ "id": 7, "history": entries }]
+        })))
+        .mount(mock)
+        .await;
+}
+
+/// Five plain status-change entries; the `when` strings ("2020-01-0N")
+/// pin which entries a window kept.
+fn five_history_entries() -> Value {
+    (1..=5)
+        .map(|n| {
+            json!({
+                "when": format!("2020-01-0{n}T00:00:00Z"),
+                "who": "dev@example.org",
+                "changes": [
+                    { "field_name": "status", "removed": "NEW", "added": "CONFIRMED" },
+                ],
+            })
+        })
+        .collect()
+}
+
+/// Parse a `bug_history` tool result as JSON.
+fn history_json(result: &CallToolResult) -> Value {
+    serde_json::from_str(&text_of(result)).expect("bug_history returns JSON")
+}
+
+#[tokio::test]
+async fn bug_history_without_window_params_serves_the_bare_array() {
+    // The default path is byte-stable: with neither head nor tail the
+    // response stays the bare array it always was — no envelope, no
+    // truncation block.
+    let mock = MockServer::start().await;
+    mount_history_window_fixture(&mock, five_history_entries()).await;
+    let client = client_for("", &mock).await;
+
+    let served = call(&client, "bug_history", json!({ "id": 7 })).await;
+    assert!(
+        !is_error(&served),
+        "the history is served: {}",
+        text_of(&served)
+    );
+    let parsed = history_json(&served);
+    let entries = parsed
+        .as_array()
+        .expect("no window params means the bare array, not an envelope");
+    assert_eq!(entries.len(), 5);
+}
+
+#[tokio::test]
+async fn bug_history_head_keeps_the_first_entries() {
+    let mock = MockServer::start().await;
+    mount_history_window_fixture(&mock, five_history_entries()).await;
+    let client = client_for("", &mock).await;
+
+    let served = call(&client, "bug_history", json!({ "id": 7, "head": 2 })).await;
+    let parsed = history_json(&served);
+    let shown = parsed["history"].as_array().expect("windowed envelope");
+    assert_eq!(shown.len(), 2);
+    assert_eq!(shown[0]["when"], json!("2020-01-01T00:00:00Z"));
+    assert_eq!(shown[1]["when"], json!("2020-01-02T00:00:00Z"));
+    assert_eq!(
+        parsed["truncation"],
+        json!({ "omitted_entries": 3, "shown_entries": 2 }),
+        "the envelope reports what the window omitted: {parsed}"
+    );
+}
+
+#[tokio::test]
+async fn bug_history_tail_keeps_the_last_entries() {
+    let mock = MockServer::start().await;
+    mount_history_window_fixture(&mock, five_history_entries()).await;
+    let client = client_for("", &mock).await;
+
+    let served = call(&client, "bug_history", json!({ "id": 7, "tail": 2 })).await;
+    let parsed = history_json(&served);
+    let shown = parsed["history"].as_array().expect("windowed envelope");
+    assert_eq!(shown.len(), 2);
+    assert_eq!(shown[0]["when"], json!("2020-01-04T00:00:00Z"));
+    assert_eq!(shown[1]["when"], json!("2020-01-05T00:00:00Z"));
+    assert_eq!(
+        parsed["truncation"],
+        json!({ "omitted_entries": 3, "shown_entries": 2 })
+    );
+}
+
+#[tokio::test]
+async fn bug_history_head_and_tail_keep_both_ends() {
+    let mock = MockServer::start().await;
+    mount_history_window_fixture(&mock, five_history_entries()).await;
+    let client = client_for("", &mock).await;
+
+    let served = call(
+        &client,
+        "bug_history",
+        json!({ "id": 7, "head": 1, "tail": 1 }),
+    )
+    .await;
+    let parsed = history_json(&served);
+    let shown = parsed["history"].as_array().expect("windowed envelope");
+    assert_eq!(shown.len(), 2);
+    assert_eq!(shown[0]["when"], json!("2020-01-01T00:00:00Z"));
+    assert_eq!(shown[1]["when"], json!("2020-01-05T00:00:00Z"));
+    assert_eq!(
+        parsed["truncation"],
+        json!({ "omitted_entries": 3, "shown_entries": 2 })
+    );
+}
+
+#[tokio::test]
+async fn bug_history_overlapping_windows_omit_nothing() {
+    // head + tail >= len keeps everything: the overlap is not
+    // double-counted and the envelope reports zeros — a deterministic
+    // shape per call signature, nothing omitted.
+    let mock = MockServer::start().await;
+    mount_history_window_fixture(&mock, five_history_entries()).await;
+    let client = client_for("", &mock).await;
+
+    let served = call(
+        &client,
+        "bug_history",
+        json!({ "id": 7, "head": 3, "tail": 3 }),
+    )
+    .await;
+    let parsed = history_json(&served);
+    assert_eq!(parsed["history"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        parsed["truncation"],
+        json!({ "omitted_entries": 0, "shown_entries": 5 })
+    );
+}
+
+#[tokio::test]
+async fn bug_history_windows_after_the_i14_scrub() {
+    // Ordering pin: the window closes over the SCRUBBED list. Entry two
+    // names only the policy-hidden bug 666, so I14 drops it BEFORE
+    // head=2 applies — it must not consume a window slot, and the hidden
+    // id must never appear. Ran the other way, head=2 would keep entry
+    // two and the scrub would leave a single-entry window.
+    let mock = MockServer::start().await;
+    mount_bug_and_padding(&mock, world_readable_bug(7)).await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/7/history"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": [{ "id": 7, "history": [
+                {
+                    "when": "2020-01-01T00:00:00Z",
+                    "who": "dev@example.org",
+                    "changes": [
+                        { "field_name": "status", "removed": "NEW", "added": "CONFIRMED" },
+                    ],
+                },
+                {
+                    "when": "2020-01-02T00:00:00Z",
+                    "who": "dev@example.org",
+                    "changes": [
+                        { "field_name": "depends_on", "removed": "", "added": "666" },
+                    ],
+                },
+                {
+                    "when": "2020-01-03T00:00:00Z",
+                    "who": "dev@example.org",
+                    "changes": [
+                        { "field_name": "status", "removed": "CONFIRMED", "added": "RESOLVED" },
+                    ],
+                },
+            ] }]
+        })))
+        .mount(&mock)
+        .await;
+    // The linked-id classify fetch answers empty: 666 is not disclosable
+    // (I4), so the scrub drops the entry that names it.
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "666"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .mount(&mock)
+        .await;
+    let client = client_for(
+        concat!(
+            "[[rule]]\nname = \"hide-secret\"\naction = \"deny\"\n",
+            "[rule.match]\nproducts = [\"Secret*\"]\n",
+        ),
+        &mock,
+    )
+    .await;
+
+    let served = call(&client, "bug_history", json!({ "id": 7, "head": 2 })).await;
+    assert!(
+        !is_error(&served),
+        "the history is served: {}",
+        text_of(&served)
+    );
+    let text = text_of(&served);
+    assert!(
+        !text.contains("666"),
+        "the hidden id must never reach the client (I14): {text}"
+    );
+    let parsed: Value = serde_json::from_str(&text).expect("bug_history returns JSON");
+    let shown = parsed["history"].as_array().expect("windowed envelope");
+    assert_eq!(
+        shown.len(),
+        2,
+        "the scrubbed-out entry consumed no window slot: {parsed}"
+    );
+    assert_eq!(shown[0]["when"], json!("2020-01-01T00:00:00Z"));
+    assert_eq!(shown[1]["when"], json!("2020-01-03T00:00:00Z"));
+    assert_eq!(
+        parsed["truncation"],
+        json!({ "omitted_entries": 0, "shown_entries": 2 }),
+        "the window omitted nothing — the scrub, not the window, dropped \
+         the entry: {parsed}"
+    );
+}
+
+#[tokio::test]
+async fn bug_history_window_params_leave_the_denial_untouched_i2() {
+    // deny_unless returns before the window code reads head/tail, so a
+    // denied bug answers with the uniform text and no envelope however the
+    // call is windowed. Pinned because hoisting the envelope around the
+    // whole handler would make a denied bug distinguishable from a
+    // nonexistent one (I2) — the truncation block alone is the tell.
+    let mock = MockServer::start().await;
+    mount_bug_and_padding(&mock, world_readable_bug(7)).await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/7/history"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": [{ "id": 7, "history": five_history_entries() }]
+        })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let client = client_for(
+        concat!(
+            "[[rule]]\nname = \"hide-kernel\"\naction = \"deny\"\n",
+            "[rule.match]\ncomponents = [\"Kernel\"]\n",
+        ),
+        &mock,
+    )
+    .await;
+
+    let plain = call(&client, "bug_history", json!({ "id": 7 })).await;
+    assert!(is_error(&plain));
+    assert_eq!(
+        text_of(&plain),
+        "Bug 7 is not accessible through this server"
+    );
+
+    for args in [
+        json!({ "id": 7, "head": 2 }),
+        json!({ "id": 7, "tail": 2 }),
+        json!({ "id": 7, "head": 1, "tail": 1 }),
+    ] {
+        let windowed = call(&client, "bug_history", args.clone()).await;
+        assert!(is_error(&windowed), "{args}");
+        assert_eq!(
+            text_of(&windowed),
+            text_of(&plain),
+            "a windowed denial must be byte-identical to the plain one: {args}"
+        );
+    }
+}
+
 /// A carve-out granting a WRITE capability on the caller's own reports.
 /// [`IDENTITY_POLICY`] cannot exercise the write gate: its grant carries
 /// no write capabilities, so a write tool refuses even the caller's own
