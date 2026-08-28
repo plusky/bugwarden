@@ -580,43 +580,41 @@ fn too_many_ids(ids: &[u64]) -> Option<CallToolResult> {
     })
 }
 
-/// Window a history list to its first `head` and/or last `tail` entries
-/// (issue #142). Returns the kept entries and how many were omitted.
+/// Keep the first `head` and last `tail` items of a list, dropping the
+/// middle. Returns the kept items and how many were omitted.
 ///
-/// Called on the SCRUBBED list (`Guard::scrub_history` ran first, I14): an
-/// entry the guard dropped must neither occupy a window slot nor leak the
-/// id it named. `head` + `tail` reaching the entry count keeps everything —
-/// the overlap is not double-counted and nothing is omitted.
-fn window_history(
-    entries: Vec<Value>,
-    head: Option<u32>,
-    tail: Option<u32>,
-) -> (Vec<Value>, usize) {
-    let len = entries.len();
-    let head = head.map(|n| n as usize);
-    let tail = tail.map(|n| n as usize);
-    match (head, tail) {
-        (None, None) => (entries, 0),
-        (Some(h), None) => {
-            let keep = h.min(len);
-            (entries.into_iter().take(keep).collect(), len - keep)
-        }
-        (None, Some(t)) => {
-            let keep = t.min(len);
-            (entries.into_iter().skip(len - keep).collect(), len - keep)
-        }
-        (Some(h), Some(t)) => {
-            if h.saturating_add(t) >= len {
-                return (entries, 0);
-            }
-            // h + t < len, so the two windows cannot overlap.
-            let mut kept = entries;
-            let last = kept.split_off(len - t);
-            kept.truncate(h);
-            kept.extend(last);
-            (kept, len - h - t)
-        }
+/// One helper for `bug_history` (issue #142) and `bug_comments`: they used to
+/// carry separate implementations that agreed on every input their handlers
+/// can produce, so an edit to one silently forked the two tools' truncation
+/// semantics.
+///
+/// Both callers run it on the post-scrub list (I14), so `omitted` counts only
+/// items the client may see and a dropped item cannot leak by arithmetic
+/// (I3). An absent side keeps nothing from that side once the other one is
+/// set; `head + tail` reaching the length keeps everything, overlap counted
+/// once. `(None, None)` keeps everything — no window asked for is not a
+/// window of nothing — though both handlers gate that call away first.
+fn window_list<T>(items: Vec<T>, head: Option<u32>, tail: Option<u32>) -> (Vec<T>, usize) {
+    if head.is_none() && tail.is_none() {
+        return (items, 0);
     }
+    let len = items.len();
+    let head = head.unwrap_or(0) as usize;
+    let tail = tail.unwrap_or(0) as usize;
+    let keep = head.saturating_add(tail).min(len);
+    let omitted = len - keep;
+    if omitted == 0 {
+        return (items, 0);
+    }
+    // Past that return `keep < len`, which a saturated sum could not be, so
+    // `head + tail < len` exactly: the skip below cannot underflow and the
+    // two ends cannot overlap. Every index here is derived from `keep`, so
+    // the underflow safety does not depend on the caller clamping anything.
+    let mut out = Vec::with_capacity(keep);
+    let mut iter = items.into_iter();
+    out.extend(iter.by_ref().take(head));
+    out.extend(iter.skip(len - head - tail));
+    (out, omitted)
 }
 
 /// Advisory attached to a quicksearch envelope when the query is nothing but
@@ -879,30 +877,6 @@ fn strip_detail_fields(bug: &mut Value) {
     if let Some(obj) = bug.as_object_mut() {
         obj.retain(|k, _| !k.ends_with("_detail"));
     }
-}
-
-/// Keep the first `head` and last `tail` comments, dropping the middle.
-/// Returns the kept comments and how many were omitted. An absent side
-/// keeps nothing from that side; overlap keeps everything and omits
-/// nothing (head + tail >= len means no window closed).
-fn window_comments(
-    comments: Vec<Value>,
-    head: Option<u32>,
-    tail: Option<u32>,
-) -> (Vec<Value>, usize) {
-    let total = comments.len();
-    let head = head.unwrap_or(0) as usize;
-    let tail = tail.unwrap_or(0) as usize;
-    let keep = head.saturating_add(tail).min(total);
-    let omitted = total - keep;
-    if omitted == 0 {
-        return (comments, 0);
-    }
-    let mut out = Vec::with_capacity(keep);
-    let mut iter = comments.into_iter();
-    out.extend(iter.by_ref().take(head));
-    out.extend(iter.skip(total - head - tail));
-    (out, omitted)
 }
 
 /// Cap each comment's `text` at `max_chars` CHARACTERS (not bytes —
@@ -2356,7 +2330,7 @@ impl BugWarden {
                     // a presentation control must not drop an odd shape.
                     other => return Ok(ok_json(other)),
                 };
-                let (shown, omitted) = window_history(entries, p.head, p.tail);
+                let (shown, omitted) = window_list(entries, p.head, p.tail);
                 if omitted > 0 {
                     if let Some(cell) = audit_cell(&ctx) {
                         cell.note_redacted("history_window");
@@ -2438,7 +2412,7 @@ impl BugWarden {
                     return Ok(ok_json(Value::Array(scrubbed)));
                 }
                 let (mut comments, omitted) = if p.head.is_some() || p.tail.is_some() {
-                    window_comments(scrubbed, p.head, p.tail)
+                    window_list(scrubbed, p.head, p.tail)
                 } else {
                     // max_comment_length alone caps texts; it does not
                     // open a window.
@@ -4647,39 +4621,6 @@ mod tests {
     }
 
     #[test]
-    fn window_comments_keeps_first_head_and_last_tail() {
-        let comments: Vec<Value> = (1..=6).map(|i| json!({ "id": i })).collect();
-        let (kept, omitted) = window_comments(comments, Some(1), Some(2));
-        let ids: Vec<u64> = kept.iter().filter_map(|c| c["id"].as_u64()).collect();
-        assert_eq!(ids, vec![1, 5, 6]);
-        assert_eq!(omitted, 3);
-    }
-
-    #[test]
-    fn window_comments_overlap_omits_nothing_and_keeps_order() {
-        let comments: Vec<Value> = (1..=3).map(|i| json!({ "id": i })).collect();
-        let (kept, omitted) = window_comments(comments, Some(3), Some(3));
-        let ids: Vec<u64> = kept.iter().filter_map(|c| c["id"].as_u64()).collect();
-        assert_eq!(ids, vec![1, 2, 3], "no duplicated middle on overlap");
-        assert_eq!(omitted, 0);
-    }
-
-    #[test]
-    fn window_comments_absent_sides_keep_nothing_from_that_side() {
-        let comments: Vec<Value> = (1..=5).map(|i| json!({ "id": i })).collect();
-        let (kept, omitted) = window_comments(comments, None, Some(2));
-        let ids: Vec<u64> = kept.iter().filter_map(|c| c["id"].as_u64()).collect();
-        assert_eq!(ids, vec![4, 5]);
-        assert_eq!(omitted, 3);
-
-        let comments: Vec<Value> = (1..=5).map(|i| json!({ "id": i })).collect();
-        let (kept, omitted) = window_comments(comments, Some(2), None);
-        let ids: Vec<u64> = kept.iter().filter_map(|c| c["id"].as_u64()).collect();
-        assert_eq!(ids, vec![1, 2]);
-        assert_eq!(omitted, 3);
-    }
-
-    #[test]
     fn cap_comment_text_counts_chars_not_bytes() {
         let mut comments = vec![json!({ "id": 1, "text": "日本語".repeat(40) })];
         assert!(cap_comment_text(&mut comments, 100));
@@ -4701,9 +4642,9 @@ mod tests {
         assert!(comments[0].get("text_truncated").is_none());
     }
 
-    /// Five history entries, told apart by a sequence number.
-    fn seq_entries() -> Vec<Value> {
-        (0..5).map(|n| json!({ "seq": n })).collect()
+    /// `n` list items, told apart by a sequence number.
+    fn seq_items(n: u64) -> Vec<Value> {
+        (0..n).map(|n| json!({ "seq": n })).collect()
     }
 
     fn seqs(shown: &[Value]) -> Vec<u64> {
@@ -4711,39 +4652,44 @@ mod tests {
     }
 
     #[test]
-    fn window_history_with_neither_param_keeps_everything() {
-        let (shown, omitted) = window_history(seq_entries(), None, None);
+    fn window_list_with_neither_param_keeps_everything() {
+        // Unreachable from either handler (both gate it away), but the
+        // merged helper must not read "no window" as "window of nothing".
+        let (shown, omitted) = window_list(seq_items(5), None, None);
         assert_eq!(seqs(&shown), vec![0, 1, 2, 3, 4]);
         assert_eq!(omitted, 0);
     }
 
     #[test]
-    fn window_history_head_keeps_the_first_entries() {
-        let (shown, omitted) = window_history(seq_entries(), Some(2), None);
+    fn window_list_head_keeps_the_first_entries() {
+        let (shown, omitted) = window_list(seq_items(5), Some(2), None);
         assert_eq!(seqs(&shown), vec![0, 1]);
         assert_eq!(omitted, 3);
     }
 
     #[test]
-    fn window_history_tail_keeps_the_last_entries() {
-        let (shown, omitted) = window_history(seq_entries(), None, Some(2));
+    fn window_list_tail_keeps_the_last_entries() {
+        let (shown, omitted) = window_list(seq_items(5), None, Some(2));
         assert_eq!(seqs(&shown), vec![3, 4]);
         assert_eq!(omitted, 3);
     }
 
     #[test]
-    fn window_history_head_and_tail_keep_both_ends() {
-        let (shown, omitted) = window_history(seq_entries(), Some(1), Some(2));
+    fn window_list_head_and_tail_keep_both_ends() {
+        let (shown, omitted) = window_list(seq_items(5), Some(1), Some(2));
         assert_eq!(seqs(&shown), vec![0, 3, 4]);
         assert_eq!(omitted, 2);
+        let (shown, omitted) = window_list(seq_items(6), Some(1), Some(2));
+        assert_eq!(seqs(&shown), vec![0, 4, 5]);
+        assert_eq!(omitted, 3);
     }
 
     #[test]
-    fn window_history_overlapping_windows_omit_nothing() {
+    fn window_list_overlapping_windows_omit_nothing() {
         // head + tail >= len keeps everything; the overlap is not
         // double-counted and the envelope reports zeros.
         for (head, tail) in [(3, 3), (5, 0), (0, 5), (2, 3), (10, 1)] {
-            let (shown, omitted) = window_history(seq_entries(), Some(head), Some(tail));
+            let (shown, omitted) = window_list(seq_items(5), Some(head), Some(tail));
             assert_eq!(
                 seqs(&shown),
                 vec![0, 1, 2, 3, 4],
@@ -4751,30 +4697,112 @@ mod tests {
             );
             assert_eq!(omitted, 0, "head={head} tail={tail} omits nothing");
         }
+        let (shown, omitted) = window_list(seq_items(3), Some(3), Some(3));
+        assert_eq!(seqs(&shown), vec![0, 1, 2], "no duplicated middle");
+        assert_eq!(omitted, 0);
     }
 
     #[test]
-    fn window_history_at_the_length_omits_nothing() {
-        let (shown, omitted) = window_history(seq_entries(), Some(5), None);
+    fn window_list_at_the_length_omits_nothing() {
+        let (shown, omitted) = window_list(seq_items(5), Some(5), None);
         assert_eq!(seqs(&shown), vec![0, 1, 2, 3, 4]);
         assert_eq!(omitted, 0);
-        let (shown, omitted) = window_history(seq_entries(), None, Some(6));
+        let (shown, omitted) = window_list(seq_items(5), None, Some(6));
         assert_eq!(seqs(&shown), vec![0, 1, 2, 3, 4]);
         assert_eq!(omitted, 0);
     }
 
     #[test]
-    fn window_history_zero_windows_omit_everything() {
-        let (shown, omitted) = window_history(seq_entries(), Some(0), Some(0));
-        assert!(shown.is_empty());
-        assert_eq!(omitted, 5);
+    fn window_list_zero_windows_omit_everything() {
+        // A zero is a window of zero items, never "no limit"; absent is the
+        // only "no limit", and an absent side contributes nothing.
+        for (head, tail) in [(Some(0), Some(0)), (Some(0), None), (None, Some(0))] {
+            let (shown, omitted) = window_list(seq_items(5), head, tail);
+            assert!(shown.is_empty(), "head={head:?} tail={tail:?}");
+            assert_eq!(omitted, 5, "head={head:?} tail={tail:?}");
+        }
     }
 
     #[test]
-    fn window_history_over_an_empty_list_omits_nothing() {
-        let (shown, omitted) = window_history(Vec::new(), Some(3), Some(3));
-        assert!(shown.is_empty());
-        assert_eq!(omitted, 0);
+    fn window_list_huge_values_keep_everything_without_overflowing() {
+        for (head, tail) in [
+            (Some(u32::MAX), Some(u32::MAX)),
+            (Some(u32::MAX), None),
+            (None, Some(u32::MAX)),
+        ] {
+            let (shown, omitted) = window_list(seq_items(5), head, tail);
+            assert_eq!(
+                seqs(&shown),
+                vec![0, 1, 2, 3, 4],
+                "head={head:?} tail={tail:?}"
+            );
+            assert_eq!(omitted, 0, "head={head:?} tail={tail:?}");
+        }
+    }
+
+    #[test]
+    fn window_list_over_an_empty_list_omits_nothing() {
+        for (head, tail) in [
+            (Some(3), Some(3)),
+            (Some(0), Some(0)),
+            (None, None),
+            (None, Some(2)),
+        ] {
+            let (shown, omitted) = window_list(Vec::<Value>::new(), head, tail);
+            assert!(shown.is_empty(), "head={head:?} tail={tail:?}");
+            assert_eq!(omitted, 0, "head={head:?} tail={tail:?}");
+        }
+    }
+
+    #[test]
+    fn window_list_matches_the_reference_model_exhaustively() {
+        // The example tests above sample; this one proves. Every
+        // (len, head, tail) triple below is checked against a naive model, so
+        // an edit to the index arithmetic cannot pass by matching whichever
+        // cases someone happened to write down.
+        fn model(len: u64, head: Option<u32>, tail: Option<u32>) -> (Vec<u64>, usize) {
+            let all: Vec<u64> = (0..len).collect();
+            if head.is_none() && tail.is_none() {
+                return (all, 0);
+            }
+            let head = head.unwrap_or(0) as usize;
+            let tail = tail.unwrap_or(0) as usize;
+            if head.saturating_add(tail) >= all.len() {
+                return (all, 0);
+            }
+            let kept: Vec<u64> = all[..head]
+                .iter()
+                .chain(&all[all.len() - tail..])
+                .copied()
+                .collect();
+            let omitted = all.len() - kept.len();
+            (kept, omitted)
+        }
+
+        let sides = [
+            None,
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(5),
+            Some(7),
+            Some(8),
+            Some(u32::MAX - 1),
+            Some(u32::MAX),
+        ];
+        for len in 0..9u64 {
+            for head in sides {
+                for tail in sides {
+                    let (shown, omitted) = window_list(seq_items(len), head, tail);
+                    assert_eq!(
+                        (seqs(&shown), omitted),
+                        model(len, head, tail),
+                        "len={len} head={head:?} tail={tail:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
