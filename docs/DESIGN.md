@@ -1208,6 +1208,46 @@ Decisions, all deliberate:
   are deliberately not stored: the schema has no field for either,
   `tracestate` is client free text, and `baggage` is unbounded client
   key/values — revisit under #34.
+- **Response size accounting (issue #145).** `outcome.response_bytes`
+  carries the serialized size of the result's `content` array, so the
+  operator stream can quantify a compression win — or a bloat
+  regression — per tool without reading payloads it must never hold. The
+  array, NOT the enclosing `CallToolResult`: the SDK clears `resultType`
+  for peers on an older revision, so sizing the object would make the
+  number move with the negotiated protocol version rather than with the
+  payload, and comparing sizes across calls is the entire point.
+  `Option<u64>`, absent rather than zero where nothing was produced — a
+  protocol error, and the pre-dispatch audit gate, which records its
+  refusal before building it and must not spend a serialization sizing a
+  fixed text. "Not measured" and "measured as empty" are different facts
+  and the reader must be able to tell them apart. Optional and
+  absent-when-unset, so the schema stays v1 (the #29 shape); pre-#145
+  lines are pinned as `GOLDEN_TOOL_CALL_PRE_RESPONSE_BYTES` and must keep
+  deserializing. Backward only: `deny_unknown_fields` means a reader built
+  before #145 REJECTS a post-#145 line outright, so "the schema stays v1"
+  buys old files new readers, not old readers new files — the issue's
+  "older readers ignore it" is wrong about this codebase's own parser.
+  THE ISSUE'S SAFETY PREMISE IS ALSO WRONG and the docs must not repeat
+  it. It claims "denial responses have constant size by construction". They
+  do not, on two counts. The uniform text interpolates the caller's id
+  (`Bug {id} is not accessible through this server`), so its length tracks
+  that id's decimal width — harmless, the id is the caller's own and
+  `request.params` already records it verbatim. More importantly the
+  verdict does not bound the payload at all: `denied` is the WORST verdict
+  of the call (worst-wins merge), so a multi-bug `bug_info` naming one
+  denied id records `denied` over an envelope holding the bugs it did
+  serve, and that record's size tracks those bodies. `download_attachment`
+  refuses in three different texts, whose lengths do not all agree. So the
+  honest statement is the simple one: the field sizes whatever was served,
+  and no verdict makes it constant. That is acceptable because it is a count and
+  never a byte of content, because the stream already carries
+  `suppressed_count`, `scan` and the ids, and because it reaches no MCP
+  surface (I15) — the response itself is byte-identical with the field on
+  or off (I3). It is, though, the first payload-derived value in the
+  stream, so a deployment shipping records to a lower-trust tier should
+  treat a size as it treats a count. Exported as the OTLP attribute
+  `bugwarden.response_bytes` beside the verdict, absent when unmeasured,
+  so a collector aggregates size per tool without parsing every body.
 - **Search-window drop accounting (issue #29).** A `bugs_quicksearch`
   record carries `guard.scan = {scanned, dropped}`: how many upstream rows
   the window scan examined and how many it dropped by verdict — without
@@ -2358,7 +2398,25 @@ wired, `server.rs` and `main.rs` are the reference.
   policy granting by NAME, and once beside an I5-dropped private comment,
   where the guard's own upgrade must clear the rule and the window beside
   it must not put it back. That pair pins the note ordering in the
-  handler as much as the notes themselves.
+  handler as much as the notes themselves. Response size accounting
+  (issue #145) is pinned on all four of its arms: a served `bug_info`
+  records exactly the length of the content the CLIENT received
+  (recomputed from the client's own copy, so measuring anything but the
+  served payload fails) and strictly more than the text inside it, so a
+  regression to the text alone or to the whole `CallToolResult` fails on
+  a byte count; a wholly denied call sizes by the caller's id width and
+  nothing else — two same-width ids over a 4 KiB bug and a minimal one
+  are EQUAL, a six-digit-wider id costs exactly six — while a partial
+  denial, verdict `denied` over an envelope that still carries a served
+  body, is strictly larger than the same denial alone, pinning that the
+  verdict does not bound the size; and the three unmeasured sites record
+  the field ABSENT rather than zero — the protocol error, the
+  handshake-skip refusal, and the pre-dispatch gate, whose line is
+  asserted not to contain the key at all, so `Some(0)` and a dropped
+  `skip_serializing_if` (a `null`) fail alike. On the export side the
+  attribute is asserted present as an Int and absent when the record
+  carries no size, and a pre-#145 line without `response_bytes`
+  deserializes with it `None` against the pinned pre-change golden.
 - Identity tests (#[cfg(test)] in crates/bugwarden/src/server.rs and
   crates/bugwarden-core/src/client.rs; crates/bugwarden/tests/
   http_transport_wiremock.rs, crates/bugwarden/tests/binary_user_agent.rs

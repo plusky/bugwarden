@@ -624,6 +624,9 @@ async fn a_handshake_free_call_is_refused_and_never_names_a_client() {
         calls[0].guard.is_none(),
         "the guard never ran, so no verdict may be recorded"
     );
+    // Nothing was dispatched, so there is no payload — absent, not zero, or
+    // a size aggregation averages in a call that returned nothing (#145).
+    assert_eq!(calls[0].outcome.response_bytes, None);
 }
 
 #[tokio::test]

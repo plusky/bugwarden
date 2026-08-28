@@ -187,6 +187,12 @@ receivers:
         if: 'attributes?.guard?.rule != nil'
         from: attributes.guard.rule
         to: attributes["bugwarden.rule"]
+      # Absent on a call that produced nothing to measure, so a mean over
+      # this attribute is a mean over calls that returned something.
+      - type: move
+        if: 'attributes?.outcome?.response_bytes != nil'
+        from: attributes.outcome.response_bytes
+        to: attributes["bugwarden.response_bytes"]
 
       # The W3C ids the client stamped on the call (issue #28). Promoting
       # them to the record's own trace context is what makes a guard

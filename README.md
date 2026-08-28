@@ -863,8 +863,23 @@ Every record carries `v`, a millisecond-precision UTC `ts`, a per-process
 monotonic `seq` (the ordering authority — file order equals `seq` order),
 and a `session` naming the transport, the session id and, over http, the
 peer address. A `tool_call` adds the client, the request (tool name, request
-id, parameters), the outcome class and duration, and — for the tools that
-consult the guard — a `guard` object:
+id, parameters), the `outcome` — class, duration and, when there was a
+result to measure, `response_bytes`: the serialized size of the content
+the server produced — the compact JSON of the result's content array,
+block framing included, so more than the length of the text inside it and
+independent of the negotiated protocol revision. It is absent, never zero,
+where no result exists (a protocol error, or a call the pre-dispatch audit
+gate turned away before building its refusal), so an operator aggregating
+payload size per tool does not average errors in. It measures the payload
+and the verdict does not bound it: `denied` is the *worst* verdict of a
+call, not a claim that nothing was served, so a multi-bug read with one
+denied id records `denied` over an envelope holding the bugs it did serve.
+Only where the whole response is a single uniform denial does the size
+reduce to a function of the id the caller asked about. Produced, not
+necessarily delivered: an audit failure after the record was written can
+swap the response for a refusal, and the record keeps describing the call
+rather than the wire — the same caveat `class` and `verdict` carry. And — for the
+tools that consult the guard — a `guard` object:
 
 | `guard` field | Meaning |
 |---------------|---------|
@@ -887,8 +902,11 @@ Bugzilla-side timings; nothing emits it yet, so do not build on it.
 
 The schema is closed — fixed structs, fixed vocabularies — and it has no
 field for the Bugzilla API key, for request headers, or for free-text bug
-content. Nothing fetched *from* Bugzilla is written: a tool result is not a
-parameter. The one open field is the request's `params`, and it is fed
+content. No *content* fetched from Bugzilla is written: a tool result is
+not a parameter. The one thing a record says about a result is its size —
+`outcome.response_bytes`, a byte count and never a byte — which is the
+same presence-and-size treatment `params` gives a blob. The one open field
+is the request's `params`, and it is fed
 through an allowlist of client-authored keys: allowlisted values are
 recorded verbatim (strings truncated at 1024 characters), and every other
 parameter — `comment`, `summary`, `description`, `url`, `whiteboard`,
@@ -896,7 +914,7 @@ parameter — `comment`, `summary`, `description`, `url`, `whiteboard`,
 presence and size but never its content.
 
 ```json
-{"v":1,"ts":"2026-02-03T04:05:06.789Z","seq":7,"session":{"id":"sess-1","transport":"http","remote":"192.0.2.7:52611"},"event":"tool_call","client":{"name":"example-agent","version":"1.4.2"},"request":{"tool":"bugs_quicksearch","id":"3","params":{"limit":50,"offset":0,"query":"kernel panic","status":"ALL"}},"guard":{"verdict":"served_filtered","policy_hash":"sha256:58013baa090cf77630373ab50cc5eaf2d679ec5a06e8a336600fc89b23bb8604","suppressed_count":2,"suppressed_ids":[1290040,1290041],"redacted_fields":[],"scan":{"scanned":50,"dropped":2}},"outcome":{"class":"ok","duration_ms":52}}
+{"v":1,"ts":"2026-02-03T04:05:06.789Z","seq":7,"session":{"id":"sess-1","transport":"http","remote":"192.0.2.7:52611"},"event":"tool_call","client":{"name":"example-agent","version":"1.4.2"},"request":{"tool":"bugs_quicksearch","id":"3","params":{"limit":50,"offset":0,"query":"kernel panic","status":"ALL"}},"guard":{"verdict":"served_filtered","policy_hash":"sha256:58013baa090cf77630373ab50cc5eaf2d679ec5a06e8a336600fc89b23bb8604","suppressed_count":2,"suppressed_ids":[1290040,1290041],"redacted_fields":[],"scan":{"scanned":50,"dropped":2}},"outcome":{"class":"ok","duration_ms":52,"response_bytes":6218}}
 ```
 
 A reader of the file should skip empty lines and tolerate at most one
@@ -935,7 +953,9 @@ What goes over the wire:
   sink — so nothing extra is added.
   Attributes lift the fields worth querying on out of the body:
   `bugwarden.event`, `.seq`, `.transport`, `.session.id` and, on a tool
-  call, `.tool`, `.verdict` and `.rule`. The record's `trace_id` and
+  call, `.tool`, `.verdict`, `.rule` and `.response_bytes` — the last
+  absent, never zero, on a call that produced nothing to measure, so a
+  size aggregation does not average errors in. The record's `trace_id` and
   `span_id` are the ones the client sent in its `traceparent`, so a guard
   decision joins the client trace that caused it. Severity follows the
   record *kind*: `audit_gap` is an error, everything else is info — the
