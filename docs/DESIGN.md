@@ -778,7 +778,8 @@ where every other criterion describes bug content. Decisions, all deliberate:
 ## MCP tool surface (crates/bugwarden/src/server.rs)
 
 Result convention: success => `CallToolResult::success` with ONE text block of
-pretty-printed JSON. The sole exception is `download_attachment`, which
+compact JSON (whitespace is not MCP API; pretty-printing costs the model
+~15-25% of every payload for nothing). The sole exception is `download_attachment`, which
 returns a JSON summary text block PLUS one image or blob-resource block. Guard refusals and input-validation failures =>
 `CallToolResult::error` with a text block (NOT a protocol error). Protocol
 issues (missing API key header in per-request custody) =>
