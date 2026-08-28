@@ -2251,3 +2251,238 @@ async fn bug_info_projection_never_changes_a_restricted_entry() {
         "the restricted entry is byte-identical across projections: {restricted:?}"
     );
 }
+
+/// Six public comments for bug 7, ids 1..=6, text "comment N".
+fn six_comments() -> Vec<Value> {
+    (1..=6)
+        .map(|i| {
+            json!({ "id": i, "bug_id": 7, "is_private": false, "text": format!("comment {i}") })
+        })
+        .collect()
+}
+
+/// Serve `comments` from bug 7's comment endpoint (unbounded).
+async fn mount_comments(mock: &MockServer, comments: Vec<Value>) {
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/7/comment"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": { "7": { "comments": comments } }
+        })))
+        .mount(mock)
+        .await;
+}
+
+/// The `comments` array of a windowed bug_comments envelope.
+fn windowed_ids(result: &Value) -> Vec<u64> {
+    result["comments"]
+        .as_array()
+        .expect("envelope carries a comments array")
+        .iter()
+        .filter_map(|c| c["id"].as_u64())
+        .collect()
+}
+
+#[tokio::test]
+async fn bug_comments_without_windowing_params_stays_a_bare_array() {
+    let mock = MockServer::start().await;
+    mount_bug_and_padding(&mock, world_readable_bug(7)).await;
+    mount_comments(&mock, six_comments()).await;
+    let client = client_for("", &mock).await;
+
+    let result = call(&client, "bug_comments", json!({ "id": 7 })).await;
+    let parsed: Value = serde_json::from_str(&text_of(&result)).expect("bug_comments returns JSON");
+    assert!(
+        parsed.is_array(),
+        "no windowing params: the response stays the bare array it always was"
+    );
+    assert_eq!(parsed.as_array().unwrap().len(), 6);
+}
+
+#[tokio::test]
+async fn bug_comments_head_tail_windows_out_the_middle() {
+    let mock = MockServer::start().await;
+    mount_bug_and_padding(&mock, world_readable_bug(7)).await;
+    mount_comments(&mock, six_comments()).await;
+    let client = client_for("", &mock).await;
+
+    let result = call(
+        &client,
+        "bug_comments",
+        json!({ "id": 7, "head": 1, "tail": 2 }),
+    )
+    .await;
+    let parsed: Value = serde_json::from_str(&text_of(&result)).expect("bug_comments returns JSON");
+    assert_eq!(
+        windowed_ids(&parsed),
+        vec![1, 5, 6],
+        "first 1 + last 2, middle omitted"
+    );
+    assert_eq!(
+        parsed["truncation"],
+        json!({ "omitted_comments": 3, "shown_comments": 3 })
+    );
+}
+
+#[tokio::test]
+async fn bug_comments_tail_only_keeps_the_end() {
+    let mock = MockServer::start().await;
+    mount_bug_and_padding(&mock, world_readable_bug(7)).await;
+    mount_comments(&mock, six_comments()).await;
+    let client = client_for("", &mock).await;
+
+    let result = call(&client, "bug_comments", json!({ "id": 7, "tail": 2 })).await;
+    let parsed: Value = serde_json::from_str(&text_of(&result)).expect("bug_comments returns JSON");
+    assert_eq!(windowed_ids(&parsed), vec![5, 6]);
+    assert_eq!(
+        parsed["truncation"],
+        json!({ "omitted_comments": 4, "shown_comments": 2 })
+    );
+}
+
+#[tokio::test]
+async fn bug_comments_window_overlap_omits_nothing() {
+    // head + tail >= len: no window closes, and the envelope still reports
+    // a zero-omission truncation block (deterministic shape per signature).
+    let mock = MockServer::start().await;
+    mount_bug_and_padding(&mock, world_readable_bug(7)).await;
+    mount_comments(&mock, six_comments()).await;
+    let client = client_for("", &mock).await;
+
+    let result = call(
+        &client,
+        "bug_comments",
+        json!({ "id": 7, "head": 4, "tail": 4 }),
+    )
+    .await;
+    let parsed: Value = serde_json::from_str(&text_of(&result)).expect("bug_comments returns JSON");
+    assert_eq!(windowed_ids(&parsed), vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(
+        parsed["truncation"],
+        json!({ "omitted_comments": 0, "shown_comments": 6 })
+    );
+}
+
+#[tokio::test]
+async fn bug_comments_window_counts_only_post_filter_comments() {
+    // I5: the middle comment is private and the policy never serves private
+    // content (allow_private_comments defaults to false). The window runs
+    // on the post-filter list: shown 1, omitted 1 — the raw total (3) must
+    // never appear, or private-comment existence leaks by arithmetic.
+    let comments = vec![
+        json!({ "id": 1, "bug_id": 7, "is_private": false, "text": "first public" }),
+        json!({ "id": 2, "bug_id": 7, "is_private": true, "text": "canary-private-3f9d" }),
+        json!({ "id": 3, "bug_id": 7, "is_private": false, "text": "last public" }),
+    ];
+    let mock = MockServer::start().await;
+    mount_bug_and_padding(&mock, world_readable_bug(7)).await;
+    mount_comments(&mock, comments).await;
+    let client = client_for("", &mock).await;
+
+    let result = call(&client, "bug_comments", json!({ "id": 7, "tail": 1 })).await;
+    let text = text_of(&result);
+    assert!(
+        !text.contains("canary-private-3f9d"),
+        "private stays out (I5)"
+    );
+    let parsed: Value = serde_json::from_str(&text).expect("bug_comments returns JSON");
+    assert_eq!(windowed_ids(&parsed), vec![3]);
+    assert_eq!(
+        parsed["truncation"],
+        json!({ "omitted_comments": 1, "shown_comments": 1 }),
+        "counts are computed after the private filter, never from the raw list"
+    );
+}
+
+#[tokio::test]
+async fn bug_comments_window_runs_after_duplicate_marker_scrubbing() {
+    // I14 ordering: a duplicate marker naming a policy-hidden bug is
+    // scrubbed BEFORE the window closes — it must not consume a window
+    // slot, and the hidden id must not appear anywhere in the response.
+    let policy = concat!(
+        "[[rule]]\nname = \"hide-secret\"\naction = \"deny\"\n",
+        "[rule.match]\nproducts = [\"Secret*\"]\n",
+    );
+    let comments = vec![
+        json!({ "id": 1, "bug_id": 7, "is_private": false,
+                "text": "*** Bug 666 has been marked as a duplicate of this bug ***" }),
+        json!({ "id": 2, "bug_id": 7, "is_private": false, "text": "the real answer" }),
+    ];
+    let mock = MockServer::start().await;
+    mount_bug_and_padding(&mock, world_readable_bug(7)).await;
+    // The disclosure assessment for 666: absent from the response, which is
+    // indistinguishable from policy-hidden — not disclosable either way (I4).
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "666"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    mount_comments(&mock, comments).await;
+    let client = client_for(policy, &mock).await;
+
+    let result = call(&client, "bug_comments", json!({ "id": 7, "tail": 1 })).await;
+    let text = text_of(&result);
+    assert!(!text.contains("666"), "the hidden id never appears (I14)");
+    let parsed: Value = serde_json::from_str(&text).expect("bug_comments returns JSON");
+    assert_eq!(
+        windowed_ids(&parsed),
+        vec![2],
+        "the scrubbed marker did not consume the window slot"
+    );
+    assert_eq!(
+        parsed["truncation"],
+        json!({ "omitted_comments": 0, "shown_comments": 1 })
+    );
+}
+
+#[tokio::test]
+async fn bug_comments_max_comment_length_caps_chars_and_marks() {
+    let long = "a".repeat(300);
+    let multibyte = "日本語".repeat(40); // 120 chars, 360 bytes
+    let comments = vec![
+        json!({ "id": 1, "bug_id": 7, "is_private": false, "text": long }),
+        json!({ "id": 2, "bug_id": 7, "is_private": false, "text": multibyte }),
+        json!({ "id": 3, "bug_id": 7, "is_private": false, "text": "short" }),
+    ];
+    let mock = MockServer::start().await;
+    mount_bug_and_padding(&mock, world_readable_bug(7)).await;
+    mount_comments(&mock, comments).await;
+    let client = client_for("", &mock).await;
+
+    let result = call(
+        &client,
+        "bug_comments",
+        json!({ "id": 7, "max_comment_length": 100 }),
+    )
+    .await;
+    let parsed: Value = serde_json::from_str(&text_of(&result)).expect("bug_comments returns JSON");
+    let comments = parsed["comments"].as_array().expect("comments array");
+
+    let first = &comments[0];
+    assert_eq!(first["text"].as_str().unwrap().chars().count(), 100);
+    assert_eq!(
+        first["text_truncated"],
+        json!({ "shown_chars": 100, "total_chars": 300 })
+    );
+
+    let second = &comments[1];
+    // Chars, not bytes: the multibyte cap lands on a char boundary and
+    // carries the true character count.
+    assert_eq!(second["text"].as_str().unwrap().chars().count(), 100);
+    assert_eq!(
+        second["text_truncated"],
+        json!({ "shown_chars": 100, "total_chars": 120 })
+    );
+
+    let third = &comments[2];
+    assert_eq!(third["text"], json!("short"));
+    assert!(
+        third.get("text_truncated").is_none(),
+        "an uncapped comment carries no marker"
+    );
+    assert_eq!(
+        parsed["truncation"],
+        json!({ "omitted_comments": 0, "shown_comments": 3 })
+    );
+}
