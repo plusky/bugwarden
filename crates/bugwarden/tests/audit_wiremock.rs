@@ -1057,6 +1057,142 @@ async fn bug_info_with_every_link_disclosable_stays_served_and_redacts_nothing()
     );
 }
 
+/// Bug 7's history as three plain status-change entries, with the
+/// classify fetch and the id=0 link-disclosure padding — the minimal
+/// mock a windowed `bug_history` call needs (issue #142).
+async fn mount_windowed_history(mock: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [world_bug(7)] })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/7/history"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": [{ "id": 7, "history": [
+                { "when": "2020-01-01T00:00:00Z", "who": "dev@example.org", "changes": [
+                    { "field_name": "status", "added": "CONFIRMED", "removed": "NEW" },
+                ] },
+                { "when": "2020-01-02T00:00:00Z", "who": "dev@example.org", "changes": [
+                    { "field_name": "status", "added": "IN_PROGRESS", "removed": "CONFIRMED" },
+                ] },
+                { "when": "2020-01-03T00:00:00Z", "who": "dev@example.org", "changes": [
+                    { "field_name": "status", "added": "RESOLVED", "removed": "IN_PROGRESS" },
+                ] },
+            ] }]
+        })))
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn bug_history_windowing_records_the_omission_it_applied() {
+    // Issue #142: head=1 over three entries omits two. The omission is
+    // something the guard withheld from the served envelope, so the
+    // record names it — redacted_fields carries "history_window" and the
+    // verdict upgrades to served_filtered.
+    let mock = MockServer::start().await;
+    mount_windowed_history(&mock).await;
+    let audited = audited_client_for(HIDE_SECRET_POLICY, &mock, "test-key").await;
+
+    let result = call(
+        &audited.client,
+        "bug_history",
+        json!({ "id": 7, "head": 1 }),
+    )
+    .await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "the windowed history is served"
+    );
+    let text = result.content[0]
+        .as_text()
+        .expect("bug_history answers with text");
+    let envelope: Value = serde_json::from_str(&text.text).expect("bug_history returns JSON");
+    assert_eq!(envelope["history"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        envelope["truncation"],
+        json!({ "omitted_entries": 2, "shown_entries": 1 }),
+        "the window omitted two of three: {envelope}"
+    );
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.request.tool, "bug_history");
+    let guard = tc.guard.as_ref().expect("guard info recorded");
+    assert_eq!(
+        guard.redacted_fields,
+        vec!["history_window".to_string()],
+        "the record names the window as the redaction it applied: {guard:?}"
+    );
+    assert_eq!(guard.verdict, Verdict::ServedFiltered);
+    assert_eq!(
+        guard.suppressed_count, 0,
+        "nothing else was withheld, so the window is the ONLY thing the \
+         filtered verdict can have come from: {guard:?}"
+    );
+    assert!(guard.suppressed_ids.is_empty());
+}
+
+#[tokio::test]
+async fn bug_history_window_that_omits_nothing_stays_silent() {
+    // The other half of issue #142's audit contract: params present but
+    // nothing omitted (head covers every entry) is a CLEAN serve — the
+    // envelope carries its zeros and the record gains no redacted field
+    // and no filtered verdict. An unconditional note would mark every
+    // windowed call served_filtered (#87/#88).
+    let mock = MockServer::start().await;
+    mount_windowed_history(&mock).await;
+    let audited = audited_client_for(HIDE_SECRET_POLICY, &mock, "test-key").await;
+
+    let result = call(
+        &audited.client,
+        "bug_history",
+        json!({ "id": 7, "head": 3, "tail": 3 }),
+    )
+    .await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "the windowed history is served"
+    );
+    let text = result.content[0]
+        .as_text()
+        .expect("bug_history answers with text");
+    let envelope: Value = serde_json::from_str(&text.text).expect("bug_history returns JSON");
+    assert_eq!(envelope["history"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        envelope["truncation"],
+        json!({ "omitted_entries": 0, "shown_entries": 3 }),
+        "the overlapping windows omitted nothing: {envelope}"
+    );
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.request.tool, "bug_history");
+    let guard = tc.guard.as_ref().expect("guard info recorded");
+    assert_eq!(
+        guard.verdict,
+        Verdict::Served,
+        "a window that withheld nothing is a clean serve: {guard:?}"
+    );
+    assert!(
+        guard.redacted_fields.is_empty(),
+        "and the window note stays silent when nothing was omitted: {:?}",
+        guard.redacted_fields
+    );
+    assert_eq!(guard.suppressed_count, 0);
+    assert!(guard.suppressed_ids.is_empty());
+}
+
 /// Policy granting `summary` and nothing else over the world product, so
 /// every bug it matches is served as the [`Guard::summary_view`]
 /// projection rather than whole — the one way a tool call reaches

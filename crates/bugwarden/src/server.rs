@@ -576,6 +576,45 @@ fn too_many_ids(ids: &[u64]) -> Option<CallToolResult> {
     })
 }
 
+/// Window a history list to its first `head` and/or last `tail` entries
+/// (issue #142). Returns the kept entries and how many were omitted.
+///
+/// Called on the SCRUBBED list (`Guard::scrub_history` ran first, I14): an
+/// entry the guard dropped must neither occupy a window slot nor leak the
+/// id it named. `head` + `tail` reaching the entry count keeps everything —
+/// the overlap is not double-counted and nothing is omitted.
+fn window_history(
+    entries: Vec<Value>,
+    head: Option<u32>,
+    tail: Option<u32>,
+) -> (Vec<Value>, usize) {
+    let len = entries.len();
+    let head = head.map(|n| n as usize);
+    let tail = tail.map(|n| n as usize);
+    match (head, tail) {
+        (None, None) => (entries, 0),
+        (Some(h), None) => {
+            let keep = h.min(len);
+            (entries.into_iter().take(keep).collect(), len - keep)
+        }
+        (None, Some(t)) => {
+            let keep = t.min(len);
+            (entries.into_iter().skip(len - keep).collect(), len - keep)
+        }
+        (Some(h), Some(t)) => {
+            if h.saturating_add(t) >= len {
+                return (entries, 0);
+            }
+            // h + t < len, so the two windows cannot overlap.
+            let mut kept = entries;
+            let last = kept.split_off(len - t);
+            kept.truncate(h);
+            kept.extend(last);
+            (kept, len - h - t)
+        }
+    }
+}
+
 /// Advisory attached to a quicksearch envelope when the query is nothing but
 /// bug ids (comma/whitespace-separated numbers, each optionally prefixed
 /// with '#').
@@ -1038,6 +1077,12 @@ pub struct BugHistoryParams {
     /// Only return history newer than this date.
     #[serde(default)]
     pub new_since: Option<DateTime<Utc>>,
+    /// Keep only the first N history entries.
+    #[serde(default)]
+    pub head: Option<u32>,
+    /// Keep only the last N history entries.
+    #[serde(default)]
+    pub tail: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -2126,7 +2171,7 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Returns the history of given bug id. new_since allows filtering history newer than the given date.",
+        description = "Returns the history of given bug id. new_since allows filtering history newer than the given date. head/tail keep only the first/last N entries (head + tail >= the entry count keeps everything); with either set the response is an envelope {\"history\": [...], \"truncation\": {\"omitted_entries\": N, \"shown_entries\": M}} instead of the bare array.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn bug_history(
@@ -2134,7 +2179,7 @@ impl BugWarden {
         Parameters(p): Parameters<BugHistoryParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        tracing::info!(id = p.id, new_since = ?p.new_since, "tool: bug_history");
+        tracing::info!(id = p.id, new_since = ?p.new_since, head = ?p.head, tail = ?p.tail, "tool: bug_history");
         let key = self.api_key(&ctx)?;
         let caller = self.guard.resolve_caller(&self.bz, &key).await;
         if let Some(denied) = self
@@ -2160,11 +2205,32 @@ impl BugWarden {
                         cell.note_suppressed(hidden);
                     }
                 }
-                Ok(ok_json(Guard::scrub_history(
-                    history,
-                    base_url,
-                    &disclosable,
-                )))
+                let scrubbed = Guard::scrub_history(history, base_url, &disclosable);
+                if p.head.is_none() && p.tail.is_none() {
+                    return Ok(ok_json(scrubbed));
+                }
+                // The window closes over the scrubbed list (I14), so a
+                // dropped entry consumes no slot and names nothing.
+                let entries = match scrubbed {
+                    Value::Array(entries) => entries,
+                    // A non-array history from upstream is served unchanged:
+                    // a presentation control must not drop an odd shape.
+                    other => return Ok(ok_json(other)),
+                };
+                let (shown, omitted) = window_history(entries, p.head, p.tail);
+                if omitted > 0 {
+                    if let Some(cell) = audit_cell(&ctx) {
+                        cell.note_redacted("history_window");
+                    }
+                }
+                let shown_len = shown.len();
+                Ok(ok_json(json!({
+                    "history": shown,
+                    "truncation": {
+                        "omitted_entries": omitted,
+                        "shown_entries": shown_len,
+                    },
+                })))
             }
             Err(e) => {
                 tracing::warn!(id = p.id, error = %e, "bug_history: fetch failed");
@@ -4128,6 +4194,7 @@ mod tests {
         let repeats = id_list_advisory(&"7 07 #7 ".repeat(30), "ALL").expect("note");
         assert!(!repeats.contains("batch"), "{repeats}");
     }
+
     use super::*;
     use bugwarden_core::policy::Policy;
 
@@ -4452,6 +4519,82 @@ mod tests {
         ];
         assert!(!cap_comment_text(&mut comments, 100));
         assert!(comments[0].get("text_truncated").is_none());
+    }
+
+    /// Five history entries, told apart by a sequence number.
+    fn seq_entries() -> Vec<Value> {
+        (0..5).map(|n| json!({ "seq": n })).collect()
+    }
+
+    fn seqs(shown: &[Value]) -> Vec<u64> {
+        shown.iter().map(|e| e["seq"].as_u64().unwrap()).collect()
+    }
+
+    #[test]
+    fn window_history_with_neither_param_keeps_everything() {
+        let (shown, omitted) = window_history(seq_entries(), None, None);
+        assert_eq!(seqs(&shown), vec![0, 1, 2, 3, 4]);
+        assert_eq!(omitted, 0);
+    }
+
+    #[test]
+    fn window_history_head_keeps_the_first_entries() {
+        let (shown, omitted) = window_history(seq_entries(), Some(2), None);
+        assert_eq!(seqs(&shown), vec![0, 1]);
+        assert_eq!(omitted, 3);
+    }
+
+    #[test]
+    fn window_history_tail_keeps_the_last_entries() {
+        let (shown, omitted) = window_history(seq_entries(), None, Some(2));
+        assert_eq!(seqs(&shown), vec![3, 4]);
+        assert_eq!(omitted, 3);
+    }
+
+    #[test]
+    fn window_history_head_and_tail_keep_both_ends() {
+        let (shown, omitted) = window_history(seq_entries(), Some(1), Some(2));
+        assert_eq!(seqs(&shown), vec![0, 3, 4]);
+        assert_eq!(omitted, 2);
+    }
+
+    #[test]
+    fn window_history_overlapping_windows_omit_nothing() {
+        // head + tail >= len keeps everything; the overlap is not
+        // double-counted and the envelope reports zeros.
+        for (head, tail) in [(3, 3), (5, 0), (0, 5), (2, 3), (10, 1)] {
+            let (shown, omitted) = window_history(seq_entries(), Some(head), Some(tail));
+            assert_eq!(
+                seqs(&shown),
+                vec![0, 1, 2, 3, 4],
+                "head={head} tail={tail} covers all five entries"
+            );
+            assert_eq!(omitted, 0, "head={head} tail={tail} omits nothing");
+        }
+    }
+
+    #[test]
+    fn window_history_at_the_length_omits_nothing() {
+        let (shown, omitted) = window_history(seq_entries(), Some(5), None);
+        assert_eq!(seqs(&shown), vec![0, 1, 2, 3, 4]);
+        assert_eq!(omitted, 0);
+        let (shown, omitted) = window_history(seq_entries(), None, Some(6));
+        assert_eq!(seqs(&shown), vec![0, 1, 2, 3, 4]);
+        assert_eq!(omitted, 0);
+    }
+
+    #[test]
+    fn window_history_zero_windows_omit_everything() {
+        let (shown, omitted) = window_history(seq_entries(), Some(0), Some(0));
+        assert!(shown.is_empty());
+        assert_eq!(omitted, 5);
+    }
+
+    #[test]
+    fn window_history_over_an_empty_list_omits_nothing() {
+        let (shown, omitted) = window_history(Vec::new(), Some(3), Some(3));
+        assert!(shown.is_empty());
+        assert_eq!(omitted, 0);
     }
 
     #[test]
