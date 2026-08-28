@@ -1131,6 +1131,275 @@ async fn add_attachment_comment_travels_as_a_plain_string() {
     assert!(text_of(&result).contains("55"));
 }
 
+// ---------- bugs_quicksearch group_by (issue #143) ----------
+
+/// The deny rule the group_by tests reuse: `Secret*` products are invisible.
+const HIDE_SECRET_POLICY: &str = concat!(
+    "[[rule]]\nname = \"hide-secret\"\naction = \"deny\"\n",
+    "[rule.match]\nproducts = [\"Secret*\"]\n",
+);
+
+/// Flatten a grouped envelope back to `{field: value, ...}`-merged bug
+/// objects, so a grouped response can be compared against a flat one.
+fn ungroup(envelope: &Value) -> Vec<Value> {
+    envelope["groups"]
+        .as_array()
+        .expect("a grouped envelope has `groups`")
+        .iter()
+        .flat_map(|g| {
+            let hoisted: Vec<(String, Value)> = g
+                .as_object()
+                .expect("group object")
+                .iter()
+                .filter(|(k, _)| *k != "bugs")
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            g["bugs"]
+                .as_array()
+                .expect("each group has `bugs`")
+                .iter()
+                .map(move |b| {
+                    let mut bug = b.as_object().expect("bug object").clone();
+                    for (k, v) in &hoisted {
+                        bug.insert(k.clone(), v.clone());
+                    }
+                    Value::Object(bug)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn quicksearch_groups_follow_served_row_order_not_sort_order() {
+    // Three bugs, products Z / A / Z: the served window decides group order,
+    // so Z comes first because bug 101 did. Sorting the groups — the easy
+    // mutation — would put A first and make group order a channel
+    // independent of the window the guard built.
+    let mock = MockServer::start().await;
+    let mut first = world_readable_bug(101);
+    first["product"] = json!("Zebra");
+    let mut second = world_readable_bug(102);
+    second["product"] = json!("Alpha");
+    let mut third = world_readable_bug(103);
+    third["product"] = json!("Zebra");
+    mount_search(&mock, vec![first, second, third]).await;
+    let client = client_for("", &mock).await;
+
+    let grouped =
+        quicksearch_json_args(&client, json!({ "query": "kernel", "group_by": "product" })).await;
+    let groups = grouped["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 2);
+    assert_eq!(
+        groups[0]["product"],
+        json!("Zebra"),
+        "first appearance wins"
+    );
+    assert_eq!(groups[1]["product"], json!("Alpha"));
+    let ids: Vec<&Value> = groups[0]["bugs"]
+        .as_array()
+        .expect("bugs")
+        .iter()
+        .map(|b| &b["id"])
+        .collect();
+    assert_eq!(
+        ids,
+        vec![&json!(101), &json!(103)],
+        "and within a group too"
+    );
+}
+
+#[tokio::test]
+async fn quicksearch_empty_group_by_is_the_flat_response() {
+    // A client that fills in every declared param sends `""`; that must mean
+    // "no grouping", not "fail the search".
+    let mock = MockServer::start().await;
+    mount_search(&mock, vec![world_readable_bug(101)]).await;
+    let client = client_for("", &mock).await;
+
+    let flat = quicksearch_json_args(&client, json!({ "query": "kernel" })).await;
+    let empty = quicksearch_json_args(&client, json!({ "query": "kernel", "group_by": "" })).await;
+    assert_eq!(empty, flat, "an empty group_by changes nothing");
+}
+
+#[tokio::test]
+async fn quicksearch_grouping_only_reshapes_the_same_bugs() {
+    // Grouping is a projection, not a filter: ungrouping must give back
+    // exactly the flat response, same bugs, same order. Two keys, one of
+    // which (`severity`) is not in the default include_fields — it is
+    // forced into the projection by group_by alone.
+    let mock = MockServer::start().await;
+    let mut other = world_readable_bug(102);
+    other["component"] = json!("YaST");
+    mount_search(&mock, vec![world_readable_bug(101), other]).await;
+    let client = client_for("", &mock).await;
+
+    let flat = quicksearch_json_args(&client, json!({ "query": "kernel" })).await;
+    let grouped = quicksearch_json_args(
+        &client,
+        json!({ "query": "kernel", "group_by": "product,severity" }),
+    )
+    .await;
+
+    assert_eq!(
+        grouped["groups"].as_array().expect("groups").len(),
+        1,
+        "both bugs share product+severity"
+    );
+    assert_eq!(grouped["groups"][0]["product"], json!("openSUSE"));
+    assert_eq!(grouped["groups"][0]["severity"], json!("normal"));
+    assert!(
+        grouped["groups"][0]["bugs"][0].get("product").is_none(),
+        "a grouped field is reported once per group, not per bug"
+    );
+
+    // The flat response never asked for `severity`, so drop it before
+    // comparing — everything else must match bug for bug, in order.
+    let mut round_tripped = ungroup(&grouped);
+    for bug in &mut round_tripped {
+        bug.as_object_mut().expect("bug object").remove("severity");
+    }
+    assert_eq!(
+        round_tripped,
+        *flat["bugs"].as_array().expect("flat bugs"),
+        "grouping must not add, drop or reorder a bug"
+    );
+}
+
+#[tokio::test]
+async fn quicksearch_grouping_hides_the_same_bugs_as_a_flat_search() {
+    // A policy-hidden row must leave no trace in the grouped envelope: no
+    // empty bucket, no group header carrying its product (I3). The grouped
+    // result over a hiding upstream must be byte-identical to the grouped
+    // result over an upstream that simply never returned that row.
+    let hiding = MockServer::start().await;
+    let mut hidden = world_readable_bug(101);
+    hidden["product"] = json!("SecretSauce");
+    mount_search(&hiding, vec![hidden, world_readable_bug(102)]).await;
+    let client = client_for(HIDE_SECRET_POLICY, &hiding).await;
+    let filtered =
+        quicksearch_json_args(&client, json!({ "query": "kernel", "group_by": "product" })).await;
+
+    let clean = MockServer::start().await;
+    mount_search(&clean, vec![world_readable_bug(102)]).await;
+    let client = client_for(HIDE_SECRET_POLICY, &clean).await;
+    let reference =
+        quicksearch_json_args(&client, json!({ "query": "kernel", "group_by": "product" })).await;
+
+    assert_eq!(
+        filtered, reference,
+        "a dropped bug must not show up as a group, a header or a count"
+    );
+    assert!(
+        !serde_json::to_string(&filtered)
+            .expect("serializable")
+            .contains("SecretSauce"),
+        "the hidden bug's product must not be hoisted into a header"
+    );
+}
+
+#[tokio::test]
+async fn quicksearch_grouping_leaves_the_advisory_note_alone() {
+    // The note sits beside `groups` exactly as it sits beside `bugs`, with
+    // the same text: it is a function of the client's query, and grouping
+    // is a reshaping of the results the query found.
+    let mock = MockServer::start().await;
+    mount_search(
+        &mock,
+        vec![world_readable_bug(101), world_readable_bug(102)],
+    )
+    .await;
+    let client = client_for("", &mock).await;
+
+    let flat = quicksearch_json(&client, "#101, 102").await;
+    let grouped = quicksearch_json_args(
+        &client,
+        json!({ "query": "#101, 102", "group_by": "product" }),
+    )
+    .await;
+    assert_eq!(
+        grouped["note"], flat["note"],
+        "the advisory must survive grouping unchanged"
+    );
+    assert!(
+        grouped.get("bugs").is_none() && grouped.get("groups").is_some(),
+        "and it must not have replaced the grouped envelope"
+    );
+}
+
+#[tokio::test]
+async fn quicksearch_grouping_keeps_the_redacted_marker() {
+    // A summary-only grant still groups: every group_by field is a summary
+    // field, so the row buckets normally and keeps `_redacted` — dropping
+    // the marker inside a group would misrepresent the grant.
+    let policy = concat!(
+        "[[rule]]\nname = \"summary-only\"\naction = \"restrict\"\n",
+        "capabilities = [\"summary\"]\n",
+        "[rule.match]\nproducts = [\"openSUSE\"]\n",
+    );
+    let mock = MockServer::start().await;
+    mount_search(&mock, vec![world_readable_bug(101)]).await;
+    let client = client_for(policy, &mock).await;
+
+    let grouped = quicksearch_json_args(
+        &client,
+        json!({ "query": "kernel", "group_by": "product,status" }),
+    )
+    .await;
+    assert_eq!(grouped["groups"][0]["product"], json!("openSUSE"));
+    assert_eq!(grouped["groups"][0]["status"], json!("NEW"));
+    assert_eq!(grouped["groups"][0]["bugs"][0]["_redacted"], json!(true));
+}
+
+#[tokio::test]
+async fn quicksearch_rejects_an_unknown_group_by_without_calling_upstream() {
+    // Validated before the round trip, and the refusal quotes only what the
+    // client itself sent — no bug id, no rule name (I1/I2).
+    let mock = MockServer::start().await;
+    mount_search(&mock, vec![world_readable_bug(101)]).await;
+    let client = client_for("", &mock).await;
+
+    let result = call(
+        &client,
+        "bugs_quicksearch",
+        json!({ "query": "kernel", "group_by": "assigned_to" }),
+    )
+    .await;
+    assert!(is_error(&result));
+    let text = text_of(&result);
+    assert!(text.contains("assigned_to"), "text: {text}");
+    assert!(text.contains("product"), "the vocabulary is listed: {text}");
+    assert!(
+        mock.received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "a malformed projection must not cost a Bugzilla round trip"
+    );
+}
+
+#[tokio::test]
+async fn quicksearch_group_by_does_not_soften_a_failing_search() {
+    // group_by rides along on an upstream failure without changing the
+    // uniform text (I2) — no partial envelope, no mention of the grouping.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock)
+        .await;
+    let client = client_for("", &mock).await;
+
+    let result = call(
+        &client,
+        "bugs_quicksearch",
+        json!({ "query": "kernel", "group_by": "product" }),
+    )
+    .await;
+    assert!(is_error(&result));
+    assert_eq!(text_of(&result), "Search failed");
+}
+
 // ---------- update_bug_fields: the widened field surface (issue #38) ----------
 
 /// Mount a successful `PUT /rest/bug/7` whose body must carry `body`,

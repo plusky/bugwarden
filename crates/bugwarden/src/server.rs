@@ -276,6 +276,7 @@ const PARAM_ALLOWLIST: &[&str] = &[
     "duplicate_of",
     "field_names",
     "file_name",
+    "group_by",
     "groups",
     "head",
     "head_lines",
@@ -870,6 +871,119 @@ fn project_fields(bug: &Value, fields: &BTreeSet<String>) -> Value {
     Value::Object(out)
 }
 
+/// Fields `bugs_quicksearch` will group by: a HAND-PICKED subset of the
+/// [`CLASSIFY_FIELDS`] ∩ [`SUMMARY_FIELDS`] intersection, not the whole of it
+/// — low-cardinality enum-ish fields only. That membership is what makes
+/// grouping free of policy consequences: the value is already fetched
+/// whatever the caller's `include_fields` says, so no extra upstream field is
+/// pulled, and a summary-redacted row carries all six, so it buckets like any
+/// other row instead of needing one of its own.
+///
+/// Membership is NOT the I14 argument — the intersection also holds `summary`
+/// (which routinely reads "regression from bug 12345") and `id`. What keeps a
+/// header clean is ordering: [`group_bugs`] runs after `scrub_bug_links`. Do
+/// not read the two membership assertions in the tests as a licence to extend
+/// this list; grouping by a free-text field is also pointless.
+///
+/// [`SUMMARY_FIELDS`]: bugwarden_core::guard::SUMMARY_FIELDS
+const GROUP_BY_FIELDS: &[&str] = &[
+    "product",
+    "component",
+    "status",
+    "resolution",
+    "severity",
+    "priority",
+];
+
+/// Parse `group_by` into a deduplicated key list, or explain why not. An
+/// unknown name is refused rather than skipped: silently ungrouping a typo'd
+/// request looks like the feature is broken.
+///
+/// Caller order is kept, but it is NOT observable: serde_json is built
+/// without `preserve_order`, so its Map is a BTreeMap and a group header
+/// serializes with its keys sorted (`bugs` first, alphabetically). Hence
+/// `group_by=status,product` and `group_by=product,status` return identical
+/// bytes. Do not promise ordering in the tool description on the strength of
+/// this Vec.
+fn parse_group_by(spec: &str) -> Result<Vec<&'static str>, String> {
+    let mut keys: Vec<&'static str> = Vec::new();
+    for raw in spec.split(',') {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let Some(known) = GROUP_BY_FIELDS.iter().find(|f| **f == name) else {
+            return Err(format!(
+                "group_by: unknown field '{name}'; valid fields are {}",
+                GROUP_BY_FIELDS.join(", ")
+            ));
+        };
+        if !keys.contains(known) {
+            keys.push(known);
+        }
+    }
+    // A spec naming nothing at all is "no grouping", not an error: `""` is
+    // what a client filling in every declared param sends, and the sibling
+    // include_fields reads an empty segment the same forgiving way. A typo
+    // is still refused above — that is a name, not an absence.
+    Ok(keys)
+}
+
+/// Bucket `rows` by their values for `keys`, hoisting those values out of
+/// every row into the group header — the whole point, one `"product": "P"`
+/// per group instead of one per bug.
+///
+/// Runs on the SERVED projection, after link scrubbing: a grouped field is
+/// forced into the projection (see the handler), so a value can only reach
+/// a group header by the same path that would have put it on the bug, and
+/// grouping never surfaces a field the projection dropped. A row missing
+/// the field buckets under `null`, which keeps every header the same shape
+/// — `project_fields` omits absent keys, so this is not only the redacted
+/// case.
+///
+/// Group order, and bug order within a group, are first appearance — the
+/// envelope is a deterministic function of the served window, so grouping
+/// cannot become a channel that reorders results by verdict, and a group
+/// exists only where a served bug put it (no empty buckets, I3). Sorting
+/// the groups instead would be the easy mutation here; the unit test picks
+/// a fixture whose first-appearance order differs from its sorted one.
+fn group_bugs(rows: Vec<Value>, keys: &[&str]) -> Vec<Value> {
+    let mut sigs: Vec<Vec<Value>> = Vec::new();
+    let mut buckets: Vec<Vec<Value>> = Vec::new();
+    for mut row in rows {
+        let sig: Vec<Value> = keys
+            .iter()
+            .map(|k| row.get(*k).cloned().unwrap_or(Value::Null))
+            .collect();
+        if let Some(obj) = row.as_object_mut() {
+            for k in keys {
+                obj.remove(*k);
+            }
+        }
+        // Linear scan: `keys` is at most six wide and the group count is
+        // bounded by the served window, which Guard::MAX_SEARCH_WINDOW
+        // caps at 1000 regardless of what `limit` asked for.
+        match sigs.iter().position(|s| *s == sig) {
+            Some(i) => buckets[i].push(row),
+            None => {
+                sigs.push(sig);
+                buckets.push(vec![row]);
+            }
+        }
+    }
+    sigs.into_iter()
+        .zip(buckets)
+        .map(|(sig, bugs)| {
+            let mut group = serde_json::Map::new();
+            for (k, v) in keys.iter().zip(sig) {
+                group.insert((*k).to_string(), v);
+            }
+            group.insert("bugs".to_string(), Value::Array(bugs));
+            Value::Object(group)
+        })
+        .collect()
+}
+
 /// Drop every `*_detail` key from a bug object: those repeat the plain
 /// account fields with real_name/id/email expanded — measured at 44-48%
 /// of a full bug's serialized size.
@@ -1233,6 +1347,16 @@ pub struct QuicksearchParams {
     /// Offset into the result list (for pagination).
     #[serde(default)]
     pub offset: u32,
+    /// Optional comma-separated list of fields to group the results by:
+    /// product, component, status, resolution, severity, priority. Omit it
+    /// (or send an empty string) for a flat `{"bugs": [...]}` response.
+    /// Given, the response is `{"groups": [{"bugs": [...], <field>:
+    /// <value>, ...}]}` and each grouped field is reported once per group
+    /// instead of once per bug. Listing the same field twice changes
+    /// nothing, and the order fields are listed in does not matter.
+    /// Unknown field names are rejected.
+    #[serde(default)]
+    pub group_by: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -2443,7 +2567,7 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Search bugs by CONTENT using bugzilla's quicksearch syntax (full-text matching over bug summaries and text). The status filter is prefixed to the query expression, and under any non-empty status (the default is ALL) a number in the query is matched as text like any other word — it returns bugs that merely MENTION that number, not an id lookup. The one exception: an empty status sends the query to bugzilla bare, and bugzilla treats a bare query of nothing but numbers as an exact id lookup. Either way, for an exact set of known bug ids call bug_info with its bug_ids array instead: every requested id comes back either as a bug or under 'restricted', so an inaccessible id is reported rather than silently missing from a search.\n\nTo reduce the token limit & response time, only returns a subset of fields for each bug. The user can query full details of each bug using the bug_info tool. Returns the top-level bug data envelope containing the matched bugs.",
+        description = "Search bugs by CONTENT using bugzilla's quicksearch syntax (full-text matching over bug summaries and text). The status filter is prefixed to the query expression, and under any non-empty status (the default is ALL) a number in the query is matched as text like any other word — it returns bugs that merely MENTION that number, not an id lookup. The one exception: an empty status sends the query to bugzilla bare, and bugzilla treats a bare query of nothing but numbers as an exact id lookup. Either way, for an exact set of known bug ids call bug_info with its bug_ids array instead: every requested id comes back either as a bug or under 'restricted', so an inaccessible id is reported rather than silently missing from a search.\n\nTo reduce the token limit & response time, only returns a subset of fields for each bug. The user can query full details of each bug using the bug_info tool. Returns the top-level bug data envelope containing the matched bugs.\n\nSet group_by to a comma-separated list of product, component, status, resolution, severity or priority to get {'groups': [{'bugs': [...], <field>: <value>, ...}]} instead of a flat bug list: each grouped field is then reported once per group rather than once per bug. Worth doing only when the results share few distinct values for those fields — grouping a heterogeneous result set by several fields at once makes the response LARGER, since a group holding one bug costs more than the fields it saved. Omit group_by for the flat response.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn bugs_quicksearch(
@@ -2457,17 +2581,32 @@ impl BugWarden {
             include_fields = %p.include_fields,
             limit = p.limit,
             offset = p.offset,
+            group_by = p.group_by.as_deref().unwrap_or(""),
             "tool: bugs_quicksearch"
         );
+        // Validated before the upstream call: a malformed projection should
+        // not cost a Bugzilla round-trip. The text names only what the
+        // client itself sent, so it is not an oracle (I2/I3).
+        let group_keys = match p.group_by.as_deref().map(parse_group_by).transpose() {
+            Ok(keys) => keys.filter(|k| !k.is_empty()),
+            Err(msg) => {
+                note_refused(&ctx);
+                return Ok(err_text(msg));
+            }
+        };
         let key = self.api_key(&ctx)?;
 
-        // Requested projection; "id" is always part of it.
+        // Requested projection; "id" is always part of it, and so is anything
+        // grouped: a grouped field is served (in the group header), so it has
+        // to travel the same projection and link-scrub path as any other
+        // served field rather than being read out of the pre-projection row.
         let requested: BTreeSet<String> = p
             .include_fields
             .split(',')
             .map(|f| f.trim().to_string())
             .filter(|f| !f.is_empty())
             .chain(std::iter::once("id".to_string()))
+            .chain(group_keys.iter().flatten().map(|k| (*k).to_string()))
             .collect();
 
         // Fetch requested ∪ CLASSIFY_FIELDS so the guard can classify.
@@ -2557,7 +2696,13 @@ impl BugWarden {
             }
         }
 
-        let mut envelope = json!({ "bugs": projected });
+        // Grouping is the last step, after the audit block above has already
+        // read the flat projection: the audit record of a call is then
+        // identical whether or not the client asked for groups.
+        let mut envelope = match &group_keys {
+            Some(keys) => json!({ "groups": group_bugs(projected, keys) }),
+            None => json!({ "bugs": projected }),
+        };
         // Steering only, computed from the request the client itself sent
         // (query and status) — never from results or verdicts (see
         // id_list_advisory).
@@ -4618,6 +4763,128 @@ mod tests {
         let mut not_an_object = json!("just a string");
         strip_detail_fields(&mut not_an_object);
         assert_eq!(not_an_object, json!("just a string"));
+    }
+
+    #[test]
+    fn parse_group_by_dedupes_and_reads_an_empty_spec_as_no_grouping() {
+        assert_eq!(
+            parse_group_by(" status , product ,status").expect("valid spec"),
+            vec!["status", "product"],
+            "a repeat is not a second key"
+        );
+        // Not an error: `""` is what a client filling in every declared
+        // param sends, and the handler maps an empty key list to the flat
+        // response rather than failing the whole search.
+        for spec in ["", " ", " , ", ",,"] {
+            assert_eq!(
+                parse_group_by(spec).expect("an empty spec is not a refusal"),
+                Vec::<&str>::new(),
+                "spec {spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_group_by_refuses_an_unknown_name() {
+        // Silently ignoring a typo would look like the feature is broken.
+        let err = parse_group_by("product,assigned_to").expect_err("unknown field");
+        assert!(err.contains("assigned_to"), "names what the caller sent");
+        assert!(err.contains("product"), "lists the vocabulary");
+        // Case-sensitive on purpose: the error lists the vocabulary, so a
+        // wrong case self-corrects on the next call.
+        assert!(parse_group_by("Product").is_err());
+    }
+
+    #[test]
+    fn group_by_vocabulary_is_fetched_and_survives_redaction() {
+        // A change detector first: the two memberships below hold for the
+        // whole CLASSIFY ∩ SUMMARY intersection, `summary` and `id`
+        // included, so they license nothing on their own. The list is
+        // hand-picked and adding to it is a decision, not a refactor.
+        assert_eq!(
+            GROUP_BY_FIELDS,
+            [
+                "product",
+                "component",
+                "status",
+                "resolution",
+                "severity",
+                "priority"
+            ]
+        );
+        // The invariant that makes grouping free of policy consequences: every
+        // key is already classified (no extra upstream field) and already on a
+        // summary-redacted row (so it groups like any other row).
+        for f in GROUP_BY_FIELDS {
+            assert!(
+                bugwarden_core::client::CLASSIFY_FIELDS
+                    .split(',')
+                    .any(|c| c == *f),
+                "{f} must be in CLASSIFY_FIELDS"
+            );
+            assert!(
+                bugwarden_core::guard::SUMMARY_FIELDS.contains(f),
+                "{f} must be in SUMMARY_FIELDS"
+            );
+        }
+    }
+
+    #[test]
+    fn group_bugs_hoists_keys_and_orders_by_first_appearance() {
+        // B before A on purpose: first appearance and sorted order disagree
+        // here, so sorting the groups fails this test instead of passing it.
+        let rows = vec![
+            json!({ "id": 1, "product": "B", "status": "NEW" }),
+            json!({ "id": 2, "product": "A", "status": "NEW" }),
+            json!({ "id": 3, "product": "B", "status": "NEW" }),
+        ];
+        let groups = group_bugs(rows, &["product"]);
+        assert_eq!(
+            groups,
+            vec![
+                json!({ "product": "B", "bugs": [
+                    { "id": 1, "status": "NEW" },
+                    { "id": 3, "status": "NEW" },
+                ]}),
+                json!({ "product": "A", "bugs": [{ "id": 2, "status": "NEW" }]}),
+            ],
+            "grouped keys leave the rows, and B precedes A because bug 1 did"
+        );
+    }
+
+    #[test]
+    fn group_headers_serialize_with_keys_sorted_and_bugs_first() {
+        // serde_json has no `preserve_order` here, so its Map is a BTreeMap:
+        // the caller's group_by order never reaches the wire. Pinned because
+        // the tool description promises clients a concrete shape, and two
+        // specs differing only in order must not look like two features.
+        let rows = vec![json!({ "id": 1, "product": "P", "status": "NEW" })];
+        let by_one = serde_json::to_string(&group_bugs(rows.clone(), &["status", "product"]))
+            .expect("serializable");
+        assert_eq!(
+            by_one,
+            r#"[{"bugs":[{"id":1}],"product":"P","status":"NEW"}]"#
+        );
+        assert_eq!(
+            by_one,
+            serde_json::to_string(&group_bugs(rows, &["product", "status"])).expect("serializable"),
+            "group_by order is not observable; do not promise it"
+        );
+    }
+
+    #[test]
+    fn group_bugs_buckets_a_missing_key_under_null() {
+        // `project_fields` omits absent keys, so a row can reach here without
+        // one; every header still has to be the same shape.
+        let rows = vec![json!({ "id": 1 }), json!({ "id": 2, "product": "A" })];
+        let groups = group_bugs(rows, &["product"]);
+        assert_eq!(
+            groups,
+            vec![
+                json!({ "product": null, "bugs": [{ "id": 1 }]}),
+                json!({ "product": "A", "bugs": [{ "id": 2 }]}),
+            ]
+        );
     }
 
     #[test]
