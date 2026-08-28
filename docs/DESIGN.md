@@ -780,7 +780,7 @@ where every other criterion describes bug content. Decisions, all deliberate:
 Result convention: success => `CallToolResult::success` with ONE text block of
 compact JSON (whitespace is not MCP API; pretty-printing costs the model
 ~15-25% of every payload for nothing). The sole exception is `download_attachment`, which
-returns a JSON summary text block PLUS one image or blob-resource block. Guard refusals and input-validation failures =>
+returns a JSON summary text block PLUS one payload block — an image block, a blob-resource block, or, when the caller windowed a text-ish payload, a second plain TEXT block. Guard refusals and input-validation failures =>
 `CallToolResult::error` with a text block (NOT a protocol error). Protocol
 issues (missing API key header in per-request custody) =>
 `McpError::invalid_request`.
@@ -1015,7 +1015,7 @@ constraints the model must know.
 | add_cc_to_bug | bug_id, cc_email | cc (write) | payload `{"cc": {"add": [email]}}` |
 | mark_as_duplicate | bug_id, duplicate_of, comment = "" | status on bug_id + summary on duplicate_of (I11) | default comment "Marking as duplicate of bug {duplicate_of}"; payload carries only `dupe_of` (+ comment) — Bugzilla's `set_dup_id` applies the instance's `duplicate_or_move_bug_status` and resolution DUPLICATE itself, so the resulting status is instance-defined, not necessarily CLOSED |
 | list_attachments | bug_id | attachments | metadata only (`exclude_fields=data`) |
-| download_attachment | attachment_id, include_private: bool = false | attachments (on the owning bug) | metadata fetched FIRST (no blob) for guard assessment + attachment_gate; unknown id, metadata OR blob fetch failure, denied owning bug, missing bug_id, and private-without-opt-in all yield the uniform attachment denial. Constant upstream request count on every path (a metadata miss still runs one classify call against bug id 0) so call latency is not an existence oracle. The gate AND the bug-id check re-run on the blob response (TOCTOU), then the actual base64 size is re-checked against the cap (a lying `size` cannot bypass it). Raster image types from a strict allowlist => ContentBlock::image; everything else (incl. image/svg+xml) => BlobResourceContents whose uri carries only the attachment id (uploader-chosen file_name never enters the uri) |
+| download_attachment | attachment_id, include_private: bool = false, head_lines?/tail_lines?/max_chars?: u32 | attachments (on the owning bug) | metadata fetched FIRST (no blob) for guard assessment + attachment_gate; unknown id, metadata OR blob fetch failure, denied owning bug, missing bug_id, and private-without-opt-in all yield the uniform attachment denial. Constant upstream request count on every path (a metadata miss still runs one classify call against bug id 0) so call latency is not an existence oracle. The gate AND the bug-id check re-run on the blob response (TOCTOU), then the actual base64 size is re-checked against the cap (a lying `size` cannot bypass it). Raster image types from a strict allowlist => ContentBlock::image; everything else (incl. image/svg+xml) => BlobResourceContents whose uri carries only the attachment id (uploader-chosen file_name never enters the uri). Optional head_lines/tail_lines/max_chars window TEXT-ish payloads only (text/* plus a fixed application/* allowlist, svg deliberately excluded): applied LAST, on the lossy-UTF-8 decode of a payload that passed both gates and the size re-check — head/tail select lines of the whole text, then a char cap that is the MIN of the caller's max_chars and `MAX_WINDOW_CHARS` (200k). That ceiling is unconditional — it binds with no max_chars and with no operator byte cap — because `max_attachment_bytes` bounds DECODED BYTES while the windowed serve is JSON text: JSON escapes every C0 byte to `\u00XX` (6 chars) and lossy UTF-8 maps every invalid byte to U+FFFD, and `content_type` is uploader-chosen, so 2 MiB of `0x01` labelled text/plain is ONE `lines()` line, takes the serve-whole branch on `head_lines: 1`, and would otherwise emit ~12 MiB — six times the cap it passed, and unbounded at `max_attachment_bytes = 0`. The windowed text rides as a plain text block and the summary gains a truncation object (total_lines/shown_lines/truncated_chars); `shown_lines` counts the lines of the SERVED text, recounted AFTER the char cap (a cap-shortened line still counts), so `total_lines - shown_lines` is never 0 over a mostly-dropped payload. Params on a non-text payload are ignored (summary: `windowing_ignored`), never an error, and so is a payload whose base64 will not decode (distinct reason string) — the whole blob then ships, and the caller is told why its window vanished. A window that cut content is audited as redacted_fields [attachment_window], one that cut nothing stays silent. The cap still measures the FULL payload, and every denial path is byte-identical with or without the params (I2). Two deliberate decisions: (a) windowing moves attacker-controlled attachment bytes into the model's TEXT channel instead of an opaque blob resource — the text-channel analogue of the image/svg+xml decision above, accepted because it is opt-in per call, bounded by MAX_WINDOW_CHARS, and never reached on a denial path; (b) the cut branch is `str::lines()` + `join("\n")`, which normalises CRLF to LF and drops a trailing newline, so a windowed text/x-patch is line-ending-normalised while the serve-whole branch stays byte-exact — windowing is a reading aid, not a fetch of the artifact |
 | bug_url | bug_id | none (I8 exception) | `{base_url}/show_bug.cgi?id={id}` |
 | bugzilla_server_info | — | none | client.server_info |
 | bugzilla_products | products?: Vec<String> (max 5) | none — present only when `global.allow_discovery = true` (I16) | no `products` named: `enterable_product_ids` then `products(ids, [], [id,name])`, projected to `{id, name}` catalog entries; `products` named: `products([], names, None)`, projected to `{name, description, is_active, default_milestone, has_unconfirmed, components[{name,description,is_active}], versions[{name,is_active}], milestones[{name,is_active}]}` — `default_assigned_to`/`default_qa_contact` are never selected. Over-cap (>5 names) refuses with a fixed text and makes ZERO upstream requests, since the refusal is a pure function of the request's own shape |
@@ -2040,7 +2040,18 @@ wired, `server.rs` and `main.rs` are the reference.
   grant carrying `attachments` (read) without `attach` (write) and uploads
   on `attach`; the upload size cap refuses before anything is POSTed; the
   attachment `comment` travels as a plain string (Bug.add_attachment
-  API shape), pinned by a wiremock body matcher; the update-field surface
+  API shape), pinned by a wiremock body matcher; download_attachment
+  windowing — head/tail selects lines of the whole text and max_chars
+  alone caps it, each arriving as a plain TEXT block with the truncation
+  object; an OVER-CAP attachment whose metadata `size` lies stays refused
+  when the call asks for one line, byte-identically to the same call
+  without the params, which pins the gate-then-window ordering (windowing
+  runs after the decoded-size re-check, never around it); a call with NO
+  windowing params is byte-identical to the pre-windowing response, blob
+  resource and compact summary block included; an image and a binary
+  payload keep their image/blob block and report `windowing_ignored`
+  rather than erroring; and a denial is byte-identical with the params
+  riding along (I2); the update-field surface
   (issue #38) — see_also travels as the `{"add": [..], "remove": [..]}`
   object with both sides present, keywords travel as add/remove and NEVER
   as the replace-all `set` (a catch-all PUT mock fails the test if any
@@ -2161,7 +2172,12 @@ wired, `server.rs` and `main.rs` are the reference.
   refusal paths and protocol errors included; the refusal map is total
   over the full router; responses byte-identical with auditing off, on,
   and failing-open; suppressed ids in the record and never in the
-  envelope; content and API-key canaries never reach the file; the
+  envelope; content and API-key canaries never reach the file;
+  download_attachment's `attachment_window` note fires only when the
+  window actually CUT something — twenty lines windowed to three record
+  it under verdict served_filtered, while params whose window covers the
+  whole text record no redaction at all, so a windowed-but-intact
+  download does not read as a filtered serve; the
   fail-closed scopes (pre-dispatch gate proven by upstream request
   counts) via the sink's cfg(test) fault injection; the transport-derived
   fail-mode defaults bound to their documented wording; the params

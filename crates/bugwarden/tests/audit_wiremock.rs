@@ -1411,6 +1411,98 @@ async fn list_attachments_with_nothing_private_stays_served_and_counts_zero() {
     );
 }
 
+/// Attachment 55 of bug 7 as a text payload of `data_b64`: the owning bug's
+/// classification plus both attachment GETs (metadata and blob share the
+/// path) — the `download_attachment` windowing fixture.
+async fn mount_windowed_attachment(mock: &MockServer, data_b64: &str) {
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [world_bug(7)] })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/attachment/55"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "attachments": { "55": {
+                "id": 55,
+                "bug_id": 7,
+                "is_private": false,
+                "size": 128,
+                "file_name": "log.txt",
+                "content_type": "text/plain",
+                "data": data_b64,
+            } }
+        })))
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn download_attachment_windowing_that_cuts_records_the_redaction() {
+    // Twenty lines windowed to three: content was removed, so the record
+    // must name the projection that did it — the same bar the summary_view
+    // note is held to.
+    use base64::{engine::general_purpose, Engine as _};
+    let mock = MockServer::start().await;
+    let text: String = (1..=20).map(|i| format!("log line {i}\n")).collect();
+    mount_windowed_attachment(&mock, &general_purpose::STANDARD.encode(&text)).await;
+    let audited = audited_client_for("", &mock, "test-key").await;
+
+    let result = call(
+        &audited.client,
+        "download_attachment",
+        json!({ "attachment_id": 55, "head_lines": 3 }),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "the window is served");
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.request.tool, "download_attachment");
+    let guard = tc.guard.as_ref().expect("guard info recorded");
+    assert_eq!(
+        guard.redacted_fields,
+        vec!["attachment_window".to_string()],
+        "the record names the window that cut the payload: {guard:?}"
+    );
+    assert_eq!(guard.verdict, Verdict::ServedFiltered);
+}
+
+#[tokio::test]
+async fn download_attachment_windowing_that_cuts_nothing_records_no_redaction() {
+    // Params present but the window covers the whole text: the note must
+    // stay silent, or every windowed-but-intact download would read as a
+    // filtered serve.
+    use base64::{engine::general_purpose, Engine as _};
+    let mock = MockServer::start().await;
+    mount_windowed_attachment(&mock, &general_purpose::STANDARD.encode("alpha\nbeta\n")).await;
+    let audited = audited_client_for("", &mock, "test-key").await;
+
+    let result = call(
+        &audited.client,
+        "download_attachment",
+        json!({ "attachment_id": 55, "head_lines": 10, "max_chars": 1000 }),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "the whole text is served");
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.request.tool, "download_attachment");
+    let guard = tc.guard.as_ref().expect("guard info recorded");
+    assert_eq!(
+        guard.verdict,
+        Verdict::Served,
+        "nothing was cut, so the serve stays clean: {guard:?}"
+    );
+    assert!(
+        guard.redacted_fields.is_empty(),
+        "and no redaction is noted: {:?}",
+        guard.redacted_fields
+    );
+}
+
 /// Serve a quicksearch corpus (issue #29 tests): search requests are paged
 /// by limit/offset the way Bugzilla pages them, and the I14 link-disclosure
 /// classify fetch — which addresses bugs by id, not by query — gets an

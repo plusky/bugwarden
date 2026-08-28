@@ -514,6 +514,324 @@ async fn add_attachment_size_cap_blocks_before_any_upload() {
     );
 }
 
+// ---------- download_attachment text windowing ----------
+
+/// Attachment 55 of bug 7 with base64 content of `content_type`, mounted for
+/// BOTH attachment GETs — the metadata fetch and the blob fetch share the
+/// path — plus the classification fetch the owning bug's assessment costs.
+async fn mount_download(mock: &MockServer, content_type: &str, data_b64: &str) {
+    mount_classify(mock, world_readable_bug(7)).await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/attachment/55"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "attachments": { "55": {
+                "id": 55,
+                "bug_id": 7,
+                "is_private": false,
+                "size": 128,
+                "file_name": "log.txt",
+                "content_type": content_type,
+                "data": data_b64,
+            } }
+        })))
+        // Metadata first, blob second (I8): exactly two fetches.
+        .expect(2)
+        .mount(mock)
+        .await;
+}
+
+/// The JSON summary of a successful download_attachment call (content[0]).
+fn summary_of(result: &CallToolResult) -> Value {
+    let block = result.content[0]
+        .as_text()
+        .expect("the summary block is text");
+    serde_json::from_str(&block.text).expect("the summary block is JSON")
+}
+
+#[tokio::test]
+async fn download_attachment_windows_text_head_and_tail() {
+    use base64::{engine::general_purpose, Engine as _};
+    let mock = MockServer::start().await;
+    let text: String = (1..=10).map(|i| format!("line{i}\n")).collect();
+    mount_download(
+        &mock,
+        "text/plain",
+        &general_purpose::STANDARD.encode(&text),
+    )
+    .await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "download_attachment",
+        json!({ "attachment_id": 55, "head_lines": 2, "tail_lines": 2 }),
+    )
+    .await;
+    assert!(
+        !is_error(&result),
+        "windowed download must succeed: {}",
+        text_of(&result)
+    );
+    assert_eq!(result.content.len(), 2, "summary block + windowed text");
+    // The window rides as a plain TEXT block, not a blob resource.
+    let window = result.content[1]
+        .as_text()
+        .expect("the windowed payload is a text block");
+    assert_eq!(window.text, "line1\nline2\nline9\nline10");
+    let summary = summary_of(&result);
+    assert_eq!(
+        summary["truncation"],
+        json!({ "total_lines": 10, "shown_lines": 4, "truncated_chars": false })
+    );
+    assert!(summary.get("windowing_ignored").is_none());
+}
+
+#[tokio::test]
+async fn download_attachment_max_chars_alone_caps_the_full_text() {
+    use base64::{engine::general_purpose, Engine as _};
+    let mock = MockServer::start().await;
+    let text = "hello world\nsecond line\n";
+    mount_download(&mock, "text/plain", &general_purpose::STANDARD.encode(text)).await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "download_attachment",
+        json!({ "attachment_id": 55, "max_chars": 5 }),
+    )
+    .await;
+    assert!(!is_error(&result), "capped download: {}", text_of(&result));
+    let window = result.content[1]
+        .as_text()
+        .expect("the capped payload is a text block");
+    assert_eq!(window.text, "hello");
+    assert_eq!(
+        summary_of(&result)["truncation"],
+        // shown_lines counts the SERVED fragment, not the pre-cap text.
+        json!({ "total_lines": 2, "shown_lines": 1, "truncated_chars": true })
+    );
+}
+
+#[tokio::test]
+async fn download_attachment_ignores_windowing_params_on_an_image() {
+    use base64::{engine::general_purpose, Engine as _};
+    let mock = MockServer::start().await;
+    let png = general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n");
+    mount_download(&mock, "image/png", &png).await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "download_attachment",
+        json!({ "attachment_id": 55, "head_lines": 1, "max_chars": 4 }),
+    )
+    .await;
+    assert!(
+        !is_error(&result),
+        "the image is served: {}",
+        text_of(&result)
+    );
+    // Params ignored, never an error: the image block is the normal path.
+    let image = result.content[1]
+        .as_image()
+        .expect("an image attachment is served as image content");
+    assert_eq!(image.data, png);
+    let summary = summary_of(&result);
+    assert_eq!(
+        summary["windowing_ignored"],
+        json!("not a text content type")
+    );
+    assert!(summary.get("truncation").is_none());
+}
+
+#[tokio::test]
+async fn download_attachment_ignores_windowing_params_on_a_binary() {
+    use base64::{engine::general_purpose, Engine as _};
+    let mock = MockServer::start().await;
+    let blob = general_purpose::STANDARD.encode(b"\x00\x01\x02\x03");
+    mount_download(&mock, "application/octet-stream", &blob).await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "download_attachment",
+        json!({ "attachment_id": 55, "tail_lines": 3 }),
+    )
+    .await;
+    assert!(
+        !is_error(&result),
+        "the blob is served: {}",
+        text_of(&result)
+    );
+    let Some(embedded) = result.content[1].as_resource() else {
+        panic!("a binary attachment is served as a blob resource")
+    };
+    let rmcp::model::ResourceContents::BlobResourceContents { uri, blob: b, .. } =
+        &embedded.resource
+    else {
+        panic!("a binary attachment is served as a BLOB resource")
+    };
+    assert_eq!(uri, "bugzilla://attachment/55");
+    assert_eq!(b, &blob, "the payload is served unwindowed");
+    let summary = summary_of(&result);
+    assert_eq!(
+        summary["windowing_ignored"],
+        json!("not a text content type")
+    );
+    assert!(summary.get("truncation").is_none());
+}
+
+#[tokio::test]
+async fn download_attachment_denial_is_byte_identical_with_windowing_params() {
+    // I2: the params are never consulted on a refusal path. Unknown id 999:
+    // a metadata miss runs the constant-cost padding classify against bug id
+    // 0 and nothing else — once per call.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/attachment/999"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "attachments": {} })))
+        .expect(2)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .expect(2)
+        .mount(&mock)
+        .await;
+    let client = client_for("", &mock).await;
+    let plain = call(
+        &client,
+        "download_attachment",
+        json!({ "attachment_id": 999 }),
+    )
+    .await;
+    let windowed = call(
+        &client,
+        "download_attachment",
+        json!({ "attachment_id": 999, "head_lines": 5, "tail_lines": 5, "max_chars": 10 }),
+    )
+    .await;
+    assert!(is_error(&plain) && is_error(&windowed));
+    assert_eq!(
+        text_of(&plain),
+        "Attachment 999 is not accessible through this server"
+    );
+    assert_eq!(
+        serde_json::to_value(&plain).unwrap(),
+        serde_json::to_value(&windowed).unwrap(),
+        "a denial must not change by one byte when windowing params ride along (I2)"
+    );
+}
+
+#[tokio::test]
+async fn download_attachment_windowing_cannot_serve_an_over_cap_attachment() {
+    // Asking for one line of a payload the operator's cap forbids must
+    // refuse, not serve one line of it. The metadata `size` lies (8 under a
+    // 64-byte cap) so the refusal comes from the DECODED re-check — the last
+    // gate before windowing, and the one windowing could have raced.
+    use base64::{engine::general_purpose, Engine as _};
+    let mock = MockServer::start().await;
+    let text: String = (1..=20).map(|i| format!("secret line {i}\n")).collect();
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "bugs": [world_readable_bug(7)] })),
+        )
+        .expect(2)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/attachment/55"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "attachments": { "55": {
+                "id": 55,
+                "bug_id": 7,
+                "is_private": false,
+                "size": 8,
+                "file_name": "log.txt",
+                "content_type": "text/plain",
+                "data": general_purpose::STANDARD.encode(&text),
+            } }
+        })))
+        // Metadata + blob on each of the two calls: the lying size buys the
+        // second fetch, nothing more.
+        .expect(4)
+        .mount(&mock)
+        .await;
+    let client = client_for("[global]\nmax_attachment_bytes = 64\n", &mock).await;
+    let windowed = call(
+        &client,
+        "download_attachment",
+        json!({ "attachment_id": 55, "head_lines": 1 }),
+    )
+    .await;
+    let plain = call(
+        &client,
+        "download_attachment",
+        json!({ "attachment_id": 55 }),
+    )
+    .await;
+    assert!(is_error(&windowed), "an over-cap attachment stays refused");
+    assert_eq!(
+        text_of(&windowed),
+        "Attachment 55 exceeds the size limit of this server"
+    );
+    assert_eq!(
+        windowed.content.len(),
+        1,
+        "the refusal carries no content block, windowed or not"
+    );
+    assert_eq!(
+        serde_json::to_value(&windowed).unwrap(),
+        serde_json::to_value(&plain).unwrap(),
+        "windowing params must not move the over-cap refusal by one byte"
+    );
+}
+
+#[tokio::test]
+async fn download_attachment_without_windowing_params_keeps_the_blob_shape() {
+    use base64::{engine::general_purpose, Engine as _};
+    let mock = MockServer::start().await;
+    let text = "alpha\nbeta\ngamma\n";
+    let data = general_purpose::STANDARD.encode(text);
+    mount_download(&mock, "text/plain", &data).await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "download_attachment",
+        json!({ "attachment_id": 55 }),
+    )
+    .await;
+    assert!(
+        !is_error(&result),
+        "unwindowed download: {}",
+        text_of(&result)
+    );
+    assert_eq!(result.content.len(), 2, "summary block + blob resource");
+    // The summary block is byte-identical to the pre-windowing shape: no
+    // truncation object, no ignored note.
+    let summary = result.content[0].as_text().expect("summary text block");
+    assert_eq!(
+        summary.text,
+        serde_json::to_string(&json!({
+            "id": 55,
+            "bug_id": 7,
+            "file_name": "log.txt",
+            "content_type": "text/plain",
+            "size": 128,
+        }))
+        .unwrap()
+    );
+    let Some(embedded) = result.content[1].as_resource() else {
+        panic!("a text attachment without params keeps the blob resource")
+    };
+    let rmcp::model::ResourceContents::BlobResourceContents { uri, blob, .. } = &embedded.resource
+    else {
+        panic!("blob resource")
+    };
+    assert_eq!(uri, "bugzilla://attachment/55");
+    assert_eq!(blob, &data, "the full payload, unwindowed");
+}
+
 // ---------- bugs_quicksearch id-list advisory ----------
 
 /// Mount an upstream that answers every quicksearch scan with `rows` and the
