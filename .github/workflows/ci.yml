@@ -32,12 +32,16 @@ jobs:
           toolchain: "1.98.0"
           components: rustfmt, clippy
       - name: Cache cargo
-        # Tag runs re-verify a release: keep them off restored build state;
-        # PR/main runs keep the cache.
+        # Tag runs re-verify a release: keep them off restored build state.
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           workspaces: . -> target
+          # A PR-written cache is invisible to main and evicts main's own by
+          # LRU once the repo is over quota; PRs restore main's entry either
+          # way, since nothing ref-specific enters the key. So: main writes,
+          # PRs only read.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -67,12 +71,12 @@ jobs:
           toolchain: "1.98.0"
           components: clippy
       - name: Cache cargo
-        # Tag runs re-verify a release: keep them off restored build state;
-        # PR/main runs keep the cache.
+        # Tag runs re-verify a release: keep them off restored build state.
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           workspaces: . -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
@@ -99,6 +103,12 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           workspaces: . -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # This leg is expected to fail sometimes (that is what it is for),
+          # and the save otherwise needs a green one. With main the only
+          # writer, a beta break would freeze this cache — right when a
+          # toolchain bump has invalidated the key and PRs need it rebuilt.
+          cache-on-failure: true
       - name: Clippy (beta)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test (beta)
@@ -140,6 +150,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           workspaces: . -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build (MSRV)
         run: cargo build --workspace --locked
 
@@ -162,6 +173,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           workspaces: . -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Regenerate man page + completions
         # Start from empty directories so an asset the generator no longer
         # emits surfaces as a deletion in the drift diff instead of shipping
