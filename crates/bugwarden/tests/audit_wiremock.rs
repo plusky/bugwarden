@@ -1135,6 +1135,12 @@ async fn bug_history_windowing_records_the_omission_it_applied() {
     );
     assert_eq!(guard.verdict, Verdict::ServedFiltered);
     assert_eq!(
+        guard.rule.as_deref(),
+        Some("default"),
+        "and the granting rule survives: the CLIENT asked for one entry, so \
+         no rule decided the omission: {guard:?}"
+    );
+    assert_eq!(
         guard.suppressed_count, 0,
         "nothing else was withheld, so the window is the ONLY thing the \
          filtered verdict can have come from: {guard:?}"
@@ -1467,6 +1473,12 @@ async fn download_attachment_windowing_that_cuts_records_the_redaction() {
         "the record names the window that cut the payload: {guard:?}"
     );
     assert_eq!(guard.verdict, Verdict::ServedFiltered);
+    assert_eq!(
+        guard.rule.as_deref(),
+        Some("default"),
+        "and the granting rule survives: the CLIENT asked for three lines, \
+         so no rule decided the cut: {guard:?}"
+    );
 }
 
 #[tokio::test]
@@ -1905,6 +1917,87 @@ fn six_public_comments() -> Vec<Value> {
         .collect()
 }
 
+/// Named grant over the world product. The windowing tests otherwise run
+/// rule-less, where the surviving rule is the literal `default` — the same
+/// value a misattribution would most plausibly produce.
+const ALLOW_WORLD_POLICY: &str = concat!(
+    "default_action = \"deny\"\n",
+    "[[rule]]\nname = \"allow-openSUSE\"\naction = \"allow\"\n",
+    "[rule.match]\nproducts = [\"openSUSE\"]\n",
+);
+
+#[tokio::test]
+async fn bug_comments_window_keeps_the_named_rule_that_granted_the_call() {
+    // Issue #67, the strong form: the record must name the rule that
+    // GRANTED the call, not merely carry some rule. `default` cannot tell
+    // those apart, so this one is granted by name.
+    let mock = MockServer::start().await;
+    mount_bug7_with_comments(&mock, six_public_comments()).await;
+    let audited = audited_client_for(ALLOW_WORLD_POLICY, &mock, "test-key").await;
+
+    let result = call(
+        &audited.client,
+        "bug_comments",
+        json!({ "id": 7, "head": 1, "tail": 2 }),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "the window is served");
+
+    let events = read_events(&audited.audit_path);
+    let guard = last_tool_call(&events)
+        .guard
+        .clone()
+        .expect("guard info recorded");
+    assert_eq!(guard.redacted_fields, vec!["comments_window".to_string()]);
+    assert_eq!(guard.verdict, Verdict::ServedFiltered);
+    assert_eq!(
+        guard.rule.as_deref(),
+        Some("allow-openSUSE"),
+        "the granting rule by name, so a fallback to `default` fails here: {guard:?}"
+    );
+    assert_eq!(guard.suppressed_count, 0);
+}
+
+#[tokio::test]
+async fn bug_comments_window_beside_an_i5_suppression_records_no_rule() {
+    // The one production combination where keeping the rule would be
+    // WRONG, and the one that pins the note ordering in the handler: the
+    // I5 drop upgrades the verdict rule-lessly BEFORE the window notes, so
+    // the guard's own decision clears the rule and the client's window
+    // cannot put it back. Reverse the two notes and this goes green on a
+    // record that credits `default` for a suppression it did not make.
+    let mock = MockServer::start().await;
+    let mut comments = six_public_comments();
+    comments[5]["is_private"] = json!(true);
+    mount_bug7_with_comments(&mock, comments).await;
+    let audited = audited_client_for("", &mock, "test-key").await;
+
+    let result = call(
+        &audited.client,
+        "bug_comments",
+        json!({ "id": 7, "head": 1, "tail": 2 }),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "the window is served");
+
+    let events = read_events(&audited.audit_path);
+    let guard = last_tool_call(&events)
+        .guard
+        .clone()
+        .expect("guard info recorded");
+    assert_eq!(guard.redacted_fields, vec!["comments_window".to_string()]);
+    assert_eq!(guard.verdict, Verdict::ServedFiltered);
+    assert_eq!(
+        guard.suppressed_count, 1,
+        "the private comment is counted, id-lessly: {guard:?}"
+    );
+    assert_eq!(
+        guard.rule, None,
+        "a GUARD suppression upgraded the verdict, so the rule goes with \
+         it — the client window beside it changes nothing: {guard:?}"
+    );
+}
+
 #[tokio::test]
 async fn bug_comments_window_records_the_redaction_it_applied() {
     // The #94 pin at the comments_window note site: windowing that actually
@@ -1931,6 +2024,12 @@ async fn bug_comments_window_records_the_redaction_it_applied() {
         guard.redacted_fields,
         vec!["comments_window".to_string()],
         "the record names the windowing that shaped the response: {guard:?}"
+    );
+    assert_eq!(
+        guard.rule.as_deref(),
+        Some("default"),
+        "and the granting rule survives: the CLIENT asked for a window, so \
+         no rule decided the omission: {guard:?}"
     );
 }
 
