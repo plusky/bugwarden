@@ -153,15 +153,39 @@ are never a justification for undoing them.
 
 A release is one push of an annotated tag; nothing is released by hand.
 
-- The tag is the bare version, no `v` prefix (`0.1.0`, `0.2.0rc1`), and must
-  equal `[workspace.package] version` — the workflow refuses to build a tag
-  that disagrees with the manifest. Bump the version in a normal PR first,
-  then tag the merge commit on `main`.
+- The tag is the bare version, no `v` prefix (`0.1.0`, `0.2.0-rc.1`; a
+  pre-release must be hyphenated semver, Cargo rejects `0.2.0rc1`), and
+  must equal `[workspace.package] version` — the workflow refuses to build
+  a tag that disagrees with the manifest. Bump the version in a normal PR
+  first, then tag the merge commit on `main`.
 - `.github/workflows/release.yml` then does everything: hermetic builds for
-  x86_64-unknown-linux-gnu and aarch64-apple-darwin, a GitHub release with
-  both tarballs and their `.sha256` files, and finally the crates.io publish
-  — `bugwarden-core` before `bugwarden`, because the binary crate resolves
-  its dependency from the index and cannot be packaged before core is there.
+  x86_64-unknown-linux-gnu and aarch64-apple-darwin, an x86_64 `.deb` and
+  `.rpm`, a GitHub release with all of those and their `.sha256` files, and
+  finally the crates.io publish — `bugwarden-core` before `bugwarden`,
+  because the binary crate resolves its dependency from the index and cannot
+  be packaged before core is there.
+- The `.deb`/`.rpm` come from `cargo-deb` and `cargo-generate-rpm`, both
+  pinned to an exact version and installed `--locked`, reading
+  `[package.metadata.deb]` / `[package.metadata.generate-rpm]` in
+  `crates/bugwarden/Cargo.toml`. That layout deliberately mirrors the
+  openSUSE spec in `devel:tools` — same binary, config, man and completion
+  paths, same two example configs under `/etc/bugwarden/` marked noreplace
+  in all three — so the packagings do not disagree about where a file
+  lives. Two documented exceptions: the spec's `%doc` resolves to
+  `/usr/share/doc/packages/bugwarden` on SUSE while these use the
+  Fedora/Debian `/usr/share/doc/bugwarden`, and cargo-generate-rpm 0.16.1
+  cannot emit rpm's `%license` flag. A new installed file is added to both
+  metadata blocks AND to the spec. x86_64 only: OBS builds every tier-1
+  arch from the source tarball, so these cover the distributions OBS does
+  not, rather than replacing it.
+- Two cargo-generate-rpm traps the workflow works around, both of which
+  fail silently if reintroduced: `auto-req` must be passed on the CLI,
+  because in metadata every value but `no`/`disabled` is discarded; and the
+  RPM `Version` is overridden with the `-`→`~` form of the tag, because RPM
+  forbids `-` there and, unlike cargo-deb, cargo-generate-rpm will not
+  convert it — leaving a pre-release that sorts *newer* than its own GA.
+  The `package` job re-checks both, plus dependency discovery and the asset
+  list, before `release` may run.
 - Publishing uses crates.io Trusted Publishing over the workflow's OIDC
   token, so the repository stores no registry credential. Both crates must
   have this repository, workflow `release.yml`, and no environment

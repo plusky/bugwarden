@@ -133,6 +133,30 @@ one is named via `--policy` / `BUGWARDEN_POLICY`, and an audit configuration
 only via `--audit-config` / `BUGWARDEN_AUDIT_CONFIG`, so installing the
 package does not by itself activate anything.
 
+### .deb / .rpm from the release page
+
+Every [release](https://github.com/plusky/bugwarden/releases) carries an
+x86_64 `.deb` and `.rpm` next to the tarballs, each with a `.sha256`:
+
+```bash
+sudo apt install ./bugwarden_<version>-1_amd64.deb   # Debian, Ubuntu
+sudo dnf install ./bugwarden-<version>-1.x86_64.rpm  # Fedora, RHEL
+```
+
+`apt`/`dnf` rather than `dpkg -i`/`rpm -i` because neither of the latter
+resolves dependencies. Both packages are built on current Ubuntu and link
+the system glibc, so they need a comparably recent one (2.38+ as of
+writing; the package's own `Depends`/`Requires` is authoritative). On an
+older enterprise base such as RHEL 9 or Debian 12 the install will refuse
+— use the container image or build from source there.
+
+Same layout as the openSUSE package above, including both
+`/etc/bugwarden/*.toml` example configs marked noreplace — so an upgrade
+keeps local edits, and installing still activates nothing on its own. On
+openSUSE prefer the OBS package: these two are x86_64 only and would
+conflict with its completion subpackages, while OBS covers every tier-1
+architecture.
+
 ### Container image
 
 ```bash

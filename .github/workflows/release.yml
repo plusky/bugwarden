@@ -79,10 +79,146 @@ jobs:
             ${{ env.DIST }}.tar.gz.sha256
           if-no-files-found: error
 
+  package:
+    # Distribution packages, x86_64 only: they mirror the one Linux triple the
+    # `build` matrix ships, and the openSUSE packages come from OBS anyway
+    # (devel:tools), which builds every tier-1 arch from the source tarball.
+    # Sibling of `build`, not downstream of it — the two share no output, and
+    # `release` waits for both.
+    name: package (deb, rpm)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
+        with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: "1.98.0"
+      # No cargo cache, same hermetic-release rule as `build` above.
+
+      - name: Verify tag matches workspace version
+        shell: bash
+        run: |
+          pkg="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$pkg" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag '$GITHUB_REF_NAME' != workspace version '$pkg'"
+            exit 1
+          fi
+
+      - name: Install packaging tools
+        # Pinned exactly and --locked: the packagers' own lockfiles decide
+        # their dependencies, so a release cannot change shape because an
+        # unrelated crate published that morning.
+        run: |
+          cargo install cargo-deb --locked --version 3.7.0
+          cargo install cargo-generate-rpm --locked --version 0.16.1
+
+      - name: Build release binary
+        run: cargo build --release --locked -p bugwarden
+
+      - name: Strip the packaged binary
+        # cargo-deb strips by default and cargo-generate-rpm cannot at all, so
+        # strip once here and tell cargo-deb not to: both packages then ship a
+        # byte-identical binary. The tarballs keep their symbols (unchanged).
+        run: strip target/release/bugwarden
+
+      - name: Build packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Note the asymmetry: cargo-deb's -p takes a PACKAGE NAME,
+          # cargo-generate-rpm's a MANIFEST DIRECTORY. Both read their
+          # metadata from crates/bugwarden/Cargo.toml and write under the
+          # workspace target dir.
+          cargo deb -p bugwarden --no-build --no-strip
+          # An RPM Version may not contain '-'. cargo-deb rewrites a semver
+          # pre-release to '~' itself; cargo-generate-rpm passes it through,
+          # producing an illegal Version that also sorts NEWER than the final
+          # release. Convert here. No-op for a plain 0.2.0 tag.
+          rpmver="$(printf '%s' "$GITHUB_REF_NAME" | tr -- - '~')"
+          # --auto-req on the CLI, not in Cargo.toml: the metadata key silently
+          # ignores every value but "no"/"disabled", which would leave the
+          # dependency set up to whichever find-requires the runner has.
+          cargo generate-rpm -p crates/bugwarden --auto-req builtin \
+            -s "version = \"${rpmver}\""
+
+      - name: Check the packages before they can be released
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb="$(echo target/debian/*.deb)"
+          rpm="$(echo target/generate-rpm/*.rpm)"
+
+          # Both packagers exit 0 on an empty dependency set, and a package that
+          # installs on a too-old glibc and then dies at exec is worse than one
+          # that fails to build. `release` needs us, so failing here costs a tag
+          # and no more.
+          dpkg-deb -f "$deb" Depends | grep -q libc6 \
+            || { echo "::error::deb has no libc6 dependency"; exit 1; }
+          rpm -qp --requires "$rpm" | grep -q '^libc\.so' \
+            || { echo "::error::rpm has no libc.so dependency"; exit 1; }
+
+          # Every asset actually landed. The two lists differ by one entry on
+          # purpose: cargo-deb gzips man pages, cargo-generate-rpm does not.
+          rpmfiles="$(rpm -qpl "$rpm")"
+          for want in /usr/bin/bugwarden /etc/bugwarden/policy.toml \
+                      /etc/bugwarden/audit.toml /usr/share/man/man1/bugwarden.1; do
+            grep -qxF "$want" <<<"$rpmfiles" \
+              || { echo "::error::rpm is missing $want"; exit 1; }
+          done
+          debfiles="$(dpkg-deb -c "$deb" | awk '{print $NF}')"
+          for want in ./usr/bin/bugwarden ./etc/bugwarden/policy.toml \
+                      ./etc/bugwarden/audit.toml ./usr/share/man/man1/bugwarden.1.gz; do
+            grep -qxF "$want" <<<"$debfiles" \
+              || { echo "::error::deb is missing $want"; exit 1; }
+          done
+
+          # /etc/bugwarden is rpm-owned, so erasing the package does not orphan
+          # it. dpkg tracks its own directories and needs no equivalent.
+          rpm -qp --qf '[%{FILENAMES}|%{FILEMODES:octal}\n]' "$rpm" \
+            | grep -qxF '/etc/bugwarden|40755' \
+            || { echo "::error::rpm does not own /etc/bugwarden"; exit 1; }
+
+          # I1: the shipped policy must not be loaded implicitly. A package that
+          # made /etc/bugwarden/policy.toml take effect on install would hand
+          # every fresh install a policy nobody chose.
+          test "$(rpm -qp --qf '%{PREIN}%{POSTIN}%{PREUN}%{POSTUN}' "$rpm")" = "(none)(none)(none)(none)" \
+            || { echo "::error::rpm gained a scriptlet"; exit 1; }
+
+      - name: Collect packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir dist
+          cp target/debian/*.deb target/generate-rpm/*.rpm dist/
+          cd dist
+          # A release asset name is rewritten by GitHub to [A-Za-z0-9._-], which
+          # a pre-release deb's '~' trips. Rename first, so the .sha256 does not
+          # end up naming a file that never arrives.
+          for f in *.deb *.rpm; do
+            safe="$(printf '%s' "$f" | tr -c 'A-Za-z0-9._-' '.')"
+            [ "$safe" = "$f" ] || mv -- "$f" "$safe"
+          done
+          for f in *.deb *.rpm; do
+            sha256sum "$f" >"${f}.sha256"
+          done
+          ls -l
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: packages
+          path: dist/*
+          if-no-files-found: error
+
   release:
-    # Publish only after every platform built successfully, so a release never
-    # ships a partial artifact set.
-    needs: build
+    # Publish only after every tarball AND both distro packages are built and
+    # checked, so a release never ships a partial artifact set. That does mean a
+    # packaging fault now blocks the crates.io publish and the container image.
+    needs: [build, package]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
