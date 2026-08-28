@@ -1639,6 +1639,55 @@ async fn quicksearch_response_is_byte_identical_whether_or_not_rows_were_dropped
 }
 
 #[tokio::test]
+async fn quicksearch_group_by_reshapes_the_envelope_and_nothing_in_the_record() {
+    // Issue #143: grouping runs after the audit block, so a grouped call and
+    // a flat call over the same window must record the same guard info —
+    // same scan, same verdict, same suppressed ids, no new redaction. Only
+    // `params` differs, and it carries `group_by` by value (allowlisted: a
+    // vocabulary field, not free text) rather than as `{"_len": n}`.
+    let mock = MockServer::start().await;
+    mount_search_corpus(&mock, vec![world_bug(1), secret_bug(2), world_bug(3)]).await;
+    let audited = audited_client_for(HIDE_SECRET_POLICY, &mock, "test-key").await;
+
+    let flat = call(&audited.client, "bugs_quicksearch", json!({ "query": "q" })).await;
+    assert_ne!(flat.is_error, Some(true), "the flat search is served");
+    let flat_guard = last_tool_call(&read_events(&audited.audit_path))
+        .guard
+        .clone()
+        .expect("guard info recorded");
+
+    let grouped = call(
+        &audited.client,
+        "bugs_quicksearch",
+        json!({ "query": "q", "group_by": "product,status" }),
+    )
+    .await;
+    assert_ne!(grouped.is_error, Some(true), "the grouped search is served");
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    let grouped_guard = tc.guard.as_ref().expect("guard info recorded");
+
+    assert_eq!(
+        *grouped_guard, flat_guard,
+        "grouping must not move a single field of the guard record"
+    );
+    assert!(
+        grouped_guard.redacted_fields.is_empty(),
+        "hoisting a field into a group header is not a redaction: {:?}",
+        grouped_guard.redacted_fields
+    );
+    assert_eq!(
+        tc.request.params["group_by"],
+        json!("product,status"),
+        "an allowlisted vocabulary param is recorded verbatim"
+    );
+    assert!(
+        serde_json::to_string(&grouped).unwrap().contains("groups"),
+        "the envelope really was grouped"
+    );
+}
+
+#[tokio::test]
 async fn quicksearch_drop_count_survives_the_suppressed_ids_knob() {
     // Acceptance (c) of issue #29: with `suppressed_ids = false` the
     // record still counts what the scan dropped — it just names no id.
