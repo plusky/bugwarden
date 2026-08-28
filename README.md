@@ -983,7 +983,7 @@ none of the three needs an API key. Every other tool does, including
 
 | Tool | What it does | Required capability |
 |------|--------------|---------------------|
-| `bug_info` | Details for up to 25 bug ids. Per id: full details with `read`, redacted summary with `summary`, otherwise a uniform "not accessible" entry | `read` / `summary` |
+| `bug_info` | Details for up to 25 bug ids. Per id: full details with `read`, redacted summary with `summary`, otherwise a uniform "not accessible" entry. Optional size control: `include_fields` (comma-separated projection; `id` always included) or `detail=false` (drops the duplicated `*_detail` fields); mutually exclusive | `read` / `summary` |
 | `bug_history` | Change history of a bug, optionally only entries newer than a timestamp | `history` |
 | `bug_comments` | Comments on a bug; private comments only per the private-comment gate | `comments` |
 | `bugs_quicksearch` | Bugzilla [quicksearch](https://bugzilla.readthedocs.io/en/latest/using/finding.html#quicksearch) — the `status` filter (default `ALL`) is prefixed to the query, and under any non-empty status a number in the query is content-matched, so it also matches bugs that merely mention it; with an empty `status` the query goes to Bugzilla bare, where a query of nothing but numbers is an exact id lookup (use `bug_info` for an exact set of known ids; an all-ids query gets an advisory note saying so). Paginated by `limit` (default 50) and `offset` (default 0) over the bugs the client may see. Results are silently policy-filtered (denied dropped, summary-only redacted) | per result: `read` / `summary` |
