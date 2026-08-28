@@ -630,7 +630,10 @@ pub struct GuardInfo {
     /// `guard` object at all.
     ///
     /// [`AuditCell`]'s worst-wins merge carries this through: a rule-less
-    /// note that outranks a rule-decided one clears the rule.
+    /// note that outranks a rule-decided one clears the rule. The
+    /// client-requested windows are the one exception — they decide
+    /// nothing, so they keep the granting rule
+    /// ([`AuditCell::note_redacted_client_window`]).
     ///
     /// Recording `"default"` rather than absence is deliberate — absence
     /// could not also express "no single rule decided". Schema v1 encodes
@@ -668,8 +671,13 @@ pub struct GuardInfo {
     /// The removed bug ids. Left empty by the recording call sites when
     /// [`AuditConfig::suppressed_ids`] is `false`.
     pub suppressed_ids: Vec<u64>,
-    /// Names of fields the guard redacted from served bugs (field names
-    /// only, never their values).
+    /// Names of what the response dropped (names only, never values), of
+    /// two kinds: what the GUARD redacted from served bugs
+    /// (`summary_view`) and the client's own presentation windows
+    /// (`comments_window`, `history_window`, `attachment_window`), noted
+    /// only when they actually cut something. Only the first is a guard
+    /// decision, which is why the second leaves [`GuardInfo::rule`]
+    /// standing — see [`AuditCell::note_redacted_client_window`].
     pub redacted_fields: Vec<String>,
     /// Search-window scan accounting, present only on calls that ran a
     /// window scan (`bugs_quicksearch`). Recorded regardless of
@@ -1487,22 +1495,29 @@ impl AuditCell {
     /// verdict may only fill an empty slot (first rule recorded wins),
     /// and a less severe verdict changes nothing.
     fn merge(&self, verdict: Verdict, rule: Option<&str>) {
+        self.merge_inner(verdict, rule, false);
+    }
+
+    /// [`AuditCell::merge`], with `keep_rule` suppressing every write to
+    /// the stored rule. One body, so the client-window carve-out cannot
+    /// drift from the merge it is a carve-out of.
+    fn merge_inner(&self, verdict: Verdict, rule: Option<&str>, keep_rule: bool) {
         let mut state = self.lock();
-        match state.verdict {
-            None => {
-                state.verdict = Some(verdict);
-                state.rule = rule.map(str::to_owned);
-            }
-            Some(current) if verdict_rank(verdict) > verdict_rank(current) => {
-                state.verdict = Some(verdict);
-                state.rule = rule.map(str::to_owned);
-            }
-            Some(current) if verdict_rank(verdict) == verdict_rank(current) => {
-                if state.rule.is_none() {
+        let rank = verdict_rank(verdict);
+        match state.verdict.map(verdict_rank) {
+            Some(current) if rank < current => {}
+            Some(current) if rank == current => {
+                if state.rule.is_none() && !keep_rule {
                     state.rule = rule.map(str::to_owned);
                 }
             }
-            Some(_) => {}
+            // Absent, or a strict upgrade: this verdict decides the call.
+            _ => {
+                state.verdict = Some(verdict);
+                if !keep_rule {
+                    state.rule = rule.map(str::to_owned);
+                }
+            }
         }
     }
 
@@ -1565,10 +1580,32 @@ impl AuditCell {
         self.lock().scan = Some(ScanInfo { scanned, dropped });
     }
 
-    /// Note a field (or view marker) the guard redacted from served
-    /// bugs. Upgrades the verdict to `ServedFiltered`.
+    /// Note a field (or view marker) the GUARD redacted from served bugs
+    /// — a decision no single rule made, so the merge carries no rule of
+    /// its own. What that does to an already-recorded rule follows
+    /// [`AuditCell::merge`] and nothing else: it CLEARS when this note is
+    /// what upgrades the verdict (`list_attachments` dropping private
+    /// metadata off a plain serve), and leaves it standing at equal rank
+    /// (`bug_info` records the `ServedFiltered` verdict AND its rule
+    /// first, then names `summary_view` here). A client-requested
+    /// presentation window is not a guard redaction at all; it goes
+    /// through [`AuditCell::note_redacted_client_window`].
     pub fn note_redacted(&self, field: &str) {
         self.merge(Verdict::ServedFiltered, None);
+        self.lock().redacted_fields.insert(field.to_owned());
+    }
+
+    /// Note a CLIENT-requested presentation window that dropped content
+    /// (`head`/`tail`/length caps). Records the field and upgrades to
+    /// `ServedFiltered` exactly as [`AuditCell::note_redacted`] does, but
+    /// never writes the rule at all — not even on the strict upgrade
+    /// where [`AuditCell::merge`] would clear it. The client asked for
+    /// less; no rule decided anything, and clearing would report a call a
+    /// rule DID grant as rule-less (issue #67). Order-independent by
+    /// construction: it cannot clear a rule a later guard note records,
+    /// and a guard note landing after it merges by the ordinary rules.
+    pub fn note_redacted_client_window(&self, field: &str) {
+        self.merge_inner(Verdict::ServedFiltered, None, true);
         self.lock().redacted_fields.insert(field.to_owned());
     }
 
@@ -2653,6 +2690,57 @@ mod tests {
         let info = cell.into_guard_info(None, true).unwrap();
         assert_eq!(info.verdict, Verdict::ServedFiltered);
         assert_eq!(info.redacted_fields, vec!["summary_view".to_string()]);
+    }
+
+    #[test]
+    fn cell_client_window_redaction_keeps_the_granting_rule() {
+        // Issue #67: a client-requested window is not a guard decision, so
+        // it must not take the granting rule down with it — the two notes
+        // are pinned side by side because they differ ONLY in that.
+        let cell = AuditCell::default();
+        cell.note_verdict_rule(Verdict::Served, "allow-desktop");
+        cell.note_redacted_client_window("attachment_window");
+        let info = cell.into_guard_info(None, true).unwrap();
+        assert_eq!(info.verdict, Verdict::ServedFiltered);
+        assert_eq!(
+            info.redacted_fields,
+            vec!["attachment_window".to_string()],
+            "the window is still named"
+        );
+        assert_eq!(
+            info.rule.as_deref(),
+            Some("allow-desktop"),
+            "the rule that granted the call survives the client's window"
+        );
+
+        let cell = AuditCell::default();
+        cell.note_verdict_rule(Verdict::Served, "allow-desktop");
+        cell.note_redacted("summary_view");
+        let info = cell.into_guard_info(None, true).unwrap();
+        assert_eq!(info.verdict, Verdict::ServedFiltered);
+        assert_eq!(
+            info.rule, None,
+            "while a guard redaction that UPGRADES the verdict clears it"
+        );
+
+        // ...but only because it upgraded. Recorded at equal rank — the
+        // shape bug_info actually produces — the ordinary merge fills an
+        // empty slot only, so the rule stands and the two notes agree.
+        let cell = AuditCell::default();
+        cell.note_verdict_rule(Verdict::ServedFiltered, "summaries-only");
+        cell.note_redacted("summary_view");
+        let info = cell.into_guard_info(None, true).unwrap();
+        assert_eq!(info.verdict, Verdict::ServedFiltered);
+        assert_eq!(info.rule.as_deref(), Some("summaries-only"));
+
+        // A guard note landing AFTER a client window merges by the
+        // ordinary rules: equal rank here, so the window's rule stands.
+        let cell = AuditCell::default();
+        cell.note_verdict_rule(Verdict::Served, "allow-desktop");
+        cell.note_redacted_client_window("comments_window");
+        cell.note_redacted("summary_view");
+        let info = cell.into_guard_info(None, true).unwrap();
+        assert_eq!(info.rule.as_deref(), Some("allow-desktop"));
     }
 
     #[test]

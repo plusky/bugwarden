@@ -2333,7 +2333,7 @@ impl BugWarden {
                 let (shown, omitted) = window_list(entries, p.head, p.tail);
                 if omitted > 0 {
                     if let Some(cell) = audit_cell(&ctx) {
-                        cell.note_redacted("history_window");
+                        cell.note_redacted_client_window("history_window");
                     }
                 }
                 let shown_len = shown.len();
@@ -2423,7 +2423,7 @@ impl BugWarden {
                     .is_some_and(|cap| cap_comment_text(&mut comments, cap));
                 if omitted > 0 || capped {
                     if let Some(cell) = audit_cell(&ctx) {
-                        cell.note_redacted("comments_window");
+                        cell.note_redacted_client_window("comments_window");
                     }
                 }
                 let shown = comments.len();
@@ -3461,7 +3461,7 @@ impl BugWarden {
             Some(window) => {
                 if window.cut_anything() {
                     if let Some(cell) = audit_cell(&ctx) {
-                        cell.note_redacted("attachment_window");
+                        cell.note_redacted_client_window("attachment_window");
                     }
                 }
                 summary["truncation"] = json!({
