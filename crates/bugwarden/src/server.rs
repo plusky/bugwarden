@@ -289,7 +289,7 @@ const PARAM_ALLOWLIST: &[&str] = &[
     "keywords_remove",
     "limit",
     "max_chars",
-    "max_comment_length",
+    "max_comment_chars",
     "new_since",
     "offset",
     "on_bug_entry_only",
@@ -1206,7 +1206,7 @@ pub struct BugCommentsParams {
     /// Cap each comment's text at this many characters. A capped comment
     /// carries a `text_truncated` marker with shown/total character counts.
     #[serde(default)]
-    pub max_comment_length: Option<u32>,
+    pub max_comment_chars: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -2353,7 +2353,7 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Returns the comments of given bug id. Private comments are not included by default but can be explicitly requested (subject to server policy). new_since allows filtering comments newer than the given date. For large threads, window with head (first N — comment 0 is the report) and tail (last N), and/or cap each comment's text with max_comment_length characters; when any of the three is set, the response is an object {comments, truncation: {omitted_comments, shown_comments}} instead of a bare array.",
+        description = "Returns the comments of given bug id. Private comments are not included by default but can be explicitly requested (subject to server policy). new_since allows filtering comments newer than the given date. For large threads, window with head (first N — comment 0 is the report) and tail (last N), and/or cap each comment's text with max_comment_chars characters; when any of the three is set, the response is an object {comments, truncation: {omitted_comments, shown_comments}} instead of a bare array.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn bug_comments(
@@ -2407,19 +2407,19 @@ impl BugWarden {
                 // exists. Without any windowing param the response stays the
                 // bare array it always was.
                 let windowing =
-                    p.head.is_some() || p.tail.is_some() || p.max_comment_length.is_some();
+                    p.head.is_some() || p.tail.is_some() || p.max_comment_chars.is_some();
                 if !windowing {
                     return Ok(ok_json(Value::Array(scrubbed)));
                 }
                 let (mut comments, omitted) = if p.head.is_some() || p.tail.is_some() {
                     window_list(scrubbed, p.head, p.tail)
                 } else {
-                    // max_comment_length alone caps texts; it does not
+                    // max_comment_chars alone caps texts; it does not
                     // open a window.
                     (scrubbed, 0)
                 };
                 let capped = p
-                    .max_comment_length
+                    .max_comment_chars
                     .is_some_and(|cap| cap_comment_text(&mut comments, cap));
                 if omitted > 0 || capped {
                     if let Some(cell) = audit_cell(&ctx) {

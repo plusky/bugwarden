@@ -3025,7 +3025,7 @@ async fn bug_comments_window_runs_after_duplicate_marker_scrubbing() {
 }
 
 #[tokio::test]
-async fn bug_comments_max_comment_length_caps_chars_and_marks() {
+async fn bug_comments_max_comment_chars_caps_and_marks() {
     let long = "a".repeat(300);
     let multibyte = "日本語".repeat(40); // 120 chars, 360 bytes
     let comments = vec![
@@ -3041,7 +3041,7 @@ async fn bug_comments_max_comment_length_caps_chars_and_marks() {
     let result = call(
         &client,
         "bug_comments",
-        json!({ "id": 7, "max_comment_length": 100 }),
+        json!({ "id": 7, "max_comment_chars": 100 }),
     )
     .await;
     let parsed: Value = serde_json::from_str(&text_of(&result)).expect("bug_comments returns JSON");
