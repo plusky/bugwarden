@@ -741,6 +741,28 @@ pub struct OutcomeInfo {
     pub class: OutcomeClass,
     /// Total request handling time, in milliseconds.
     pub duration_ms: u64,
+    /// Serialized size of the payload the server produced, in bytes: the
+    /// compact JSON of the result's content array, not just the text it
+    /// carries and not the enclosing result object, whose `resultType`
+    /// depends on the negotiated revision (issue #145). Absent when no
+    /// result exists to measure — a protocol error, or a refusal the audit
+    /// gate records before it is built.
+    ///
+    /// Produced, not necessarily delivered: a record whose write survived
+    /// but whose `record_event` still failed can be followed by a fail-mode
+    /// swap, leaving this sizing a payload the client never received.
+    /// [`OutcomeInfo::class`] and [`GuardInfo::verdict`] have the same
+    /// property; the record describes the call, not the wire.
+    ///
+    /// It sizes the PAYLOAD, and the verdict does not bound it. `denied` is
+    /// the *worst* verdict of the call, not a claim that nothing was
+    /// served: a multi-bug `bug_info` with one denied id records `denied`
+    /// over an envelope carrying the bugs it did serve, so that record's
+    /// size tracks those bodies. Only where the whole payload is one
+    /// uniform denial does the size reduce to a function of the caller's
+    /// own id width. Reading this as "how big was the refusal" is wrong.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_bytes: Option<u64>,
 }
 
 /// Coarse outcome of a tool call. Note that a guard denial is `ok` here:
@@ -1717,6 +1739,7 @@ mod tests {
             outcome: OutcomeInfo {
                 class: OutcomeClass::Ok,
                 duration_ms: 52,
+                response_bytes: Some(1462),
             },
         }))
     }
@@ -1819,6 +1842,23 @@ mod tests {
         r#""suppressed_count":2,"suppressed_ids":[1290040,1290041],"redacted_fields":["cc","flags"],"#,
         r#""scan":{"scanned":200,"dropped":2}},"#,
         r#""upstream":{"requests":1,"status":200,"latency_ms":48},"#,
+        r#""outcome":{"class":"ok","duration_ms":52,"response_bytes":1462}}"#,
+    );
+
+    /// [`GOLDEN_TOOL_CALL`] as records looked before `outcome.response_bytes`
+    /// existed (issue #145) — byte-identical to the golden before that field,
+    /// same additive-optional shape as the pre-#29 pin below.
+    const GOLDEN_TOOL_CALL_PRE_RESPONSE_BYTES: &str = concat!(
+        r#"{"v":1,"ts":"2026-02-03T04:05:06.789Z","seq":7,"#,
+        r#""session":{"id":"sess-1","transport":"http","remote":"192.0.2.7:52611"},"#,
+        r#""event":"tool_call","#,
+        r#""client":{"name":"example-agent","version":"1.4.2","principal":"alice@example.org"},"#,
+        r#""trace":{"trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331"},"#,
+        r#""request":{"tool":"bug_info","id":"3","params":{"id":1290042,"include_private":false}},"#,
+        r#""guard":{"verdict":"served_filtered","rule":"group-restricted","policy_hash":"2b6e8f5d1c9a4e70","#,
+        r#""suppressed_count":2,"suppressed_ids":[1290040,1290041],"redacted_fields":["cc","flags"],"#,
+        r#""scan":{"scanned":200,"dropped":2}},"#,
+        r#""upstream":{"requests":1,"status":200,"latency_ms":48},"#,
         r#""outcome":{"class":"ok","duration_ms":52}}"#,
     );
 
@@ -1865,6 +1905,20 @@ mod tests {
     fn golden_audit_gap_json() {
         let event = envelope(9, session_stdio(), sample_gap());
         assert_eq!(serde_json::to_string(&event).unwrap(), GOLDEN_AUDIT_GAP);
+    }
+
+    #[test]
+    fn tool_call_line_without_response_bytes_still_deserializes() {
+        // A pre-#145 record has no `outcome.response_bytes` bytes at all;
+        // it must parse with the size simply unknown, not defaulted to 0 —
+        // "not measured" and "measured as empty" are different facts.
+        let event: AuditEvent = serde_json::from_str(GOLDEN_TOOL_CALL_PRE_RESPONSE_BYTES)
+            .expect("an old line must parse");
+        let AuditEventKind::ToolCall(tc) = &event.kind else {
+            panic!("expected a tool_call event");
+        };
+        assert_eq!(tc.outcome.response_bytes, None, "absent means unknown");
+        assert_eq!(tc.outcome.duration_ms, 52, "the rest is read unchanged");
     }
 
     #[test]

@@ -502,7 +502,7 @@ fn now_unix_nano() -> u64 {
 /// newline; it becomes the record body unchanged (I12: the exported
 /// payload carries exactly what the file carries).
 fn audit_entry(event: &AuditEvent, line: &[u8]) -> LogEntry {
-    let mut attrs: Vec<(&'static str, AttrValue)> = Vec::with_capacity(8);
+    let mut attrs: Vec<(&'static str, AttrValue)> = Vec::with_capacity(10);
     attrs.push(("bugwarden.stream", AttrValue::Str("audit".to_owned())));
     let (kind, severity) = match &event.kind {
         AuditEventKind::ToolCall(_) => ("tool_call", Severity::Info),
@@ -539,6 +539,15 @@ fn audit_entry(event: &AuditEvent, line: &[u8]) -> LogEntry {
             if let Some(rule) = &guard.rule {
                 attrs.push(("bugwarden.rule", AttrValue::Str(rule.clone())));
             }
+        }
+        // Projected out of the body so a collector can aggregate response
+        // size per tool without parsing every record (issue #145). Left off
+        // when the record carries no size, rather than exported as zero.
+        if let Some(bytes) = call.outcome.response_bytes {
+            attrs.push((
+                "bugwarden.response_bytes",
+                AttrValue::Int(i64::try_from(bytes).unwrap_or(i64::MAX)),
+            ));
         }
         // Correlation ids the client claimed; unauthenticated, exactly as
         // the audit record documents them. Anything that does not decode
@@ -1600,6 +1609,7 @@ mod tests {
             outcome: OutcomeInfo {
                 class: OutcomeClass::Ok,
                 duration_ms: 3,
+                response_bytes: Some(87),
             },
         }))
     }
@@ -1661,6 +1671,23 @@ mod tests {
             attr(&entry, "bugwarden.rule"),
             Some(&AttrValue::Str("embargo".to_owned()))
         );
+        assert_eq!(
+            attr(&entry, "bugwarden.response_bytes"),
+            Some(&AttrValue::Int(87))
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_response_exports_no_size_attribute() {
+        // Absent, not zero: a collector averaging response size must not
+        // see a refusal the gate never sized pulled into the mean.
+        let mut kind = tool_call(None);
+        let AuditEventKind::ToolCall(call) = &mut kind else {
+            unreachable!()
+        };
+        call.outcome.response_bytes = None;
+        let entry = audit_entry(&event(kind), b"{}");
+        assert_eq!(attr(&entry, "bugwarden.response_bytes"), None);
     }
 
     #[test]

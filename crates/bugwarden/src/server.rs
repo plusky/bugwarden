@@ -483,6 +483,60 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// A `Write` that keeps the length and throws the bytes away.
+///
+/// `download_attachment` can serialize megabytes here, on the async worker,
+/// purely to be measured — buffering that would be a multi-MB alloc and copy
+/// per call for a number.
+struct ByteCounter(u64);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serialized size of the payload the client is shown, in bytes (issue #145):
+/// the compact JSON of the result's `content` array — block framing included,
+/// so it is more than the length of the text inside.
+///
+/// The array, NOT the whole `CallToolResult`: `resultType` is cleared
+/// downstream for peers on an older revision, so sizing the enclosing object
+/// would make the number move with the negotiated protocol version instead of
+/// with the payload, and the point of the field is to compare payload sizes
+/// across calls. `isError` is excluded with it — a constant, carrying nothing.
+///
+/// `None` where there is nothing to measure: a protocol error is a JSON-RPC
+/// `error`, not a result, and the response variants this build does not serve
+/// carry no completed result at all. Also `None` if serialization fails, which
+/// it cannot for a `ContentBlock` — no float, no non-string key — but an
+/// unmeasured record is the right answer if that ever changes.
+///
+/// Counts rather than buffers, so the cost is the serialize alone and no
+/// allocation, and it is paid only when auditing is on.
+fn response_bytes(result: &Result<CallToolResponse, McpError>) -> Option<u64> {
+    let Ok(CallToolResponse::Complete(complete)) = result else {
+        return None;
+    };
+    // Structured output would be part of the payload — and for a client that
+    // prefers it, the whole of it — so measuring `content` alone would
+    // under-report. Nothing returns `Json<T>` today; this is the tripwire for
+    // the first tool that does.
+    debug_assert!(
+        complete.structured_content.is_none(),
+        "response_bytes measures `content` only: teach it structuredContent first"
+    );
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, &complete.content)
+        .ok()
+        .map(|()| counter.0)
+}
+
 /// Persist one audit record without blocking the async worker: the sink
 /// is synchronous by design (that is what makes "persisted before the
 /// response is returned" a guarantee), so the write moves to the blocking
@@ -3966,6 +4020,8 @@ impl ServerHandler for BugWarden {
                     outcome: audit::OutcomeInfo {
                         class: audit::OutcomeClass::Error,
                         duration_ms: elapsed_ms(started),
+                        // A protocol error, so no result to size.
+                        response_bytes: None,
                     },
                 }));
                 let session = self.session_info(&context, &audit);
@@ -4060,6 +4116,10 @@ impl ServerHandler for BugWarden {
                 outcome: audit::OutcomeInfo {
                     class: audit::OutcomeClass::Refused,
                     duration_ms: elapsed_ms(started),
+                    // The refusal is built below, after this record: the
+                    // gate must not spend a serialization to size a text
+                    // whose length is fixed by `audit_refusal` anyway.
+                    response_bytes: None,
                 },
             }));
             let _ = record_event(&audit, event, session).await;
@@ -4112,6 +4172,13 @@ impl ServerHandler for BugWarden {
             outcome: audit::OutcomeInfo {
                 class,
                 duration_ms: elapsed_ms(started),
+                // Sizes the DISPATCHED result. A record that persisted but
+                // whose `record_event` still failed (fsync, or an export
+                // refusal after the file write) can be followed by a
+                // fail-mode arm below swapping the response for a refusal,
+                // leaving this describing the result the client did not
+                // get — exactly as `class` above already does.
+                response_bytes: response_bytes(&result),
             },
         }));
         match record_event(&audit, event, session).await {

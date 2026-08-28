@@ -2108,3 +2108,217 @@ async fn bug_comments_window_with_nothing_omitted_records_no_redaction() {
         "nothing omitted, nothing capped: no redaction is recorded: {guard:?}"
     );
 }
+
+// ---------- outcome.response_bytes (issue #145) ----------
+
+/// Serialized length of the content the client actually received.
+///
+/// Computed from the client's own view of the result, so the assertion is
+/// end to end: if `response_bytes` were measured off anything but the
+/// payload that reached the client, this would not match. Deliberately
+/// sizes `content` alone — the enclosing `CallToolResult` carries
+/// `resultType`, which the SDK clears per negotiated revision.
+fn content_len(result: &CallToolResult) -> u64 {
+    serde_json::to_vec(&result.content)
+        .expect("served content must serialize")
+        .len() as u64
+}
+
+#[tokio::test]
+async fn response_bytes_is_the_served_payload_length() {
+    let mock = MockServer::start().await;
+    mount_fixture(&mock).await;
+    let audited = audited_client_for("", &mock, "test-key").await;
+
+    let result = call(&audited.client, "bug_info", json!({ "bug_ids": [7] })).await;
+    assert_ne!(result.is_error, Some(true), "bug 7 is served");
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(
+        tc.outcome.response_bytes,
+        Some(content_len(&result)),
+        "the record sizes the content the client received"
+    );
+    // Block framing is real: the array is strictly larger than the text
+    // it wraps, so this is not silently measuring the text alone.
+    let text = match result.content.first() {
+        Some(block) => block.as_text().expect("one text block").text.clone(),
+        None => panic!("a served bug_info carries content"),
+    };
+    let bytes = tc.outcome.response_bytes.expect("measured");
+    assert!(
+        bytes > text.len() as u64,
+        "{bytes} must exceed the {} bytes of text it wraps",
+        text.len()
+    );
+}
+
+#[tokio::test]
+async fn a_wholly_denied_call_is_sized_by_its_id_width_and_nothing_else() {
+    // WHOLLY denied — the qualifier is the point. `denied` is the WORST
+    // verdict of a call, not a claim that nothing was served, so this
+    // property holds only where the entire payload is the uniform denial
+    // (contrast `a_partial_denial_is_sized_by_what_was_served`).
+    //
+    // Where it does hold: the denial text (I2) interpolates the id the
+    // CALLER asked for — `Bug {id} is not accessible through this server`
+    // — so its length is fixed by that id's decimal width and by nothing
+    // about the bug. Both halves are pinned: two same-width ids over
+    // wildly different upstream bugs must size identically (nothing about
+    // the bug leaks into the size), and a wider id must cost exactly the
+    // extra digits (nothing else varies). The id itself is not a
+    // disclosure — the caller supplied it and `request.params` already
+    // records it verbatim — and the stream reaches no MCP surface (I15).
+    let policy = concat!(
+        "[[rule]]\nname = \"hide-secret\"\naction = \"deny\"\n",
+        "[rule.match]\nproducts = [\"Secret*\"]\n",
+    );
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .mount(&mock)
+        .await;
+    // 7 and 8 are the same width; 4242424 is six digits wider. Bug 8 is
+    // deliberately bulky where bug 7 is minimal.
+    for id in [7_u64, 8, 4_242_424] {
+        let mut secret = world_bug(id);
+        secret["product"] = json!("SecretSauce");
+        if id == 8 {
+            secret["summary"] = json!("x".repeat(4096));
+            secret["whiteboard"] = json!("y".repeat(512));
+            secret["keywords"] = json!(["alpha", "beta", "gamma"]);
+        }
+        Mock::given(method("GET"))
+            .and(path("/rest/bug"))
+            .and(query_param("id", id.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [secret] })))
+            .mount(&mock)
+            .await;
+    }
+    let audited = audited_client_for(policy, &mock, "test-key").await;
+
+    let mut sizes = Vec::new();
+    for id in [7_u64, 8, 4_242_424] {
+        let denied = call(&audited.client, "bug_history", json!({ "id": id })).await;
+        assert_eq!(denied.is_error, Some(true), "bug {id} is denied");
+        let events = read_events(&audited.audit_path);
+        let tc = last_tool_call(&events);
+        assert_eq!(
+            tc.guard.as_ref().expect("the guard ran").verdict,
+            Verdict::Denied
+        );
+        let bytes = tc
+            .outcome
+            .response_bytes
+            .expect("a denial is still content");
+        assert_eq!(
+            bytes,
+            content_len(&denied),
+            "a denial is sized like any other served content"
+        );
+        sizes.push(bytes);
+    }
+    assert_eq!(
+        sizes[0], sizes[1],
+        "a 4KiB bug and a minimal one deny at the same size: the bug does not \
+         reach the denial"
+    );
+    assert_eq!(
+        sizes[2] - sizes[0],
+        6,
+        "4242424 is six digits wider than 7, and that is the whole difference"
+    );
+}
+
+#[tokio::test]
+async fn a_partial_denial_is_sized_by_what_was_served() {
+    // The counterexample to reading `response_bytes` as "how big was the
+    // refusal". `bug_info` puts served bugs and denied ones in ONE
+    // envelope, and the record takes the WORST verdict of the call, so a
+    // record can read `denied` over a payload carrying a full bug body.
+    // Pinned because the field is easy to misread the other way: the size
+    // tracks the payload, and no verdict bounds it.
+    let policy = concat!(
+        "[[rule]]\nname = \"hide-secret\"\naction = \"deny\"\n",
+        "[rule.match]\nproducts = [\"Secret*\"]\n",
+    );
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [world_bug(7)] })))
+        .mount(&mock)
+        .await;
+    let mut secret = world_bug(8);
+    secret["product"] = json!("SecretSauce");
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "8"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [secret] })))
+        .mount(&mock)
+        .await;
+    let audited = audited_client_for(policy, &mock, "test-key").await;
+
+    let whole = call(&audited.client, "bug_info", json!({ "bug_ids": [8] })).await;
+    let events = read_events(&audited.audit_path);
+    let denied_only = last_tool_call(&events)
+        .outcome
+        .response_bytes
+        .expect("measured");
+    drop(whole);
+
+    let partial = call(&audited.client, "bug_info", json!({ "bug_ids": [7, 8] })).await;
+    assert_ne!(
+        partial.is_error,
+        Some(true),
+        "bug 7 is still served alongside the denial"
+    );
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(
+        tc.guard.as_ref().expect("the guard ran").verdict,
+        Verdict::Denied,
+        "worst-wins: one denied id stamps the whole record"
+    );
+    let bytes = tc.outcome.response_bytes.expect("measured");
+    assert_eq!(
+        bytes,
+        content_len(&partial),
+        "the record sizes the envelope"
+    );
+    assert!(
+        bytes > denied_only,
+        "{bytes} carries bug 7's body on top of the same denial ({denied_only}): a \
+         `denied` record is not bounded by the refusal's width"
+    );
+}
+
+#[tokio::test]
+async fn a_protocol_error_records_no_response_size() {
+    // No result exists, so the field is absent rather than zero: an
+    // operator averaging payload size must not see errors pulled in.
+    let mock = MockServer::start().await;
+    mount_fixture(&mock).await;
+    let audited = audited_client_for("", &mock, "test-key").await;
+
+    let err = audited
+        .client
+        .call_tool(CallToolRequestParams::new("no_such_tool".to_string()))
+        .await
+        .expect_err("an unknown tool is a protocol error");
+    drop(err);
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.outcome.class, OutcomeClass::Error);
+    assert_eq!(tc.outcome.response_bytes, None, "absent, not zero");
+}

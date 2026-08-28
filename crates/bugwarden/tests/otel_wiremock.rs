@@ -637,6 +637,27 @@ async fn a_mid_serve_collector_death_gates_uniformly_and_recovery_clears() {
             .any(|l| l.contains("\"event\":\"audit_gap\"") && l.contains("\"write_error\"")),
         "the undelivered window must be accounted in an audit_gap: {lines:?}"
     );
+
+    // The pre-dispatch gate's own records (issue #145). They are written
+    // before the refusal exists, so they carry no size — and this is the
+    // one path where such a record reaches the FILE, because the write
+    // succeeds and only the export refuses. Absent, never zero: a zero
+    // would drag every average over the gated window down.
+    let gated: Vec<_> = lines
+        .iter()
+        .filter(|l| l.contains("\"event\":\"tool_call\"") && l.contains("\"class\":\"refused\""))
+        .collect();
+    assert!(!gated.is_empty(), "the gated window is recorded: {lines:?}");
+    for line in gated {
+        // A substring test, and deliberately: it pins the WIRE shape, so it
+        // catches `response_bytes: Some(0)` at the gate site and a dropped
+        // `skip_serializing_if` (which would emit `"response_bytes":null`)
+        // alike. Rewriting it to parse the field would reopen the second.
+        assert!(
+            !line.contains("response_bytes"),
+            "a gate refusal has nothing to size: {line}"
+        );
+    }
 }
 
 #[tokio::test]
