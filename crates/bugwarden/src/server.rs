@@ -267,6 +267,7 @@ const PARAM_ALLOWLIST: &[&str] = &[
     "content_type",
     "depends_on_add",
     "depends_on_remove",
+    "detail",
     "duplicate_of",
     "field_names",
     "file_name",
@@ -821,6 +822,15 @@ fn project_fields(bug: &Value, fields: &BTreeSet<String>) -> Value {
     Value::Object(out)
 }
 
+/// Drop every `*_detail` key from a bug object: those repeat the plain
+/// account fields with real_name/id/email expanded — measured at 44-48%
+/// of a full bug's serialized size.
+fn strip_detail_fields(bug: &mut Value) {
+    if let Some(obj) = bug.as_object_mut() {
+        obj.retain(|k, _| !k.ends_with("_detail"));
+    }
+}
+
 /// Add `"comment": {"body": ...}` to a `Bug.update` payload when a comment is
 /// set. This is the UPDATE shape only — `Bug.add_attachment` takes `comment`
 /// as a plain string and must not use this helper.
@@ -948,6 +958,17 @@ fn default_limit() -> u32 {
 pub struct BugInfoParams {
     /// Bug ids to fetch. At most 25 distinct ids per call.
     pub bug_ids: Vec<u64>,
+    /// Comma-separated list of fields to return for each bug (`id` is
+    /// always included). Applied after policy checks, so a field the
+    /// policy redacts is never reachable by naming it here. Mutually
+    /// exclusive with `detail`.
+    #[serde(default)]
+    pub include_fields: Option<String>,
+    /// Set to false to drop every `*_detail` field (the duplicated
+    /// real_name/id/email expansion next to each plain account field).
+    /// Mutually exclusive with `include_fields`.
+    #[serde(default)]
+    pub detail: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1839,7 +1860,7 @@ impl BugWarden {
 #[tool_router]
 impl BugWarden {
     #[tool(
-        description = "Returns the entire information for one or more bugzilla bug ids. Bugs that are not accessible through this server are listed under 'restricted'.",
+        description = "Returns the entire information for one or more bugzilla bug ids. Bugs that are not accessible through this server are listed under 'restricted'. To reduce response size, pass include_fields (comma-separated; id is always included) to project each bug to the named fields, or detail=false to drop the duplicated *_detail fields; the two options are mutually exclusive.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn bug_info(
@@ -1866,6 +1887,20 @@ impl BugWarden {
             note_refused(&ctx);
             return Ok(refusal);
         }
+        if p.include_fields.is_some() && p.detail.is_some() {
+            note_refused(&ctx);
+            return Ok(err_text("include_fields and detail are mutually exclusive"));
+        }
+        // The projection, parsed once. `id` is forced in (same as
+        // bugs_quicksearch): without it the envelope's `served` set and the
+        // client's bookkeeping both break.
+        let projection: Option<BTreeSet<String>> = p.include_fields.as_ref().map(|csv| {
+            csv.split(',')
+                .map(|f| f.trim().to_string())
+                .filter(|f| !f.is_empty())
+                .chain(std::iter::once("id".to_string()))
+                .collect()
+        });
 
         // Resolved at most once per tool call and threaded to EVERY
         // classification below — the assessment, the assemble re-check and
@@ -1916,6 +1951,22 @@ impl BugWarden {
         // update_bug_dependencies applies before WRITING such a link).
         let mut envelope =
             assemble_bug_info(&self.guard, &ids, &assessments, &full, caller.as_deref());
+        // Projection is the last step before link scrubbing and serving: it
+        // runs on the bodies the guard just re-checked (I4/I8), so a field
+        // the client did not ask for is never assessed and never served —
+        // and a link field the projection drops costs no disclosure
+        // assessment below.
+        if projection.is_some() || p.detail == Some(false) {
+            if let Some(bugs) = envelope.get_mut("bugs").and_then(Value::as_array_mut) {
+                for bug in bugs.iter_mut() {
+                    if let Some(fields) = &projection {
+                        *bug = project_fields(bug, fields);
+                    } else {
+                        strip_detail_fields(bug);
+                    }
+                }
+            }
+        }
         let base_url = self.bz.base_url();
         // Only ids actually SERVED in this envelope are already answered for.
         // A requested id that was denied must not be whitelisted: asking
@@ -4219,6 +4270,31 @@ mod tests {
             );
         }
         assert!(server.tool_router.has_route("bug_info"));
+    }
+
+    #[test]
+    fn strip_detail_fields_drops_only_detail_keys() {
+        let mut bug = json!({
+            "id": 7,
+            "assigned_to": "dev@example.com",
+            "assigned_to_detail": {"id": 5, "real_name": "Dev"},
+            "cc_detail": [],
+            "summary": "plain",
+        });
+        strip_detail_fields(&mut bug);
+        let obj = bug.as_object().expect("bug object");
+        assert!(obj.contains_key("assigned_to"));
+        assert!(!obj.contains_key("assigned_to_detail"));
+        assert!(!obj.contains_key("cc_detail"));
+        assert!(obj.contains_key("summary"));
+        assert!(obj.contains_key("id"));
+    }
+
+    #[test]
+    fn strip_detail_fields_leaves_non_objects_alone() {
+        let mut not_an_object = json!("just a string");
+        strip_detail_fields(&mut not_an_object);
+        assert_eq!(not_an_object, json!("just a string"));
     }
 
     #[test]

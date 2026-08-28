@@ -2003,3 +2003,245 @@ async fn discovery_tools_absent_from_the_listing_by_default() {
     assert!(names.contains(&"bugzilla_products"));
     assert!(names.contains(&"bug_fields"));
 }
+
+/// A world-readable bug carrying the duplicated `*_detail` account fields.
+fn detailed_bug(id: u64) -> Value {
+    let mut bug = world_readable_bug(id);
+    bug["assigned_to"] = json!("dev@example.com");
+    bug["assigned_to_detail"] = json!({
+        "id": 5, "email": "dev@example.com", "name": "dev@example.com",
+        "real_name": "Dev",
+    });
+    bug["cc"] = json!(["watcher@example.com"]);
+    bug["cc_detail"] = json!([{
+        "id": 6, "email": "watcher@example.com", "name": "watcher@example.com",
+        "real_name": "Watcher",
+    }]);
+    bug
+}
+
+#[tokio::test]
+async fn bug_info_detail_false_strips_only_detail_fields() {
+    let mock = MockServer::start().await;
+    mount_bug_and_padding(&mock, detailed_bug(7)).await;
+    let client = client_for("", &mock).await;
+
+    let full = call(&client, "bug_info", json!({ "bug_ids": [7] })).await;
+    let full: Value = serde_json::from_str(&text_of(&full)).expect("bug_info returns JSON");
+    assert!(
+        full["bugs"][0].get("assigned_to_detail").is_some(),
+        "the default view keeps the detail fields"
+    );
+
+    let lean = call(
+        &client,
+        "bug_info",
+        json!({ "bug_ids": [7], "detail": false }),
+    )
+    .await;
+    assert!(!is_error(&lean), "{}", text_of(&lean));
+    let lean: Value = serde_json::from_str(&text_of(&lean)).expect("bug_info returns JSON");
+    let bug = lean["bugs"][0].as_object().expect("bug object");
+    assert_eq!(bug.get("assigned_to"), Some(&json!("dev@example.com")));
+    let leaked: Vec<&String> = bug.keys().filter(|k| k.ends_with("_detail")).collect();
+    assert!(
+        leaked.is_empty(),
+        "detail=false must drop every *_detail field: {leaked:?}"
+    );
+}
+
+#[tokio::test]
+async fn bug_info_include_fields_projects_and_always_keeps_id() {
+    let mock = MockServer::start().await;
+    mount_bug_and_padding(&mock, detailed_bug(7)).await;
+    let client = client_for("", &mock).await;
+
+    let projected = call(
+        &client,
+        "bug_info",
+        json!({ "bug_ids": [7], "include_fields": "summary, product" }),
+    )
+    .await;
+    let projected: Value =
+        serde_json::from_str(&text_of(&projected)).expect("bug_info returns JSON");
+    let keys: Vec<&String> = projected["bugs"][0]
+        .as_object()
+        .expect("bug object")
+        .keys()
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["id", "product", "summary"],
+        "exactly the requested fields plus the forced id: {keys:?}"
+    );
+}
+
+#[tokio::test]
+async fn bug_info_include_fields_preserves_the_redacted_marker() {
+    // A summary-only grant projected by include_fields must still carry
+    // `_redacted` — dropping the marker would misrepresent the grant.
+    let policy = concat!(
+        "[[rule]]\nname = \"summary-only\"\naction = \"restrict\"\n",
+        "capabilities = [\"summary\"]\n",
+        "[rule.match]\nproducts = [\"openSUSE\"]\n",
+    );
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "bugs": [detailed_bug(7)] })),
+        )
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .mount(&mock)
+        .await;
+    let client = client_for(policy, &mock).await;
+
+    let result = call(
+        &client,
+        "bug_info",
+        json!({ "bug_ids": [7], "include_fields": "summary" }),
+    )
+    .await;
+    let result: Value = serde_json::from_str(&text_of(&result)).expect("bug_info returns JSON");
+    assert_eq!(result["bugs"][0]["_redacted"], json!(true));
+    assert_eq!(result["bugs"][0]["summary"], json!("a plain bug"));
+    assert!(
+        result["bugs"][0].get("product").is_none(),
+        "a field outside the projection stays out even in a summary view"
+    );
+}
+
+#[tokio::test]
+async fn bug_info_include_fields_and_detail_are_mutually_exclusive() {
+    let mock = MockServer::start().await;
+    // The request is invalid on its own key names, so it must be refused
+    // before any upstream traffic.
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let client = client_for("", &mock).await;
+
+    let result = call(
+        &client,
+        "bug_info",
+        json!({ "bug_ids": [7], "include_fields": "id,summary", "detail": false }),
+    )
+    .await;
+    assert!(is_error(&result), "both projections set must be an error");
+    assert!(
+        text_of(&result).contains("mutually exclusive"),
+        "the refusal must say why: {}",
+        text_of(&result)
+    );
+}
+
+#[tokio::test]
+async fn bug_info_projection_drops_link_fields_before_the_disclosure_fetch() {
+    // A link field the projection drops is never served, so it must never
+    // be assessed either: bug 9 is named only by blocks, and blocks is not
+    // in the projection — no request for 9 may leave the server.
+    let mut bug = detailed_bug(7);
+    bug["blocks"] = json!([9]);
+    let mock = MockServer::start().await;
+    mount_bug_and_padding(&mock, bug).await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "9"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "bugs": [world_readable_bug(9)] })),
+        )
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let client = client_for("", &mock).await;
+
+    let projected = call(
+        &client,
+        "bug_info",
+        json!({ "bug_ids": [7], "include_fields": "id,summary" }),
+    )
+    .await;
+    let projected: Value =
+        serde_json::from_str(&text_of(&projected)).expect("bug_info returns JSON");
+    assert!(
+        projected["bugs"][0].get("blocks").is_none(),
+        "a link field outside the projection is simply absent"
+    );
+}
+
+#[tokio::test]
+async fn bug_info_projected_link_fields_are_still_scrubbed() {
+    // The contrast case: a link field that IS projected in goes through
+    // I14 scrubbing exactly as before — bug 9 is policy-hidden upstream
+    // (absent from its classify response), so it must not be named.
+    let mut bug = detailed_bug(7);
+    bug["blocks"] = json!([9]);
+    let mock = MockServer::start().await;
+    mount_bug_and_padding(&mock, bug).await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let client = client_for("", &mock).await;
+
+    let projected = call(
+        &client,
+        "bug_info",
+        json!({ "bug_ids": [7], "include_fields": "id,blocks" }),
+    )
+    .await;
+    let projected: Value =
+        serde_json::from_str(&text_of(&projected)).expect("bug_info returns JSON");
+    assert_eq!(
+        projected["bugs"][0]["blocks"],
+        json!([]),
+        "a hidden linked bug is scrubbed out of the projected field (I14)"
+    );
+}
+
+#[tokio::test]
+async fn bug_info_projection_never_changes_a_restricted_entry() {
+    // A denied id produces the uniform restricted entry regardless of
+    // projection params (I2) — the projection loop must not touch it.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "8"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .mount(&mock)
+        .await;
+    let client = client_for("", &mock).await;
+
+    let mut restricted: Vec<String> = Vec::new();
+    for args in [
+        json!({ "bug_ids": [8] }),
+        json!({ "bug_ids": [8], "detail": false }),
+        json!({ "bug_ids": [8], "include_fields": "id,summary" }),
+    ] {
+        let result = call(&client, "bug_info", args).await;
+        let result: Value = serde_json::from_str(&text_of(&result)).expect("bug_info returns JSON");
+        assert!(result["bugs"].as_array().expect("bugs").is_empty());
+        restricted.push(result["restricted"].to_string());
+    }
+    assert!(
+        restricted.windows(2).all(|w| w[0] == w[1]),
+        "the restricted entry is byte-identical across projections: {restricted:?}"
+    );
+}
