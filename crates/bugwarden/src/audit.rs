@@ -70,9 +70,12 @@
 //! [`AuditError`]: crate::audit::AuditError
 //! [`AuditEvent`]: crate::audit::AuditEvent
 //! [`AuditEventKind`]: crate::audit::AuditEventKind
+//! [`AuditExport`]: crate::audit::AuditExport
 //! [`AuditSink`]: crate::audit::AuditSink
 //! [`AuditSink::record`]: crate::audit::AuditSink::record
+//! [`FailMode`]: crate::audit::FailMode
 //! [`RequestInfo::params`]: crate::audit::RequestInfo::params
+//! [`select_sinks`]: crate::audit::select_sinks
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};

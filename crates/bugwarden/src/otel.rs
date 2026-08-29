@@ -52,7 +52,8 @@
 //! [`AuditEvent`]: crate::audit::AuditEvent
 //! [`AuditExport::delivery_failing`]: crate::audit::AuditExport::delivery_failing
 //! [`FailMode`]: crate::audit::FailMode
-//! [`OTEL_EXPORTER_OTLP_HEADERS`]: HEADERS_VAR
+//! [`OTEL_EXPORTER_OTLP_HEADERS`]: crate::otel::HEADERS_VAR
+//! [`Pipeline::probe`]: crate::otel::Pipeline::probe
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
