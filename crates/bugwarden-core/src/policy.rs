@@ -237,9 +237,9 @@ pub struct Matcher {
     /// Case-insensitive substrings searched in the bug's whiteboard.
     ///
     /// A whiteboard the classification data does not carry is unknown, not
-    /// empty, and unknown resolves per `unknown_matches` in
-    /// [`Matcher::matches`] (I4). An empty whiteboard is knowledge: it
-    /// simply contains no substring.
+    /// empty, so the criterion yields [`MatchOutcome::Unknown`], which
+    /// [`Policy::classify`] resolves fail-closed (I4). An empty whiteboard
+    /// is knowledge: it simply contains no substring.
     #[serde(default)]
     pub whiteboard_contains: Vec<String>,
     /// Case-insensitive substrings searched in the bug's summary.
@@ -257,8 +257,8 @@ pub struct Matcher {
     /// Group NAMES differ per instance, so a policy that must hold on any
     /// Bugzilla cannot enumerate them; this criterion asks the
     /// instance-independent question instead. A bug whose group list could
-    /// not be read answers neither way and resolves per `unknown_matches`
-    /// (I4), whichever side the rule asked about.
+    /// not be read answers neither way, so the criterion is undecidable
+    /// whichever side the rule asked about and resolves fail-closed (I4).
     #[serde(default)]
     pub group_restricted: Option<bool>,
     /// Matches on whether the REQUESTING account authored the bug: `true`
@@ -271,18 +271,18 @@ pub struct Matcher {
     /// against the bug's `creator`. When the relationship cannot be
     /// established — the creator is unreadable, OR the caller's identity
     /// did not resolve (no identity rule triggered a lookup, or `whoami`
-    /// failed) — the criterion is undecidable and resolves per
-    /// `unknown_matches` fail-closed (I4), whichever side the rule asked
-    /// about. In the create gate the prospective bug's author is
-    /// definitionally the caller, so there `created_by_me` is forced true
-    /// with no lookup at all (see `Guard::may_create`).
+    /// failed) — the criterion is undecidable whichever side the rule
+    /// asked about and resolves fail-closed (I4). In the create gate the
+    /// prospective bug's author is definitionally the caller, so there
+    /// `created_by_me` is forced true with no lookup at all (see
+    /// `Guard::may_create`).
     #[serde(default)]
     pub created_by_me: Option<bool>,
     /// Matches when `creation_time` is newer than `now - N days`.
     ///
-    /// A bug with a missing/unparsable `creation_time` MATCHES this
-    /// criterion (fail closed, I4): this matcher exists to deny or restrict
-    /// young bugs, so a bug of unknown age must be treated as young.
+    /// A bug with a missing/unparsable `creation_time` has no age to
+    /// compare, so the criterion is undecidable and resolves fail-closed
+    /// (I4), exactly like every other unreadable field.
     #[serde(default)]
     pub younger_than_days: Option<i64>,
 }
@@ -590,7 +590,7 @@ pub struct GlobalGuards {
     /// The login `identity_source = "declared"` asserts. Required (and
     /// validated non-blank) exactly when `identity_source = "declared"`;
     /// setting it under `whoami` is a hard startup error rather than a
-    /// silently ignored key (see [`Policy::validate`]). Compared with
+    /// silently ignored key (see [`Policy::from_toml_str`]). Compared with
     /// Bugzilla's own `eq` — case-sensitive (see DESIGN.md).
     #[serde(default)]
     pub identity_login: Option<String>,
