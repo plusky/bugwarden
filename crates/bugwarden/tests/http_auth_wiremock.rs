@@ -351,6 +351,58 @@ async fn every_unauthenticated_request_gets_one_byte_identical_refusal() {
     }
 }
 
+/// The status line the server answers a POST of `body`, presenting
+/// `authorization` when one is given.
+///
+/// Raw TCP rather than reqwest, because every answer this drives arrives
+/// while the body is still being written and is followed by a close: the
+/// remaining write then fails with a connection reset, and reqwest abandons
+/// the response it already holds along with it. Here the send is
+/// best-effort and the read is what the test waits on, so the answer is
+/// read whether or not the rest of the body ever landed — which is the only
+/// way to observe a server that deliberately refuses before consuming what
+/// it was sent.
+async fn oversized_post_status(
+    addr: SocketAddr,
+    authorization: Option<&str>,
+    body: &[u8],
+) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let credential = authorization.map_or_else(String::new, |v| format!("Authorization: {v}\r\n"));
+    let mut request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\n{credential}\
+         Content-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+
+    let socket = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to the listener");
+    let (mut reader, mut writer) = socket.into_split();
+    let sender = tokio::spawn(async move {
+        let _ = writer.write_all(&request).await;
+    });
+    let mut response = Vec::new();
+    // `read_to_end` keeps what it already read when the peer resets, which
+    // is exactly the case under test; only a server that answers nothing at
+    // all leaves the buffer empty.
+    let read = async { reader.read_to_end(&mut response).await };
+    tokio::time::timeout(Duration::from_secs(10), read)
+        .await
+        .expect("the server must answer")
+        .ok();
+    sender.abort();
+    String::from_utf8_lossy(&response)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
 #[tokio::test]
 async fn an_oversized_body_from_a_stranger_is_refused_by_the_gate_not_the_cap() {
     // The gate is a layer in FRONT of rmcp, so an unauthenticated caller
@@ -358,61 +410,32 @@ async fn an_oversized_body_from_a_stranger_is_refused_by_the_gate_not_the_cap() 
     // rests the 413-observability argument on exactly this.
     let mock = MockServer::start().await;
     let addr = serve_guarded(&mock, &both_tokens(), false).await;
-    let http = reqwest::Client::new();
-    let url = format!("http://{addr}/mcp");
     // Past the 4 MiB floor the default policy derives.
-    let oversized = "x".repeat(5 * 1024 * 1024);
+    let oversized = "x".repeat(5 * 1024 * 1024).into_bytes();
 
-    let anonymous = http
-        .post(&url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(oversized.clone())
-        .send()
-        .await
-        .expect("the server must answer");
-    assert_eq!(anonymous.status().as_u16(), 401, "the gate answers first");
+    let anonymous = oversized_post_status(addr, None, &oversized).await;
+    assert!(
+        anonymous.starts_with("HTTP/1.1 401"),
+        "the gate answers first: {anonymous:?}"
+    );
 
-    let authenticated = http
-        .post(&url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header(
-            reqwest::header::ACCEPT,
-            "application/json, text/event-stream",
-        )
-        .header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {WRITE_TOKEN}"),
-        )
-        .body(oversized)
-        .send()
-        .await
-        .expect("the server must answer");
-    assert_eq!(
-        authenticated.status().as_u16(),
-        413,
-        "a credentialed caller reaches the cap, and only then"
+    let authenticated =
+        oversized_post_status(addr, Some(&format!("Bearer {WRITE_TOKEN}")), &oversized).await;
+    assert!(
+        authenticated.starts_with("HTTP/1.1 413"),
+        "a credentialed caller reaches the cap, and only then: {authenticated:?}"
     );
 
     // The READ scope reaches it too: the cap is a transport limit and the
     // scope gate sits above it in the handler, so a credential that may not
     // upload at all still sees the boundary. DESIGN.md's #52 disclosure note
     // says so; this is what makes that sentence true.
-    let read_scope = http
-        .post(&url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header(
-            reqwest::header::ACCEPT,
-            "application/json, text/event-stream",
-        )
-        .header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {READ_TOKEN}"),
-        )
-        .body("y".repeat(5 * 1024 * 1024))
-        .send()
-        .await
-        .expect("the server must answer");
-    assert_eq!(read_scope.status().as_u16(), 413);
+    let read_scope =
+        oversized_post_status(addr, Some(&format!("Bearer {READ_TOKEN}")), &oversized).await;
+    assert!(
+        read_scope.starts_with("HTTP/1.1 413"),
+        "the read scope reaches the cap too: {read_scope:?}"
+    );
 }
 
 // ---------- the two scopes ----------
