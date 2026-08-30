@@ -202,7 +202,7 @@ const SCOPE_NAME: &str = "bugwarden";
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// What the four OTLP variables held when the process started.
+/// What the OTLP variables held when the process started.
 ///
 /// A plain struct rather than a direct read of `std::env`, so resolution is
 /// a function of its argument and a test states its own world instead of
@@ -227,7 +227,7 @@ pub struct OtelEnv {
 }
 
 impl OtelEnv {
-    /// Read the four variables out of the process environment.
+    /// Read the variables out of the process environment.
     ///
     /// A variable set to the empty string counts as one that was never set,
     /// the same "cleared" idiom unit files and container specs use for
@@ -320,17 +320,14 @@ impl ExportConfig {
 /// - An endpoint that is not an `http://` or `https://` URL.
 /// - A header entry that is not a usable `key=value` HTTP header.
 ///
-/// Every message names the variable that carried the offending value —
-/// the specific one where it was the specific one that lost — and, for a
-/// header list, the position of the offending entry, never a value: a
-/// mispasted credential is exactly what lands in the wrong position
-/// (I12).
+/// Every message names the variable that carried the offending value
+/// (the logs-specific one where that one won) and, for a header list,
+/// the position of the offending entry — never a value: a mispasted
+/// credential is exactly what lands in the wrong position (I12).
 pub fn resolve(env: &OtelEnv) -> anyhow::Result<Option<ExportConfig>> {
-    // The logs-specific variable wins where it is set, and is used as the
-    // operator wrote it — the signal path is appended only to the general
-    // one. Honouring it is not optional decoration: a fleet that sets only
-    // `_LOGS_ENDPOINT` is a fleet that expects logs to be exported, and
-    // reading just the general variable would leave export silently off.
+    // Set alone, the logs-specific variable still turns export ON: a fleet
+    // naming only `_LOGS_ENDPOINT` expects logs, and reading just the
+    // general variable would leave export silently off.
     let (endpoint_var, endpoint, append_path) = match logs_override(env.logs_endpoint.as_deref()) {
         Some(endpoint) => (LOGS_ENDPOINT_VAR, endpoint, false),
         None => (
@@ -854,10 +851,7 @@ impl Pipeline {
     /// not an audit record, which would mean inventing an event kind the
     /// schema does not have — so this exercises the whole path: DNS, TCP,
     /// TLS, the headers, the protocol and the collector's own acceptance.
-    ///
-    /// Bounded retry, because a collector and a server that start together
-    /// race, and losing that race by half a second is not a
-    /// misconfiguration.
+    /// Bounded retry — see [`PROBE_ATTEMPTS`].
     ///
     /// # Errors
     ///

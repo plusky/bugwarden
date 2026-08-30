@@ -21,7 +21,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The ambient environment must not reach the child: every one of these is
-/// read by `Cli`, or — the `OTEL_*` four — by `bugwarden::otel` outside
+/// read by `Cli`, or — the `OTEL_*` set — by `bugwarden::otel` outside
 /// clap entirely (`RUST_LOG` only muddies the captured stderr). Scrubbed as
 /// one set rather than per test — the http-only knobs are inert for a stdio
 /// run today, and pruning them is how the list falls behind `Cli` again.

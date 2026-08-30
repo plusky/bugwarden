@@ -517,8 +517,8 @@ impl std::io::Write for ByteCounter {
 /// it cannot for a `ContentBlock` — no float, no non-string key — but an
 /// unmeasured record is the right answer if that ever changes.
 ///
-/// Counts rather than buffers, so the cost is the serialize alone and no
-/// allocation, and it is paid only when auditing is on.
+/// Counts rather than buffers (see `ByteCounter`); paid only when
+/// auditing is on.
 fn response_bytes(result: &Result<CallToolResponse, McpError>) -> Option<u64> {
     let Ok(CallToolResponse::Complete(complete)) = result else {
         return None;
@@ -638,10 +638,8 @@ fn too_many_ids(ids: &[u64]) -> Option<CallToolResult> {
 /// Keep the first `head` and last `tail` items of a list, dropping the
 /// middle. Returns the kept items and how many were omitted.
 ///
-/// One helper for `bug_history` (issue #142) and `bug_comments`: they used to
-/// carry separate implementations that agreed on every input their handlers
-/// can produce, so an edit to one silently forked the two tools' truncation
-/// semantics.
+/// One helper for `bug_history` (issue #142) and `bug_comments`, so an
+/// edit cannot silently fork the two tools' truncation semantics.
 ///
 /// Both callers run it on the post-scrub list (I14), so `omitted` counts only
 /// items the client may see and a dropped item cannot leak by arithmetic
