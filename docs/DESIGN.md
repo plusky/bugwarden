@@ -1643,7 +1643,7 @@ names an endpoint.
 ## rmcp 3.1 usage notes
 
 Reference source is the rmcp this workspace pins, unpacked in the local
-registry: `~/.cargo/registry/src/*/rmcp-3.1.2/` — today's version, and the
+registry: `~/.cargo/registry/src/*/rmcp-3.1.4/` — today's version, and the
 directory holding the `rmcp` package's `manifest_path` in `cargo metadata
 --format-version 1` on any day, so it follows `Cargo.lock` rather than a copy
 of it and is by construction the source this build compiles against. Every rmcp
@@ -1653,8 +1653,8 @@ routing traps), `handler/server/router/tool.rs` (`ToolRouter`, incl.
 `remove_route` / `has_route` — I13), `model.rs` and `model/serde_impl.rs`
 (`InitializeResult`, the `_meta` strip), `service.rs` (the serve loop); the
 `#[tool_router]` / `#[tool_handler]` expansions are in the sibling
-`rmcp-macros-3.1.2` tree. The published crate carries no `examples/` — those
-live upstream at the `rmcp-v3.1.2` tag — but for how this server is actually
+`rmcp-macros-3.1.4` tree. The published crate carries no `examples/` — those
+live upstream at the `rmcp-v3.1.4` tag — but for how this server is actually
 wired, `server.rs` and `main.rs` are the reference.
 
 - `rmcp = { version = "3.1", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }`
@@ -1866,7 +1866,7 @@ wired, `server.rs` and `main.rs` are the reference.
   comma-only now. An entry that is not a hostname or `host:port` — `*`, a
   scheme-carrying URL, `a;b`, a percent-encoded comma, zero-width unicode, a
   space-containing typo — is a startup error (`Cli::checked_allowed_hosts`);
-  rmcp 3.1.2's `parse_allowed_authority` would otherwise keep validation on
+  rmcp 3.1.4's `parse_allowed_authority` would otherwise keep validation on
   and store (or skip) a host no inbound `Host` matches, a silent deny-all
   discovered one 403 at a time. HTTP start logs one info line stating
   whether Host validation is on or off and, when on, the resolved list
