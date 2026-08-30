@@ -140,17 +140,48 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+      - name: Read the MSRV from Cargo.toml
+        id: msrv
+        shell: bash
+        run: |
+          set -euo pipefail
+          msrv="$(sed -n 's/^rust-version = "\([^"]*\)".*/\1/p' Cargo.toml)"
+          if [ -z "$msrv" ]; then
+            echo "::error::cannot read rust-version from Cargo.toml"
+            exit 1
+          fi
+          echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
+          # The action only sets the rustup default, which rust-toolchain.toml
+          # outranks; an ambient RUSTUP_TOOLCHAIN outranks the toml in turn.
+          echo "RUSTUP_TOOLCHAIN=$msrv" >> "$GITHUB_ENV"
       - name: Install Rust toolchain (MSRV)
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
         with:
-          # Keep in sync with rust-version in Cargo.toml.
-          toolchain: "1.88"
+          toolchain: ${{ steps.msrv.outputs.msrv }}
       - name: Cache cargo
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           workspaces: . -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Assert the toolchain is the MSRV
+        # If the export above ever stops working, fail here instead of
+        # silently re-testing the pinned channel.
+        shell: bash
+        env:
+          MSRV: ${{ steps.msrv.outputs.msrv }}
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          actual="$(rustc --version | cut -d' ' -f2)"
+          case "$actual" in
+            "$MSRV" | "$MSRV".*) ;;
+            *)
+              echo "::error::MSRV job is on rustc $actual, expected $MSRV"
+              exit 1
+              ;;
+          esac
       - name: Build (MSRV)
         run: cargo build --workspace --locked
 

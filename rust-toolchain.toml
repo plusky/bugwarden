@@ -1,7 +1,8 @@
 # Pinned toolchain for reproducible local checks. Keep in sync with the CI
-# toolchain inputs in .github/workflows/ and with the Dockerfile's rust tag,
-# which ci.yml's toolchain-drift job compares against this channel; the
-# workspace MSRV (rust-version in Cargo.toml) is a separate, lower bound.
+# toolchain inputs that name this channel (rust-msrv and rust-beta
+# deliberately differ) and with the Dockerfile's rust tag, which ci.yml's
+# toolchain-drift job compares against this channel; the workspace MSRV
+# (rust-version in Cargo.toml) is a separate, lower bound.
 [toolchain]
 channel = "1.98.0"
 components = ["rustfmt", "clippy"]
