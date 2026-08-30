@@ -1753,22 +1753,36 @@ wired, `server.rs` and `main.rs` are the reference.
   must likewise be built in this crate rather than in the library that
   holds the HTTP client (issue #55, "Caller identity on the wire" above).
 - **rmcp trap — the handshake-free lifecycle is chosen by `_meta` shape, not
-  by revision.** `message_has_per_request_protocol_version`
-  (`transport/streamable_http_server/tower.rs`) routes a request to the
-  stateless path when `_meta.io.modelcontextprotocol/protocolVersion` is
-  merely PRESENT, whatever revision it names, and that path synthesises a
-  peer whose `client_info` is `Implementation::default()` — the SDK's own
-  crate name and version. Narrowing the revision list therefore does **not**
-  keep a request off it: a client naming `2025-11-25`, which this build
-  serves, would otherwise reach a tool with no `initialize` behind it and
+  by `SUPPORTED_PROTOCOL_VERSIONS`.** In rmcp 3.1.4 `is_legacy_request`
+  (`transport/streamable_http_server/tower.rs`) sends a POST down the
+  stateless path when the request's revision is `2026-07-28` or newer — the
+  `_meta` one, or `initialize`'s own `protocolVersion`, falling back to the
+  `MCP-Protocol-Version` header and then `2025-03-26` — **or** when a
+  non-`initialize` request carries the whole discover shape — BOTH
+  `io.modelcontextprotocol/protocolVersion` and `…/clientCapabilities`
+  (`missing_required_keys(&V_2026_07_28).is_empty()`). Re-read that predicate
+  on every rmcp bump: it is version-specific, this description was already
+  wrong once, and nothing fails when the prose goes stale. Two rmcp gates
+  narrow it — the version key alone below `2026-07-28` takes the session path
+  instead, and `handler/server.rs` refuses a per-request revision outside
+  `supported_protocol_versions()` — but neither closes it, because neither
+  covers a revision this build *does* serve sent with both keys. That still
+  reaches `serve_negotiated_request_directly`, whose synthesised peer carries
+  `client_info = Implementation::default()` — the SDK's own crate name and
+  version. Served, it would reach a tool with no `initialize` behind it and
   land in the audit stream as a client the server never spoke to. So
-  `call_tool` and `list_tools` refuse any request carrying that key
-  (`skips_the_handshake`), and a refused call is recorded with `client`
-  absent rather than with the placeholder. `server/discover` takes the same
-  path unconditionally in rmcp; it answers `get_info` only and reaches no
-  tool, guard or router. General rule: **no `_meta` key and no `Mcp-*` header
-  may carry a security decision** — like `KNOWN_VERSIONS`, they are the SDK's
-  vocabulary, not this build's contract.
+  `call_tool` and `list_tools` refuse any request carrying the version key
+  (`skips_the_handshake`), and a refused call is recorded with `client` absent
+  rather than with the placeholder. Grep misleads here:
+  `message_has_per_request_protocol_version` tests presence alone, and inside
+  the stateless arm that presence does pick a route — but nothing it decides
+  gets a request INTO that arm; everywhere else it only feeds header
+  validation. `server/discover` is never answered from a session: only
+  `serve_negotiated_request_directly` serves it, and it refuses every shape
+  but a `_meta` carrying both keys at a revision this build serves. It answers
+  `get_info` only and reaches no tool, guard or router. General rule: **no
+  `_meta` key and no `Mcp-*` header may carry a security decision** — like
+  `KNOWN_VERSIONS`, they are the SDK's vocabulary, not this build's contract.
 - `list_tools` names every `ListToolsResult` field: `result_type` is
   `COMPLETE`, and the 2026-07-28 cache hints stay absent while that revision
   is unserved. When it is adopted, `cache_scope` is `Private` — the listing is
