@@ -241,12 +241,47 @@ jobs:
           --generate-notes
           dist/*
 
+  toolchain-drift:
+    # ci.yml's guard, script copied verbatim, so a tag push is prevented and
+    # not merely reported. It gates `container` and through it
+    # `container-manifest` alone: the image is the sole artifact the
+    # Dockerfile toolchain reaches (build, package and publish compile under
+    # the rust-toolchain.toml pin), a pushed manifest cannot be cleanly
+    # unshipped, and a container fault must still not hold back binaries or
+    # crates. Same job name deliberately -- release.yml never runs on a pull
+    # request, so this check run cannot collide with the required context of
+    # that name.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compare Dockerfile rust tags with rust-toolchain.toml channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          tags="$(sed -n 's/^FROM rust:\([0-9][0-9.]*\)-alpine.*/\1/p' Dockerfile)"
+          channel="$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)"
+          if [ -z "$tags" ] || [ -z "$channel" ]; then
+            echo "::error::cannot read the Rust version: Dockerfile FROM tags '$tags', rust-toolchain.toml channel '$channel'"
+            exit 1
+          fi
+          # Check every rust stage, so a second one cannot drift past the guard.
+          while IFS= read -r tag; do
+            if [ "$tag" != "$channel" ]; then
+              echo "::error::toolchain drift: Dockerfile builds on rust:$tag but rust-toolchain.toml pins channel $channel -- bump both together"
+              exit 1
+            fi
+          done <<< "$tags"
+          echo "in sync: Dockerfile rust:$channel == rust-toolchain.toml channel $channel"
+
   container:
     # Native runners per architecture: an emulated aws-lc-sys compile under
     # QEMU takes tens of minutes, and ubuntu-24.04-arm makes it unnecessary.
     # Sibling of `publish`, not upstream of it: a broken image build must not
     # hold back the crates.io release of a tag whose binaries already shipped.
-    needs: release
+    needs: [release, toolchain-drift]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     permissions:

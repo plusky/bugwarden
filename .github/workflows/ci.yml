@@ -249,9 +249,8 @@ jobs:
     # bump can move the container's rustc off the pinned channel with nothing
     # failing. Deliberately not behind the `changes` paths filter: the check
     # is two sed calls, and paths-filter would skip it on a tag push.
-    # release.yml is a separate workflow this job cannot hold back, so on a
-    # tag it only reports the mismatch that shipped; the PR run is where it
-    # flags a bump before it lands.
+    # release.yml carries its own copy gating the image push; this one is the
+    # required context that blocks the merge, so a bump is caught on the PR.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
