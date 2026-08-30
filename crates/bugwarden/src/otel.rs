@@ -1525,7 +1525,7 @@ mod tests {
         .expect("grpc must be refused wherever it came from");
         assert!(
             format!("{err}").contains(LOGS_PROTOCOL_VAR),
-            "the error must name the losing variable, not its general twin: {err}"
+            "the error must name the logs-specific variable that won, not its general twin: {err}"
         );
     }
 
