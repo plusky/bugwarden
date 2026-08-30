@@ -143,7 +143,7 @@ fn env_token(var: &str) -> Option<String> {
 /// What is wrong with a token the operator configured.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TokenFlaw {
-    /// Under [`MIN_TOKEN_LEN`] characters.
+    /// Under `MIN_TOKEN_LEN` characters.
     TooShort,
     /// Holds a byte that cannot ride in an `Authorization` header, or a
     /// space, which usually means a value was pasted with something attached.
@@ -499,7 +499,7 @@ fn unauthorized() -> Response {
     response
 }
 
-/// The scope [`gate`] attached to this request, as the MCP handler sees it.
+/// The scope `gate` attached to this request, as the MCP handler sees it.
 ///
 /// `None` means no scope was attached, which happens over stdio, under
 /// `--insecure-no-auth`, and — were the listener ever built without the gate
