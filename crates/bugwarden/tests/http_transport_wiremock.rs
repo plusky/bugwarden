@@ -30,7 +30,18 @@
 //! - the POST body cap going back to a fixed value, which refuses uploads
 //!   the operator's `global.max_attachment_bytes` permits, or losing its
 //!   4 MiB floor, which would let a policy shrink the transport's memory
-//!   bound (or remove it entirely at `0`).
+//!   bound (or remove it entirely at `0`);
+//! - `session_info` taking the audit `session.id` from the `mcp-session-id`
+//!   REQUEST header again, which leaves every `initialize` record without
+//!   the id that would join it to its own session and lets a stateless
+//!   caller file a refusal under a live session's id (#180);
+//! - serving on a bare `LocalSessionManager` instead of
+//!   `AuditedSessionManager`, or a wrapper that stamps in only one of
+//!   `initialize_session` / `create_stream`, mints a fresh id per message,
+//!   or carries one id across sessions;
+//! - the handshake refusal clearing `session.id`, which would unanchor the
+//!   refusals that DID open a session — invisible to every other test,
+//!   because the stateless refusal's id is absent either way.
 
 use std::io::Write as _;
 use std::net::SocketAddr;
@@ -38,6 +49,7 @@ use std::sync::Arc;
 
 use bugwarden::audit::{AuditConfig, AuditEvent, AuditEventKind, AuditSink, AuditState, FailMode};
 use bugwarden::config::Cli;
+use bugwarden::http_session::AuditedSessionManager;
 use bugwarden::server::{BugWarden, USER_AGENT};
 use bugwarden_core::client::BugzillaClient;
 use bugwarden_core::guard::Guard;
@@ -46,9 +58,7 @@ use clap::Parser as _;
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, StreamableHttpService,
-};
+use rmcp::transport::streamable_http_server::StreamableHttpService;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::ServiceExt as _;
 use serde_json::{json, Value};
@@ -108,9 +118,12 @@ async fn serve_http(
     let config = server
         .http_server_config()
         .expect("the test Host list must be matchable");
+    // Load-bearing pair with main.rs: the session id an audit record
+    // carries is stamped by this wrapper, so a harness on the plain
+    // LocalSessionManager would test a server no deployment runs.
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
-        LocalSessionManager::default().into(),
+        AuditedSessionManager::default().into(),
         config,
     );
     let router = axum::Router::new().nest_service("/mcp", service);
@@ -857,5 +870,391 @@ async fn the_body_cap_follows_the_policy_attachment_ceiling() {
         upstream.is_empty(),
         "no handshake may contact Bugzilla: {} request(s)",
         upstream.len()
+    );
+}
+
+/// An audit sink writing JSONL to `path`, wired as a deployment wires one.
+fn audit_to(path: &std::path::Path) -> Arc<AuditState> {
+    let sink = AuditSink::open(AuditConfig {
+        path: Some(path.to_path_buf()),
+        fsync: false,
+        fail_mode: None,
+        rotate_max_bytes: 0,
+        rotate_keep: 8,
+        suppressed_ids: true,
+    })
+    .expect("audit sink must open");
+    Arc::new(AuditState::new(sink, FailMode::Open, None))
+}
+
+/// Every record written to `path`, in file order.
+fn audit_events(path: &std::path::Path) -> Vec<AuditEvent> {
+    std::fs::read_to_string(path)
+        .expect("audit file must be readable")
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("every audit line must parse"))
+        .collect()
+}
+
+/// A POST to `/mcp`, carrying `session` as the `mcp-session-id` request
+/// header when one is given. Bounded, so a stream that never ends fails the
+/// test instead of hanging the run.
+fn mcp_post(addr: SocketAddr, session: Option<&str>) -> reqwest::RequestBuilder {
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("reqwest client")
+        .post(format!("http://{addr}/mcp"))
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json");
+    if let Some(id) = session {
+        builder = builder.header("mcp-session-id", id);
+    }
+    builder
+}
+
+/// Handshake as `client_name` and return the session id rmcp minted, read
+/// off the RESPONSE header.
+///
+/// Raw reqwest rather than the rmcp client because that header is the whole
+/// point: the `initialize` REQUEST cannot carry the id — it does not exist
+/// yet — so anything reading the request header records nothing here.
+async fn raw_initialize(addr: SocketAddr, client_name: &str) -> String {
+    let response = mcp_post(addr, None)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": client_name, "version": "1" }
+            }
+        }))
+        .send()
+        .await
+        .expect("the initialize request must reach the server");
+    assert!(
+        response.status().is_success(),
+        "the handshake must succeed, got {}",
+        response.status()
+    );
+    let id = response
+        .headers()
+        .get("mcp-session-id")
+        .expect("rmcp answers initialize with a minted session id")
+        .to_str()
+        .expect("the minted id is ascii")
+        .to_owned();
+    // Drain the one-message SSE body: the handshake is complete only once
+    // the server has produced its result.
+    let _ = response.text().await.expect("an initialize response body");
+
+    let accepted = mcp_post(addr, Some(&id))
+        .json(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+        .send()
+        .await
+        .expect("the initialized notification must reach the server");
+    assert!(
+        accepted.status().is_success(),
+        "notifications/initialized must be accepted, got {}",
+        accepted.status()
+    );
+    id
+}
+
+/// Call `tool` inside session `id` over raw HTTP; returns the SSE body.
+async fn raw_call_in_session(addr: SocketAddr, id: &str, tool: &str, args: Value) -> String {
+    let response = mcp_post(addr, Some(id))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": tool, "arguments": args }
+        }))
+        .send()
+        .await
+        .expect("the tool call must reach the server");
+    assert!(
+        response.status().is_success(),
+        "an in-session tool call must be routed, got {}",
+        response.status()
+    );
+    response.text().await.expect("a tool call response body")
+}
+
+/// The `initialize` record whose client called itself `name`.
+fn initialize_of<'a>(events: &'a [AuditEvent], name: &str) -> &'a AuditEvent {
+    events
+        .iter()
+        .find(|e| match &e.kind {
+            AuditEventKind::Initialize(ev) => ev.client.name.as_deref() == Some(name),
+            _ => false,
+        })
+        .unwrap_or_else(|| panic!("no initialize record names {name}"))
+}
+
+/// The `tool_call` record whose client called itself `name`.
+fn tool_call_of<'a>(events: &'a [AuditEvent], name: &str) -> &'a AuditEvent {
+    events
+        .iter()
+        .find(|e| match &e.kind {
+            AuditEventKind::ToolCall(ev) => ev.client.name.as_deref() == Some(name),
+            _ => false,
+        })
+        .unwrap_or_else(|| panic!("no tool_call record names {name}"))
+}
+
+#[tokio::test]
+async fn initialize_record_joins_its_session() {
+    // Issue #180: the record whose whole job is to anchor a session had no
+    // join key. `session_info` read the `mcp-session-id` REQUEST header,
+    // which cannot exist on `initialize` — rmcp mints the id afterwards and
+    // returns it on the response — so the anchor was written with `id:
+    // None` and a reader could only join by adjacency.
+    let mock = MockServer::start().await;
+    mount_bug_for_key(&mock, world_readable_bug(7), "srv-key").await;
+
+    let dir = tempfile::tempdir().expect("audit temp dir");
+    let audit_path = dir.path().join("audit.jsonl");
+    let file = key_file("srv-key\n");
+    let cli = http_cli(&mock, Some(file.path()));
+    let addr = serve_http(cli, "", &mock, Some(audit_to(&audit_path))).await;
+
+    let wire_id = raw_initialize(addr, "joining-client").await;
+    let body = raw_call_in_session(addr, &wire_id, "bug_info", json!({ "bug_ids": [7] })).await;
+    assert!(
+        body.contains("\"result\""),
+        "the in-session call must be served: {body}"
+    );
+
+    let events = audit_events(&audit_path);
+    let init = events
+        .iter()
+        .find(|e| matches!(e.kind, AuditEventKind::Initialize(_)))
+        .expect("the handshake is recorded");
+    let call = events
+        .iter()
+        .find(|e| matches!(e.kind, AuditEventKind::ToolCall(_)))
+        .expect("the tool call is recorded");
+
+    assert_eq!(
+        init.session.id.as_deref(),
+        Some(wire_id.as_str()),
+        "the anchor must carry the id the transport minted and put on the wire"
+    );
+    assert_eq!(
+        call.session.id, init.session.id,
+        "the tool call must join its own initialize"
+    );
+    assert!(
+        init.seq < call.seq,
+        "the anchor precedes what it anchors: {} vs {}",
+        init.seq,
+        call.seq
+    );
+}
+
+#[tokio::test]
+async fn concurrent_sessions_join_to_their_own_initialize() {
+    // Two sessions, handshakes interleaved and the calls issued in the
+    // reverse order, so adjacency — the nearest preceding initialize from
+    // the same remote, which #180 says is not a join — answers wrongly for
+    // both. Kills a wrapper carrying id state ACROSS calls (set at
+    // initialize, read at create_stream): it stamps the newer session onto
+    // the older one's call.
+    //
+    // Sequential by construction, so it does NOT kill a wrapper that sets
+    // and re-reads shared state WITHIN one call. Only overlapping traffic
+    // separates that from correct code, and measured here it killed such a
+    // mutant in 2 of 20 runs at 8 concurrent sessions — a guard that weak
+    // would launder the regression it is meant to catch, so it is left out
+    // deliberately. (#167 rhymes without matching: there a race-dependent
+    // observation was made deterministic by changing the mechanism; here
+    // no deterministic mechanism exists, so the coverage goes rather than
+    // the determinism.) What excludes that class is structural, not this
+    // test: `stamp` takes the id as a parameter, and the wrapper adds no
+    // state of its own to `LocalSessionManager`.
+    let mock = MockServer::start().await;
+    mount_bug_for_key(&mock, world_readable_bug(7), "srv-key").await;
+
+    let dir = tempfile::tempdir().expect("audit temp dir");
+    let audit_path = dir.path().join("audit.jsonl");
+    let file = key_file("srv-key\n");
+    let cli = http_cli(&mock, Some(file.path()));
+    let addr = serve_http(cli, "", &mock, Some(audit_to(&audit_path))).await;
+
+    let a = raw_initialize(addr, "client-a").await;
+    let b = raw_initialize(addr, "client-b").await;
+    assert_ne!(a, b, "two handshakes are two sessions");
+    // b calls first: record order is not handshake order.
+    raw_call_in_session(addr, &b, "bug_info", json!({ "bug_ids": [7] })).await;
+    raw_call_in_session(addr, &a, "bug_info", json!({ "bug_ids": [7] })).await;
+
+    let events = audit_events(&audit_path);
+    assert_eq!(
+        initialize_of(&events, "client-a").session.id.as_deref(),
+        Some(a.as_str()),
+        "a's anchor must carry a's minted id"
+    );
+    assert_eq!(
+        initialize_of(&events, "client-b").session.id.as_deref(),
+        Some(b.as_str()),
+        "b's anchor must carry b's minted id"
+    );
+    assert_eq!(
+        tool_call_of(&events, "client-a").session.id.as_deref(),
+        Some(a.as_str()),
+        "a's call must join a's initialize, not the nearest one"
+    );
+    assert_eq!(
+        tool_call_of(&events, "client-b").session.id.as_deref(),
+        Some(b.as_str()),
+        "b's call must join b's initialize, not the nearest one"
+    );
+}
+
+#[tokio::test]
+async fn a_forged_session_id_is_not_copied_into_a_refusal_record() {
+    // The other half of #180. `serve_negotiated_request_directly` injects
+    // the request Parts verbatim and `has_session` runs only on the session
+    // branch, so on the stateless path `mcp-session-id` is client free
+    // text: a caller that never handshook could file its refusal under a
+    // live session's id. The record answers with no id rather than a
+    // forgeable one (#34: a forgeable id is worse than none).
+    let mock = MockServer::start().await;
+    mount_bug_for_key(&mock, world_readable_bug(7), "srv-key").await;
+
+    let dir = tempfile::tempdir().expect("audit temp dir");
+    let audit_path = dir.path().join("audit.jsonl");
+    let file = key_file("srv-key\n");
+    let cli = http_cli(&mock, Some(file.path()));
+    let addr = serve_http(cli, "", &mock, Some(audit_to(&audit_path))).await;
+
+    let victim = raw_initialize(addr, "real-client").await;
+
+    // The one handshake-free shape still reachable on a revision this build
+    // serves (see `a_handshake_free_call_is_refused_and_never_names_a_client`),
+    // wearing the live session's id.
+    let response = mcp_post(addr, Some(&victim))
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "bug_info",
+                "arguments": { "bug_ids": [7] },
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2025-11-25",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("the forged request must reach the server");
+    let body = response.text().await.expect("a body");
+    assert!(
+        !body.contains("a plain bug"),
+        "a handshake-free call must not be served: {body}"
+    );
+
+    let events = audit_events(&audit_path);
+    let calls: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e.kind, AuditEventKind::ToolCall(_)))
+        .collect();
+    assert_eq!(calls.len(), 1, "the refused call is recorded exactly once");
+    assert_eq!(
+        calls[0].session.id, None,
+        "a client-supplied session id must never become a record's id; \
+         the forged value was {victim}"
+    );
+    // The victim's own anchor is untouched: only the forger loses an id.
+    assert_eq!(
+        initialize_of(&events, "real-client").session.id.as_deref(),
+        Some(victim.as_str()),
+        "the handshake that really happened keeps its anchor"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_call_in_a_session_keeps_its_session_anchor() {
+    // The refused class spans BOTH arrivals, and only this one has a
+    // session to name. `skips_the_handshake` fires on any `_meta` protocol
+    // declaration, which is deliberately broader than rmcp's stateless
+    // routing: a sub-2026 declaration without `clientCapabilities` stays on
+    // the session branch (see that function's rustdoc), so the refusal is
+    // recorded with the real minted id and joins its own `initialize` —
+    // the join #180 newly makes possible, since that anchor had no id
+    // before. Pinned because prose alone got this backwards once.
+    //
+    // The `MCP-Protocol-Version` header is load-bearing: without it rmcp
+    // answers -32020 ("request _meta protocolVersion requires
+    // MCP-Protocol-Version header") before any handler runs, and this test
+    // would pass having recorded no refusal at all — true for the wrong
+    // reason.
+    let mock = MockServer::start().await;
+    mount_bug_for_key(&mock, world_readable_bug(7), "srv-key").await;
+
+    let dir = tempfile::tempdir().expect("audit temp dir");
+    let audit_path = dir.path().join("audit.jsonl");
+    let file = key_file("srv-key\n");
+    let cli = http_cli(&mock, Some(file.path()));
+    let addr = serve_http(cli, "", &mock, Some(audit_to(&audit_path))).await;
+
+    let wire_id = raw_initialize(addr, "declaring-client").await;
+    let response = mcp_post(addr, Some(&wire_id))
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "bug_info",
+                "arguments": { "bug_ids": [7] },
+                "_meta": { "io.modelcontextprotocol/protocolVersion": "2025-11-25" }
+            }
+        }))
+        .send()
+        .await
+        .expect("the declaring call must reach the server");
+    let body = response.text().await.expect("a body");
+    assert!(
+        body.contains("requires the initialize handshake"),
+        "the declaration must be refused by the handler, not served or \
+         turned away by the transport: {body}"
+    );
+    let upstream = mock.received_requests().await.unwrap_or_default();
+    assert!(
+        upstream.is_empty(),
+        "a refused call must contact no upstream: {} request(s)",
+        upstream.len()
+    );
+
+    let events = audit_events(&audit_path);
+    let calls: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            AuditEventKind::ToolCall(ev) => Some((e, ev.as_ref())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 1, "the refused call is recorded exactly once");
+    let (record, event) = calls[0];
+    assert_eq!(event.client.name, None, "a refusal names no client");
+    assert!(event.guard.is_none(), "the guard never ran");
+
+    let anchor = initialize_of(&events, "declaring-client");
+    assert_eq!(
+        record.session.id.as_deref(),
+        Some(wire_id.as_str()),
+        "a refusal that DID open a session keeps its id"
+    );
+    assert_eq!(
+        record.session.id, anchor.session.id,
+        "and so joins the initialize that anchors it"
     );
 }

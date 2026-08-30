@@ -2159,11 +2159,16 @@ impl BugWarden {
         }
     }
 
-    /// The session an audit record belongs to. http: the server-assigned
-    /// `mcp-session-id` header and, when the listener was built with
-    /// connect-info, the remote peer address — both from the HTTP request
-    /// parts rmcp copies into the request extensions. stdio: the
-    /// process-scoped session id from [`AuditState`].
+    /// The session an audit record belongs to. http: the id the transport
+    /// minted, stamped into the request extensions by
+    /// [`AuditedSessionManager`](crate::http_session::AuditedSessionManager),
+    /// plus the remote peer address when the listener was built with
+    /// connect-info. stdio: the process-scoped session id from
+    /// [`AuditState`].
+    ///
+    /// Never the `mcp-session-id` request header (issue #180): it does not
+    /// exist yet on `initialize`, and on the stateless path it is
+    /// unvalidated client text.
     fn session_info(
         &self,
         ctx: &RequestContext<RoleServer>,
@@ -2175,22 +2180,21 @@ impl BugWarden {
                 transport: TransportKind::Stdio,
                 remote: None,
             },
-            Transport::Http => {
-                let parts = ctx.extensions.get::<axum::http::request::Parts>();
-                audit::SessionInfo {
-                    id: parts
-                        .and_then(|p| p.headers.get("mcp-session-id"))
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_owned),
-                    transport: TransportKind::Http,
-                    remote: parts
-                        .and_then(|p| {
-                            p.extensions
-                                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                        })
-                        .map(|ci| ci.0.to_string()),
-                }
-            }
+            Transport::Http => audit::SessionInfo {
+                id: ctx
+                    .extensions
+                    .get::<crate::http_session::TransportSessionId>()
+                    .map(|session| session.0.to_string()),
+                transport: TransportKind::Http,
+                remote: ctx
+                    .extensions
+                    .get::<axum::http::request::Parts>()
+                    .and_then(|p| {
+                        p.extensions
+                            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                    })
+                    .map(|ci| ci.0.to_string()),
+            },
         }
     }
 
@@ -4009,7 +4013,11 @@ impl ServerHandler for BugWarden {
             // by policy, not ignorance: on the stateless path `peer_info`
             // is rmcp's placeholder, in-session it is the real handshake
             // identity, and one refusal class must not be recorded two
-            // ways. `session.id` is still present when there is one.
+            // ways. `session.id` is still present when there is one:
+            // this refusal is broader than rmcp's stateless routing (see
+            // `skips_the_handshake`), so a declaration that took the
+            // session branch arrives with its real id stamped, while a
+            // stateless one had no session to stamp (#180).
             if let Some(audit) = self.audit.clone() {
                 let event = audit::AuditEventKind::ToolCall(Box::new(audit::ToolCallEvent {
                     client: audit::ClientInfo {

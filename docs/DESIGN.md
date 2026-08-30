@@ -1184,9 +1184,13 @@ Decisions, all deliberate:
 - **Record provenance.** `guard.policy_hash` is `sha256:<hex>` over the
   policy file bytes, so a record ties to the exact policy that produced
   it (`None` under the built-in default policy). stdio sessions are
-  anchored by `<pid>-<startup epoch>`; http sessions by the
-  `mcp-session-id` header, with the remote address when the listener
-  provides connect-info.
+  anchored by `<pid>-<startup epoch>`; http sessions by the id the
+  transport minted — stamped into the request extensions by the
+  `SessionManager` wrapper in `http_session`, never read from the
+  `mcp-session-id` request header (issue #180) — with the remote address
+  when the listener provides connect-info. The `initialize` record carries
+  it too, so the anchor joins to what it anchors; a handshake-free
+  stateless request opens no session and its record carries no id.
 - **Trace enrichment (issue #28).** When a tool call's `params._meta`
   carries a `traceparent` (SEP-414), its trace and span ids are copied
   into the record's `trace` field — the pre-dispatch fail-closed gate
@@ -1783,6 +1787,26 @@ wired, `server.rs` and `main.rs` are the reference.
   `get_info` only and reaches no tool, guard or router. General rule: **no
   `_meta` key and no `Mcp-*` header may carry a security decision** — like
   `KNOWN_VERSIONS`, they are the SDK's vocabulary, not this build's contract.
+- **rmcp trap — `mcp-session-id` is a validated header on only one of the two
+  routes.** In rmcp 3.1.4 the session branch of `handle_post`
+  (`transport/streamable_http_server/tower.rs`) checks the header against
+  `has_session` before it routes on it, and 404s an id it does not know; the
+  stateless branch has no such check and `serve_negotiated_request_directly`
+  injects the request Parts verbatim, so on that route the header is client
+  free text. On `initialize` there is no header at all — rmcp mints the id
+  after injecting the Parts and returns it on the *response*. Sourcing the
+  audit `session.id` from that header therefore did both wrong things at once
+  (issue #180): the record that exists to anchor a session had no join key,
+  and a stateless refusal could be filed under a live session's id. The id now
+  rides a `TransportSessionId` request extension stamped by this build's own
+  `SessionManager` wrapper (`http_session`), which is handed the minted id
+  together with the owned message — the seam rmcp itself uses for
+  `SessionRestoreMarker`, message extensions reaching `RequestContext`
+  verbatim. Re-check both halves on every rmcp bump: that `SessionManager`
+  still receives the message, and that the stateless branch still validates no
+  session. Deliberate consequence: a stateless refusal records no session id
+  even when the caller innocently echoed one, because a forgeable id is worse
+  than none (#34).
 - `list_tools` names every `ListToolsResult` field: `result_type` is
   `COMPLETE`, and the 2026-07-28 cache hints stay absent while that revision
   is unserved. When it is adopted, `cache_scope` is `Private` — the listing is
@@ -2297,7 +2321,18 @@ wired, `server.rs` and `main.rs` are the reference.
   startup error from `http_server_config` — the same call `serve_http` and
   `main` take — so it cannot reach rmcp as a silent deny-all. The info
   line and the unparsable refusal are also pinned in server.rs / config.rs
-  unit tests (deleting either fails a test).
+  unit tests (deleting either fails a test). Session-id provenance (#180),
+  driven over the raw wire because the value in question is a header no
+  rmcp client exposes: the `initialize` record carries the id rmcp minted
+  and returned on the RESPONSE, and a tool call in that session carries
+  the same one at a later `seq`; two sessions each join their own
+  `initialize` rather than the nearest; a handshake-free request wearing
+  a live session's `mcp-session-id` is refused with NO id recorded, never
+  that session's; and — because the handshake refusal is deliberately
+  broader than rmcp's stateless routing — a declaration that stayed on
+  the session branch is refused WITH its real id and joins its own
+  `initialize`. That last arm is the only test pinning it, and the
+  comment asserting it has been wrong once.
 - Configuration tests (crates/bugwarden/tests/env_config.rs, the REAL
   process environment): every flag is settable from the environment, which
   is what a container deployment configures through (#31/#32). ONE test by
@@ -2461,8 +2496,10 @@ wired, `server.rs` and `main.rs` are the reference.
   ambient timing: a threshold over a localhost round trip is either
   flaky or so loose a constant passes it, so the assertion is that a
   delayed request's total EXCEEDS an undelayed one's by most of the
-  delay. The http `session` block (its id and remote peer)
-  is observed only over a hand-built value; the stdio arm is pinned. The
+  delay. The http `session.id` is now pinned end to end against the id on
+  the wire (issue #180); `remote` is still observed only over a
+  hand-built value, no harness serving with connect-info; stdio is
+  pinned. The
   `bug_history` window (issue #142) is pinned on both sides: a `head` that
   actually omits entries records `history_window` in `redacted_fields`
   under verdict `served_filtered`, while params covering every entry stay

@@ -13,15 +13,13 @@ use bugwarden::audit::{
     TransportKind,
 };
 use bugwarden::http_auth::{self, HttpEnv};
+use bugwarden::http_session::AuditedSessionManager;
 use bugwarden::otel::{self, OtelEnv, Pipeline};
 use bugwarden::{config, server};
 use bugwarden_core::{guard::Guard, policy::Policy};
 use clap::Parser;
 use rmcp::{
-    transport::{
-        stdio,
-        streamable_http_server::{session::local::LocalSessionManager, StreamableHttpService},
-    },
+    transport::{stdio, streamable_http_server::StreamableHttpService},
     ServiceExt,
 };
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -264,9 +262,15 @@ async fn main() -> anyhow::Result<()> {
                 let config = server
                     .http_server_config()?
                     .with_cancellation_token(ct.child_token());
+                // Load-bearing pair with `serve_http` in
+                // tests/http_transport_wiremock.rs: the audit session id
+                // comes from this wrapper's stamp and nowhere else, so a
+                // plain LocalSessionManager here serves every http record
+                // with no session id at all. The join test forces the
+                // harness; only review forces this call site.
                 let service = StreamableHttpService::new(
                     move || Ok(server.clone()),
-                    LocalSessionManager::default().into(),
+                    AuditedSessionManager::default().into(),
                     config,
                 );
                 // `resolve_for` returns the gate for every http start, so the
