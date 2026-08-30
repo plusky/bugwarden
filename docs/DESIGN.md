@@ -2626,4 +2626,7 @@ wired, `server.rs` and `main.rs` are the reference.
   runs in-process and logs a line per request, which would feed the very
   loop under test.
 - CI: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-  `cargo test --workspace --locked`, `cargo deny check`.
+  `cargo test --workspace --locked`, `cargo deny check`, plus
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --locked`
+  over the workspace and again over the `gen` bin, and
+  `cargo test --workspace --doc --locked`.
