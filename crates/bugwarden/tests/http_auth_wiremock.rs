@@ -49,6 +49,9 @@ use serde_json::{json, Value};
 use wiremock::matchers::{any, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "common/raw_post.rs"]
+mod raw_post;
+
 /// 32 printable non-space characters each, and distinct.
 const WRITE_TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const READ_TOKEN: &str = "fedcba9876543210fedcba9876543210";
@@ -351,58 +354,6 @@ async fn every_unauthenticated_request_gets_one_byte_identical_refusal() {
     }
 }
 
-/// The status line the server answers a POST of `body`, presenting
-/// `authorization` when one is given.
-///
-/// Raw TCP rather than reqwest, because every answer this drives arrives
-/// while the body is still being written and is followed by a close: the
-/// remaining write then fails with a connection reset, and reqwest abandons
-/// the response it already holds along with it. Here the send is
-/// best-effort and the read is what the test waits on, so the answer is
-/// read whether or not the rest of the body ever landed — which is the only
-/// way to observe a server that deliberately refuses before consuming what
-/// it was sent.
-async fn oversized_post_status(
-    addr: SocketAddr,
-    authorization: Option<&str>,
-    body: &[u8],
-) -> String {
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-    let credential = authorization.map_or_else(String::new, |v| format!("Authorization: {v}\r\n"));
-    let mut request = format!(
-        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
-         Accept: application/json, text/event-stream\r\n{credential}\
-         Content-Length: {}\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    request.extend_from_slice(body);
-
-    let socket = tokio::net::TcpStream::connect(addr)
-        .await
-        .expect("connect to the listener");
-    let (mut reader, mut writer) = socket.into_split();
-    let sender = tokio::spawn(async move {
-        let _ = writer.write_all(&request).await;
-    });
-    let mut response = Vec::new();
-    // `read_to_end` keeps what it already read when the peer resets, which
-    // is exactly the case under test; only a server that answers nothing at
-    // all leaves the buffer empty.
-    let read = async { reader.read_to_end(&mut response).await };
-    tokio::time::timeout(Duration::from_secs(10), read)
-        .await
-        .expect("the server must answer")
-        .ok();
-    sender.abort();
-    String::from_utf8_lossy(&response)
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_owned()
-}
-
 #[tokio::test]
 async fn an_oversized_body_from_a_stranger_is_refused_by_the_gate_not_the_cap() {
     // The gate is a layer in FRONT of rmcp, so an unauthenticated caller
@@ -413,14 +364,14 @@ async fn an_oversized_body_from_a_stranger_is_refused_by_the_gate_not_the_cap() 
     // Past the 4 MiB floor the default policy derives.
     let oversized = "x".repeat(5 * 1024 * 1024).into_bytes();
 
-    let anonymous = oversized_post_status(addr, None, &oversized).await;
+    let anonymous = raw_post::post_status_line(addr, None, &oversized).await;
     assert!(
         anonymous.starts_with("HTTP/1.1 401"),
         "the gate answers first: {anonymous:?}"
     );
 
     let authenticated =
-        oversized_post_status(addr, Some(&format!("Bearer {WRITE_TOKEN}")), &oversized).await;
+        raw_post::post_status_line(addr, Some(&format!("Bearer {WRITE_TOKEN}")), &oversized).await;
     assert!(
         authenticated.starts_with("HTTP/1.1 413"),
         "a credentialed caller reaches the cap, and only then: {authenticated:?}"
@@ -431,7 +382,7 @@ async fn an_oversized_body_from_a_stranger_is_refused_by_the_gate_not_the_cap() 
     // upload at all still sees the boundary. DESIGN.md's #52 disclosure note
     // says so; this is what makes that sentence true.
     let read_scope =
-        oversized_post_status(addr, Some(&format!("Bearer {READ_TOKEN}")), &oversized).await;
+        raw_post::post_status_line(addr, Some(&format!("Bearer {READ_TOKEN}")), &oversized).await;
     assert!(
         read_scope.starts_with("HTTP/1.1 413"),
         "the read scope reaches the cap too: {read_scope:?}"
