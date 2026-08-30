@@ -1,4 +1,4 @@
-complete -c bugwarden -l bugzilla-server -d 'Base URL of the Bugzilla server (e.g., \'https://bugzilla.example.com\'). Environment variable BUGZILLA_SERVER is used if the argument is not provided' -r
+complete -c bugwarden -l bugzilla-server -d 'Base URL of the Bugzilla server (e.g., `https://bugzilla.example.com`). Environment variable BUGZILLA_SERVER is used if the argument is not provided' -r
 complete -c bugwarden -l transport -d 'Transport for the MCP server: \'http\' (default) or \'stdio\'. Environment variable MCP_TRANSPORT can also be used' -r -f -a "http\t'Streamable HTTP transport (default). Clients send the Bugzilla API key per-request via the API key header, unless `--api-key-file` selects server-held key mode (then the header is not consulted at all)'
 stdio\t'Stdio transport. The API key comes from `--api-key` / `BUGZILLA_API_KEY` or `--api-key-file` at startup'"
 complete -c bugwarden -l host -d 'Host address for the MCP server to listen on (http transport only). Defaults to 127.0.0.1 or the MCP_HOST environment variable' -r

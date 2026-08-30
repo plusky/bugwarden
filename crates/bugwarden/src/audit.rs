@@ -1622,7 +1622,7 @@ impl AuditCell {
     /// Note a field (or view marker) the GUARD redacted from served bugs
     /// — a decision no single rule made, so the merge carries no rule of
     /// its own. What that does to an already-recorded rule follows
-    /// [`AuditCell::merge`] and nothing else: it CLEARS when this note is
+    /// `AuditCell::merge` and nothing else: it CLEARS when this note is
     /// what upgrades the verdict (`list_attachments` dropping private
     /// metadata off a plain serve), and leaves it standing at equal rank
     /// (`bug_info` records the `ServedFiltered` verdict AND its rule
@@ -1638,7 +1638,7 @@ impl AuditCell {
     /// (`head`/`tail`/length caps). Records the field and upgrades to
     /// `ServedFiltered` exactly as [`AuditCell::note_redacted`] does, but
     /// never writes the rule at all — not even on the strict upgrade
-    /// where [`AuditCell::merge`] would clear it. The client asked for
+    /// where `AuditCell::merge` would clear it. The client asked for
     /// less; no rule decided anything, and clearing would report a call a
     /// rule DID grant as rule-less (issue #67). Order-independent by
     /// construction: it cannot clear a rule a later guard note records,

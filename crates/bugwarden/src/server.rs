@@ -3980,7 +3980,7 @@ impl ServerHandler for BugWarden {
     }
 
     /// The revisions this handler serves, narrowing the SDK's default of
-    /// every revision it knows (see [`SUPPORTED_PROTOCOL_VERSIONS`]). The
+    /// every revision it knows (see `SUPPORTED_PROTOCOL_VERSIONS`). The
     /// SDK consults this on the handshake, on the stateless request path
     /// and in `server/discover`, so the whole surface narrows with it.
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {

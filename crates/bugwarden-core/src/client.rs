@@ -93,7 +93,7 @@ impl UpstreamStats {
 /// Run `fut` with `stats` collecting every Bugzilla request made on this
 /// task, then return its output.
 ///
-/// The one choke point is [`BugzillaClient::send`], so the count covers
+/// The one choke point is `BugzillaClient::send`, so the count covers
 /// requests the caller cannot itself see — a guard classification, a
 /// `whoami`, a search window's chunk scan — with no call site opting in.
 /// Nested scopes shadow rather than nest: the innermost one collects.

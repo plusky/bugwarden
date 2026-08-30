@@ -30,7 +30,7 @@ pub enum Transport {
 #[derive(Parser)]
 #[command(name = "bugwarden", version, about)]
 pub struct Cli {
-    /// Base URL of the Bugzilla server (e.g., 'https://bugzilla.example.com').
+    /// Base URL of the Bugzilla server (e.g., `https://bugzilla.example.com`).
     /// Environment variable BUGZILLA_SERVER is used if the argument is not
     /// provided.
     #[arg(long, env = "BUGZILLA_SERVER")]

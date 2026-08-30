@@ -67,7 +67,7 @@ use tracing_subscriber::Layer;
 
 use crate::audit::{AuditEvent, AuditEventKind, AuditExport, ExportRefused};
 
-/// Collector base URL; [`LOGS_PATH`] is appended to it. Unset or empty —
+/// Collector base URL; `LOGS_PATH` is appended to it. Unset or empty —
 /// with [`LOGS_ENDPOINT_VAR`] unset or empty too — turns the whole feature
 /// off.
 pub const ENDPOINT_VAR: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
@@ -163,7 +163,7 @@ const SELF_TARGET: &str = "bugwarden::otel";
 /// drop warning is the obvious case, but the expensive one is the HTTP
 /// stack underneath: at `RUST_LOG=debug` a single flush makes
 /// `hyper_util`'s connection pool log "pooling idle connection for
-/// <authority>" and `reqwest::connect` log "starting new connection", each
+/// `<authority>`" and `reqwest::connect` log "starting new connection", each
 /// of which would become a record in the NEXT batch, whose flush logs
 /// again — a loop that sustains itself at one export per batch interval
 /// forever, on an idle server, and puts the collector authority on the
@@ -312,7 +312,7 @@ impl ExportConfig {
 ///
 /// The three logs-specific variables override their general counterparts,
 /// as the OTLP specification requires. [`LOGS_ENDPOINT_VAR`] is used
-/// exactly as given — [`LOGS_PATH`] is appended only to [`ENDPOINT_VAR`],
+/// exactly as given — `LOGS_PATH` is appended only to [`ENDPOINT_VAR`],
 /// because the signal-specific form is the operator's whole URL.
 ///
 /// # Errors
@@ -852,7 +852,7 @@ impl Pipeline {
     /// not an audit record, which would mean inventing an event kind the
     /// schema does not have — so this exercises the whole path: DNS, TCP,
     /// TLS, the headers, the protocol and the collector's own acceptance.
-    /// Bounded retry — see [`PROBE_ATTEMPTS`].
+    /// Bounded retry — see `PROBE_ATTEMPTS`.
     ///
     /// # Errors
     ///
