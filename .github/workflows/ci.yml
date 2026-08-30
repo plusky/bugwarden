@@ -89,6 +89,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     continue-on-error: true
+    env:
+      # The action only sets the rustup default, which rust-toolchain.toml
+      # outranks; an ambient RUSTUP_TOOLCHAIN outranks the toml in turn.
+      RUSTUP_TOOLCHAIN: beta
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -109,6 +113,22 @@ jobs:
           # writer, a beta break would freeze this cache — right when a
           # toolchain bump has invalidated the key and PRs need it rebuilt.
           cache-on-failure: true
+      - name: Assert the toolchain is a beta build
+        # Guards the export above. Beta has no fixed version string, so key
+        # off the channel suffix; every stable pin lacks it.
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          actual="$(rustc --version | cut -d' ' -f2)"
+          case "$actual" in
+            *-beta | *-beta.*) ;;
+            *)
+              echo "::error::beta job is on rustc $actual, expected a beta build"
+              exit 1
+              ;;
+          esac
       - name: Clippy (beta)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test (beta)
