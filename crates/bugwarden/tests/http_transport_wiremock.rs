@@ -510,7 +510,7 @@ async fn an_allowed_hosts_entry_naming_no_host_leaves_validation_off() {
 
 #[tokio::test]
 async fn an_unparsable_allowed_hosts_entry_is_a_startup_error() {
-    // The same path `serve_http` and `main` take: rmcp 3.1.2 would store
+    // The same path `serve_http` and `main` take: rmcp 3.1.4 would store
     // `*` as a host that matches only `Host: *`, turning validation on as
     // a silent deny-all. Refusing here is what the operator sees instead
     // of one 403 at a time.

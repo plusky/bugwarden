@@ -204,7 +204,7 @@ impl Cli {
     /// authority (`*`, a scheme-carrying URL, `a;b`, a percent-encoded
     /// comma, zero-width unicode, a space-containing typo) is a startup
     /// error. Bare IPv6 (`::1`) is matchable: it is rmcp's default
-    /// loopback spelling. rmcp 3.1.2's `parse_allowed_authority` would
+    /// loopback spelling. rmcp 3.1.4's `parse_allowed_authority` would
     /// otherwise keep an unparsable list (validation on) and store a host
     /// no inbound `Host` header will ever equal — a silent deny-all.
     pub fn checked_allowed_hosts(&self) -> anyhow::Result<Option<Vec<&str>>> {
@@ -298,7 +298,7 @@ impl Cli {
     }
 }
 
-/// True when `entry` is a Host authority rmcp 3.1.2 would compare to a
+/// True when `entry` is a Host authority rmcp 3.1.4 would compare to a
 /// successfully parsed inbound `Host`.
 ///
 /// `http::uri::Authority` is the same parser rmcp uses. A bare IPv6
@@ -668,7 +668,7 @@ mod tests {
 
     #[test]
     fn unparsable_allowed_hosts_are_a_startup_error_named_in_the_message() {
-        // Each of these is what rmcp 3.1.2 would store (or skip) without
+        // Each of these is what rmcp 3.1.4 would store (or skip) without
         // matching any inbound Host — validation on, deny-all. Refusing
         // them here is what makes that fail at startup instead of one 403
         // at a time. Deleting the refusal, or warning and continuing, must
