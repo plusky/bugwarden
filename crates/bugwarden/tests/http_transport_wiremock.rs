@@ -536,14 +536,17 @@ async fn an_unparsable_allowed_hosts_entry_is_a_startup_error() {
 
 #[tokio::test]
 async fn a_handshake_free_call_is_refused_and_never_names_a_client() {
-    // rmcp routes a request to its handshake-free lifecycle on the mere
-    // PRESENCE of `_meta.io.modelcontextprotocol/protocolVersion` — whatever
-    // revision that key names — and synthesises the peer with the SDK's own
-    // build identity. So a client naming 2025-11-25, a revision this build
-    // does serve, reaches a tool with no `initialize` behind it, and the
-    // record would name `rmcp`/<sdk version>: a client the server never
-    // spoke to. Narrowing SUPPORTED_PROTOCOL_VERSIONS cannot close this —
-    // the routing never consults it — so the handler refuses the request.
+    // rmcp 3.1.4 routes to its handshake-free lifecycle when the request's
+    // revision is 2026-07-28 or newer, or `_meta` carries BOTH
+    // `protocolVersion` and `clientCapabilities`, synthesising the peer with
+    // the SDK's own build
+    // identity. The body below sends both keys at 2025-11-25 deliberately:
+    // that is the one shape still reachable on a revision this build serves
+    // — a tool with no `initialize` behind it, recorded as `rmcp`/<sdk
+    // version>, a client the server never spoke to. Drop `clientCapabilities`
+    // and it takes the session path instead, proving nothing.
+    // Narrowing SUPPORTED_PROTOCOL_VERSIONS cannot close it either, the
+    // routing never consults it, so the handler refuses the request.
     let mock = MockServer::start().await;
     mount_bug_for_key(&mock, world_readable_bug(7), "srv-key").await;
 

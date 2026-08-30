@@ -420,21 +420,30 @@ fn max_request_body_bytes(max_attachment_bytes: u64) -> usize {
         .clamp(MAX_REQUEST_BODY_FLOOR, MAX_REQUEST_BODY_CEILING)
 }
 
-/// Whether this request took rmcp's handshake-free lifecycle.
+/// Whether this request declares its own protocol revision in `_meta`.
 ///
-/// The transport routes on the PRESENCE of
-/// `_meta.io.modelcontextprotocol/protocolVersion`, whatever revision that
-/// key names — not on the negotiated revision, and not on
-/// [`SUPPORTED_PROTOCOL_VERSIONS`]. So excluding `2026-07-28` does not keep
-/// a request off that path: a client naming a revision this build does
-/// serve reaches the handler with no `initialize` behind it, and rmcp
-/// synthesises its peer with the SDK's own build identity as `client_info`.
-/// Served, such a call would put a client the server never spoke to into
-/// the audit stream, with no session record anchoring it — a plausible
-/// wrong attribution, which is the one an audit trail can least afford.
+/// rmcp 3.1.4 routes on `_meta` shape, not on the negotiated revision and
+/// not on [`SUPPORTED_PROTOCOL_VERSIONS`]: the stateless path takes a
+/// request naming `2026-07-28` or newer, or one carrying BOTH
+/// `io.modelcontextprotocol/protocolVersion` and `…/clientCapabilities`.
+/// So excluding `2026-07-28` does not keep a request off that path — a
+/// client naming a revision this build does serve, with both keys, reaches
+/// the handler with no `initialize` behind it, and rmcp synthesises its peer
+/// with the SDK's own build identity as `client_info`. Served, such a call
+/// would put a client the server never spoke to into the audit stream, with
+/// no session record anchoring it — a plausible wrong attribution, which is
+/// the one an audit trail can least afford.
 ///
-/// No revision this build serves defines that lifecycle, so a request
-/// carrying it is out of contract and is refused.
+/// No revision this build serves defines that lifecycle, so the declaration
+/// is out of contract and is refused wherever it arrives. Broader than the
+/// routing on purpose: a sub-2026 declaration lacking `clientCapabilities`
+/// takes the session path, so this also fires on requests that did complete a
+/// handshake. Separately, the routing reads more than `_meta` — the
+/// `MCP-Protocol-Version` header, and `initialize`'s own `protocolVersion` —
+/// but neither needs cover here: a header-only `2026-07-28` is refused by the
+/// transport before any handler, and an `initialize` naming it does take the
+/// stateless path but is recorded from `request.client_info`, never from the
+/// synthesized peer.
 fn skips_the_handshake(ctx: &RequestContext<RoleServer>) -> bool {
     ctx.meta.protocol_version().is_some()
 }
@@ -3996,10 +4005,11 @@ impl ServerHandler for BugWarden {
         if skips_the_handshake(&context) {
             // Recorded before it is refused, like every other turned-away
             // call: a stream that went quiet for a whole request class
-            // could not be read as a complete account. `client` is left
-            // absent rather than carrying the placeholder identity the
-            // handshake-free path synthesises — the record says the caller
-            // is unknown, because it is.
+            // could not be read as a complete account. `client` is absent
+            // by policy, not ignorance: on the stateless path `peer_info`
+            // is rmcp's placeholder, in-session it is the real handshake
+            // identity, and one refusal class must not be recorded two
+            // ways. `session.id` is still present when there is one.
             if let Some(audit) = self.audit.clone() {
                 let event = audit::AuditEventKind::ToolCall(Box::new(audit::ToolCallEvent {
                     client: audit::ClientInfo {
@@ -4230,8 +4240,8 @@ impl ServerHandler for BugWarden {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         // Refused on the same terms as a tool call: the listing is pruned
-        // per deployment (I13), so serving it to a handshake-free caller
-        // would disclose which tools this policy removed. Unrecorded, as
+        // per deployment (I13), so answering one of these would disclose
+        // which tools this policy removed. Unrecorded, as
         // every listing is — schema v1 has no event kind for one.
         if skips_the_handshake(&context) {
             return Err(handshake_required());

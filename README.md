@@ -555,10 +555,10 @@ server names itself and its version — `bugwarden` and the release it was
 built from — never the SDK's.
 
 Every session must complete the `initialize` handshake. A request that
-carries a protocol revision in its own `_meta` instead — the handshake-free
-lifecycle — is refused whatever revision it names, because a server that
-answered it would be talking to a client it never greeted, and no audit
-record could say who that was.
+declares a protocol revision in its own `_meta` instead of negotiating one is
+refused whatever revision it names — some such requests skip the handshake
+outright, and a server that answered those would be talking to a client it
+never greeted, with no audit record able to say who that was.
 
 The advertised capability set is tools only: bugwarden registers no MCP
 prompts and no MCP resources. `summarize_bug` is a tool that returns prompt
