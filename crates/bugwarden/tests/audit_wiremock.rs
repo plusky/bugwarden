@@ -335,6 +335,15 @@ fn minimal_args(tool: &str) -> Value {
     }
 }
 
+/// Requests wiremock has actually served, the independent ground truth the
+/// record's `upstream.requests` is measured against.
+async fn upstream_hits(mock: &MockServer) -> usize {
+    mock.received_requests()
+        .await
+        .expect("wiremock records requests by default")
+        .len()
+}
+
 #[tokio::test]
 async fn every_routed_tool_writes_exactly_one_record_per_call() {
     let mock = MockServer::start().await;
@@ -354,7 +363,9 @@ async fn every_routed_tool_writes_exactly_one_record_per_call() {
     let mut expected = 1;
     assert_eq!(read_events(&audited.audit_path).len(), expected);
     for tool in &tools {
+        let before = upstream_hits(&mock).await;
         let _ = call(&audited.client, &tool.name, minimal_args(&tool.name)).await;
+        let hits = upstream_hits(&mock).await - before;
         expected += 1;
         // Read IMMEDIATELY after the response future resolves: the
         // record must already be on disk (persisted before response).
@@ -389,6 +400,37 @@ async fn every_routed_tool_writes_exactly_one_record_per_call() {
             "version too: {:?}",
             tc.client
         );
+        // Issue #118, the same blind spot at the `upstream` block: it was
+        // read only off the hand-built goldens. Measured against what
+        // wiremock independently served, so a hardcoded count cannot pass
+        // the whole walk — bug_info fans out to a classify plus a body
+        // fetch, quicksearch_syntax makes its one non-REST page.cgi call,
+        // and bug_url makes none.
+        assert_eq!(
+            tc.upstream.map_or(0, |u| u.requests) as usize,
+            hits,
+            "calling {} must record every upstream request it made: {:?}",
+            tool.name,
+            tc.upstream
+        );
+        assert_eq!(
+            tc.upstream.is_some(),
+            hits > 0,
+            "and carry the block exactly when Bugzilla was contacted: {}",
+            tool.name
+        );
+        if let Some(upstream) = tc.upstream {
+            // The fixture answers 200 everywhere, so the recorded status is
+            // the observed one and not a default. latency_ms is asserted
+            // present only: against a localhost mock its magnitude rounds
+            // to 0 ms and no threshold on it could fail.
+            assert_eq!(
+                upstream.status,
+                Some(200),
+                "and the status the fixture returned: {}",
+                tool.name
+            );
+        }
     }
 }
 
@@ -421,25 +463,37 @@ async fn refusal_paths_write_exactly_one_record_each() {
     let audited = audited_client_for(policy, &mock, "test-key").await;
 
     let mut expected = 1; // initialize
-    let mut check = |events: Vec<AuditEvent>, verdict: Verdict, rule: Option<&str>| {
+
+    // `requests` is the upstream count the record must carry (issue #118):
+    // a refusal decided from the request alone contacts Bugzilla not at all
+    // and must leave the block absent, while a DENIAL still paid for the
+    // classify that produced the verdict.
+    let mut check = |events: Vec<AuditEvent>, verdict: Verdict, rule: Option<&str>, reqs: u32| {
         expected += 1;
         assert_eq!(events.len(), expected, "exactly one new record");
         let tc = last_tool_call(&events);
         let guard = tc.guard.as_ref().expect("the guard was consulted");
         assert_eq!(guard.verdict, verdict);
         assert_eq!(guard.rule.as_deref(), rule);
+        assert_eq!(
+            tc.upstream.map_or(0, |u| u.requests),
+            reqs,
+            "upstream requests: {:?}",
+            tc.upstream
+        );
+        assert_eq!(tc.upstream.is_some(), reqs > 0);
     };
 
     // too_many_ids: 26 distinct ids.
     let ids: Vec<u64> = (1..=26).collect();
     let refused = call(&audited.client, "bug_info", json!({ "bug_ids": ids })).await;
     assert_eq!(refused.is_error, Some(true));
-    check(read_events(&audited.audit_path), Verdict::Refused, None);
+    check(read_events(&audited.audit_path), Verdict::Refused, None, 0);
 
     // Empty id list.
     let refused = call(&audited.client, "bug_info", json!({ "bug_ids": [] })).await;
     assert_eq!(refused.is_error, Some(true));
-    check(read_events(&audited.audit_path), Verdict::Refused, None);
+    check(read_events(&audited.audit_path), Verdict::Refused, None, 0);
 
     // A guard denial names its rule in the record — and nowhere else.
     let denied = call(&audited.client, "bug_history", json!({ "id": 99 })).await;
@@ -448,6 +502,7 @@ async fn refusal_paths_write_exactly_one_record_each() {
         read_events(&audited.audit_path),
         Verdict::Denied,
         Some("hide-secret"),
+        1,
     );
     // The denial is a well-formed response: outcome class stays ok.
     let events = read_events(&audited.audit_path);
@@ -466,7 +521,23 @@ async fn refusal_paths_write_exactly_one_record_each() {
     )
     .await;
     assert_eq!(refused.is_error, Some(true));
-    check(read_events(&audited.audit_path), Verdict::Refused, None);
+    // The padded create refusal: no POST, but one classify against bug 0.
+    check(read_events(&audited.audit_path), Verdict::Refused, None, 1);
+
+    // A DENIED bug_info: the classify that produced the verdict ran and the
+    // link-disclosure padding after it did, but no body fetch — the exact
+    // two-request shape, measured at the client's send choke point, which
+    // no handler could have reported (the padding is inside the guard).
+    let denied = call(&audited.client, "bug_info", json!({ "bug_ids": [99] })).await;
+    // bug_info answers a denial inside its envelope's `restricted` list, so
+    // this is a well-formed response — the denial lives in the record.
+    assert_eq!(denied.is_error, Some(false));
+    check(
+        read_events(&audited.audit_path),
+        Verdict::Denied,
+        Some("hide-secret"),
+        2,
+    );
 }
 
 #[tokio::test]

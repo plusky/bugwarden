@@ -13,11 +13,93 @@
 //! `CARGO_PKG_*` would name `bugwarden-core` in the access log of every
 //! binary that embeds it (issue #55).
 
-use std::time::Duration;
+use std::future::Future;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+
+tokio::task_local! {
+    /// The accounting [`with_upstream_stats`] installed for this task, read
+    /// only by [`BugzillaClient::send`]. Absent outside a scope, where every
+    /// record is a no-op — startup preflight is not a tool call.
+    static UPSTREAM: Arc<UpstreamStats>;
+}
+
+/// Per-scope accounting of the requests a [`BugzillaClient`] made.
+///
+/// Three integers and nothing else: no URL, no header, no body and no error
+/// text ever enters this (I12), so an audit record built from it cannot
+/// carry the API key or Bugzilla content.
+///
+/// Requests are attributed by *task*: a client call counts here when it is
+/// awaited, directly or transitively, inside [`with_upstream_stats`]. Work
+/// moved onto a separate task with `tokio::spawn` leaves the scope and is
+/// not counted.
+#[derive(Debug, Default)]
+pub struct UpstreamStats {
+    requests: AtomicU32,
+    /// Microseconds, summed; rounding each request to whole milliseconds
+    /// would floor a fast server's every wait to zero and lose the total.
+    latency_us: AtomicU64,
+    /// Status of the last request to complete, `0` for "no response".
+    status: AtomicU32,
+}
+
+impl UpstreamStats {
+    /// Record one completed request: how long it took, and the HTTP status
+    /// if a response line arrived at all.
+    fn record(&self, elapsed: Duration, status: Option<u16>) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.latency_us.fetch_add(
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.status
+            .store(u32::from(status.unwrap_or(0)), Ordering::Relaxed);
+    }
+
+    /// How many requests this client issued — REST and otherwise (the
+    /// quicksearch syntax page is `page.cgi`), counted whether they
+    /// succeeded or not. Dispatches, not wire requests: nothing overrides
+    /// reqwest's default redirect policy, so a followed redirect chain is
+    /// one request here and several on the wire.
+    pub fn requests(&self) -> u32 {
+        self.requests.load(Ordering::Relaxed)
+    }
+
+    /// Total time spent waiting on Bugzilla, in whole milliseconds. Each
+    /// request is measured from handing it to the transport until its body
+    /// has been read — reading the body is time spent waiting on Bugzilla.
+    pub fn latency_ms(&self) -> u64 {
+        self.latency_us.load(Ordering::Relaxed) / 1_000
+    }
+
+    /// HTTP status of the last request to complete. `None` when that
+    /// request produced no response at all (a transport failure or a
+    /// timeout), which is deliberately not distinguished from "no request
+    /// was made": both mean no status was observed.
+    pub fn status(&self) -> Option<u16> {
+        match self.status.load(Ordering::Relaxed) {
+            0 => None,
+            s => u16::try_from(s).ok(),
+        }
+    }
+}
+
+/// Run `fut` with `stats` collecting every Bugzilla request made on this
+/// task, then return its output.
+///
+/// The one choke point is [`BugzillaClient::send`], so the count covers
+/// requests the caller cannot itself see — a guard classification, a
+/// `whoami`, a search window's chunk scan — with no call site opting in.
+/// Nested scopes shadow rather than nest: the innermost one collects.
+pub async fn with_upstream_stats<F: Future>(stats: Arc<UpstreamStats>, fut: F) -> F::Output {
+    UPSTREAM.scope(stats, fut).await
+}
 
 /// Fields fetched for guard classification of a bug.
 pub const CLASSIFY_FIELDS: &str =
@@ -506,6 +588,10 @@ impl BugzillaClient {
 
     /// Send a prepared request, returning `(status, body)`. Logs method and
     /// path only (no query string — I12) and sanitizes transport errors.
+    ///
+    /// Every request the client makes passes through here, which is what
+    /// makes it the one honest place to count them for
+    /// [`with_upstream_stats`].
     async fn send(
         &self,
         rb: reqwest::RequestBuilder,
@@ -513,10 +599,24 @@ impl BugzillaClient {
         path: &str,
     ) -> Result<(reqwest::StatusCode, String)> {
         tracing::debug!(method, path, "bugzilla request");
-        let resp = rb.send().await.map_err(sanitize)?;
-        let status = resp.status();
-        let body = resp.text().await.map_err(sanitize)?;
-        Ok((status, body))
+        let started = Instant::now();
+        let (seen, out) = match rb.send().await {
+            Ok(resp) => {
+                // Read before the body: a body that fails to read still had
+                // a response line, and that status is the observed one.
+                let status = resp.status();
+                let out = match resp.text().await {
+                    Ok(body) => Ok((status, body)),
+                    Err(e) => Err(sanitize(e)),
+                };
+                (Some(status.as_u16()), out)
+            }
+            Err(e) => (None, Err(sanitize(e))),
+        };
+        // Three integers only, never the URL, headers, body or error (I12).
+        // No scope installed (startup preflight, an embedder) is a no-op.
+        let _ = UPSTREAM.try_with(|stats| stats.record(started.elapsed(), seen));
+        out
     }
 
     /// Authenticated GET of a REST path (relative to `{base_url}/rest`)

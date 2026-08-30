@@ -895,8 +895,32 @@ A `tool_call` also carries `trace` when the client sends a valid W3C
 `traceparent` in the request's `_meta`, which makes the call correlatable
 with the client's own trace. The parse is strict and silent: a malformed
 value leaves the field absent, is never logged, and never influences the
-guard or the response. Schema v1 reserves an `upstream` field for
-Bugzilla-side timings; nothing emits it yet, so do not build on it.
+guard or the response.
+
+A `tool_call` that reached Bugzilla also carries `upstream`, the Bugzilla
+side of the call: `requests`, how many requests the client issued (REST and
+otherwise — `quicksearch_syntax` fetches `page.cgi`), counted whether they
+succeeded or not; `status`, the HTTP status of the last request to
+complete, absent where that request got no response at all rather than
+reporting an earlier one's status as the outcome; and `latency_ms`, the
+total time spent waiting on Bugzilla, each request measured until its body
+has been read. The count is taken inside the client, so it includes the
+work a tool does on your behalf and not just the obvious fetch — the
+guard's per-bug classification, the identity lookup, a search window's
+chunked scan, and the deliberate padding requests that keep a denial from
+being cheaper than a serve. It counts what the client sent, so a redirect
+chain followed inside one of them is one request here and several on the
+wire. It is three integers and nothing else: no URL, no header, no body.
+The whole block is absent, never zeroed, when the call contacted Bugzilla
+not at all — `bug_url`, an unknown tool, a refusal decided from the request
+alone — so its absence is a statement.
+
+Do not expect `requests` to be derivable from the other counts. The
+`bugs_quicksearch` record further down spends three on fifty scanned rows:
+the window scan reads whole 200-row chunks and only an empty page ends it,
+so a fifty-row answer costs a second page to learn there is no more, and
+the link-disclosure classify after it is issued even with no links to
+disclose (skipping it would price "no links" below "links, all hidden").
 
 ### What can never appear in a record
 
@@ -914,7 +938,7 @@ parameter — `comment`, `summary`, `description`, `url`, `whiteboard`,
 presence and size but never its content.
 
 ```json
-{"v":1,"ts":"2026-02-03T04:05:06.789Z","seq":7,"session":{"id":"sess-1","transport":"http","remote":"192.0.2.7:52611"},"event":"tool_call","client":{"name":"example-agent","version":"1.4.2"},"request":{"tool":"bugs_quicksearch","id":"3","params":{"limit":50,"offset":0,"query":"kernel panic","status":"ALL"}},"guard":{"verdict":"served_filtered","policy_hash":"sha256:58013baa090cf77630373ab50cc5eaf2d679ec5a06e8a336600fc89b23bb8604","suppressed_count":2,"suppressed_ids":[1290040,1290041],"redacted_fields":[],"scan":{"scanned":50,"dropped":2}},"outcome":{"class":"ok","duration_ms":52,"response_bytes":6218}}
+{"v":1,"ts":"2026-02-03T04:05:06.789Z","seq":7,"session":{"id":"sess-1","transport":"http","remote":"192.0.2.7:52611"},"event":"tool_call","client":{"name":"example-agent","version":"1.4.2"},"request":{"tool":"bugs_quicksearch","id":"3","params":{"limit":50,"offset":0,"query":"kernel panic","status":"ALL"}},"guard":{"verdict":"served_filtered","policy_hash":"sha256:58013baa090cf77630373ab50cc5eaf2d679ec5a06e8a336600fc89b23bb8604","suppressed_count":2,"suppressed_ids":[1290040,1290041],"redacted_fields":[],"scan":{"scanned":50,"dropped":2}},"upstream":{"requests":3,"status":200,"latency_ms":48},"outcome":{"class":"ok","duration_ms":52,"response_bytes":6218}}
 ```
 
 A reader of the file should skip empty lines and tolerate at most one
