@@ -50,8 +50,28 @@ jobs:
         # --all-targets skips bins whose required-features are off, so the
         # asset generator needs its own leg to stay warning-free.
         run: cargo clippy -p bugwarden --features gen --all-targets -- -D warnings
+      - name: Doc
+        # rustdoc warnings are not errors, so a broken link exits 0 without
+        # this. Escalated here, not in [workspace.lints], matching the clippy
+        # split; private items because most of this repo's prose is on them.
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --document-private-items --locked
+      - name: Doc (gen tool)
+        # Same required-features gap as the clippy leg above. Neither leg
+        # reaches main.rs: default target selection skips the `bugwarden`
+        # bin because it shares the lib's name, and --bins would collide on
+        # the lib's doc output path. main.rs stays human-reviewed.
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p bugwarden --features gen --no-deps --document-private-items --locked
       - name: Test
         run: cargo test --workspace --all-targets --locked
+      - name: Doctest
+        # --all-targets never runs doctests, and zero exist today (the one
+        # fence is toml), so this gates the first future Rust example. Keeps
+        # RUSTDOCFLAGS per-step: job-level would leak into this collection.
+        run: cargo test --workspace --doc --locked
 
   rust-macos:
     # Portability check on macOS (Apple Silicon, aarch64-apple-darwin): build

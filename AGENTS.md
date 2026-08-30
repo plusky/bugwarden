@@ -12,7 +12,10 @@ Run commands from the repository root:
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p bugwarden --features gen --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items --locked
+RUSTDOCFLAGS="-D warnings" cargo doc -p bugwarden --features gen --no-deps --document-private-items --locked
 cargo test --workspace --all-targets --locked
+cargo test --workspace --doc --locked
 cargo deny check
 ```
 
@@ -121,9 +124,9 @@ are never a justification for undoing them.
 - A dependency change must update `Cargo.lock`, preserve the MSRV, and pass
   `cargo deny check`. Prefer the smallest compatible version change; do not
   run a broad `cargo update` as part of an unrelated change.
-- `typos` runs as its own workflow and is not part of the five verification
-  commands; `typos.toml` is an allowlist of deliberate spellings, never a
-  mask for a real typo.
+- `typos` runs as its own workflow and is not part of the verification
+  commands above; `typos.toml` is an allowlist of deliberate spellings,
+  never a mask for a real typo.
 
 ## Commits and Pull Requests
 
