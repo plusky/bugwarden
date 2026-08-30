@@ -748,19 +748,14 @@ pub struct OutcomeInfo {
     /// result exists to measure — a protocol error, or a refusal the audit
     /// gate records before it is built.
     ///
-    /// Produced, not necessarily delivered: a record whose write survived
-    /// but whose `record_event` still failed can be followed by a fail-mode
-    /// swap, leaving this sizing a payload the client never received.
-    /// [`OutcomeInfo::class`] and [`GuardInfo::verdict`] have the same
-    /// property; the record describes the call, not the wire.
-    ///
-    /// It sizes the PAYLOAD, and the verdict does not bound it. `denied` is
-    /// the *worst* verdict of the call, not a claim that nothing was
-    /// served: a multi-bug `bug_info` with one denied id records `denied`
-    /// over an envelope carrying the bugs it did serve, so that record's
-    /// size tracks those bodies. Only where the whole payload is one
-    /// uniform denial does the size reduce to a function of the caller's
-    /// own id width. Reading this as "how big was the refusal" is wrong.
+    /// Produced, not necessarily delivered: a fail-mode swap after a
+    /// failed `record_event` can leave this sizing a payload the client
+    /// never received — like [`OutcomeInfo::class`] and
+    /// [`GuardInfo::verdict`], the record describes the call, not the
+    /// wire. And the verdict does not bound it: `denied` is the *worst*
+    /// verdict of the call, not a claim that nothing was served, so a
+    /// multi-bug `bug_info` with one denied id still sizes the bugs it
+    /// served. Reading this as "how big was the refusal" is wrong.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_bytes: Option<u64>,
 }

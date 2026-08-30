@@ -124,12 +124,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some(pipeline) = &otel {
         // Fills the slot the diagnostics layer installed above reads.
         let _ = otel_slot.set(pipeline.clone());
-        // The delivery probe, mirroring the identity preflight: audit
-        // records are load-bearing on this collector, so a deployment
-        // that cannot deliver them refuses to start — a startup failure
-        // now beats a wave of fail-mode refusals under load. Bounded
-        // retry inside, because a collector starting alongside us is
-        // allowed to lose the race by a few seconds.
+        // The delivery probe, mirroring the identity preflight: a
+        // deployment that cannot deliver its audit records refuses to
+        // start (bounded retry inside — a co-starting collector may lose
+        // the race by a few seconds).
         pipeline.probe().await?;
         tracing::info!(
             "OTLP export enabled: audit records are exported to the configured \
