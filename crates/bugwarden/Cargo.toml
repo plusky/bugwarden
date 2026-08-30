@@ -43,6 +43,10 @@ rmcp = { version = "3.1", features = [
     "transport-streamable-http-server",
 ] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# `Stream`, to name the return types of the `SessionManager` wrapper in
+# `http_session`. Already in the lock file through rmcp; the facade crate
+# `futures` would pull executor and sink machinery nothing here uses.
+futures-core = "0.3"
 # Same crate rmcp uses to parse Host authorities (`parse_allowed_authority`).
 http = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }

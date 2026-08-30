@@ -461,8 +461,12 @@ pub enum GapReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionInfo {
-    /// Server-assigned session identifier, when the transport has one
-    /// (streamable HTTP does; a stdio session is the process itself).
+    /// Server-assigned session identifier, present when the transport
+    /// actually opened a session: over http the id rmcp minted, over
+    /// stdio the process itself. Never a client-supplied value — the
+    /// `mcp-session-id` request header is not read (#180) — so the
+    /// handshake-free stateless path, which opens no session, records
+    /// none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// Which transport carried the session.
@@ -1437,7 +1441,8 @@ pub struct AuditState {
     pub policy_hash: Option<String>,
     /// Session id stamped into stdio records. One process is one stdio
     /// session, so `<pid>-<unix epoch secs at startup>` anchors those
-    /// records the way the `mcp-session-id` header anchors http ones.
+    /// records the way the transport-minted id anchors http ones (see
+    /// [`crate::http_session`] — never the request header, #180).
     pub stdio_session_id: String,
 }
 
