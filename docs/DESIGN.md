@@ -1248,6 +1248,56 @@ Decisions, all deliberate:
   treat a size as it treats a count. Exported as the OTLP attribute
   `bugwarden.response_bytes` beside the verdict, absent when unmeasured,
   so a collector aggregates size per tool without parsing every body.
+- **Upstream accounting (issue #118).** `upstream = {requests, status,
+  latency_ms}` is populated from `BugzillaClient::send`, the single point
+  every request the client makes passes through, collected into a
+  `bugwarden_core::client::UpstreamStats` that `call_tool` scopes around
+  the whole dispatch (`with_upstream_stats`) and drains into the cell just
+  before `take_upstream`. Instrumenting the handlers instead would
+  systematically undercount: a handler cannot see the guard's per-id
+  classify fetches, `resolve_caller`'s whoami, the search window's chunk
+  scan (up to ten requests), `disclosable`'s I2 link padding, or
+  `create_bug`'s padding classify — all of which are requests the call
+  really made and an operator really pays for. The scope is a
+  `tokio::task_local`, which is why `bugwarden-core` names tokio as a
+  direct dependency; that is a runtime edge core already had through
+  reqwest, and it was preferred over threading a stats handle through
+  every client and guard signature, which would have put an audit-shaped
+  out-parameter across the whole public API of the portable domain crate
+  to buy a coverage guarantee the compiler cannot actually make (it
+  forces a value to be passed, not the right one). The known limit: a
+  handler that moved work onto its own task with `tokio::spawn` would
+  leave the scope and go uncounted. No handler spawns today, and the
+  router walk's per-tool equality against wiremock's request log fences
+  only half of it. An AWAITED spawn is caught: the mock logs a request
+  before its response resolves, so the uncounted request is inside that
+  tool's snapshot window and the two numbers disagree. A DETACHED one is
+  not — nothing orders a fire-and-forget task's request against the
+  snapshot, so the miscount drifts into the next tool's window or, on the
+  walk's last tool, off the end of it, and the equality passes over a
+  wrong count. Detached upstream work is a review rule, not a tested one.
+  `requests` counts client dispatches, not wire requests: nothing
+  overrides reqwest's default redirect policy, so up to ten hops inside
+  one `send` are one request here. Three integers and nothing else, so no
+  URL, header, body, error text or API key can reach a record through
+  this path (I12). Absent, never zero, when the call contacted Bugzilla
+  not at all — a local tool like `bug_url`, an unrouted name, a refusal
+  answered from the request alone, the pre-dispatch gate. Absence is a
+  measurement here (zero requests), the opposite side from
+  `outcome.response_bytes`, whose absence means there was nothing to
+  measure. `status` is the last request to complete, absent where that
+  request produced no response at all (transport failure, timeout) rather
+  than reporting an earlier request's status as the outcome; `latency_ms`
+  sums each request from hand-off to the transport until its body has
+  been read, because reading the body is time spent waiting on Bugzilla.
+  Optional and absent-when-unset, so the schema stays v1 and no golden
+  shape moves. Startup preflight runs outside any scope and is counted
+  nowhere: it is not a tool call. Pinned at both levels: the core suite
+  proves the scope counts only its own requests, that a refused connect
+  is counted with `status` cleared to absent, and that `latency_ms`
+  tracks a mounted response delay rather than any constant, while the
+  server suite measures every routed tool's count against wiremock's own
+  request log.
 - **Search-window drop accounting (issue #29).** A `bugs_quicksearch`
   record carries `guard.scan = {scanned, dropped}`: how many upstream rows
   the window scan examined and how many it dropped by verdict — without
@@ -2381,11 +2431,23 @@ wired, `server.rs` and `main.rs` are the reference.
   verdict too. The same blind spot elsewhere in the record: `request.id`
   and the handshake identity on a TOOL-CALL record had been read only off
   the hand-built schema fixtures, and are now asserted for every routed
-  tool. Two fields are asserted absent deliberately — `client.principal`
-  because nothing self-declared is ever promoted into it, and the
-  `upstream` block because `note_upstream` has no production caller, so
-  no real record carries one; each is pinned with a value only over the
-  hand-built golden. The http `session` block (its id and remote peer)
+  tool. `client.principal` is asserted absent deliberately, because
+  nothing self-declared is ever promoted into it, and is pinned with a
+  value only over the hand-built golden. The `upstream` block was the
+  same blind spot until #118 gave it a production caller; the router
+  walk now measures `upstream.requests` for every tool against what
+  wiremock independently served, so a count that ignores its input dies
+  on the fan-out (a served `bug_info` costs three — classify, body fetch,
+  link disclosure — while `bug_url` and `mcp_server_info` touch nothing
+  and keep the block absent). The refusal suite pins the denial side, where
+  a denied `bug_info` costs two — the classify plus `disclosable`'s I2
+  padding — against a refusal decided from the request alone, which
+  costs zero. `latency_ms` needs a mounted response delay to be pinned
+  at all, which is why it is asserted in the core suite and not off
+  ambient timing: a threshold over a localhost round trip is either
+  flaky or so loose a constant passes it, so the assertion is that a
+  delayed request's total EXCEEDS an undelayed one's by most of the
+  delay. The http `session` block (its id and remote peer)
   is observed only over a hand-built value; the stdio arm is pinned. The
   `bug_history` window (issue #142) is pinned on both sides: a `head` that
   actually omits entries records `history_window` in `redacted_fields`

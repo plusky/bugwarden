@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use base64::{engine::general_purpose, Engine as _};
-use bugwarden_core::client::{BugzillaClient, CLASSIFY_FIELDS};
+use bugwarden_core::client::{with_upstream_stats, BugzillaClient, UpstreamStats, CLASSIFY_FIELDS};
 use bugwarden_core::guard::{Guard, SearchRequest, SearchWindow};
 use bugwarden_core::policy::{Access, Action, Capability, IdentitySource};
 use chrono::{DateTime, Utc};
@@ -4126,19 +4126,35 @@ impl ServerHandler for BugWarden {
 
         let cell = Arc::new(AuditCell::default());
         context.extensions.insert(Arc::clone(&cell));
+        // Upstream accounting for the whole dispatch (issue #118). Scoped
+        // here, not per handler: a handler cannot see the guard's classify
+        // fetches, `resolve_caller`'s whoami, the search window's chunk
+        // scan, or create_bug's padding classify, so only the client's own
+        // choke point counts them all.
+        let stats = Arc::new(UpstreamStats::default());
         // Recorded like any other call, refused or not: exactly one record,
         // with no guard verdict and no upstream leg, the same shape an
         // unknown tool name produces.
         let result = if reachable {
-            self.tool_router
-                .call(ToolCallContext::new(self, request, context))
-                .await
+            let dispatch = self
+                .tool_router
+                .call(ToolCallContext::new(self, request, context));
+            with_upstream_stats(Arc::clone(&stats), dispatch).await
         } else {
             Err(tool_not_found())
         };
 
         // Exactly one record per call, whatever `result` is — including
         // an unknown tool or another protocol error from the router.
+        // Zero requests leaves the block absent: "Bugzilla was never
+        // contacted" is what its absence means, so it must not be a zero.
+        if stats.requests() > 0 {
+            cell.note_upstream(audit::UpstreamInfo {
+                requests: stats.requests(),
+                status: stats.status(),
+                latency_ms: stats.latency_ms(),
+            });
+        }
         let upstream = cell.take_upstream();
         let guard = cell.into_guard_info(audit.policy_hash.as_deref(), audit.sink.suppressed_ids());
         let guard_verdict = guard.as_ref().map(|g| g.verdict);

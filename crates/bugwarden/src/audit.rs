@@ -409,7 +409,9 @@ pub struct ToolCallEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guard: Option<GuardInfo>,
     /// The Bugzilla side of the call. Absent when Bugzilla was never
-    /// contacted (denied before any upstream request, or a local tool).
+    /// contacted: a local tool, a refusal answered from the request alone,
+    /// or the pre-dispatch gate. Absence means zero requests, never
+    /// "not measured".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream: Option<UpstreamInfo>,
     /// How the call ended, from the client's point of view.
@@ -723,16 +725,33 @@ pub enum Verdict {
     Refused,
 }
 
-/// The Bugzilla side of a tool call.
+/// The Bugzilla side of a tool call, counted at the client's own send
+/// choke point ([`bugwarden_core::client::UpstreamStats`]) — so it covers
+/// the requests a handler never sees: guard classifications,
+/// `resolve_caller`'s whoami, the search window's chunk scan,
+/// `create_bug`'s padding classify.
+///
+/// Three integers by construction: nothing here can carry a URL, a
+/// header, a body, an error text, or the API key (I12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamInfo {
-    /// How many Bugzilla REST requests the call made.
+    /// How many requests the client issued — REST and otherwise
+    /// (`quicksearch_syntax` fetches `page.cgi`), counted whether they
+    /// succeeded or not. Dispatches, not wire requests: a redirect chain
+    /// reqwest follows inside one of them counts once. Never zero: a call
+    /// that did not contact Bugzilla at all omits the whole block.
     pub requests: u32,
-    /// HTTP status of the final upstream response, when one was received.
+    /// HTTP status of the last request to complete. Absent where that
+    /// request produced no response at all — a transport failure or a
+    /// timeout — rather than reporting an earlier request's status as if
+    /// it were the outcome.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
-    /// Total time spent waiting on Bugzilla, in milliseconds.
+    /// Total time spent waiting on Bugzilla, in milliseconds: each
+    /// request from hand-off to the transport until its body has been
+    /// read, summed. Reading the body is time spent waiting on Bugzilla,
+    /// so it counts.
     pub latency_ms: u64,
 }
 
@@ -1629,7 +1648,9 @@ impl AuditCell {
         self.lock().redacted_fields.insert(field.to_owned());
     }
 
-    /// Note the Bugzilla side of the call, where the caller has it.
+    /// Note the Bugzilla side of the call. Called once per tool call by
+    /// the `call_tool` wrapper, from the accounting the core client
+    /// collected over the dispatch — never by a tool.
     pub fn note_upstream(&self, upstream: UpstreamInfo) {
         self.lock().upstream = Some(upstream);
     }

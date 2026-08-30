@@ -6,7 +6,9 @@
 //! client error mapping, the API key never appearing in error text (I12),
 //! and the summary view carrying no sensitive fields.
 
-use bugwarden_core::client::BugzillaClient;
+use std::sync::Arc;
+
+use bugwarden_core::client::{with_upstream_stats, BugzillaClient, UpstreamStats};
 use bugwarden_core::guard::{Guard, SearchRequest};
 use bugwarden_core::policy::{Access, Capability, Policy};
 use serde_json::{json, Value};
@@ -1397,5 +1399,123 @@ async fn classification_fetch_requests_the_creator_field() {
     assert!(
         out[&7].0.allows(Capability::Read),
         "the caller's own bug must classify from a creator-carrying projection"
+    );
+}
+
+#[tokio::test]
+async fn upstream_stats_count_every_request_inside_the_scope_and_none_outside() {
+    // Issue #118: the audit record's `upstream` block is built from this,
+    // so what it counts is what an operator is told the call cost.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "version": "5.0" })))
+        .mount(&server)
+        .await;
+    let bz = client(&server);
+
+    // Outside a scope the recording is a no-op, not a panic: startup
+    // preflight and any embedder call the same client.
+    bz.version(KEY).await.expect("version must succeed");
+
+    let stats = Arc::new(UpstreamStats::default());
+    with_upstream_stats(Arc::clone(&stats), async {
+        bz.version(KEY).await.expect("version must succeed");
+        bz.version(KEY).await.expect("version must succeed");
+    })
+    .await;
+    // Two, not three: the pre-scope call is not attributed to this scope.
+    assert_eq!(stats.requests(), 2);
+    assert_eq!(stats.status(), Some(200));
+
+    // A fresh scope starts from zero and sees only its own request.
+    let second = Arc::new(UpstreamStats::default());
+    with_upstream_stats(Arc::clone(&second), async {
+        bz.version(KEY).await.expect("version must succeed");
+    })
+    .await;
+    assert_eq!(second.requests(), 1);
+}
+
+#[tokio::test]
+async fn upstream_stats_count_a_failed_request_with_no_status() {
+    // A request that never got a response line still cost a round trip, so
+    // it is counted — but there is no status to report, and the previous
+    // request's must not stand in for it.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/version"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({ "error": true })))
+        .mount(&server)
+        .await;
+    let reachable = client(&server);
+    let refused = BugzillaClient::new(&refused_base_url(), false, TEST_USER_AGENT)
+        .expect("client must build");
+
+    let stats = Arc::new(UpstreamStats::default());
+    tokio::time::timeout(
+        REFUSED_CONNECT_BUDGET,
+        with_upstream_stats(Arc::clone(&stats), async {
+            // An error STATUS is still a response: counted, and reported.
+            assert!(reachable.version(KEY).await.is_err());
+            assert!(refused.version(KEY).await.is_err());
+        }),
+    )
+    .await
+    .expect("a refused loopback connect must not hang");
+
+    assert_eq!(stats.requests(), 2, "both round trips cost something");
+    assert_eq!(
+        stats.status(),
+        None,
+        "the last request produced no response, so no status is reported"
+    );
+}
+
+#[tokio::test]
+async fn upstream_stats_latency_tracks_the_wait_and_not_a_constant() {
+    // Differential, because a constant passes any lower bound: the SAME
+    // request behind a mounted delay must cost most of that delay more
+    // than it does without one. No ambient-timing threshold, so nothing
+    // here depends on how fast the loopback happens to be.
+    const DELAY_MS: u64 = 200;
+    let quick = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "version": "5.0" })))
+        .mount(&quick)
+        .await;
+    let delayed = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/version"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "version": "5.0" }))
+                .set_delay(std::time::Duration::from_millis(DELAY_MS)),
+        )
+        .mount(&delayed)
+        .await;
+
+    let quick_stats = Arc::new(UpstreamStats::default());
+    with_upstream_stats(Arc::clone(&quick_stats), async {
+        client(&quick).version(KEY).await.expect("version");
+    })
+    .await;
+    let delayed_stats = Arc::new(UpstreamStats::default());
+    with_upstream_stats(Arc::clone(&delayed_stats), async {
+        client(&delayed).version(KEY).await.expect("version");
+    })
+    .await;
+
+    assert!(
+        delayed_stats.latency_ms() >= DELAY_MS,
+        "the mounted delay is time spent waiting: {} ms",
+        delayed_stats.latency_ms()
+    );
+    assert!(
+        delayed_stats.latency_ms() >= quick_stats.latency_ms() + DELAY_MS / 2,
+        "latency must track the wait, not report a fixed number: {} ms delayed vs {} ms quick",
+        delayed_stats.latency_ms(),
+        quick_stats.latency_ms()
     );
 }
