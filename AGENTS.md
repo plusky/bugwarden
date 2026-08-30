@@ -22,14 +22,14 @@ the `FROM rust:` tag in the `Dockerfile` all name the same version and move
 together; `rust-msrv` (the MSRV) and `rust-beta` (`beta`) are the deliberate
 exceptions. An input only installs that toolchain and sets the rustup
 default, which `rust-toolchain.toml` outranks: a job compiles with the pin
-unless it also overrides the toml. Only `rust-msrv` does (an exported
-`RUSTUP_TOOLCHAIN`, asserted against `rustc --version`); `rust-beta` does
-not, so it re-tests the pin rather than beta. The workspace MSRV is declared
-once in `Cargo.toml` (`rust-version = "1.88"`) and `rust-msrv` reads it from
-there; do not introduce APIs or dependencies which require a newer compiler
-without deliberately updating both the pin and the MSRV policy. CI and
-reproducible local checks use the committed `Cargo.lock`, so use `--locked`
-for verification.
+unless it also overrides the toml. Both exceptions do, via an exported
+`RUSTUP_TOOLCHAIN` plus an assert on `rustc --version`; anything else off
+the pin needs the same two parts or it silently re-tests the pin. The
+workspace MSRV is declared once in `Cargo.toml` (`rust-version = "1.88"`)
+and `rust-msrv` reads it from there; do not introduce APIs or dependencies
+which require a newer compiler without deliberately updating both the pin
+and the MSRV policy. CI and reproducible local checks use the committed
+`Cargo.lock`, so use `--locked` for verification.
 
 ## Workspace Architecture
 
