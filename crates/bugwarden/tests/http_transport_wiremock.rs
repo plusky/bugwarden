@@ -55,6 +55,9 @@ use serde_json::{json, Value};
 use wiremock::matchers::{any, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "common/raw_post.rs"]
+mod raw_post;
+
 /// Build the http-transport `Cli` against `mock`, with `key_file` when the
 /// test runs in server-held mode. Every field an ambient environment
 /// variable could set behind the fixed arguments below is then assigned
@@ -765,15 +768,18 @@ async fn traceparent_over_http_lands_in_the_audit_record() {
 }
 
 /// POST a raw JSON-RPC `initialize` whose serialized body is at least
-/// `bytes` long, and answer with the HTTP status the transport gave it.
+/// `bytes` long, and answer with the status line the transport gave it.
 ///
 /// The size rides on `clientInfo.title`, a plain string field: what is
 /// under test is the transport's body cap, which is applied while the body
 /// is still being collected — before any tool, session or guard exists —
 /// so the cheapest well-formed request that the cap can refuse is the
 /// handshake itself. A body the cap admits is answered `200`; one it
-/// refuses is answered `413` with no JSON-RPC message at all.
-async fn initialize_body_of(addr: SocketAddr, bytes: usize) -> reqwest::StatusCode {
+/// refuses is answered `413` with no JSON-RPC message at all — and
+/// answered mid-write, before the body it is refusing has been read, which
+/// is why the status line comes off a raw socket rather than a reqwest
+/// round-trip the peer's reset would discard (#167).
+async fn initialize_body_of(addr: SocketAddr, bytes: usize) -> String {
     let request = |title: String| {
         json!({
             "jsonrpc": "2.0",
@@ -796,15 +802,7 @@ async fn initialize_body_of(addr: SocketAddr, bytes: usize) -> reqwest::StatusCo
         "the padding must reach the target size"
     );
 
-    reqwest::Client::new()
-        .post(format!("http://{addr}/mcp"))
-        .header("Accept", "application/json, text/event-stream")
-        .header("Content-Type", "application/json")
-        .body(body)
-        .send()
-        .await
-        .expect("the request must reach the server")
-        .status()
+    raw_post::post_status_line(addr, None, &body).await
 }
 
 #[tokio::test]
@@ -828,24 +826,25 @@ async fn the_body_cap_follows_the_policy_attachment_ceiling() {
     )
     .await;
     let admitted = initialize_body_of(permissive, 5 * 1024 * 1024).await;
-    assert_eq!(
-        admitted, 200,
+    assert!(
+        admitted.starts_with("HTTP/1.1 200"),
         "a body the policy's own attachment cap permits must not be refused \
-         by the transport"
+         by the transport: {admitted:?}"
     );
-    assert_eq!(
-        initialize_body_of(permissive, 10 * 1024 * 1024).await,
-        413,
-        "past the derived cap the memory bound still holds"
+    let past_derived = initialize_body_of(permissive, 10 * 1024 * 1024).await;
+    assert!(
+        past_derived.starts_with("HTTP/1.1 413"),
+        "past the derived cap the memory bound still holds: {past_derived:?}"
     );
 
     // Nothing was loosened for everyone else: under the default policy the
     // 4 MiB floor stands, and the very same 5 MiB body is refused.
     let floored = serve_http(http_cli(&mock, Some(file.path())), "", &mock, None).await;
-    assert_eq!(
-        initialize_body_of(floored, 5 * 1024 * 1024).await,
-        413,
-        "a policy that permits no such attachment keeps the 4 MiB floor"
+    let at_floor = initialize_body_of(floored, 5 * 1024 * 1024).await;
+    assert!(
+        at_floor.starts_with("HTTP/1.1 413"),
+        "a policy that permits no such attachment keeps the 4 MiB floor: \
+         {at_floor:?}"
     );
 
     // A refused body reaches neither tool nor guard, so it also reaches no
