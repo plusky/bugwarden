@@ -45,7 +45,7 @@
 //! |---|---|---|
 //! | Self-declared | `client.name`, `client.version` | Whatever the client said about itself. Never verified, by anything: a label, never an identity. |
 //! | Server-verified | `client.principal`, `client.work_context` | Only a validator this server trusts may mint one, and nothing self-declared may be promoted into either. Reserved: no verifier exists, so neither appears in a record THIS BUILD writes — a later build that can prove a caller fills them without moving `v`. |
-//! | Server-minted | `session.id` | Within one deployment's stream, proves that records sharing it passed through one transport session, and joins them to that session's `initialize`. Says nothing about WHO was on the other end. |
+//! | Server-minted | `session.id` | Within one deployment's stream, proves that records sharing it passed through one transport session — and, where that session began with a handshake, joins them to its `initialize`. Says nothing about WHO was on the other end. |
 //! | Correlation hint | `trace`, `request.id`, `session.remote` | Client-chosen or path-dependent — a `traceparent` any caller may stamp, an id the client picked, a peer address that is the last proxy's behind one. Useful for joining records; evidence of nothing. |
 //!
 //! This table is normative and versioned with the schema: a new field
@@ -523,11 +523,22 @@ pub struct ToolCallEvent {
     pub outcome: OutcomeInfo,
 }
 
-/// Payload of an `initialize` record: a client opened an MCP session.
+/// Payload of an `initialize` record: a client sent an `initialize`.
+///
+/// Usually that opened a session, and [`SessionInfo::id`] then joins this
+/// anchor to the records it anchors. A `2026-07-28` `initialize` over http
+/// is the exception: rmcp routes it down the handshake-free path, so it is
+/// answered and recorded but opens nothing, and the record carries no id.
+/// It is written anyway: recording every handshake unconditionally is the
+/// invariant, and joins are on id equality, so an anchor with no id anchors
+/// nothing and gathers nothing that belongs elsewhere either. Over stdio the
+/// same request is an ordinary handshake and does open a session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InitializeEvent {
-    /// The client as it introduced itself in the handshake.
+    /// The client as it introduced itself in the handshake — the
+    /// REQUEST's own `clientInfo`, never a peer identity the transport
+    /// synthesised.
     pub client: ClientInfo,
     /// The MCP protocol version the session negotiated — the revision
     /// actually spoken, which is not always the one the client asked for:
@@ -572,9 +583,19 @@ pub struct SessionInfo {
     /// `mcp-session-id` request header is not read (#180).
     ///
     /// What it GUARANTEES is grouping WITHIN ONE DEPLOYMENT'S STREAM:
-    /// records sharing an id passed through one transport session, and
-    /// that session's `initialize` record carries the same id, so a tool
-    /// record can be joined to the handshake that anchors it.
+    /// records sharing an id passed through one transport session. Where
+    /// that session began with a handshake, its `initialize` record carries
+    /// the same id, so a tool record joins the handshake that anchors it.
+    ///
+    /// The anchor is not guaranteed, and the gap is not the http one. A
+    /// 2026-07-28 client over STDIO may open with an ordinary request and
+    /// never send `initialize` at all — rmcp serves that first message and
+    /// keeps the connection — while this id, minted from the process, is
+    /// stamped on every record regardless. A whole session of records can
+    /// therefore share an id no `initialize` names. They stay truthful: the
+    /// id is unforgeable and no other session shares it, so an unanchored
+    /// group is never joined to the WRONG session — it simply has nothing to
+    /// join to.
     ///
     /// That scope is load-bearing, not boilerplate. Over stdio the id is
     /// `<pid>-<startup epoch seconds>`, unique on a host and not beyond
@@ -587,11 +608,13 @@ pub struct SessionInfo {
     /// What it does NOT: it is not an identity. A session is a
     /// connection, and nothing about who was on the other end of it
     /// follows from the id. Nor does it exist on the handshake-free
-    /// per-request path, which opens no session — there the only
-    /// candidate is the `mcp-session-id` header, unvalidated client text
-    /// that any caller could stamp with a live session's id, and a
-    /// forgeable id is worse than none. Grouping there is
-    /// [`SessionInfo::remote`] plus nothing.
+    /// per-request path OVER HTTP, which opens no session — there the
+    /// only candidate is the `mcp-session-id` request header, unvalidated
+    /// client text that any caller could stamp with a live session's id,
+    /// and a forgeable id is worse than none. Grouping there is
+    /// [`SessionInfo::remote`] plus nothing. Over stdio the same
+    /// lifecycle keeps its id: that one is minted from the process, not
+    /// read off a request, so there is nothing to forge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// Which transport carried the session.
@@ -626,10 +649,14 @@ pub enum TransportKind {
 #[serde(deny_unknown_fields)]
 pub struct ClientInfo {
     /// Client name as the client declared it: the `initialize`
-    /// handshake, and per-request `_meta` on a handshake-free revision
-    /// should this build ever serve one — the same trust level either
-    /// way. Self-declared and therefore untrusted: treat it as a label,
-    /// never as an identity.
+    /// handshake, or the request's own `_meta` on the handshake-free
+    /// 2026-07-28 lifecycle this build serves — the same trust level
+    /// either way. Self-declared and therefore untrusted: treat it as a
+    /// label, never as an identity. Absent when the caller declared
+    /// nothing, which the per-request lifecycle permits (`clientInfo` is
+    /// optional there) — absent is the honest answer, and never the
+    /// SDK's own build identity, which is what the transport synthesises
+    /// for a peer that never handshook.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Client version, from the same source and at the same trust level
@@ -1636,9 +1663,17 @@ pub struct AuditState {
     /// policy applies (there is no file to hash).
     pub policy_hash: Option<String>,
     /// Session id stamped into stdio records. One process is one stdio
-    /// session, so `<pid>-<unix epoch secs at startup>` anchors those
-    /// records the way the transport-minted id anchors http ones (see
+    /// session, so `<pid>-<unix epoch secs at startup>` groups those
+    /// records the way the transport-minted id groups http ones (see
     /// [`crate::http_session`] — never the request header, #180).
+    ///
+    /// Stamped UNCONDITIONALLY, including on the 2026-07-28 per-request
+    /// lifecycle, where the http path records no id at all: there the only
+    /// candidate is a forgeable request header, here the value is minted
+    /// from the process and cannot be forged. The consequence is that a
+    /// stdio client which never sends `initialize` produces a run of
+    /// records sharing an id that no `initialize` anchors — see
+    /// [`SessionInfo::id`], which is where that limit is stated.
     pub stdio_session_id: String,
 }
 

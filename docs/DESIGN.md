@@ -953,11 +953,12 @@ Decisions, all deliberate:
   whether a mandatory *unauthenticated* pre-request surface should survive the
   arrival of auth. It does not: the gate wraps the whole router, so
   `server/discover` needs a token like any other request. Decided rather than
-  inherited, and the cheap direction — no revision this build serves defines
-  that surface (`2026-07-28` is unadopted, #34), so nothing needs it today,
-  and opening a pre-request identity surface ahead of the revision that gives
-  it a purpose would hand out the deployed version to strangers for nothing.
-  Reopening it is a one-line route exemption if #34 ever needs one.
+  inherited: opening a pre-request identity surface to strangers would hand
+  out the deployed version for nothing, and the callers that need it are
+  exactly the ones a deployment authenticates anyway. Unchanged by #34 stage
+  2 adopting `2026-07-28`, the revision that makes the surface mandatory —
+  a handshake-free caller presents its bearer token like any other.
+  Reopening it is a one-line route exemption if one is ever needed.
 - **What this deliberately does NOT do.** No caller identity: `principal` stays
   `None`, and a deployment credential must never fill it (#32). No per-caller
   policy: one operator policy per process (I1) is unchanged, and a token
@@ -1194,8 +1195,21 @@ Decisions, all deliberate:
   `SessionManager` wrapper in `http_session`, never read from the
   `mcp-session-id` request header (issue #180) — with the remote address
   when the listener provides connect-info. The `initialize` record carries
-  it too, so the anchor joins to what it anchors; a handshake-free
-  stateless request opens no session and its record carries no id.
+  it too, so where a handshake happened the anchor joins to what it anchors.
+  It is not promised to exist: a 2026-07-28 STDIO client may open with an
+  ordinary request and never send `initialize` (rmcp serves that first
+  message and keeps the connection), while the process-scoped id is stamped
+  on every record regardless — a run of records sharing an id nothing
+  anchors. Truthful rather than misleading: no other session holds that id,
+  so those records are never gathered under the wrong one — they simply have
+  nothing to join to. A handshake-free http
+  request opens no session and its record carries no id, served or refused —
+  including a `2026-07-28` `initialize`, which rmcp routes statelessly, so
+  that anchor names no session either; grouping there is `remote` and nothing
+  else. Over stdio the same lifecycle keeps the process-scoped id, which is
+  minted rather than read off a request. The client on a per-request record
+  is the one the request itself declared in `_meta`, absent when it declared
+  none, and capped at 1024 characters like an audited parameter value.
 - **Trace enrichment (issue #28).** When a tool call's `params._meta`
   carries a `traceparent` (SEP-414), its trace and span ids are copied
   into the record's `trace` field — the pre-dispatch fail-closed gate
@@ -1840,8 +1854,16 @@ wired, `server.rs` and `main.rs` are the reference.
   the SDK default of every revision it knows. What that override bounds is
   precisely which **declared** revisions `initialize`, per-request `_meta` and
   `server/discover` may agree to; it does not decide which request *lifecycle*
-  the transport routes to (see the `_meta`-shape trap below). `2026-07-28` is excluded
-  because this build has not adopted it (issue #34, stage 2).
+  the transport routes to (see the `_meta`-shape trap below). `2026-07-28` is
+  SERVED as of issue #34 stage 2: its handshake-free requests carry the calling
+  client in their own `_meta`, which `client_of` reads, so a record on that path
+  names the caller or names nobody. Adoption ADDED it — `2024-11-05` through
+  `2025-11-25` keep their handshakes and their sessions — so the two lifecycles
+  are served side by side and `DEFAULT_PROTOCOL_VERSION` stays `2025-11-25`.
+  One consequence worth stating because nothing enforces it: rmcp's
+  `KNOWN_VERSIONS` now equals this list, so there is no known-but-unserved
+  revision left to test the fallback with, and the negotiation tests use a
+  fabricated `"9999-01-01"` instead.
   The hand-written `initialize` tests the same list — the SDK negotiates
   again afterwards using the handler's answer as its fallback, so a handler
   that echoed an unsupported request would make the SDK echo it too — and
@@ -1917,11 +1939,33 @@ wired, `server.rs` and `main.rs` are the reference.
   covers a revision this build *does* serve sent with both keys. That still
   reaches `serve_negotiated_request_directly`, whose synthesised peer carries
   `client_info = Implementation::default()` — the SDK's own crate name and
-  version. Served, it would reach a tool with no `initialize` behind it and
-  land in the audit stream as a client the server never spoke to. So
-  `call_tool` and `list_tools` refuse any request carrying the version key
-  (`skips_the_handshake`), and a refused call is recorded with `client` absent
-  rather than with the placeholder. Grep misleads here:
+  version. So the handler decides for itself, three ways (`lifecycle_of`,
+  server.rs), on the revision the request DECLARES and never on the session's
+  negotiated one: no declaration is the handshake lifecycle, `>= 2026-07-28`
+  AND on `SUPPORTED_PROTOCOL_VERSIONS` is the per-request one, anything else
+  is out of contract and refused by `call_tool` and `list_tools`
+  (`mixed_lifecycle_refused`; the refusal is recorded with `client` absent).
+  The `contains` half of the middle arm is defence in depth behind rmcp's own
+  -32022 — every rmcp comparison is lexical, and a fabricated `"9999-01-01"`
+  outranks every real revision.
+  The refusal arm survives adoption precisely because the second routing shape
+  does: a PRE-2026 revision with both keys still arrives with no `initialize`
+  behind it. It is broader than the routing on purpose — such a declaration
+  without `clientCapabilities` takes the session path — so it fires on requests
+  that did complete a handshake too.
+  **rmcp trap within the trap — `RequestContext::client_info()` is not a safe
+  accessor.** It falls back to `peer_info().client_info` unless
+  `peer.request_metadata_required()`, which rmcp 3.1.4 sets on exactly one path
+  (`service/server.rs`, the stdio first-message-is-not-`initialize` case) and
+  never over streamable http. So on the http handshake-free path that
+  convenience accessor IS the placeholder, silently. `client_of` therefore
+  reads `ctx.meta.client_info()` directly on the per-request arm and
+  `peer.peer_info()` only on the handshake arm — never the accessor, never the
+  peer on the per-request arm. `ctx.meta.client_info()` decodes
+  all-or-nothing, so a half-declared identity records as nothing at all. Both
+  recorded fields are capped at `PARAM_VALUE_MAX_CHARS`, the audited-parameter
+  cap: per-request sourcing repeats a client-controlled string into every
+  record where the handshake wrote it once per session. Grep misleads here:
   `message_has_per_request_protocol_version` tests presence alone, and inside
   the stateless arm that presence does pick a route — but nothing it decides
   gets a request INTO that arm; everywhere else it only feeds header
@@ -1931,6 +1975,15 @@ wired, `server.rs` and `main.rs` are the reference.
   `get_info` only and reaches no tool, guard or router. General rule: **no
   `_meta` key and no `Mcp-*` header may carry a security decision** — like
   `KNOWN_VERSIONS`, they are the SDK's vocabulary, not this build's contract.
+  Two more things to re-check on an rmcp bump, both load-bearing for the
+  handshake arm: that a POST naming `2026-07-28` in the `MCP-Protocol-Version`
+  header ALONE, with no `_meta`, is still refused by the transport
+  (`validate_request_protocol_version_meta`, -32602) — otherwise such a request
+  reaches the handler looking like an ordinary in-session one while its peer
+  never handshook — and that `request_metadata_required()` is still set on no
+  http path. The first has a test
+  (`a_header_only_2026_declaration_is_refused_by_the_transport`); the second
+  does not, and is why `client_of` never uses the convenience accessor.
 - **rmcp trap — `mcp-session-id` is a validated header on only one of the two
   routes.** In rmcp 3.1.4 the session branch of `handle_post`
   (`transport/streamable_http_server/tower.rs`) checks the header against
@@ -1948,9 +2001,13 @@ wired, `server.rs` and `main.rs` are the reference.
   `SessionRestoreMarker`, message extensions reaching `RequestContext`
   verbatim. Re-check both halves on every rmcp bump: that `SessionManager`
   still receives the message, and that the stateless branch still validates no
-  session. Deliberate consequence: a stateless refusal records no session id
+  session. Deliberate consequence: a stateless request records no session id
   even when the caller innocently echoed one, because a forgeable id is worse
-  than none (#34).
+  than none (#34). Since stage 2 that covers SERVED calls as well as refused
+  ones — the hazard widened with the lifecycle, and the served half is the
+  worse one, since those forged records would describe work that actually
+  happened. Over stdio the same lifecycle keeps its id: it is minted from the
+  process, not read off a request, so there is nothing to forge.
 - `list_tools` names every `ListToolsResult` field: `result_type` is
   `COMPLETE`, and the SEP-2549 cache hints are gated on the request's
   revision. **rmcp trap — the only version-shaped edit the SDK makes to a
@@ -1981,13 +2038,15 @@ wired, `server.rs` and `main.rs` are the reference.
   `skip_serializing_if`, hard-coded to `0`/`Private` by both constructors,
   and this build keeps rmcp's default `server/discover` — so a legacy peer
   naming 2025-11-25 gets the pair from *that* surface today, whatever
-  `tools/list` does. `2026-07-28` is off `SUPPORTED_PROTOCOL_VERSIONS`, so
-  the served branch is unreachable end to end — but only because
-  `initialize` stores the NEGOTIATED revision (above): while it stored the
-  requested one, a second `initialize` reopened this branch on a live stdio
-  session. It is therefore tested in-process against a hand-built
-  `RequestContext`; the legacy branch is live and tested over real
-  streamable HTTP.
+  `tools/list` does. Since stage 2 the served branch is reachable end to end —
+  a 2026-07-28 request, or a session that negotiated it — and is tested over
+  real streamable HTTP as well as in-process. The in-process rows are still the
+  sharp ones: `RequestContext::protocol_version()` reads the request's `_meta`
+  first and the session's revision second, and over http the handshake-free
+  path's SYNTHESISED peer carries the same revision the `_meta` names, so the
+  two sources agree there and a gate reading only the peer survives every wire
+  test. Only a hand-built context with a peer carrying no info at all separates
+  them.
 - **rmcp trap — `input_schema` is schemars' rendering, unfiltered by rmcp.**
   `SchemaSettings::draft2020_12()` (`handler/server/common.rs`) runs zero
   transforms, so whatever schemars 1.x emits for a `#[tool]` param struct is
@@ -2031,8 +2090,8 @@ wired, `server.rs` and `main.rs` are the reference.
   | `max_request_body_bytes` | 4 MiB | **set** — derived from `global.max_attachment_bytes`, floored at that same 4 MiB (see below) |
   | `cancellation_token` | fresh token | **set** (main.rs) — a child of the process token |
   | `allowed_origins` | `[]`, i.e. validation off | inherited, deliberately |
-  | `stateless_protocol_metadata_required` | `false` | inherited; #34 decides it |
-  | `legacy_session_mode` | `true` | inherited |
+  | `stateless_protocol_metadata_required` | `false` | inherited, deliberately — #34 decided it (see below) |
+  | `legacy_session_mode` | `true` | inherited — sessions for the legacy revisions; 2026-07-28 routes statelessly regardless |
   | `session_store` | `None` | inherited |
   | `json_response` | `false` | inherited |
   | `sse_keep_alive` / `sse_retry` | 15 s / 3 s | inherited |
@@ -2158,22 +2217,27 @@ wired, `server.rs` and `main.rs` are the reference.
   below `2026-07-28` do not attach that metadata, so enabling it refuses their
   ordinary requests, and the field's own rustdoc says a server using it should
   advertise only `2026-07-28` and later. Adopting the revision (#34) therefore
-  has to pick one — enforce at the transport and drop `2024-11-05` through
+  had to pick one — enforce at the transport and drop `2024-11-05` through
   `2025-11-25`, or keep them and enforce in the handler. **DECIDED 2026-08-05:
   keep the legacy revisions and enforce in the handler**, so this field stays
-  `false` and #34 adds `2026-07-28` to the existing list rather than replacing
-  it. Flipping it to `true` is not a tuning knob: it silently drops every
-  revision this build serves. The rejected alternative is rejected on timing,
-  not on cleanliness — transport-level enforcement is the tidier mechanism, but
-  `2026-07-28` is not yet even rmcp's own `LATEST` (upstream PR #1105 is open),
-  so taking it now would strand every current client to gain validation the
-  handler can do itself, in a handler that already polices this exact request
-  class. Revisit when the ecosystem has moved and dropping the legacy revisions
-  costs little. Moot until then: `skips_the_handshake` refuses the whole
-  request class before it reaches a tool. `legacy_session_mode` is inherited
-  `true`, so sessions exist for the revisions served; per SEP-2567 rmcp serves
+  `false` and #34 stage 2 ADDED `2026-07-28` to the existing list rather than
+  replacing it. Flipping it to `true` is not a tuning knob: it silently drops
+  every revision this build served before. The rejected alternative is rejected
+  on timing, not on cleanliness — transport-level enforcement is the tidier
+  mechanism, but `2026-07-28` is not yet even rmcp's own `LATEST` (upstream PR
+  #1105 is open), so taking it now would strand every current client to gain
+  validation the handler can do itself, in a handler that already polices this
+  exact request class. Revisit when the ecosystem has moved and dropping the
+  legacy revisions costs little. What the handler does instead is `lifecycle_of`
+  (above): the per-request `_meta` is validated where a refusal can be recorded
+  and where the identity it carries is read, rather than at a layer that sees
+  neither. `legacy_session_mode` is inherited
+  `true`, so sessions exist for the legacy revisions; per SEP-2567 rmcp serves
   `2026-07-28` requests statelessly whatever this flag says, which #34 inherits
-  rather than configures. `session_store` stays `None`: the client's
+  rather than configures. **That is the asymmetry to hold onto: a `2026-07-28`
+  `initialize` mints a session over stdio and nothing over http** — both are
+  rmcp's routing, not a bugwarden choice, and both are audited, so over http
+  the `initialize` record is written with no `session.id` at all. `session_store` stays `None`: the client's
   `initialize` parameters remain in-process, and there is one process here and
   no cross-instance recovery to do. `json_response`, `sse_keep_alive` and
   `sse_retry` set response framing and SSE liveness — client-visible timing,
@@ -2503,12 +2567,45 @@ wired, `server.rs` and `main.rs` are the reference.
   and returned on the RESPONSE, and a tool call in that session carries
   the same one at a later `seq`; two sessions each join their own
   `initialize` rather than the nearest; a handshake-free request wearing
-  a live session's `mcp-session-id` is refused with NO id recorded, never
-  that session's; and — because the handshake refusal is deliberately
-  broader than rmcp's stateless routing — a declaration that stayed on
-  the session branch is refused WITH its real id and joins its own
-  `initialize`. That last arm is the only test pinning it, and the
-  comment asserting it has been wrong once.
+  a live session's `mcp-session-id` records NO id, never that session's,
+  in both the refused and the SERVED shape (the served one is the C3
+  hazard adoption widened, and the worse half — those records would
+  describe work that actually happened); and — because the out-of-contract
+  refusal is deliberately broader than rmcp's stateless routing — a
+  declaration that stayed on the session branch is refused WITH its real
+  id and joins its own `initialize`. That last arm is the only test
+  pinning it, and the comment asserting it has been wrong once.
+  The per-request lifecycle (#34 stage 2) is driven from the same raw
+  harness, since no rmcp client sends the shape at all: a `tools/call`
+  declaring `2026-07-28` and NO `clientInfo` anywhere is served, recorded
+  once, names no client — the whole audit file is asserted free of
+  `"rmcp"` — and carries `remote` but no session id; the same call
+  declaring one records it verbatim (the row an unconditional `(None,
+  None)` passes the first test on); a `tools/list` really does reach the
+  enabled half of the SEP-2549 gate end to end; a `2026-07-28`
+  `initialize` is answered with that revision, mints no `mcp-session-id`,
+  and is recorded from the REQUEST's `clientInfo` with no id; a header-only
+  `2026-07-28` with no `_meta` is refused by the transport (-32602) with
+  nothing recorded, which is the barrier the handshake arm leans on; and
+  I13 and I2 are re-run on the path — a `--read-only`-pruned tool and a
+  nonexistent name answer byte-identically, a policy-denied bug and a
+  nonexistent one answer with the same uniform text. `list_tools` has its own
+  refusal row — an out-of-contract declaration is refused and the answer names
+  no tool at all — because listings are unrecorded, so deleting that arm is
+  invisible to every record-based test and it was a surviving mutant until the
+  row existed. Two in-process rows pin what no wire test could: the
+  handshake arm answering with the client the server GREETED when a request
+  smuggles a `clientInfo` into `_meta` WITHOUT a `protocolVersion` (that shape
+  stays on the handshake arm, and `RequestContext::client_info()` would prefer
+  the smuggled value while leaving every ordinary session working — it
+  survived the whole suite), and a stdio per-request call KEEPING its
+  process-scoped `session.id`, which is the deliberate asymmetry with http and
+  was likewise pinned by nothing. The bearer gate and
+  its scope split are re-run there too
+  (crates/bugwarden/tests/http_auth_wiremock.rs): a per-request POST with no
+  token is the same `401`, the read scope reaches a read tool but sees a
+  write tool exactly as it sees a name that does not exist, and a read-scope
+  listing carries no write tools.
 - Configuration tests (crates/bugwarden/tests/env_config.rs, the REAL
   process environment): every flag is settable from the environment, which
   is what a container deployment configures through (#31/#32). ONE test by
@@ -2725,7 +2822,7 @@ wired, `server.rs` and `main.rs` are the reference.
   body, is strictly larger than the same denial alone, pinning that the
   verdict does not bound the size; and the three unmeasured sites record
   the field ABSENT rather than zero — the protocol error, the
-  handshake-skip refusal, and the pre-dispatch gate, whose line is
+  out-of-contract refusal, and the pre-dispatch gate, whose line is
   asserted not to contain the key at all, so `Some(0)` and a dropped
   `skip_serializing_if` (a `null`) fail alike. On the export side the
   attribute is asserted present as an Int and absent when the record

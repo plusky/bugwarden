@@ -548,19 +548,33 @@ authenticated `initialize` request from outside the container.
 
 ### MCP protocol revisions
 
-bugwarden serves four revisions of the Model Context Protocol —
-`2024-11-05`, `2025-03-26`, `2025-06-18` and `2025-11-25` — and offers
-`2025-11-25` when a client asks for something outside that set. The list is
-pinned rather than inherited from the SDK, so a dependency bump cannot
+bugwarden serves five revisions of the Model Context Protocol —
+`2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25` and `2026-07-28` — and
+offers `2025-11-25` when a client asks for something outside that set. The
+list is pinned rather than inherited from the SDK, so a dependency bump cannot
 quietly widen or narrow what a deployment speaks. In the handshake the
 server names itself and its version — `bugwarden` and the release it was
 built from — never the SDK's.
 
-Every session must complete the `initialize` handshake. A request that
-declares a protocol revision in its own `_meta` instead of negotiating one is
-refused whatever revision it names — some such requests skip the handshake
-outright, and a server that answered those would be talking to a client it
-never greeted, with no audit record able to say who that was.
+Two lifecycles are served side by side, and a request is placed by the
+revision it declares in its own `_meta`:
+
+- **no declaration** — the ordinary case. The session negotiated its revision
+  through the `initialize` handshake, and the client is the one that
+  handshake named.
+- **`2026-07-28`, or a later revision this build serves** — the
+  handshake-free lifecycle that revision defines. The request carries its own
+  revision and capabilities, and over HTTP there is no session at all: no
+  `mcp-session-id`, and each request stands alone. It may also carry its own
+  `clientInfo`, which is what an audit record then names; a request that
+  declares none is served, and the record names nobody rather than guessing.
+- **anything else** — refused. Below `2026-07-28` because those revisions
+  negotiate through the handshake, so a per-request declaration mixes two
+  contracts and a server that answered it could be talking to a client it
+  never greeted with no way to say who that was. At or above it, because a
+  revision is served only if it is on the list above — being newer is not
+  enough, and a client naming one gets the served list back from the server
+  before it ever reaches this decision.
 
 The advertised capability set is tools only: bugwarden registers no MCP
 prompts and no MCP resources. `summarize_bug` is a tool that returns prompt
@@ -851,9 +865,11 @@ are byte-identical.
 
 One JSON object per line, schema version 2, in three kinds:
 
-- **`initialize`** — a client opened a session; carries the client's
+- **`initialize`** — a client sent an `initialize`; carries the client's
   self-declared name and version and the *negotiated* protocol revision.
-  Written unconditionally, with no knob to suppress it.
+  Written unconditionally, with no knob to suppress it. Usually that opened
+  a session; a `2026-07-28` `initialize` over HTTP does not, so that record
+  carries no session id.
 - **`tool_call`** — exactly one per tool invocation, including calls that
   were denied, refused, or aimed at a tool name that does not exist. The
   tool listing is deliberately not recorded. One per *attempt*, precisely:
@@ -868,8 +884,9 @@ One JSON object per line, schema version 2, in three kinds:
 Every record carries `v`, a millisecond-precision UTC `ts`, a per-process
 monotonic `seq` (the ordering authority — file order equals `seq` order),
 and a `session` naming the transport, the peer address over http, and the
-session id where the transport opened a session at all — a call refused on
-the handshake-free path opened none, and carries no id. A `tool_call` adds the client, the request (tool name, request
+session id where the transport opened a session at all — a call on the
+handshake-free path over HTTP opened none, served or refused, and carries no
+id; over stdio it keeps the process-scoped one. A `tool_call` adds the client, the request (tool name, request
 id, parameters), the `outcome` — class, duration and, when there was a
 result to measure, `response_bytes`: the serialized size of the content
 the server produced — the compact JSON of the result's content array,
@@ -939,8 +956,13 @@ identities. `client.principal` and `client.work_context` are the opposite,
 nothing self-declared may be promoted into either, and both are reserved —
 no verifier exists, so neither appears in a record this build writes.
 `session.id` is *server-minted*: records sharing one passed through a single
-transport session and join that session's `initialize` record, which proves
-grouping and says nothing about who was at the other end. Everything else
+transport session — and where that session began with a handshake, they join
+its `initialize` record. It proves grouping and says nothing about who was at
+the other end. The anchor is not promised: a 2026-07-28 stdio client may open
+with an ordinary request and never send `initialize`, leaving a whole
+session's records sharing an id nothing anchors. They are still truthful — the
+id is minted, not client-supplied, so an unanchored group cannot join the
+wrong session, it simply has nothing to join. Everything else
 that looks like an identifier — `trace`, `request.id`, `session.remote` — is
 a *correlation hint*, client-chosen or path-dependent: useful for joining
 records, evidence of nothing. The normative version of that list lives with
