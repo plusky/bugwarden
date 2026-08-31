@@ -2076,6 +2076,62 @@ wired, `server.rs` and `main.rs` are the reference.
   `ToolRouter::map` and `ToolRoute::attr` are public fields of
   `#[non_exhaustive]` structs; an rmcp upgrade that reshapes either breaks
   the build loudly rather than silently skipping the pass.
+- **rmcp trap — `x-mcp-header` is ours to author, never theirs to enable.**
+  SEP-2243's `x-mcp-header` is a schema ANNOTATION, not a server switch. The
+  CLIENT transport reads it off a served tool's `input_schema` and promotes
+  the named parameter into an `Mcp-Param-*` header
+  (`transport/streamable_http_client.rs`); the server then cross-checks that
+  header against the body before any handler runs, `tower.rs` →
+  `validate_standard_headers` → `mcp_headers::validate_request_headers` →
+  `param_header_annotations`. There is nothing to switch off: the annotation
+  only exists if bugwarden writes the key into its own schemas, so "never
+  enable it" reduces to "never author it". This is I10's mirror — I10 stops a
+  request header reaching a result; an annotation here would let a tool
+  ARGUMENT reach the transport layer — and both sit under the general rule
+  recorded above: no `_meta` key and no `Mcp-*` header may carry a security
+  decision. `no_served_tool_authors_an_x_mcp_header_annotation` (server.rs)
+  makes that structural: a substring assertion over every serialized `Tool`,
+  from the unpruned `tool_router()` AND from a maximal built server re-read
+  through `get_tool`, with the two name sets bound equal so a tool added
+  behind a new knob cannot be skipped;
+  `the_x_mcp_header_tripwire_fires_at_every_planted_position` is its canary,
+  because a walk over zero annotations passes even when gutted. The check is
+  deliberately broader than rmcp's functional read, which in 3.1.4 is
+  top-level `properties`, string-valued only (`param_header_annotations`;
+  `validate_param_header_annotations` and `reject_nested_annotations` are the
+  client-side validation, and reject the key at ANY depth — but only down
+  chained `properties`, never through `items`, `$defs` or the other
+  applicators). Those depth rules are version-specific, so the key is banned
+  at any depth and any value type. There is no upstream constant for the
+  spelling — the test declares its own — so re-grep the vendored tree for
+  `x-mcp-header` on every rmcp bump.
+
+  **The #116 record, closed here rather than fixed.** `ServerHandler::get_tool`
+  is still `fn get_tool(&self, name: &str) -> Option<Tool>` in 3.1.4: no
+  `RequestContext`, so the schema cache `tower.rs` builds for `Mcp-Param-*`
+  validation answers per DEPLOYMENT — the I13-pruned instance router, pinned
+  by `get_tool_serves_the_pruned_instance_router_i13` — and never per
+  credential. The bearer gate fronts the whole router, so no `Mcp-Param-*`
+  validation runs for an unauthenticated request. What remains is a
+  validate-vs-skip oracle: a caller sending `Mcp-Param-*` headers could in
+  principle tell a name whose schema the cache found from one it did not, by
+  the validation those headers do or do not trigger. It cannot while zero
+  annotations are served — the validation loop iterates the annotated
+  properties, of which there are none, so the headers are inert either way —
+  which is what the tripwire above keeps true, and what
+  `a_stray_mcp_param_header_is_inert_on_the_per_request_path`
+  (http_transport_wiremock.rs) pins over real http: each leg byte-identical
+  to ITSELF with and without a stray header (the two legs differ from each
+  other — one is served, one refused). That test's EQUALITY oracles pin the
+  SDK, not this code — no bugwarden mutant is uniquely caught by them, and
+  their failure mode is an rmcp bump that starts rejecting or promoting
+  unannotated `Mcp-Param-*` headers. Its liveness and refusal-shape guards do
+  cross this repo: the served leg asserts the fixture summary as bugwarden
+  renders it, the refused leg an error shape and no upstream leg. No
+  read-scope variant is worth building — `get_tool` takes only a name, so the
+  vacuity is uniform across credentials by construction.
+  Accepted as a bounded leak (validate-vs-skip only, never bug data).
+  Revisit if `get_tool` ever grows a context parameter.
 - **Every `StreamableHttpServerConfig` field is accounted for below** — set by
   name or inherited for a stated reason. `BugWarden::http_server_config()`
   (server.rs) names two; main.rs adds a third at the call site. The struct is
