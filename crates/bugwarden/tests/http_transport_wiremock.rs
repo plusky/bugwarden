@@ -1771,13 +1771,29 @@ async fn a_per_request_call_cannot_reach_a_tool_the_deployment_pruned_i13() {
         "the read tool is served: {served}"
     );
 
+    // Count the delta, never match a path: both tools hit `/rest/bug` with no
+    // trailing segment, so the old `contains("/rest/bug/")` was vacuous (#193).
+    // A leak shows up as create_bug's refused-path padding classify
+    // (`GET /rest/bug?id=0`): drop that padding and only byte-identity still
+    // catches a prune regression.
+    let before = mock.received_requests().await.unwrap_or_default().len();
     let mut answers = Vec::new();
     for name in ["create_bug", "no_such_tool_at_all"] {
         let response = per_request_post(
             addr,
             None,
             "tools/call",
-            json!({ "name": name, "arguments": {} }),
+            // Schema-valid for `create_bug`, same literal for both names: with
+            // `{}` a leaked dispatch dies at parse and the count cannot move.
+            json!({
+                "name": name,
+                "arguments": {
+                    "product": "P",
+                    "component": "C",
+                    "summary": "S",
+                    "version": "V"
+                }
+            }),
             None,
         )
         .await;
@@ -1793,11 +1809,9 @@ async fn a_per_request_call_cannot_reach_a_tool_the_deployment_pruned_i13() {
         "and both must be REFUSED, not two identical successes: {:?}",
         answers[0]
     );
-    let upstream = mock.received_requests().await.unwrap_or_default();
-    assert!(
-        upstream
-            .iter()
-            .all(|r| !r.url.path().contains("/rest/bug/")),
+    assert_eq!(
+        mock.received_requests().await.unwrap_or_default().len(),
+        before,
         "no unrouted call may reach Bugzilla"
     );
 }
@@ -1842,13 +1856,15 @@ async fn a_per_request_denial_is_uniform_with_a_nonexistent_bug_i2() {
             None,
         )
         .await;
+        let status = response.status();
         let body = response.text().await.expect("a body");
         assert!(
             body.contains(&format!("Bug {id} is not accessible through this server")),
             "the uniform denial text, for bug {id}: {body}"
         );
-        // Only the id the caller already knows may differ.
-        answers.push(body.replace(&format!("Bug {id} "), "Bug _ "));
+        // Only the id the caller already knows may differ; status included so a
+        // status-only distinguisher cannot hide behind equal bodies.
+        answers.push((status, body.replace(&format!("Bug {id} "), "Bug _ ")));
     }
     assert_eq!(
         answers[0], answers[1],
