@@ -333,8 +333,10 @@ and the server says so loudly at startup.
 > that only implements the spec's `401` → resource-metadata → OAuth dance will
 > not authenticate; use one that lets you set a header. And the token
 > authenticates a *deployment*, not a caller: audit records carry no
-> `principal`, which stays [issue #32](https://github.com/plusky/bugwarden/issues/32)'s
-> job.
+> `principal` and no `work_context`. Both slots are reserved for a validator
+> that can prove *which* caller made a call and *what work* it was authorized
+> under, which stays
+> [issue #32](https://github.com/plusky/bugwarden/issues/32)'s job.
 
 #### Bugzilla credentials
 
@@ -847,22 +849,27 @@ are byte-identical.
 
 ### Records
 
-One JSON object per line, schema version 1, in three kinds:
+One JSON object per line, schema version 2, in three kinds:
 
 - **`initialize`** — a client opened a session; carries the client's
   self-declared name and version and the *negotiated* protocol revision.
   Written unconditionally, with no knob to suppress it.
 - **`tool_call`** — exactly one per tool invocation, including calls that
   were denied, refused, or aimed at a tool name that does not exist. The
-  tool listing is deliberately not recorded.
+  tool listing is deliberately not recorded. One per *attempt*, precisely:
+  a client that loses a response and re-issues the call produces a second
+  record under a new request id, and two records is the true account — the
+  re-issued call did its upstream work again, so collapsing them would
+  under-report real Bugzilla writes.
 - **`audit_gap`** — records were lost; carries how many and whether the
   cause was a write or a rotation error. The gap is reported in the stream
   itself, so silent loss is impossible to miss.
 
 Every record carries `v`, a millisecond-precision UTC `ts`, a per-process
 monotonic `seq` (the ordering authority — file order equals `seq` order),
-and a `session` naming the transport, the session id and, over http, the
-peer address. A `tool_call` adds the client, the request (tool name, request
+and a `session` naming the transport, the peer address over http, and the
+session id where the transport opened a session at all — a call refused on
+the handshake-free path opened none, and carries no id. A `tool_call` adds the client, the request (tool name, request
 id, parameters), the `outcome` — class, duration and, when there was a
 result to measure, `response_bytes`: the serialized size of the content
 the server produced — the compact JSON of the result's content array,
@@ -886,7 +893,8 @@ tools that consult the guard — a `guard` object:
 | `verdict` | `served`, `served_filtered`, `denied` or `refused`; the worst verdict of the call wins |
 | `rule` | What decided a per-bug assessment. Alongside the policy's own rule names the guard reports its own: `default` when no rule matched — a default-decided call records that literal, never an absent field — `min_bug_age_days` for the age quarantine, `<name>:unreadable-metadata` for a *granting* rule whose verdict hinged on metadata that could not be read (an undecidable deny rule keeps its plain name, having denied for its own reason), `unavailable` for a bug the classification fetch could not reach. A policy naming one of its own rules `default` — or any of the others — is a startup error, so this field says what decided *and* what kind of thing it was. Absent only where no single rule decided: a refusal, the pre-dispatch gate, a search, either arm of the create gate, an id the guard could not assess, a withheld attachment, and a serve that a rule-less note — a suppression, a guard redaction, a search scan that dropped rows — *upgraded* to `served_filtered`, since the worst verdict wins and none of those was any one rule's doing. Only an upgrade clears it: a rule-less note recorded alongside a verdict already that severe leaves the rule standing, which is why `bug_info`'s `summary_view` record still names its rule. A *client-requested* window (the three `*_window` names under `redacted_fields`) never touches the rule at all, upgrade or not, because the client asking for fewer lines decided nothing. A tool removed from the router (read-only mode, `disabled_tools`, discovery off) records no `guard` object at all |
 | `policy_hash` | `sha256:` over the raw policy file bytes, so a record says which policy text judged the call. Absent when no policy file is loaded |
-| `suppressed_count` | How much the response withheld, in total: bug ids on a search or a multi-bug read, plus the private comments and attachment metadata the private-content gate removed. The two never overlap — a call reads its bug ids off the content that survived filtering — so the field is their sum, and it is the authoritative number: never infer a count from the id list, which names bugs only and can be switched off entirely. Two ids under a count of five means three withheld items had no bug id of their own |
+| `suppressed_ids_count` | How many withheld items had a bug id of their own: rows a search dropped, and bug ids scrubbed out of what was served — a hidden `depends_on`, `see_also` or duplicate-marker reference — so a single-bug `bug_comments` or `summarize_bug` call can carry them too. Counted from the guard's own id set *before* the `suppressed_ids` switch can elide the list, so it survives that switch — never infer it from the id list, which may be empty while this is not |
+| `suppressed_other_count` | How many withheld items had no bug id: the private comments and attachment metadata the private-content gate removed, counted but never named. Disjoint from the count above — a call reads its bug ids off the content that survived filtering, so nothing is in both — and no total is recorded, because a stored total beside its own parts can disagree with them. Add them yourself if you want one |
 | `suppressed_ids` | The withheld bug ids, subject to the `suppressed_ids` switch |
 | `redacted_fields` | Names of what a response dropped, never values, of two kinds: what the guard redacted — `summary_view` for a bug served through the redacted summary view — and what the client's own `head`/`tail`/length params cut, `comments_window`, `history_window` and `attachment_window`, present only when the window actually cut something. Only the first kind is a guard decision, which is why the second leaves `rule` standing |
 | `scan` | Present on every served search, carrying how many rows the window scanned and how many it dropped, so `dropped: 0` is a statement and not an omission; absent on a search that failed and on tools that scan nothing. The counts are recorded whatever the `suppressed_ids` switch says: counts are not ids |
@@ -922,6 +930,22 @@ so a fifty-row answer costs a second page to learn there is no more, and
 the link-disclosure classify after it is issued even with no links to
 disclose (skipping it would price "no links" below "links, all hidden").
 
+Not every field in a record is worth the same, and the difference is a
+property of the field rather than of the value it happens to hold.
+`client.name` and `client.version` are *self-declared* — whatever the client
+said about itself, verified by nothing, so they are labels and never
+identities. `client.principal` and `client.work_context` are the opposite,
+*server-verified*: only a validator this server trusts may ever fill them,
+nothing self-declared may be promoted into either, and both are reserved —
+no verifier exists, so neither appears in a record this build writes.
+`session.id` is *server-minted*: records sharing one passed through a single
+transport session and join that session's `initialize` record, which proves
+grouping and says nothing about who was at the other end. Everything else
+that looks like an identifier — `trace`, `request.id`, `session.remote` — is
+a *correlation hint*, client-chosen or path-dependent: useful for joining
+records, evidence of nothing. The normative version of that list lives with
+the schema, in the module documentation of `crates/bugwarden/src/audit.rs`.
+
 ### What can never appear in a record
 
 The schema is closed — fixed structs, fixed vocabularies — and it has no
@@ -938,12 +962,21 @@ parameter — `comment`, `summary`, `description`, `url`, `whiteboard`,
 presence and size but never its content.
 
 ```json
-{"v":1,"ts":"2026-02-03T04:05:06.789Z","seq":7,"session":{"id":"sess-1","transport":"http","remote":"192.0.2.7:52611"},"event":"tool_call","client":{"name":"example-agent","version":"1.4.2"},"request":{"tool":"bugs_quicksearch","id":"3","params":{"limit":50,"offset":0,"query":"kernel panic","status":"ALL"}},"guard":{"verdict":"served_filtered","policy_hash":"sha256:58013baa090cf77630373ab50cc5eaf2d679ec5a06e8a336600fc89b23bb8604","suppressed_count":2,"suppressed_ids":[1290040,1290041],"redacted_fields":[],"scan":{"scanned":50,"dropped":2}},"upstream":{"requests":3,"status":200,"latency_ms":48},"outcome":{"class":"ok","duration_ms":52,"response_bytes":6218}}
+{"v":2,"ts":"2026-02-03T04:05:06.789Z","seq":7,"session":{"id":"sess-1","transport":"http","remote":"192.0.2.7:52611"},"event":"tool_call","client":{"name":"example-agent","version":"1.4.2"},"request":{"tool":"bugs_quicksearch","id":"3","params":{"limit":50,"offset":0,"query":"kernel panic","status":"ALL"}},"guard":{"verdict":"served_filtered","policy_hash":"sha256:58013baa090cf77630373ab50cc5eaf2d679ec5a06e8a336600fc89b23bb8604","suppressed_ids_count":2,"suppressed_other_count":0,"suppressed_ids":[1290040,1290041],"redacted_fields":[],"scan":{"scanned":50,"dropped":2}},"upstream":{"requests":3,"status":200,"latency_ms":48},"outcome":{"class":"ok","duration_ms":52,"response_bytes":6218}}
 ```
 
 A reader of the file should skip empty lines and tolerate at most one
 unparsable line per outage: a failed write can leave a partial line, and the
 stream heals itself on the next successful record.
+
+Version 2 broke one line shape, deliberately. A `tool_call` written by a
+pre-2 bugwarden carries `guard.suppressed_count`, the single field the two
+counts above replaced, and a version 2 reader rejects that line rather than
+invent a split for a number that cannot be split after the fact. Nothing
+else broke: older `initialize`, `audit_gap` and guard-less `tool_call` lines
+still parse. Records are never rewritten, so a file spanning an upgrade
+holds both versions and every line keeps the `v` it was written with — split
+on that field before assuming what a field name means.
 
 ### OpenTelemetry export
 

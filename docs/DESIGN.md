@@ -850,8 +850,9 @@ units and container specs). Decisions, all deliberate:
 Key custody above answers "who authenticates to Bugzilla". This answers the
 other half — who authenticates to bugwarden — for the http transport only.
 Partial delivery of issue #32, deliberately scoped: it authenticates a
-DEPLOYMENT, not a caller, so `ClientInfo.principal` stays `None` and #32 stays
-open until a verified caller identity fills it.
+DEPLOYMENT, not a caller, so `ClientInfo.principal` and
+`ClientInfo.work_context` both stay `None` and #32 stays open until a verified
+caller identity fills them.
 
 Over stdio the client launched the process and is its only principal. Over http
 the port was the whole access control, and under server-held key custody that
@@ -932,8 +933,11 @@ Decisions, all deliberate:
   once per process rather than per request.
 - **Refusals are logged, not audited.** Rejection happens in the layer, before
   `call_tool`, which is where audit records are written — so #32's "refusals
-  must be recorded" cannot be met by the audit stream without a new event kind,
-  and the schema's event set is #34's to decide. What lands instead is a
+  must be recorded" cannot be met by the audit stream without a new event kind.
+  #34 has since decided that: schema v2's growth rule allows a new record kind
+  WITHIN a version — same compatibility profile as an optional field, and a
+  consumer filtering `event == "tool_call"` is untouched — so adding one would
+  not force a v3, and the choice is a design one rather than a schema one. What lands instead is a
   counter logged on the first refusal and then at every power of two: bounded,
   so an unauthenticated client cannot drive log volume, and carrying no token,
   header, path or peer, so it is no oracle. A read-scope caller's refused write
@@ -1156,8 +1160,9 @@ Decisions, all deliberate:
   The record is accepted by every configured sink before the response is
   returned (the file write is synchronous; the OTLP hand-off only queues).
   `initialize` is always recorded, with no configuration knob to turn it
-  off; `list_tools` is not recorded in schema v1 — no event kind exists
-  for a listing, deliberately.
+  off; `list_tools` is not recorded in schema v2 — no event kind exists
+  for a listing, deliberately, and the growth rule would permit adding one
+  without a version bump.
 - **Boundary.** Records go to the sinks the operator named
   (`select_sinks`): the JSONL file (0600, parent 0700), an OTLP
   collector, both, or neither. Never stderr, never any MCP surface. When
@@ -1209,9 +1214,13 @@ Decisions, all deliberate:
   unrelated calls with an id an operator is pivoting on — so they are
   correlation hints, never evidence; attribution rests on the record's
   session and client anchoring, not on `trace`. `tracestate` and `baggage`
-  are deliberately not stored: the schema has no field for either,
-  `tracestate` is client free text, and `baggage` is unbounded client
-  key/values — revisit under #34.
+  are deliberately not stored, and as of schema v2 that is DECIDED and
+  PERMANENT rather than pending (#34): skipped, not capped. The schema has
+  no field for either, `tracestate` is client free text and `baggage` is
+  unbounded client key/values, and a capped copy would still be a
+  client-writable free-text channel into an append-only operator file —
+  I15's no-secrets guarantee is structural, and a length limit does not
+  make it one. Reopening this needs a new argument, not a cap.
 - **Response size accounting (issue #145).** `outcome.response_bytes`
   carries the serialized size of the result's `content` array, so the
   operator stream can quantify a compression win — or a bloat
@@ -1225,12 +1234,17 @@ Decisions, all deliberate:
   refusal before building it and must not spend a serialization sizing a
   fixed text. "Not measured" and "measured as empty" are different facts
   and the reader must be able to tell them apart. Optional and
-  absent-when-unset, so the schema stays v1 (the #29 shape); pre-#145
-  lines are pinned as `GOLDEN_TOOL_CALL_PRE_RESPONSE_BYTES` and must keep
-  deserializing. Backward only: `deny_unknown_fields` means a reader built
-  before #145 REJECTS a post-#145 line outright, so "the schema stays v1"
-  buys old files new readers, not old readers new files — the issue's
-  "older readers ignore it" is wrong about this codebase's own parser.
+  absent-when-unset, so the schema stayed v1 (the #29 shape); pre-#145
+  lines were pinned as `GOLDEN_TOOL_CALL_PRE_RESPONSE_BYTES` and kept
+  deserializing. That promise HELD THROUGH v1 AND WAS REVOKED AT v2: the
+  `suppressed_count` split means a v2 reader rejects any v1 `tool_call`
+  line carrying a `guard` object, pre-#145 and post-#145 alike, so the
+  pinned constant and its test are gone and `GOLDEN_TOOL_CALL_V1` pins the
+  rejection instead ("Schema v2", below). Backward only, then and now:
+  `deny_unknown_fields` means a reader built before #145 REJECTS a
+  post-#145 line outright, so "the schema stays v1" bought old files new
+  readers, not old readers new files — the issue's "older readers ignore
+  it" is wrong about this codebase's own parser.
   THE ISSUE'S SAFETY PREMISE IS ALSO WRONG and the docs must not repeat
   it. It claims "denial responses have constant size by construction". They
   do not, on two counts. The uniform text interpolates the caller's id
@@ -1245,7 +1259,7 @@ Decisions, all deliberate:
   honest statement is the simple one: the field sizes whatever was served,
   and no verdict makes it constant. That is acceptable because it is a count and
   never a byte of content, because the stream already carries
-  `suppressed_count`, `scan` and the ids, and because it reaches no MCP
+  the two suppression counts, `scan` and the ids, and because it reaches no MCP
   surface (I15) — the response itself is byte-identical with the field on
   or off (I3). It is, though, the first payload-derived value in the
   stream, so a deployment shipping records to a lower-trust tier should
@@ -1294,8 +1308,11 @@ Decisions, all deliberate:
   than reporting an earlier request's status as the outcome; `latency_ms`
   sums each request from hand-off to the transport until its body has
   been read, because reading the body is time spent waiting on Bugzilla.
-  Optional and absent-when-unset, so the schema stays v1 and no golden
-  shape moves. Startup preflight runs outside any scope and is counted
+  Optional and absent-when-unset, so the schema stayed v1 and no golden
+  shape moved when the block arrived — a backward promise revoked at v2
+  with the other two ("Schema v2", below): a v1 `tool_call` line carrying
+  a `guard` object no longer parses, whether or not it also carried
+  `upstream`. Startup preflight runs outside any scope and is counted
   nowhere: it is not a tool call. Pinned at both levels: the core suite
   proves the scope counts only its own requests, that a refused connect
   is counted with `status` cleared to absent, and that `latency_ms`
@@ -1315,8 +1332,10 @@ Decisions, all deliberate:
   `{scanned: 0, dropped: 0}`, and a failed search records no scan (the
   error discards its partial accounting along with the window) — so on
   a served search, `dropped: 0` is a statement, not an omission;
-  records from before the field existed deserialize with no scan
-  (optional field, schema still v1). The dropped IDS ride the existing suppressed-ids machinery —
+  records from before the field existed deserialized with no scan
+  (optional field, schema still v1) — a promise that held through v1 and
+  was revoked at v2 along with the pre-#145 one, for the same reason
+  ("Schema v2", below). The dropped IDS ride the existing suppressed-ids machinery —
   unioned into `guard.suppressed_ids` under the same `suppressed_ids`
   config switch, no second knob — while the counts in `scan` are recorded
   regardless of that switch. DELIBERATE verdict change: a search whose
@@ -1383,20 +1402,29 @@ Decisions, all deliberate:
   Going forward the disambiguator is `redacted_fields` holding only
   `*_window` names. Same treatment as #68 below. A tool the router never
   carried (I13) is not any of this: it records no `guard` object.
-  Re-encoding a default decision AS absence would be a record-schema
-  change and is deferred to #34; schema v1 records `"default"`.
-- **What `guard.suppressed_count` totals (issue #68).** The cell keeps two
-  tallies: a `BTreeSet` of bug ids the guard withheld (`note_suppressed` —
+  Re-encoding a default decision AS absence was considered under #34 and
+  DECIDED AGAINST, permanently: absence already means "no single rule
+  decided" — the enumerated cases above — so the default-as-absence
+  encoding would load a second, incompatible meaning onto the same
+  silence, and no reader could separate them. Schema v2 records
+  `"default"`, and this is not deferred to any later version.
+- **The two suppression tallies (issue #68).** The cell keeps two tallies:
+  a `BTreeSet` of bug ids the guard withheld (`note_suppressed` —
   I14-scrubbed links, scrubbed duplicate markers, verdict-dropped search
   rows) and a plain counter of suppressed content that HAS no bug id
   (`note_suppressed_count` — private comments in `bug_comments` and
   `summarize_bug`, private attachment metadata in `list_attachments`).
-  `suppressed_count` is their SUM. It used to be their maximum, which is
-  not a count of anything: a `summarize_bug` call that dropped three
-  private comments while scrubbing two duplicate-marker ids recorded
-  `3` beside a two-element id list, under-reporting by two and still
-  validating. Summing is sound because the populations are disjoint by
-  construction — both comment sites derive their marker ids from the
+  **Schema v2 ships each as its own field**, `suppressed_ids_count` and
+  `suppressed_other_count`, and ships no total ("Schema v2", below).
+  `suppressed_ids_count` is taken from the id SET, before the
+  `suppressed_ids` config switch empties the emitted vector — deriving it
+  from that vector would zero it exactly where it is the only signal left.
+  v1 shipped their SUM in one `suppressed_count`, and before that their
+  maximum, which is not a count of anything: a `summarize_bug` call that
+  dropped three private comments while scrubbing two duplicate-marker ids
+  recorded `3` beside a two-element id list, under-reporting by two and
+  still validating. Both readings rest on the same property, which the
+  split does not retire: the populations are disjoint by construction — both comment sites derive their marker ids from the
   comments that SURVIVED the private filter, so a dropped comment can
   never also contribute an id, and the attachment site names no ids at
   all; within the id set itself a `BTreeSet` dedupes the overlap between
@@ -1410,12 +1438,15 @@ Decisions, all deliberate:
   This matters because I3 forbids telling the CLIENT anything was
   withheld, so the audit stream is the only place the fact surfaces, and
   `suppressed_ids` is gated behind the `suppressed_ids` config switch
-  while the count always ships — a maximum cannot be the authoritative
-  number the field claims to be.
-  ACCEPTED COST, deliberate: no field is added or removed and the wire
-  shape is unchanged, so this stays schema v1 — but parseable is not
-  comparable, and the change of MEANING inside v1 is undetectable from a
-  record. There is no discriminator: an event carries `v`, `ts`, `seq`
+  while the counts always ship — a maximum could not be the authoritative
+  number the field claimed to be.
+  The max→sum correction was an ACCEPTED COST inside v1: no field was
+  added or removed and the wire shape was unchanged, so it stayed schema
+  v1 — but parseable is not comparable, and that change of MEANING inside
+  v1 was undetectable from a record. That invisibility is precisely the
+  argument for making the distinction STRUCTURAL at v2, and the paragraph
+  below is now the history of a corpus, not a live hazard for new
+  records. There is no discriminator: an event carries `v`, `ts`, `seq`
   and `session` only, `initialize` records the CLIENT's version and never
   bugwarden's build, `policy_hash` is unchanged unless the operator
   edited policy, and `suppressed_count >= len(suppressed_ids)` holds
@@ -1434,10 +1465,98 @@ Decisions, all deliberate:
   already documented as authoritative — which a maximum never satisfied,
   making this a correction to the stated contract rather than a new one.
   The rule this relies on is that `v` tracks structure, not meaning; it
-  is now stated on `SCHEMA_VERSION` itself. Splitting the tallies into
-  two fields (`suppressed_ids_count` and `suppressed_other_count`) is the
-  cleaner end state, would have made the change self-announcing, and
-  stays with the v2 work in #34.
+  is stated on `SCHEMA_VERSION` itself. Splitting the tallies into two
+  fields was the cleaner end state all along, and it LANDED at schema v2
+  (#34): the split is self-announcing where the sum was silent, because a
+  v1 consumer reading `suppressed_count` now fails instead of quietly
+  reading a number that means something else.
+
+- **Schema v2 (issue #34).** `SCHEMA_VERSION = 2`. The number is a
+  compatibility commitment, so what a shipped version may still grow is
+  stated on `SCHEMA_VERSION` itself rather than argued per change.
+  - **The growth rule.** Within one version a record may gain an OPTIONAL
+    field that is absent when unset, AND the stream may gain a new RECORD
+    KIND. Neither MAY redefine a field already shipping — an optional
+    flag that changes what an existing field means is structurally
+    additive and still forbidden, being #68's invisible meaning-shift
+    again, and it moves the number. Past that the two are permitted
+    together because they break in one direction: new readers read old
+    files, old readers reject both alike (`deny_unknown_fields` for a
+    field, an unknown `event` tag for a kind), and a consumer selecting
+    `event == "tool_call"` is untouched by a kind it never asked for. Removing, renaming,
+    REORDERING or retyping a field moves the number — reordering included,
+    because serde_json emits declaration order, so the struct edit IS the
+    wire-order decision. Widening a CLOSED VOCABULARY (`GapReason`,
+    `Verdict`, …) moves it too and is not the additive case: an added
+    field or kind is something a reader can decline to look at, while a
+    new variant lands inside a field every reader of that kind already
+    reads. Recorded consequence: a new kind does not force a v3, so #32's
+    refusal record could be added without one.
+  - **What v2 changed, and nothing else.** `guard.suppressed_count` split
+    into `suppressed_ids_count` and `suppressed_other_count` (#68, above),
+    and `client.work_context` reserved beside `client.principal`. No
+    recording behaviour moved with it beyond the `into_guard_info`
+    projection: no cap on a recorded field, no new source for one, no new
+    kind implemented.
+  - **No total field.** The parts ship, the sum does not. A stored total
+    beside its own parts can desync, the total is addition a reader can
+    do, and losing the shared field NAME is what makes the break loud
+    rather than silent.
+  - **`principal` and `work_context` are CONTRACTS, not values.** Both are
+    documented by who may fill them — only a validator this server trusts,
+    never anything self-declared, including anything a request carries in
+    `_meta` — rather than as the `None` they hold, so authentication
+    arriving is a value change and not a v3 over a slot already reserved
+    for exactly it. They are two facts and one field cannot carry both:
+    WHO called, and WHAT WORK the call was authorized under.
+    `work_context` stays optional even once a verifier exists, because a
+    fleet-level agent belongs to no work item; its absence therefore reads
+    "reserved" today and "no work item" then, with the deployed build as
+    the boundary, exactly as #68's correction did inside v1. Its format is
+    deliberately unpinned — an RRID syntax written into the contract is
+    one #32's validator would owe.
+  - **Trust tiers are normative and live with the schema.** The table is
+    in `audit.rs`'s module rustdoc, versioned with the schema and covered
+    by the rustdoc gate. It rules on the fields that name a caller or
+    join records to one, not on the server's own account of what it did
+    (verdicts, counts, timings), which claims nothing about anybody; README carries a PROSE rendering and this file
+    records the decision, because three copies of one table is how they
+    drift. FOUR tiers, deliberately extending the three #34 asks for:
+    `session.id` fits none of them cleanly. This server mints it, so it is
+    not a client claim; it proves grouping and nothing about who was on
+    the other end, so it is not a verified identity; and a caller cannot
+    choose it (#180 stopped reading the `mcp-session-id` header), so it is
+    stronger than a correlation hint. Calling it any of the three would
+    have overstated or understated it.
+  - **The v1 corpus break, scoped exactly.** A v2 reader REJECTS every v1
+    `tool_call` line carrying a `guard` object: `deny_unknown_fields`
+    refuses `suppressed_count`. Accepted, and load-bearing — a reader that
+    took the line would have to invent a split for a number that cannot be
+    split after the fact. It rejects NOTHING ELSE: v1 `initialize`,
+    `audit_gap` and guard-less `tool_call` lines still parse, and parse
+    carrying `v: 1`, because the reader does not dispatch on `v`. So "v1
+    files are unreadable" is over-broad and "mostly compatible" is
+    under-broad; a consumer holding a mixed corpus must split on `v`
+    itself before assuming either version's semantics. Both halves are
+    tested, so widening the break is a deliberate edit.
+  - **Goldens across a bump.** Within a version the discipline is
+    unchanged: an added field updates the golden and pins the prior bytes
+    with a still-deserializes test, while an added kind has no prior
+    bytes to pin and simply gains a golden of its own. Across a bump it INVERTS — the
+    prior version's line stays pinned (`GOLDEN_TOOL_CALL_V1`) with a test
+    proving it is REJECTED, and v1's two pre-change constants and their
+    tests are deleted, their promise having expired with v1. New golden
+    bytes are derived BY HAND from the old ones BEFORE the structs change,
+    so a failure indicts the code; pasting serializer output into a golden
+    can only enshrine whatever the code does, bug included.
+  - **Retry duplicates: a documented property, no mechanism** (#34 §3(e)).
+    A client that loses a response and re-issues the call does so under a
+    new request id, and the re-issued call performs its upstream work
+    again — so two records is the true account of what reached Bugzilla.
+    Deduplicating would under-report real mutations, the one direction
+    this stream must not err in. Recorded on `RequestInfo::id`: records
+    are per-ATTEMPT, and `request.id` is a client-chosen correlation hint
+    and never an identity.
 - **Rule names the operator may not take (issue #84).** `Policy::validate`
   rejects a rule named `"default"`, `"min_bug_age_days"` or
   `"unavailable"`, a rule whose name ends in `":unreadable-metadata"`, a
@@ -1481,8 +1600,12 @@ Decisions, all deliberate:
   in the suffix and names are unique, so no generated
   `"<rule>:unreadable-metadata"` can ever equal a bare reserved name. The
   alternative, namespacing the synthetics in the record (a `rule_kind`
-  field, or a prefix), was rejected here: it is a record-schema change and
-  belongs to #34.
+  field, or a prefix), was carried to #34 and REJECTED there, permanently:
+  the SINGLE-SOURCED reservation above already disambiguates — the emit
+  sites and `RESERVED_RULE_NAMES` read the same constants, so no operator
+  name can collide with a synthetic one — and a second discriminator would
+  be a separate thing that can drift from the reservation it duplicates.
+  Schema v2 adds no `rule_kind`.
 
 ## OTLP export (crates/bugwarden/src/otel.rs)
 
@@ -2392,11 +2515,11 @@ wired, `server.rs` and `main.rs` are the reference.
   verdict `served_filtered`, while the served envelope carries not a
   byte of accounting and is byte-identical to the same window over an
   upstream where the hidden rows do not exist; with `suppressed_ids =
-  false` the scan counts and `suppressed_count` survive while the ids
-  are elided; a clean search records `scan.dropped == 0` under verdict
-  `served`; and a pre-#29 record line without `guard.scan`
-  deserializes with the scan absent (plus the cell-level note_scan
-  merge tests and the updated schema golden in audit.rs); and that
+  false` the scan counts and `suppressed_ids_count` survive while the
+  ids are elided; a clean search records `scan.dropped == 0` under
+  verdict `served` (plus the cell-level note_scan merge tests and the
+  schema golden in audit.rs — the pre-#29 still-deserializes test is
+  gone with v1, replaced by the v2 pins below); and that
   grouping (issue #143) reshapes the envelope and nothing else — a
   grouped and a flat call over the same window record an EQUAL
   `GuardInfo` (same scan, verdict, suppressed ids, no new
@@ -2407,31 +2530,55 @@ wired, `server.rs` and `main.rs` are the reference.
   allow side alike, while a CLEAN search (no drops, so nothing the scan
   merge could have cleared) records no rule at all even though a named
   rule granted every row it served, since absence means "no single rule
-  decided" and not "the default decided"; and what `suppressed_count`
-  totals (issue #68) — `bug_comments` AND `summarize_bug`, each on a
-  call that drops three private comments while scrubbing two
-  duplicate-marker ids in the SAME request, record
-  `suppressed_count == 5` over a two-element `suppressed_ids`, so the
-  count exceeds the id list rather than being the larger tally, and with
-  `suppressed_ids = false` the same call still records `5` with no id at
-  all — the operator's only signal. One of those three private comments
-  is itself a duplicate marker naming a third hidden bug, so the fixture
-  DEFENDS the disjointness the sum rests on: harvesting marker ids from
-  the pre-filter comment list counts that one comment in both tallies
-  and records `6` over three ids, and both tools' tests fail on the
-  number (plus the cell-level sum tests in audit.rs); and the counter's
+  decided" and not "the default decided"; and schema v2
+  (issue #34) — the three record goldens pin the v2 bytes, so a
+  `SCHEMA_VERSION` revert, a serde rename or reorder, and (2 against 3 in
+  the `tool_call` fixture) a swap of the two split counters each change
+  them; `GOLDEN_TOOL_CALL_V1` is pinned as REJECTED with the rejection
+  asserted to name `suppressed_count`, so dropping `deny_unknown_fields`
+  or adding an `alias`/`default` that read a v1 line into a zeroed
+  `suppressed_other_count` fails; each of the three v1 line shapes the
+  break spares — a guard-less `tool_call`, an `initialize`, an
+  `audit_gap` — still parses and still reads `v == 1`, pinning the exact
+  scope so widening it takes a deliberate edit; neither `principal` nor
+  `work_context` appears as a KEY in a record whose slots are `None`, so
+  dropping either `skip_serializing_if` fails; and one record written
+  through `AuditSink::record` is asserted to start with the literal
+  `"v":2` — the goldens stamp `v` from a fixture, so that is the only
+  test reaching `write_event`'s stamp; and the two suppression tallies
+  (issue #68 at v2) — `bug_comments` AND `summarize_bug`, each on a call
+  that drops three private comments while scrubbing two duplicate-marker
+  ids in the SAME request, record `suppressed_ids_count == 2` and
+  `suppressed_other_count == 3` over a two-element `suppressed_ids`, with
+  the id list asserted equal to its OWN tally and to neither the other;
+  the two numbers are unequal on purpose, so a swap of the fields fails
+  where a single summed field structurally could not; and with
+  `suppressed_ids = false` the same call still records `2` and `3` with
+  no id at all — the id count is then the operator's only statement that
+  two bugs were withheld, which a count re-derived from the emptied
+  vector would have zeroed. One of those three private comments is itself
+  a duplicate marker naming a third hidden bug, so the fixture DEFENDS
+  the disjointness the two fields rest on: harvesting marker ids from the
+  pre-filter comment list counts that one comment in both tallies and
+  records `suppressed_ids_count == 3` over three ids, and both tools'
+  tests fail on the number (plus the cell-level split tests in audit.rs,
+  over a third asymmetric pair — one named id against three id-less
+  suppressions noted in two calls — so a tally swap and a last-note-wins
+  accumulator fail separately, and a second test pins that
+  `suppressed_ids_count` comes from the id SET and not from the vector
+  the config empties); and the counter's
   zero guard (issue #87) — a `bug_comments` call whose private filter
-  dropped nothing records verdict `served`, `suppressed_count == 0` and
+  dropped nothing records verdict `served`, both counts `0` and
   the rule that decided it, so deleting `note_suppressed_count`'s
   `n == 0` early return, which would merge `served_filtered` (rule-less,
   clearing the rule) on EVERY call of the three tools that feed the
   counter, fails on the verdict rather than on a count that stays `0`
   either way; and `list_attachments`, the id-less site whose guard fields
   no record assertion had reached (the one-record-per-call test calls the
-  tool but reads only its envelope), records a non-zero count over an
-  EMPTY `suppressed_ids` when the I5 gate drops private attachment
-  metadata, and `served` with a zero count over a listing of PUBLIC
-  attachments the gate kept — a real "nothing was withheld" rather than
+  tool but reads only its envelope), records `suppressed_other_count == 2`
+  over an EMPTY `suppressed_ids` with `suppressed_ids_count == 0` when
+  the I5 gate drops private attachment metadata, and `served` with both
+  counts zero over a listing of PUBLIC attachments the gate kept — a real "nothing was withheld" rather than
   an empty list's "nothing to withhold". Between them: deleting that
   counter call, counting the whole list rather than the drop, and adding
   any unconditional note beside it (a `note_redacted`, a rule-less
@@ -2444,7 +2591,7 @@ wired, `server.rs` and `main.rs` are the reference.
   `suppressed_ids` on every call, and `note_redacted` does the same over
   a `redacted_fields` naming a view the client was never put into. A
   `summarize_bug` call whose comments are all public and name one
-  DISCLOSABLE bug records verdict `served`, `suppressed_count == 0`, no
+  DISCLOSABLE bug records verdict `served`, both counts `0`, no
   id and the rule that decided it — pinning that tool's id-set guard and
   giving the counter's third call site the clean-call record #87 left it
   without; a `bug_info` call over a bug served whole whose only link the
@@ -2469,7 +2616,7 @@ wired, `server.rs` and `main.rs` are the reference.
   the cell directly or serialised a hand-built `GuardInfo`. A `restrict`
   rule granting `summary` alone now drives a real summary view through
   each tool, and both records name `summary_view`. Neither fixture
-  withholds anything else — `suppressed_count == 0`, no id, and for the
+  withholds anything else — both counts `0`, no id, and for the
   search `scan.dropped == 0` — so the projection is the only thing the
   `served_filtered` verdict can have come from; and a field outside
   `SUMMARY_FIELDS` (a whiteboard, an `assigned_to` from the tool's default projection)
@@ -2480,9 +2627,10 @@ wired, `server.rs` and `main.rs` are the reference.
   verdict too. The same blind spot elsewhere in the record: `request.id`
   and the handshake identity on a TOOL-CALL record had been read only off
   the hand-built schema fixtures, and are now asserted for every routed
-  tool. `client.principal` is asserted absent deliberately, because
-  nothing self-declared is ever promoted into it, and is pinned with a
-  value only over the hand-built golden. The `upstream` block was the
+  tool. `client.principal` and `client.work_context` are asserted
+  absent on every routed tool of that walk, because nothing self-declared
+  is ever promoted into either; both are pinned with a VALUE only over
+  the hand-built golden, where an example binds no contract. The `upstream` block was the
   same blind spot until #118 gave it a production caller; the router
   walk now measures `upstream.requests` for every tool against what
   wiremock independently served, so a count that ignores its input dies
@@ -2528,8 +2676,8 @@ wired, `server.rs` and `main.rs` are the reference.
   asserted not to contain the key at all, so `Some(0)` and a dropped
   `skip_serializing_if` (a `null`) fail alike. On the export side the
   attribute is asserted present as an Int and absent when the record
-  carries no size, and a pre-#145 line without `response_bytes`
-  deserializes with it `None` against the pinned pre-change golden.
+  carries no size. The pre-#145 still-deserializes test is gone with v1,
+  for the reason the pre-#29 one is ("Schema v2" under "Audit stream").
 - Identity tests (#[cfg(test)] in crates/bugwarden/src/server.rs and
   crates/bugwarden-core/src/client.rs; crates/bugwarden/tests/
   http_transport_wiremock.rs, crates/bugwarden/tests/binary_user_agent.rs
@@ -2574,7 +2722,8 @@ wired, `server.rs` and `main.rs` are the reference.
   POST from a stranger is answered `401` by the gate and `413` only for a
   credentialed caller, which is what the 413-observability argument under
   "rmcp 3.1 usage notes" rests on; a scope-refused call leaves exactly ONE
-  audit record, with no guard verdict, no upstream leg and no `principal`;
+  audit record, with no guard verdict, no upstream leg and neither
+  `principal` nor `work_context`;
   scopes
   enforced with NO scope on the request serves an empty listing and refuses
   every name, the fail-closed branch `main` cannot reach; the constant-time

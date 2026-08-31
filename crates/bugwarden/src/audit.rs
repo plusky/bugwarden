@@ -24,7 +24,7 @@
 //!
 //! # File format
 //!
-//! One JSON object per line (JSONL), schema version 1: see [`AuditEvent`]
+//! One JSON object per line (JSONL), schema version 2: see [`AuditEvent`]
 //! for the envelope and [`AuditEventKind`] for the record kinds. Records
 //! are append-only; [`AuditSink`] optionally rotates the file by size.
 //! A failed write can tear the stream: a failed `write(2)` may leave a
@@ -32,6 +32,34 @@
 //! record with a newline. After an outage the file may therefore contain
 //! one empty line and possibly one torn (unparsable) line — parsers must
 //! skip empty lines and may encounter at most one torn line per outage.
+//!
+//! # Trust tiers
+//!
+//! The fields that name a caller, or that let records be joined to one,
+//! come from four different places — and reading one at the wrong tier
+//! is how an audit trail misleads. The tier is a property of the FIELD,
+//! not of the value it happens to hold: a plausible-looking name is
+//! still self-declared.
+//!
+//! | Tier | Fields | What it is worth |
+//! |---|---|---|
+//! | Self-declared | `client.name`, `client.version` | Whatever the client said about itself. Never verified, by anything: a label, never an identity. |
+//! | Server-verified | `client.principal`, `client.work_context` | Only a validator this server trusts may mint one, and nothing self-declared may be promoted into either. Reserved: no verifier exists, so neither appears in a record THIS BUILD writes — a later build that can prove a caller fills them without moving `v`. |
+//! | Server-minted | `session.id` | Within one deployment's stream, proves that records sharing it passed through one transport session, and joins them to that session's `initialize`. Says nothing about WHO was on the other end. |
+//! | Correlation hint | `trace`, `request.id`, `session.remote` | Client-chosen or path-dependent — a `traceparent` any caller may stamp, an id the client picked, a peer address that is the last proxy's behind one. Useful for joining records; evidence of nothing. |
+//!
+//! This table is normative and versioned with the schema: a new field
+//! that names or correlates a caller belongs to one of these four tiers,
+//! and adding one without saying which is the omission that lets a
+//! reader promote a claim into a fact. The REST of a record — verdicts,
+//! rule names, counts, timings, the tool called — is the server's own
+//! account of what it did rather than a claim about anybody, so the
+//! tiering question does not arise for it. ONE EXCEPTION, and it is the
+//! case a future field is likeliest to hit: [`RequestInfo::params`] is
+//! verbatim CLIENT-authored content, not the server's account of
+//! anything, so a value read out of it is a correlation hint at best and
+//! never an identity — a grouping handle a client was given and handed
+//! back included.
 //!
 //! # What can never appear in a record
 //!
@@ -90,14 +118,85 @@ use sha2::{Digest as _, Sha256};
 
 /// The audit record schema version stamped into every event (`v`).
 ///
-/// It tracks the STRUCTURE a reader must handle — fields, their names,
-/// their types — and not the meaning of what those fields hold. A field
-/// whose definition is corrected without changing the wire shape keeps
-/// `v`, so a corpus at one version can span both readings and the
-/// deployed build, not this number, is the boundary between them (see
-/// `guard.suppressed_count` in DESIGN.md, issue #68). Re-encoding the
-/// stream so that meaning changes ARE visible is #34's business.
-pub const SCHEMA_VERSION: u32 = 1;
+/// It tracks the STRUCTURE a reader must handle — the fields, their
+/// names, their order and their types, and the record kinds — and not
+/// the meaning of what those fields hold. A field whose definition is
+/// corrected without changing the wire shape keeps `v`, so a corpus at
+/// one version can span both readings, with the deployed BUILD and not
+/// this number as the boundary between them. What that structure may
+/// still GROW inside a version is the rule below; the rest of it is
+/// frozen for the version's life.
+///
+/// # The growth rule
+///
+/// Within one version, two changes are allowed:
+///
+/// - adding an OPTIONAL field that is absent when unset;
+/// - adding a new RECORD KIND.
+///
+/// Neither MAY change how an existing field is read. That is a
+/// requirement of the rule, not an observation about it: an optional
+/// field that redefines a field already shipping — a hypothetical
+/// `guard.counts_are_floors`, absent when unset — is structurally
+/// additive and still forbidden, because it is #68's injury again, a
+/// meaning moving invisibly under an unchanged `v`. Such a change moves
+/// the number however optional it looks.
+///
+/// Past that the two differ, and the difference is not symmetric: a new
+/// KIND never reaches a consumer selecting on `event` — one filtering
+/// `event == "tool_call"` does not see it — while a new FIELD has no
+/// such escape and lands in the very records that consumer already
+/// selects. What they share is
+/// the direction of the break they can cause: `deny_unknown_fields`
+/// means a reader built BEFORE the addition rejects a line carrying it,
+/// so staying within a version buys old files new readers, never old
+/// readers new files. The goldens block in this module's tests pins the
+/// discipline that goes with it.
+///
+/// REMOVING, RENAMING, REORDERING or RETYPING a field moves this number.
+/// So a new kind is not a bump, and #32's refusal record — should it
+/// ever be recorded rather than logged — would not force one.
+///
+/// Widening a CLOSED VOCABULARY ([`GapReason`], [`Verdict`],
+/// [`OutcomeClass`], [`TransportKind`]) is NOT the additive case, and it
+/// does move the number. An added field or kind is something a reader
+/// can decline to look at; a new VARIANT lands inside a field every
+/// reader of that kind already reads, and there is nothing to decline.
+/// That missing escape is the difference, so a vocabulary change does
+/// not inherit the licence the other two have.
+///
+/// # What v2 changed
+///
+/// - `guard.suppressed_count` is GONE, split into
+///   [`GuardInfo::suppressed_ids_count`] and
+///   [`GuardInfo::suppressed_other_count`] (issue #68). No total ships:
+///   a total beside its own parts can disagree with them, and losing the
+///   shared field name is what makes the break loud rather than silent.
+/// - [`ClientInfo::work_context`] is reserved beside
+///   [`ClientInfo::principal`], and both are documented as CONTRACTS
+///   about who may fill them rather than as the `None` they hold today
+///   (issue #34).
+///
+/// v1 carried a correction the split supersedes: `suppressed_count`
+/// became the SUM of the two tallies where it had been their maximum,
+/// invisible on the wire and therefore undetectable from a record. That
+/// invisibility is precisely the argument for making the distinction
+/// structural now.
+///
+/// # The v1 break, and its exact scope
+///
+/// Deliberate, and load-bearing. A v2 reader REJECTS every v1
+/// `tool_call` line that carries a `guard` object:
+/// `deny_unknown_fields` refuses `suppressed_count`, and a reader that
+/// accepted it would have to invent a split for a number that cannot be
+/// split after the fact.
+///
+/// It rejects nothing else. v1 `initialize`, `audit_gap`, and
+/// guard-less `tool_call` lines still parse — and parse carrying
+/// `v: 1`, because this reader does not dispatch on `v`. A consumer
+/// holding a mixed corpus must therefore split on that field itself
+/// before assuming either version's semantics.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// How often a persistently failing sink repeats its `tracing` diagnostic.
 const FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
@@ -339,7 +438,7 @@ pub fn select_sinks(
 }
 
 // ---------------------------------------------------------------------------
-// Event schema (v1)
+// Event schema (v2)
 // ---------------------------------------------------------------------------
 
 /// One audit record: the envelope common to every kind.
@@ -354,7 +453,13 @@ pub fn select_sinks(
 /// structs are closed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditEvent {
-    /// Schema version; always [`SCHEMA_VERSION`].
+    /// Schema version. Write side: this build stamps [`SCHEMA_VERSION`]
+    /// into every record it produces. READ side is not the same claim —
+    /// the deserializer neither checks this field nor dispatches on it,
+    /// so a line off disk carries whatever version wrote it, and a v1
+    /// line outside the v2 break parses with `v: 1` intact (see
+    /// [`SCHEMA_VERSION`]). A consumer holding a mixed corpus must split
+    /// on this value before assuming either version's semantics.
     pub v: u32,
     /// Wall-clock record time, RFC 3339 UTC with millisecond precision.
     /// Stamped by the sink. `seq`, not `ts`, is the ordering authority —
@@ -461,12 +566,32 @@ pub enum GapReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionInfo {
-    /// Server-assigned session identifier, present when the transport
+    /// Server-MINTED session identifier, present when the transport
     /// actually opened a session: over http the id rmcp minted, over
     /// stdio the process itself. Never a client-supplied value — the
-    /// `mcp-session-id` request header is not read (#180) — so the
-    /// handshake-free stateless path, which opens no session, records
-    /// none.
+    /// `mcp-session-id` request header is not read (#180).
+    ///
+    /// What it GUARANTEES is grouping WITHIN ONE DEPLOYMENT'S STREAM:
+    /// records sharing an id passed through one transport session, and
+    /// that session's `initialize` record carries the same id, so a tool
+    /// record can be joined to the handshake that anchors it.
+    ///
+    /// That scope is load-bearing, not boilerplate. Over stdio the id is
+    /// `<pid>-<startup epoch seconds>`, unique on a host and not beyond
+    /// it, and no field of a record names the deployment that wrote it.
+    /// A collector merging several deployments must therefore key on the
+    /// exporter's `service.name` beside the id — and that name defaults
+    /// to the constant `bugwarden`, so an operator aggregating more than
+    /// one deployment has to set it.
+    ///
+    /// What it does NOT: it is not an identity. A session is a
+    /// connection, and nothing about who was on the other end of it
+    /// follows from the id. Nor does it exist on the handshake-free
+    /// per-request path, which opens no session — there the only
+    /// candidate is the `mcp-session-id` header, unvalidated client text
+    /// that any caller could stamp with a live session's id, and a
+    /// forgeable id is worse than none. Grouping there is
+    /// [`SessionInfo::remote`] plus nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// Which transport carried the session.
@@ -487,21 +612,68 @@ pub enum TransportKind {
 }
 
 /// The calling client's identity, as far as one exists.
+///
+/// Two opposite contracts in one struct. [`ClientInfo::name`] and
+/// [`ClientInfo::version`] are SELF-DECLARED — whatever the client said
+/// about itself, in the `initialize` handshake (the only source this
+/// build has) or, on a handshake-free revision, in the request's own
+/// `_meta`. The source does not change the trust level; neither value is
+/// ever verified against anything. [`ClientInfo::principal`] and
+/// [`ClientInfo::work_context`] are the other contract: SERVER-VERIFIED,
+/// absent until a verifier exists, and never filled from anything
+/// self-declared.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientInfo {
-    /// Client name from the `initialize` handshake. Self-declared and
-    /// therefore untrusted: treat it as a label, never as an identity.
+    /// Client name as the client declared it: the `initialize`
+    /// handshake, and per-request `_meta` on a handshake-free revision
+    /// should this build ever serve one — the same trust level either
+    /// way. Self-declared and therefore untrusted: treat it as a label,
+    /// never as an identity.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Client version from the `initialize` handshake. Untrusted, as
-    /// `name` is.
+    /// Client version, from the same source and at the same trust level
+    /// as [`ClientInfo::name`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// Reserved for a future authenticated identity. Always `None` for
-    /// now; nothing self-declared may ever be promoted into it.
+    /// SERVER-VERIFIED caller identity: who called, as this deployment
+    /// PROVED it — not who the caller says it is.
+    ///
+    /// Reserved. No verifier exists, so this field is absent from every
+    /// record THIS BUILD writes — which is a statement about the build,
+    /// not about the version: the slot is reserved precisely so that a
+    /// build which can prove a caller starts filling it without moving
+    /// `v`. Only a validator this server trusts may ever mint a value
+    /// here — the per-caller credential direction in issue #32 — and
+    /// nothing self-declared may be promoted into it, not
+    /// [`ClientInfo::name`] and not anything a request carries in
+    /// `_meta`. The deployment-wide bearer token does not qualify
+    /// either: it authenticates a deployment, not a caller.
+    ///
+    /// Not the same fact as [`ClientInfo::work_context`] — this one is
+    /// WHO.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
+    /// SERVER-VERIFIED work item the call was authorized under: a
+    /// maintenance-update identifier, a ticket, whatever a deployment's
+    /// validator binds its credential to. The format is deliberately not
+    /// pinned here — a syntax written into this contract is one issue
+    /// #32's validator would owe.
+    ///
+    /// Reserved, under [`ClientInfo::principal`]'s rule: only a trusted
+    /// validator may fill it, nothing self-declared may be promoted into
+    /// it, and it is absent from every record this build writes — again a
+    /// statement about the build, since filling it is a value change and
+    /// not a version change.
+    ///
+    /// Optional even once verification exists — a fleet-level agent
+    /// belongs to no work item. So absence carries two readings across
+    /// the life of v2: "no verifier yet" while this remains reserved,
+    /// "this caller belongs to no work item" once one ships. Like #68's
+    /// correction inside v1, the boundary is the deployed BUILD and not
+    /// `v`, which tracks structure and not meaning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_context: Option<String>,
 }
 
 /// W3C-style trace correlation ids, when the transport carried any.
@@ -584,6 +756,17 @@ pub struct RequestInfo {
     /// MCP tool name.
     pub tool: String,
     /// JSON-RPC request id, when the transport exposes one.
+    ///
+    /// CLIENT-chosen, so a correlation hint and never an identity:
+    /// nothing stops two callers picking the same id, or one caller
+    /// reusing one.
+    ///
+    /// Records are per-ATTEMPT, not per intended call. A client that
+    /// loses a response and re-issues the call does so under a new id,
+    /// and the re-issued call performs its upstream work again — so two
+    /// records is the true account of what reached Bugzilla.
+    /// Deduplicating them would under-report real mutations, the one
+    /// direction this stream must not err in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// CLIENT-authored request parameters, passed through an allowlist
@@ -644,10 +827,12 @@ pub struct GuardInfo {
     /// nothing, so they keep the granting rule
     /// ([`AuditCell::note_redacted_client_window`]).
     ///
-    /// Recording `"default"` rather than absence is deliberate — absence
-    /// could not also express "no single rule decided". Schema v1 encodes
-    /// it this way; the decision is recorded in DESIGN.md under "Audit
-    /// stream", and #34 tracks the schema change.
+    /// Recording `"default"` rather than absence is deliberate, and as
+    /// of schema v2 it is DECIDED rather than deferred (issue #67):
+    /// absence already means "no single rule decided" — the enumerated
+    /// cases above — so encoding the default as absence would load a
+    /// second meaning onto it that no reader could separate from the
+    /// first. Recorded in DESIGN.md under "Audit stream".
     ///
     /// [`Access`]: bugwarden_core::policy::Access
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -656,29 +841,37 @@ pub struct GuardInfo {
     /// the exact policy that produced it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_hash: Option<String>,
-    /// How much the guard withheld from the response, in total: the
-    /// withheld bug ids PLUS the suppressed content that carries no bug
-    /// id of its own — private comments and private attachment metadata
-    /// the I5 gate removed. Not a count of bugs, then, and not a count of
-    /// either tally alone.
+    /// How many withheld items had a bug id of their own: the size of
+    /// the id set behind [`GuardInfo::suppressed_ids`] — I14-scrubbed
+    /// links, scrubbed duplicate-marker ids, search rows the scan
+    /// dropped by verdict.
     ///
-    /// The two populations are disjoint by construction, so the sum can
-    /// never double-count. The two tools that feed BOTH tallies —
+    /// Counted from that set BEFORE [`AuditConfig::suppressed_ids`] can
+    /// elide the list, so it survives the switch: with ids off this is
+    /// the only surviving statement of how many bugs were withheld, and
+    /// it must never be re-derived from the emitted vector.
+    pub suppressed_ids_count: u64,
+    /// How many withheld items had NO bug id: private comments and
+    /// private attachment metadata the I5 gate removed — counted, never
+    /// named.
+    ///
+    /// Disjoint from [`GuardInfo::suppressed_ids_count`] by
+    /// construction. The two tools that feed BOTH tallies —
     /// `bug_comments` and `summarize_bug` — derive their duplicate-marker
     /// ids from the comments that SURVIVED the private filter, so a
     /// dropped comment contributes its id to nothing even when it carries
     /// one; `list_attachments`, the third id-less site, names no ids at
     /// all.
     ///
-    /// This count is authoritative — it is the only tally that always
-    /// ships. [`GuardInfo::suppressed_ids`] carries bug ids alone, and
-    /// may be elided entirely by [`AuditConfig::suppressed_ids`], so
-    /// consumers must never infer the count from the id list: two ids
-    /// under a count of five says three withheld items had no bug id, not
-    /// that the record contradicts itself.
-    pub suppressed_count: u64,
+    /// No total ships beside the two (schema v2, issue #68). Addition is
+    /// the reader's, and a stored total could disagree with its own
+    /// parts; the split also makes the difference between the two
+    /// populations legible, which the single summed field never was.
+    pub suppressed_other_count: u64,
     /// The removed bug ids. Left empty by the recording call sites when
-    /// [`AuditConfig::suppressed_ids`] is `false`.
+    /// [`AuditConfig::suppressed_ids`] is `false` — an empty vector then
+    /// says nothing at all about how many there were, which is what
+    /// [`GuardInfo::suppressed_ids_count`] is for.
     pub suppressed_ids: Vec<u64>,
     /// Names of what the response dropped (names only, never values), of
     /// two kinds: what the GUARD redacted from served bugs
@@ -708,7 +901,7 @@ pub struct ScanInfo {
     /// included, because each one was fetched and looked at.
     pub scanned: u64,
     /// Rows the scan dropped by verdict. Authoritative on its own, like
-    /// [`GuardInfo::suppressed_count`]: the dropped ids ride
+    /// [`GuardInfo::suppressed_ids_count`]: the dropped ids ride
     /// [`GuardInfo::suppressed_ids`] and may be elided by configuration,
     /// so consumers must never infer this count from that list.
     pub dropped: u64,
@@ -832,12 +1025,15 @@ pub enum AuditError {
 impl AuditError {
     fn gap_reason(&self) -> GapReason {
         match self {
-            // `Export` reports as a write error on purpose: schema v1's
-            // vocabulary has no spelling for a delivery failure, and
-            // adding one would fork every reader of a v1 corpus over a
-            // record whose shape is unchanged. The DIAGNOSTIC says which
-            // sink failed; the record says only that records were lost.
-            // #34 owns the v2 vocabulary.
+            // `Export` reports as a write error on purpose: `GapReason`
+            // has no spelling for a delivery failure, and v2 declined to
+            // add one. Widening a closed vocabulary is not the growth
+            // rule's additive case — every reader of `audit_gap` meets
+            // the new variant in a field it already reads, with no
+            // `event` filter to opt out of it — so it would cost a
+            // version bump for a record whose shape is unchanged. The
+            // DIAGNOSTIC says which sink failed; the record says only
+            // that records were lost.
             AuditError::Serialize(_) | AuditError::Write(_) | AuditError::Export => {
                 GapReason::WriteError
             }
@@ -1596,9 +1792,10 @@ impl AuditCell {
     /// verdict exactly as [`AuditCell::note_suppressed`] does.
     ///
     /// This tally and [`AuditCell::note_suppressed`]'s id set must stay
-    /// disjoint populations: [`GuardInfo::suppressed_count`] SUMS them,
-    /// so a call site that counted an item here and also named it there
-    /// would count it twice.
+    /// disjoint populations: they ship as two fields a reader ADDS
+    /// ([`GuardInfo::suppressed_other_count`] and
+    /// [`GuardInfo::suppressed_ids_count`]), so a call site that counted
+    /// an item here and also named it there would count it twice.
     pub fn note_suppressed_count(&self, n: u64) {
         if n == 0 {
             return;
@@ -1668,10 +1865,10 @@ impl AuditCell {
     /// Drain the cell into the record's [`GuardInfo`]. `None` when no
     /// verdict was ever noted — the tool performed no guard assessment.
     /// When `suppressed_ids_cfg` is `false` the ids are dropped and only
-    /// the count ships ([`AuditConfig::suppressed_ids`]). The count is
-    /// the id set PLUS the id-less counter (issue #68): the two are
-    /// disjoint populations, so their sum is the total withheld and
-    /// nothing is counted twice.
+    /// the counts ship ([`AuditConfig::suppressed_ids`]). The two tallies
+    /// are projected into their own fields (issue #68, schema v2), never
+    /// summed here: they are disjoint populations, and the reader adds
+    /// them if it wants a total.
     pub fn into_guard_info(
         &self,
         policy_hash: Option<&str>,
@@ -1679,13 +1876,16 @@ impl AuditCell {
     ) -> Option<GuardInfo> {
         let state = std::mem::take(&mut *self.lock());
         let verdict = state.verdict?;
-        let suppressed_count =
-            (state.suppressed_ids.len() as u64).saturating_add(state.suppressed_extra);
+        // From the SET, before the config elision below empties the
+        // emitted vector — deriving it from that vector would zero the
+        // count exactly where it is the only signal left.
+        let suppressed_ids_count = state.suppressed_ids.len() as u64;
         Some(GuardInfo {
             verdict,
             rule: state.rule,
             policy_hash: policy_hash.map(str::to_owned),
-            suppressed_count,
+            suppressed_ids_count,
+            suppressed_other_count: state.suppressed_extra,
             suppressed_ids: if suppressed_ids_cfg {
                 state.suppressed_ids.into_iter().collect()
             } else {
@@ -1723,13 +1923,17 @@ mod tests {
         }
     }
 
-    /// A `tool_call` with every schema field populated.
+    /// A `tool_call` with every schema field populated — the two
+    /// reserved identity slots included, which no record this build
+    /// writes carries. An example value does not bind their contract;
+    /// filling them here is what makes the goldens a shape test.
     fn sample_tool_call() -> AuditEventKind {
         AuditEventKind::ToolCall(Box::new(ToolCallEvent {
             client: ClientInfo {
                 name: Some("example-agent".into()),
                 version: Some("1.4.2".into()),
                 principal: Some("alice@example.org".into()),
+                work_context: Some("SUSE:Maintenance:12345:678901".into()),
             },
             trace: Some(TraceContext {
                 trace_id: "0af7651916cd43dd8448eb211c80319c".into(),
@@ -1747,7 +1951,10 @@ mod tests {
                 verdict: Verdict::ServedFiltered,
                 rule: Some("group-restricted".into()),
                 policy_hash: Some("2b6e8f5d1c9a4e70".into()),
-                suppressed_count: 2,
+                suppressed_ids_count: 2,
+                // Deliberately NOT equal to the ids count: a swap of the
+                // two fields must change the golden's bytes.
+                suppressed_other_count: 3,
                 suppressed_ids: vec![1290040, 1290041],
                 redacted_fields: vec!["cc".into(), "flags".into()],
                 scan: Some(ScanInfo {
@@ -1774,6 +1981,7 @@ mod tests {
                 name: Some("example-agent".into()),
                 version: Some("1.4.2".into()),
                 principal: None,
+                work_context: None,
             },
             protocol_version: Some("2025-06-18".into()),
         })
@@ -1844,18 +2052,46 @@ mod tests {
         }
     }
 
-    // ---------- schema goldens (v1 stability gate) ----------
+    // ---------- schema goldens (v2 stability gate) ----------
     //
     // These strings ARE the wire format. A failure here means the schema
     // changed; that requires a deliberate decision, not an updated
-    // constant. One shape of change stays within v1: adding a field that
-    // is optional and absent when unset (as `guard.scan` was, issue #29).
-    // Such a change updates the golden AND must pin the prior byte
-    // sequence as a GOLDEN_*_PRE_* constant with a test proving old lines
-    // still deserialize. Any other byte change — removing, renaming,
-    // reordering, or retyping a field — requires a version bump.
+    // constant. Never paste serializer output into one of these — that
+    // can only enshrine whatever the code does, bug included; derive the
+    // new bytes by hand from the old ones and let the test judge the
+    // code.
+    //
+    // WITHIN v2 one shape of change is allowed: adding a field that is
+    // optional and absent when unset, or adding a record kind (see
+    // `SCHEMA_VERSION`). An added FIELD updates the golden AND must pin
+    // the prior byte sequence as a GOLDEN_*_PRE_* constant with a test
+    // proving old lines still deserialize; an added KIND has no prior
+    // bytes to pin and simply gains a golden of its own. ACROSS a bump the discipline
+    // inverts: the prior version's line stays pinned — here
+    // `GOLDEN_TOOL_CALL_V1` — with a test proving the current reader
+    // REJECTS it. Removing, renaming, reordering or retyping a field is
+    // what forces that bump.
 
     const GOLDEN_TOOL_CALL: &str = concat!(
+        r#"{"v":2,"ts":"2026-02-03T04:05:06.789Z","seq":7,"#,
+        r#""session":{"id":"sess-1","transport":"http","remote":"192.0.2.7:52611"},"#,
+        r#""event":"tool_call","#,
+        r#""client":{"name":"example-agent","version":"1.4.2","principal":"alice@example.org","work_context":"SUSE:Maintenance:12345:678901"},"#,
+        r#""trace":{"trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331"},"#,
+        r#""request":{"tool":"bug_info","id":"3","params":{"id":1290042,"include_private":false}},"#,
+        r#""guard":{"verdict":"served_filtered","rule":"group-restricted","policy_hash":"2b6e8f5d1c9a4e70","#,
+        r#""suppressed_ids_count":2,"suppressed_other_count":3,"suppressed_ids":[1290040,1290041],"#,
+        r#""redacted_fields":["cc","flags"],"scan":{"scanned":200,"dropped":2}},"#,
+        r#""upstream":{"requests":1,"status":200,"latency_ms":48},"#,
+        r#""outcome":{"class":"ok","duration_ms":52,"response_bytes":1462}}"#,
+    );
+
+    /// The last `tool_call` byte sequence schema v1 produced, pinned so
+    /// the break at v2 is tested rather than assumed. A v2 reader must
+    /// REJECT it: `deny_unknown_fields` refuses `guard.suppressed_count`,
+    /// and there is no honest way to accept it — the field summed two
+    /// populations that cannot be separated after the fact.
+    const GOLDEN_TOOL_CALL_V1: &str = concat!(
         r#"{"v":1,"ts":"2026-02-03T04:05:06.789Z","seq":7,"#,
         r#""session":{"id":"sess-1","transport":"http","remote":"192.0.2.7:52611"},"#,
         r#""event":"tool_call","#,
@@ -1869,47 +2105,40 @@ mod tests {
         r#""outcome":{"class":"ok","duration_ms":52,"response_bytes":1462}}"#,
     );
 
-    /// [`GOLDEN_TOOL_CALL`] as records looked before `outcome.response_bytes`
-    /// existed (issue #145) — byte-identical to the golden before that field,
-    /// same additive-optional shape as the pre-#29 pin below.
-    const GOLDEN_TOOL_CALL_PRE_RESPONSE_BYTES: &str = concat!(
-        r#"{"v":1,"ts":"2026-02-03T04:05:06.789Z","seq":7,"#,
-        r#""session":{"id":"sess-1","transport":"http","remote":"192.0.2.7:52611"},"#,
-        r#""event":"tool_call","#,
-        r#""client":{"name":"example-agent","version":"1.4.2","principal":"alice@example.org"},"#,
-        r#""trace":{"trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331"},"#,
-        r#""request":{"tool":"bug_info","id":"3","params":{"id":1290042,"include_private":false}},"#,
-        r#""guard":{"verdict":"served_filtered","rule":"group-restricted","policy_hash":"2b6e8f5d1c9a4e70","#,
-        r#""suppressed_count":2,"suppressed_ids":[1290040,1290041],"redacted_fields":["cc","flags"],"#,
-        r#""scan":{"scanned":200,"dropped":2}},"#,
-        r#""upstream":{"requests":1,"status":200,"latency_ms":48},"#,
-        r#""outcome":{"class":"ok","duration_ms":52}}"#,
-    );
-
-    /// [`GOLDEN_TOOL_CALL`] as records looked before `guard.scan` existed
-    /// (issue #29). The field was added optional-and-absent-when-unset, so
-    /// lines from older files must keep deserializing — to a `None` scan.
-    const GOLDEN_TOOL_CALL_PRE_SCAN: &str = concat!(
-        r#"{"v":1,"ts":"2026-02-03T04:05:06.789Z","seq":7,"#,
-        r#""session":{"id":"sess-1","transport":"http","remote":"192.0.2.7:52611"},"#,
-        r#""event":"tool_call","#,
-        r#""client":{"name":"example-agent","version":"1.4.2","principal":"alice@example.org"},"#,
-        r#""trace":{"trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331"},"#,
-        r#""request":{"tool":"bug_info","id":"3","params":{"id":1290042,"include_private":false}},"#,
-        r#""guard":{"verdict":"served_filtered","rule":"group-restricted","policy_hash":"2b6e8f5d1c9a4e70","#,
-        r#""suppressed_count":2,"suppressed_ids":[1290040,1290041],"redacted_fields":["cc","flags"]},"#,
-        r#""upstream":{"requests":1,"status":200,"latency_ms":48},"#,
-        r#""outcome":{"class":"ok","duration_ms":52}}"#,
-    );
+    /// The v1 lines OUTSIDE the break: a `tool_call` from a tool that
+    /// consulted no guard (`bug_url`), and v1's `initialize` and
+    /// `audit_gap`, whose payloads v2 did not touch. None of them names a
+    /// field v2 removed, so all three still parse and still read `v: 1`.
+    /// That is the exact scope of the break, pinned here so widening it
+    /// takes a deliberate edit.
+    const V1_LINES_OUTSIDE_THE_BREAK: [&str; 3] = [
+        concat!(
+            r#"{"v":1,"ts":"2026-02-03T04:05:06.789Z","seq":7,"#,
+            r#""session":{"id":"sess-1","transport":"http","remote":"192.0.2.7:52611"},"#,
+            r#""event":"tool_call","#,
+            r#""client":{"name":"example-agent","version":"1.4.2"},"#,
+            r#""request":{"tool":"bug_url","id":"3","params":{"id":1290042}},"#,
+            r#""outcome":{"class":"ok","duration_ms":1}}"#,
+        ),
+        concat!(
+            r#"{"v":1,"ts":"2026-02-03T04:05:06.789Z","seq":1,"session":{"transport":"stdio"},"#,
+            r#""event":"initialize","client":{"name":"example-agent","version":"1.4.2"},"#,
+            r#""protocol_version":"2025-06-18"}"#,
+        ),
+        concat!(
+            r#"{"v":1,"ts":"2026-02-03T04:05:06.789Z","seq":9,"session":{"transport":"stdio"},"#,
+            r#""event":"audit_gap","dropped":3,"reason":"write_error"}"#,
+        ),
+    ];
 
     const GOLDEN_INITIALIZE: &str = concat!(
-        r#"{"v":1,"ts":"2026-02-03T04:05:06.789Z","seq":1,"session":{"transport":"stdio"},"#,
+        r#"{"v":2,"ts":"2026-02-03T04:05:06.789Z","seq":1,"session":{"transport":"stdio"},"#,
         r#""event":"initialize","client":{"name":"example-agent","version":"1.4.2"},"#,
         r#""protocol_version":"2025-06-18"}"#,
     );
 
     const GOLDEN_AUDIT_GAP: &str = concat!(
-        r#"{"v":1,"ts":"2026-02-03T04:05:06.789Z","seq":9,"session":{"transport":"stdio"},"#,
+        r#"{"v":2,"ts":"2026-02-03T04:05:06.789Z","seq":9,"session":{"transport":"stdio"},"#,
         r#""event":"audit_gap","dropped":3,"reason":"write_error"}"#,
     );
 
@@ -1932,31 +2161,80 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_line_without_response_bytes_still_deserializes() {
-        // A pre-#145 record has no `outcome.response_bytes` bytes at all;
-        // it must parse with the size simply unknown, not defaulted to 0 —
-        // "not measured" and "measured as empty" are different facts.
-        let event: AuditEvent = serde_json::from_str(GOLDEN_TOOL_CALL_PRE_RESPONSE_BYTES)
-            .expect("an old line must parse");
-        let AuditEventKind::ToolCall(tc) = &event.kind else {
-            panic!("expected a tool_call event");
-        };
-        assert_eq!(tc.outcome.response_bytes, None, "absent means unknown");
-        assert_eq!(tc.outcome.duration_ms, 52, "the rest is read unchanged");
+    fn v1_tool_call_with_a_guard_is_rejected() {
+        // The v2 break, tested rather than assumed: `suppressed_count` is
+        // not a field this reader knows, and `deny_unknown_fields` must
+        // refuse the line outright. Dropping that attribute, or adding an
+        // `alias`/`default` that let a v1 line in, would read it with
+        // `suppressed_other_count` silently zeroed — a wrong number where
+        // the old one was merely coarse.
+        let err = serde_json::from_str::<AuditEvent>(GOLDEN_TOOL_CALL_V1)
+            .expect_err("a v1 tool_call carrying a guard must not parse under v2");
+        assert!(
+            err.to_string().contains("suppressed_count"),
+            "the rejection must name the removed field: {err}"
+        );
     }
 
     #[test]
-    fn tool_call_line_without_scan_still_deserializes() {
-        // A pre-#29 record has no `guard.scan` bytes at all; it must parse
-        // into today's types with the scan simply absent.
-        let event: AuditEvent =
-            serde_json::from_str(GOLDEN_TOOL_CALL_PRE_SCAN).expect("an old line must parse");
-        let AuditEventKind::ToolCall(tc) = &event.kind else {
+    fn v1_lines_outside_the_break_still_parse_as_v1() {
+        // The scope of that break, pinned on every line the docs promise
+        // survives it: a v1 line naming no removed field still parses,
+        // and still reads `v: 1`. The reader does not dispatch on `v`, so
+        // a later "helpful" version check would widen the break past what
+        // the schema documents — this test makes that a deliberate edit.
+        let parsed: Vec<AuditEvent> = V1_LINES_OUTSIDE_THE_BREAK
+            .iter()
+            .map(|line| {
+                serde_json::from_str(line).unwrap_or_else(|e| {
+                    panic!("a v1 line outside the break stays readable: {line}: {e}")
+                })
+            })
+            .collect();
+        for event in &parsed {
+            assert_eq!(event.v, 1, "the version is read back, never rewritten");
+        }
+        let AuditEventKind::ToolCall(tc) = &parsed[0].kind else {
             panic!("expected a tool_call event");
         };
-        let guard = tc.guard.as_ref().expect("the old line carries a guard");
-        assert_eq!(guard.scan, None, "absent field means None, not an error");
-        assert_eq!(guard.suppressed_count, 2, "the rest is read unchanged");
+        assert_eq!(tc.guard, None, "the guard-less shape is what survives");
+        assert_eq!(tc.request.tool, "bug_url");
+        assert!(matches!(parsed[1].kind, AuditEventKind::Initialize(_)));
+        assert!(matches!(parsed[2].kind, AuditEventKind::AuditGap(_)));
+    }
+
+    #[test]
+    fn reserved_identity_slots_are_absent_when_none() {
+        // Both server-verified slots are `None` in every record this
+        // build writes, and neither may appear as a key. Dropping either
+        // `skip_serializing_if` would emit `"principal":null` /
+        // `"work_context":null` — a reader cannot tell a null reserved
+        // slot from a verified empty one.
+        let line = serde_json::to_string(&envelope(1, session_stdio(), sample_initialize()))
+            .expect("the fixture serializes");
+        for key in ["principal", "work_context"] {
+            assert!(
+                !line.contains(key),
+                "a reserved slot holding None must emit no key at all: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_written_line_carries_the_current_schema_version() {
+        // The goldens stamp `v` from the fixture; only `write_event`
+        // stamps it on a real record, so this is the one test that reaches
+        // that line. Asserted as the LITERAL bytes: comparing against
+        // `SCHEMA_VERSION` would pass under any value of it.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path().join("audit.jsonl"));
+        let sink = AuditSink::open(cfg.clone()).unwrap();
+        sink.record(sample_tool_call(), session_http()).unwrap();
+        let contents = std::fs::read_to_string(live_path(&cfg)).unwrap();
+        assert!(
+            contents.starts_with(r#"{"v":2,"#),
+            "a written record must be stamped v2: {contents}"
+        );
     }
 
     #[test]
@@ -2709,37 +2987,47 @@ mod tests {
         let info = cell.into_guard_info(Some("sha256:ab"), true).unwrap();
         assert_eq!(info.verdict, Verdict::ServedFiltered);
         assert_eq!(info.suppressed_ids, vec![1290040, 1290041]);
-        assert_eq!(info.suppressed_count, 2);
+        assert_eq!(info.suppressed_ids_count, 2);
+        assert_eq!(info.suppressed_other_count, 0);
         assert_eq!(info.policy_hash.as_deref(), Some("sha256:ab"));
     }
 
     #[test]
-    fn cell_suppressed_count_sums_ids_and_counter() {
-        // Issue #68: the two tallies are disjoint populations, so the
-        // count is their TOTAL — not the larger of them, which would
-        // silently under-report whenever both are non-empty.
+    fn cell_split_counters_report_their_own_populations() {
+        // Issue #68 at v2: each tally ships as itself. The two numbers
+        // are deliberately DIFFERENT, so swapping the fields fails here —
+        // which a single summed field structurally could not catch. The
+        // id-less notes also accumulate rather than last-note-wins.
         let cell = AuditCell::default();
         cell.note_suppressed([7]);
         cell.note_suppressed_count(2);
         cell.note_suppressed_count(1);
         let info = cell.into_guard_info(None, true).unwrap();
+        assert_eq!(info.suppressed_ids_count, 1, "one named id");
         assert_eq!(
-            info.suppressed_count, 4,
-            "one named id plus three id-less suppressions"
+            info.suppressed_other_count, 3,
+            "two id-less suppressions plus one more, added not replaced"
         );
         assert_eq!(info.suppressed_ids, vec![7]);
     }
 
     #[test]
-    fn cell_suppressed_ids_config_ships_the_count_only() {
+    fn cell_split_survives_the_ids_config() {
+        // With the ids elided the emitted vector is empty, so a count
+        // derived from IT would read zero — and the operator's only
+        // remaining signal that two bugs were withheld would vanish.
         let cell = AuditCell::default();
         cell.note_suppressed([40, 41]);
         cell.note_suppressed_count(3);
         let info = cell.into_guard_info(None, false).unwrap();
         assert!(info.suppressed_ids.is_empty(), "ids elided by config");
         assert_eq!(
-            info.suppressed_count, 5,
-            "the elided ids still count, and the id-less ones add to them"
+            info.suppressed_ids_count, 2,
+            "counted from the set, not from the vector the config emptied"
+        );
+        assert_eq!(
+            info.suppressed_other_count, 3,
+            "the id-less tally is untouched"
         );
     }
 
@@ -2887,7 +3175,8 @@ mod tests {
         cell.note_suppressed([12, 19]);
         let info = cell.into_guard_info(None, false).unwrap();
         assert!(info.suppressed_ids.is_empty(), "ids elided by config");
-        assert_eq!(info.suppressed_count, 2, "the count still ships");
+        assert_eq!(info.suppressed_ids_count, 2, "the count still ships");
+        assert_eq!(info.suppressed_other_count, 0);
         assert_eq!(
             info.scan,
             Some(ScanInfo {
