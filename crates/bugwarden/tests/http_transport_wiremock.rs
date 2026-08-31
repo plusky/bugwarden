@@ -695,6 +695,21 @@ async fn discover_names_this_build_and_reaches_nothing_else() {
         json!({ "name": "bugwarden", "version": env!("CARGO_PKG_VERSION") }),
         "discover must name this build, and nothing else: {body}"
     );
+    // rmcp's `DiscoverResult` hard-codes both SEP-2549 hints as non-Option
+    // fields, so this pre-2026 request carries them however `tools/list` is
+    // gated. Pinned because the gate's rationale is scoped to *this
+    // handler's listings* on the strength of it, and prose that overreached
+    // here is exactly what the sequence has been blocked on.
+    assert_eq!(
+        payload["result"]["ttlMs"],
+        json!(0),
+        "the SDK's discover serves ttlMs unconditionally: {body}"
+    );
+    assert_eq!(
+        payload["result"]["cacheScope"],
+        json!("private"),
+        "the SDK's discover serves cacheScope unconditionally: {body}"
+    );
     // It answers `get_info` and nothing else: no tool, no guard, no
     // upstream. That is what makes an unauthenticated pre-request surface
     // acceptable while #32 is open.
@@ -703,6 +718,45 @@ async fn discover_names_this_build_and_reaches_nothing_else() {
         upstream.is_empty(),
         "discover must contact no upstream: {} request(s)",
         upstream.len()
+    );
+}
+
+#[tokio::test]
+async fn a_legacy_session_listing_carries_no_cache_hints() {
+    // The regression guard for every client alive today, at the only place
+    // it is the real thing: the in-process rows serialize what the handler
+    // RETURNS, this reads what a client is actually handed once rmcp has
+    // post-processed the result. A gate inversion fails the in-process rows
+    // too — what is unique here is the wire, not the inversion. Substring
+    // assertions hold because no served schema, description or annotation
+    // spells either field; pin that if one ever does.
+    let mock = MockServer::start().await;
+    let file = key_file("srv-key\n");
+    let cli = http_cli(&mock, Some(file.path()));
+    let addr = serve_http(cli, "", &mock, None).await;
+
+    let session = raw_initialize(addr, "legacy-client").await;
+    let response = mcp_post(addr, Some(&session))
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .json(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }))
+        .send()
+        .await
+        .expect("the listing request must reach the server");
+    let body = response.text().await.expect("a body");
+
+    assert!(
+        body.contains("\"bug_info\""),
+        // A named tool, not the `"tools"` key: that key is present even
+        // for an empty listing or a scope that reaches nothing.
+        "the session must be served a real listing: {body}"
+    );
+    assert!(
+        !body.contains("ttlMs"),
+        "a legacy session must see no cache ttl: {body}"
+    );
+    assert!(
+        !body.contains("cacheScope"),
+        "a legacy session must see no cache scope: {body}"
     );
 }
 

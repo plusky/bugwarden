@@ -4280,24 +4280,26 @@ impl ServerHandler for BugWarden {
             Reach::ReadOnly => tools.retain(|tool| read_scope_serves(&tool.name)),
             Reach::Nothing => tools.clear(),
         }
+        // The SEP-2549 hints are ours to gate: rmcp 3.1.4 strips
+        // `resultType` for a legacy peer and leaves these two alone. The
+        // predicate is HAND-COPIED from its `sep_2322_supported` — no shared
+        // constant, no test pinning the agreement — so re-read both on an
+        // rmcp bump. `None`, meaning no request revision and no session, is
+        // legacy.
+        let serves_cache_hints = context
+            .protocol_version()
+            .is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str());
         Ok(ListToolsResult {
             tools,
             result_type: Some(ResultType::COMPLETE),
             meta: None,
             next_cursor: None,
-            // The 2026-07-28 cache hints stay absent, exactly as they
-            // were before this SDK had the fields: no revision this
-            // build serves defines them, and emitting them anyway would
-            // add fields to responses no peer asked for. When the
-            // revision is adopted, `cache_scope` is `Private` — the
-            // listing is pruned per deployment by policy and by
-            // read-only mode (I13), and per CREDENTIAL by the bearer
-            // scope above, so a shared cache must never serve one
-            // deployment's list to another, nor a write list to a read
-            // token. `CacheScope::default()` is `Public`; this field is
-            // always written by name.
-            ttl_ms: None,
-            cache_scope: None,
+            // `Private`/immediately stale because this listing is pruned
+            // per deployment (I13) and per credential (the bearer scope
+            // above), and `CacheScope::default()` is `Public`. Both
+            // fields stay written by name.
+            ttl_ms: serves_cache_hints.then_some(0),
+            cache_scope: serves_cache_hints.then_some(CacheScope::Private),
         })
     }
 
@@ -6596,6 +6598,110 @@ mod tests {
         let calls = tool_calls(&events);
         assert_eq!(calls.len(), 1, "exactly the direct call is recorded");
         assert_trace_is_canonical(calls[0].trace.as_ref());
+    }
+
+    #[tokio::test]
+    async fn a_2026_request_gets_private_immediately_stale_cache_hints() {
+        // The enabled half of the gate. Unreachable over any transport
+        // while `2026-07-28` is off `SUPPORTED_PROTOCOL_VERSIONS`: no
+        // request may declare it and no session may negotiate it. The
+        // enabler here is therefore the HAND-BUILT peer, not the direct
+        // call — `Service::handle_request` would dispatch this same context
+        // and serve the hints; it is bypassed only because routing through
+        // it would test rmcp rather than the gate.
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz).expect("server must build");
+        let peer = peer_of(&server).await;
+        peer.set_peer_info(
+            ClientInfo::default().with_protocol_version(ProtocolVersion::V_2026_07_28),
+        );
+        // Empty meta is mandatory: any `_meta` revision, 2026-07-28
+        // included, is refused by `skips_the_handshake` above the gate.
+        let context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer);
+        assert!(
+            context.meta.protocol_version().is_none(),
+            "the session's revision, not the request's, must open the gate here"
+        );
+
+        let listed = ServerHandler::list_tools(&server, None, context)
+            .await
+            .expect("a 2026 session lists tools");
+        // On the JSON, not the enum: the wire spelling is what a caching
+        // intermediary reads, and `CacheScope` renames lowercase.
+        let json = serde_json::to_value(&listed).expect("the listing must serialize");
+        assert_eq!(
+            json["cacheScope"],
+            json!("private"),
+            "a per-deployment, per-credential listing is never publicly cacheable"
+        );
+        assert_eq!(
+            json["ttlMs"],
+            json!(0),
+            "a memory-served listing is stale on arrival"
+        );
+        assert!(
+            !listed.tools.is_empty(),
+            "the hints must ride a real listing, not a refusal or an empty one"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_hints_stay_absent_below_2026_and_with_no_peer_info() {
+        // `skip_serializing_if` makes absence the only observable. The
+        // first row is every client alive today. The second is the `None`
+        // arm, which a production stdio session really can produce —
+        // rmcp's handshake-free lifecycle builds its peer with no info
+        // (`service/server.rs`) — but never at this line: that lifecycle
+        // mandates per-request `_meta`, so `protocol_version()` is `Some`
+        // and `skips_the_handshake` refuses the request above the gate.
+        // Pinned anyway: a handler with no revision to read must fail
+        // toward the legacy wire shape, never toward emission.
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz).expect("server must build");
+
+        let negotiated = peer_of(&server).await;
+        assert_eq!(
+            negotiated
+                .peer_info()
+                .expect("the duplex handshake stores peer info")
+                .protocol_version,
+            DEFAULT_PROTOCOL_VERSION,
+            "the negotiated row must actually be pre-2026"
+        );
+
+        // No handshake, so no peer info at all — the shape rmcp hands a
+        // handler when it cannot name the caller's revision.
+        let (client_io, _server_io) = tokio::io::duplex(1 << 16);
+        let running: RunningService<RoleServer, BugWarden> =
+            rmcp::service::serve_directly(server.clone(), client_io, None);
+        let bare = running.peer().clone();
+        assert!(
+            bare.peer_info().is_none(),
+            "the bare row must carry no revision at all"
+        );
+
+        for (row, peer) in [
+            ("negotiated 2025-11-25", negotiated),
+            ("no peer info", bare),
+        ] {
+            let context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer);
+            let listed = ServerHandler::list_tools(&server, None, context)
+                .await
+                .expect("a legacy listing is served, not refused");
+            let json = serde_json::to_value(&listed).expect("the listing must serialize");
+            assert!(
+                json.get("ttlMs").is_none(),
+                "{row}: ttlMs must be absent from the wire"
+            );
+            assert!(
+                json.get("cacheScope").is_none(),
+                "{row}: cacheScope must be absent from the wire"
+            );
+            assert!(
+                !listed.tools.is_empty(),
+                "{row}: absence must be read off a real listing"
+            );
+        }
     }
 
     #[tokio::test]
