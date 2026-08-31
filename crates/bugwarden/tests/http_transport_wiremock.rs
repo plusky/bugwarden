@@ -1855,3 +1855,101 @@ async fn a_per_request_denial_is_uniform_with_a_nonexistent_bug_i2() {
         "a policy-denied bug and a nonexistent one must be indistinguishable (I2)"
     );
 }
+
+/// One per-request `tools/call` POST for `tool`, optionally carrying a stray
+/// SEP-2243 `Mcp-Param-*` header, as `(status, body)`.
+///
+/// Inlined rather than widening [`per_request_post`]: exactly one caller
+/// wants the extra header, and no other test should grow a parameter for it.
+async fn per_request_call_with_canary(
+    addr: SocketAddr,
+    tool: &str,
+    canary: bool,
+) -> (reqwest::StatusCode, String) {
+    let mut builder = mcp_post(addr, None)
+        .header("MCP-Protocol-Version", PER_REQUEST_REVISION)
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", tool.to_owned());
+    if canary {
+        builder = builder.header("Mcp-Param-X-Bugwarden-Canary", "1");
+    }
+    let response = builder
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": tool,
+                "arguments": { "bug_ids": [7] },
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": PER_REQUEST_REVISION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("the per-request POST must reach the server");
+    let status = response.status();
+    (status, response.text().await.expect("a body"))
+}
+
+#[tokio::test]
+async fn a_stray_mcp_param_header_is_inert_on_the_per_request_path() {
+    // #116's validate-vs-skip oracle, pinned where adoption first makes it
+    // meaningful. rmcp's `validate_request_headers` iterates only the
+    // properties a served schema ANNOTATES with `x-mcp-header`; we author
+    // none — `no_served_tool_authors_an_x_mcp_header_annotation` in
+    // server.rs keeps it that way — so the loop has nothing to iterate and a
+    // stray `Mcp-Param-*` header changes NEITHER answer: each leg is
+    // byte-identical to itself with and without one, whether `get_tool`
+    // found the schema or not. (The two legs differ from each other, of
+    // course — one is served, one refused.) That per-leg invariance is what
+    // makes the missing `RequestContext` on `get_tool` a bounded leak rather
+    // than a live one.
+    //
+    // Honest caveat: the two EQUALITY oracles below pin the SDK, not our
+    // code — no bugwarden mutant is uniquely caught by them, and their
+    // failure mode is an rmcp bump that starts rejecting or promoting
+    // unannotated `Mcp-Param-*` headers, the same genre as
+    // `a_header_only_2026_declaration_is_refused_by_the_transport`. The
+    // liveness and refusal-shape guards around them do cross our code.
+    let mock = MockServer::start().await;
+    mount_bug_for_key(&mock, world_readable_bug(7), "srv-key").await;
+    let file = key_file("srv-key\n");
+    let cli = http_cli(&mock, Some(file.path()));
+    let addr = serve_http(cli, "", &mock, None).await;
+
+    // Schema found. Serving it is also the liveness guard: two identical
+    // refusals would prove nothing.
+    let plain = per_request_call_with_canary(addr, "bug_info", false).await;
+    let canaried = per_request_call_with_canary(addr, "bug_info", true).await;
+    assert!(
+        plain.1.contains("a plain bug"),
+        "the schema-found leg must really be served: {plain:?}"
+    );
+    assert_eq!(
+        plain, canaried,
+        "a stray Mcp-Param-* header must change nothing for a tool with a schema"
+    );
+
+    // Schema absent. Counting upstream requests rather than matching a path
+    // prefix: `bug_info` and `create_bug` both hit `/rest/bug` with no
+    // trailing segment, so a prefix match would pass vacuously.
+    let before = mock.received_requests().await.unwrap_or_default().len();
+    let missing = per_request_call_with_canary(addr, "no_such_tool_at_all", false).await;
+    let missing_canaried = per_request_call_with_canary(addr, "no_such_tool_at_all", true).await;
+    assert!(
+        missing.1.contains("\"error\""),
+        "the schema-absent leg must be refused, not served: {missing:?}"
+    );
+    assert_eq!(
+        missing, missing_canaried,
+        "a stray Mcp-Param-* header must change nothing for a tool without one"
+    );
+    assert_eq!(
+        mock.received_requests().await.unwrap_or_default().len(),
+        before,
+        "a refused call contacts no upstream, canary header or not"
+    );
+}

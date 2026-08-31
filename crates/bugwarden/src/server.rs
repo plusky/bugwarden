@@ -5519,6 +5519,162 @@ mod tests {
         }
     }
 
+    /// SEP-2243's schema annotation, byte-exact as rmcp 3.1.4 reads it —
+    /// `schema.get("x-mcp-header")` in `transport/common/mcp_headers.rs`
+    /// (`param_header_annotations`, `validate_param_header_annotations`,
+    /// `reject_nested_annotations`). Upstream exports no constant for the
+    /// spelling, so this is our own copy: re-grep the vendored tree on every
+    /// rmcp bump.
+    const X_MCP_HEADER: &str = "x-mcp-header";
+
+    /// The forbidden annotation anywhere in a serialized tool definition, as
+    /// `Some(reason)`.
+    ///
+    /// A substring check, not a structural walk: rmcp's read is a byte-exact
+    /// map `get`, serde_json emits map keys verbatim, and no character of
+    /// this key is ever escaped — so substring-absence proves key-absence at
+    /// EVERY depth (`properties`, `items`, `$defs`, output schema, prose)
+    /// with no recursion arms to keep in lockstep, which is the maintenance
+    /// surface `schema_portability_error` above has to carry.
+    ///
+    /// Deliberately broader than rmcp's functional read, which in 3.1.4 is
+    /// top-level `properties` and string-valued only: the key is banned
+    /// everywhere, at any value type, because upstream's depth rules are
+    /// version-specific. It will also trip on the substring appearing in a
+    /// description or a property name — accepted; a tripwire fails loud and
+    /// a human looks.
+    fn x_mcp_header_smell(name: &str, tool_json: &Value) -> Option<String> {
+        let serialized = tool_json.to_string();
+        serialized.contains(X_MCP_HEADER).then(|| {
+            format!("{name}: a served tool definition authors {X_MCP_HEADER}: {serialized}")
+        })
+    }
+
+    #[test]
+    fn no_served_tool_authors_an_x_mcp_header_annotation() {
+        // `x-mcp-header` is not a server switch. The client transport
+        // promotes an annotated tool parameter into an `Mcp-Param-*` header
+        // and the server cross-checks it, so nothing happens unless WE
+        // author the key in our own schemas: "never enable" reduces to
+        // "never author". #34 calls it I10's mirror — I10 stops a request
+        // header reaching a result; this would let a tool argument reach the
+        // transport layer.
+        //
+        // Two dynamic loops, no hardcoded tool list. The raw router is the
+        // unpruned superset every deployment prunes FROM and takes no
+        // config, so it is immune to the ambient environment; the built
+        // server is re-read through `get_tool`, the exact door rmcp's
+        // `Mcp-Param-*` validation opens (`tower.rs::tool_schema`), and is
+        // the only loop that would see an annotation injected at
+        // construction.
+        let mut unpruned = Vec::new();
+        for tool in BugWarden::tool_router().list_all() {
+            let json = serde_json::to_value(&tool).expect("a Tool serializes");
+            if let Some(err) = x_mcp_header_smell(&tool.name, &json) {
+                panic!("{err}");
+            }
+            unpruned.push(tool.name.to_string());
+        }
+
+        let (cfg, guard, bz) = parts("[global]\nallow_discovery = true\n");
+        let server = BugWarden::new(cfg, guard, bz).expect("server builds");
+        let mut served = Vec::new();
+        for tool in server.tool_router.list_all() {
+            let definition = server
+                .get_tool(&tool.name)
+                .unwrap_or_else(|| panic!("{}: a listed tool has a definition", tool.name));
+            for json in [
+                serde_json::to_value(&tool).expect("a Tool serializes"),
+                serde_json::to_value(&definition).expect("a Tool serializes"),
+            ] {
+                if let Some(err) = x_mcp_header_smell(&tool.name, &json) {
+                    panic!("{err}");
+                }
+            }
+            served.push(tool.name.to_string());
+        }
+
+        // `list_all` sorts by name, so these compare as sets. Binding them
+        // makes a tool added later behind a new opt-in knob break loudly
+        // instead of being skipped by the maximal build.
+        assert_eq!(
+            unpruned, served,
+            "the maximal deployment must serve the whole unpruned router"
+        );
+        // A floor, so an empty enumeration is not a silent pass.
+        for required in ["bug_info", "create_bug"] {
+            assert!(
+                served.iter().any(|name| name == required),
+                "{required} must be among the walked tools: {served:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_x_mcp_header_tripwire_fires_at_every_planted_position() {
+        // The canary for the walk above, mirroring
+        // `mirror_walk_rejects_a_dirty_node_under_every_new_draft_position`:
+        // with zero annotations served, a gutted or inverted check would
+        // pass that walk forever. rmcp's real read site, a depth its own
+        // nested-reject never reaches, a position `portable_schema` never
+        // visits, and prose — the last pinning the over-trip as deliberate.
+        let planted = [
+            (
+                "top-level properties (rmcp's own read site)",
+                json!({
+                    "inputSchema": {
+                        "properties": { "p": { "type": "string", "x-mcp-header": "X-Canary" } }
+                    }
+                }),
+            ),
+            (
+                "nested under items -> properties",
+                json!({
+                    "inputSchema": {
+                        "properties": {
+                            "p": {
+                                "type": "array",
+                                "items": {
+                                    "properties": {
+                                        "q": { "type": "string", "x-mcp-header": "X-Canary" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }),
+            ),
+            (
+                "$defs",
+                json!({
+                    "inputSchema": {
+                        "$defs": {
+                            "Nested": {
+                                "properties": {
+                                    "p": { "type": "string", "x-mcp-header": "X-Canary" }
+                                }
+                            }
+                        }
+                    }
+                }),
+            ),
+            (
+                "a description",
+                json!({ "description": "set x-mcp-header to promote this parameter" }),
+            ),
+        ];
+        let missed: Vec<_> = planted
+            .iter()
+            .filter(|(_, tool)| x_mcp_header_smell("planted", tool).is_none())
+            .map(|(label, _)| *label)
+            .collect();
+        assert!(
+            missed.is_empty(),
+            "the tripwire missed {}; a planted annotation was not rejected",
+            missed.join(", ")
+        );
+    }
+
     /// Non-portable node planted under each newly covered keyword. Live
     /// `#[tool]` structs do not emit these positions today (the only
     /// `additionalProperties` in served schemas is boolean `true`), so a
