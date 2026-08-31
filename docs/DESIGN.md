@@ -1845,7 +1845,28 @@ wired, `server.rs` and `main.rs` are the reference.
   The hand-written `initialize` tests the same list — the SDK negotiates
   again afterwards using the handler's answer as its fallback, so a handler
   that echoed an unsupported request would make the SDK echo it too — and
-  records the negotiated revision, never the requested one. `get_info` pins
+  records the negotiated revision, never the requested one. It also **stores**
+  the negotiated revision in `peer_info`, which is not the same statement:
+  in rmcp 3.1.4 that second negotiation runs only on the FIRST, handshake
+  `initialize` (`service/server.rs`; `NegotiatingStatelessHttpService` in
+  `tower.rs` for stateless http), while a second `initialize` mid-session
+  reaches this handler through `serve_inner` with no correction after it and
+  no re-init gate before it — so storing the request verbatim let a client
+  set its own session's `RequestContext::protocol_version()` to a revision
+  this build refuses, or to a string no revision has ever had
+  (`ProtocolVersion` deserializes unknown values through, and every rmcp
+  version comparison is lexical, so `"9999-01-01"` outranks all of them).
+  Both transports carried it, with different reach: stdio unrestricted,
+  while over http only a SUB-2026 fabrication rides a live session — it is
+  classified legacy and reaches the handler on that session's own stream —
+  because `2026-07-28` and above is routed statelessly and mints no session
+  to poison. So http could move a session's revision but never past the
+  2026-07-28 threshold every version-gated reader compares against.
+  The handler is gate-agnostic about this: if a future rmcp refuses or drops
+  a second `initialize`, it is simply never reached and stores nothing. Its
+  TEST is not — that test asserts the second `initialize` is answered, so a
+  bump gating re-init fails it loudly, and it should then be re-scoped or
+  retired rather than taught to accept a refusal. `get_info` pins
   `DEFAULT_PROTOCOL_VERSION` rather than inheriting `ProtocolVersion::default()`,
   which moves with the SDK.
 - **rmcp trap — `Implementation::from_build_env()` names the SDK, not this
