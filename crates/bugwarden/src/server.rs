@@ -3950,16 +3950,13 @@ impl ServerHandler for BugWarden {
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
-        // The default handler's peer bookkeeping, replicated: the
-        // handshake info is stored so later calls (and their audit
-        // records) can read it back through `peer_info`.
-        context.peer.set_peer_info(request.clone());
-        // Negotiate before recording: the record names the revision the
-        // session actually speaks, not the one the client asked for.
-        // Echo a requested revision this build serves, keep the server
-        // default otherwise — the same shape the SDK's own negotiation
-        // has, tested against `SUPPORTED_PROTOCOL_VERSIONS` rather than
-        // the wider set of revisions the SDK merely knows about.
+        // Negotiate before anything stores or records it: both the record
+        // and `peer_info` must name the revision the session SPEAKS, not
+        // the one the client asked for. Echo a requested revision this
+        // build serves, keep the server default otherwise — the same shape
+        // the SDK's own negotiation has, tested against
+        // `SUPPORTED_PROTOCOL_VERSIONS` rather than the wider set of
+        // revisions the SDK merely knows about.
         let mut info = self.get_info();
         if SUPPORTED_PROTOCOL_VERSIONS.contains(&request.protocol_version) {
             info.protocol_version = request.protocol_version.clone();
@@ -3970,6 +3967,19 @@ impl ServerHandler for BugWarden {
                 "client requested unsupported protocol version; falling back to server default"
             );
         }
+        // The default handler's peer bookkeeping, replicated — with the
+        // NEGOTIATED revision substituted. rmcp corrects `peer_info` to the
+        // negotiated value only on its own handshake path
+        // (`service/server.rs`, and `NegotiatingStatelessHttpService` for
+        // stateless http); a SECOND `initialize` mid-session reaches this
+        // handler through `serve_inner` with no correction behind it and no
+        // re-init gate in front of it. Storing the request verbatim let a
+        // stdio client raise its own session's `protocol_version()` to any
+        // string it liked — `ProtocolVersion` deserializes unknown values
+        // through — while the answer it was handed said otherwise.
+        let mut negotiated = request.clone();
+        negotiated.protocol_version = info.protocol_version.clone();
+        context.peer.set_peer_info(negotiated);
         if let Some(audit) = &self.audit {
             // Every session start is recorded, unconditionally — no
             // configuration knob: a stream that could omit session
@@ -6656,6 +6666,127 @@ mod tests {
             recorded,
             DEFAULT_PROTOCOL_VERSION.as_str(),
             "the record names the revision the session speaks, not the one requested"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_initialize_stores_only_what_the_server_answered() {
+        // rmcp corrects `peer_info` to the negotiated revision only on its
+        // own handshake path, and gates re-initialization nowhere: a second
+        // `initialize` lands in this handler through `serve_inner`, so
+        // whatever it stores is final. Storing the request verbatim let a
+        // client set its own session's `protocol_version()` — which the
+        // response shaping and, from #34 stage 2, per-request identity all
+        // read — to a revision this build refuses, or to a string no
+        // revision has ever had. The invariant is not that a second
+        // `initialize` cannot move the session (a supported one does, in
+        // the last row below): it is that it can only move it to what the
+        // server ANSWERED. Driven over a real duplex session because the
+        // defect is the SECOND request, not the handler in isolation.
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz).expect("server must build");
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let serving = server.clone();
+        let server_task = tokio::spawn(async move { serving.serve(server_io).await });
+        let client = ().serve(client_io).await.expect("the handshake must succeed");
+        // Held, not dropped: this is the live session's own peer, and it is
+        // the only way to read back what the handler stored.
+        let running = server_task
+            .await
+            .expect("serve task must not panic")
+            .expect("server must serve");
+        let stored = || {
+            running
+                .peer()
+                .peer_info()
+                .expect("the handshake stores peer info")
+                .protocol_version
+                .clone()
+        };
+        assert_eq!(
+            stored(),
+            DEFAULT_PROTOCOL_VERSION,
+            "the session starts here"
+        );
+
+        // "9999-01-01" is not a typo: `ProtocolVersion` deserializes an
+        // unknown string through, and every version comparison in rmcp is
+        // lexical, so a fabricated future date outranks every real
+        // revision. It must be refused by the same arm 2026-07-28 is.
+        for probe in ["2026-07-28", "9999-01-01"] {
+            let asked: ProtocolVersion =
+                serde_json::from_value(json!(probe)).expect("a wire revision parses");
+            let answered = client
+                .peer()
+                .send_request(ClientRequest::InitializeRequest(InitializeRequest::new(
+                    ClientInfo::default().with_protocol_version(asked),
+                )))
+                .await
+                .expect("a second initialize is answered, not dropped");
+            let ServerResult::InitializeResult(answered) = answered else {
+                panic!("initialize answers with an InitializeResult")
+            };
+            assert_eq!(
+                answered.protocol_version, DEFAULT_PROTOCOL_VERSION,
+                "{probe}: the answer must name the negotiated revision"
+            );
+            // The half that was wrong: the answer already said 2025-11-25
+            // while the stored value said otherwise, so no client-visible
+            // assertion could catch it.
+            assert_eq!(
+                stored(),
+                DEFAULT_PROTOCOL_VERSION,
+                "{probe}: the stored revision must be the negotiated one, not the requested one"
+            );
+        }
+
+        // The other direction, and the only place the store is observable
+        // at all: rmcp overwrites whatever this handler put there on the
+        // FIRST handshake, so every assertion above would also hold with no
+        // store at all. A second `initialize` naming a DIFFERENT supported
+        // revision legitimately moves the session — that is what
+        // `set_peer_info` is for — and the failure to catch here is the
+        // mirror of the one fixed: stored disagreeing with answered.
+        let answered = client
+            .peer()
+            .send_request(ClientRequest::InitializeRequest(InitializeRequest::new(
+                InitializeRequestParams::new(
+                    ClientCapabilities::default(),
+                    Implementation::new("renegotiating-client", "9.9"),
+                )
+                .with_protocol_version(ProtocolVersion::V_2024_11_05),
+            )))
+            .await
+            .expect("a supported renegotiation is answered");
+        let ServerResult::InitializeResult(answered) = answered else {
+            panic!("initialize answers with an InitializeResult")
+        };
+        assert_eq!(
+            answered.protocol_version,
+            ProtocolVersion::V_2024_11_05,
+            "a supported revision is echoed, so the session really does move"
+        );
+        assert_eq!(
+            stored(),
+            answered.protocol_version,
+            "the stored revision must equal the one the server answered"
+        );
+        let stored_client = running
+            .peer()
+            .peer_info()
+            .expect("the handshake stores peer info")
+            .client_info
+            .clone();
+        // The identity is re-declared wholesale, so it must follow — and it
+        // must not be the SDK's own build identity, which is what
+        // `Implementation::default()` is and what #34 §3(c) calls the
+        // plausible wrong value an audit trail can least afford.
+        assert_eq!(stored_client.name, "renegotiating-client");
+        assert_eq!(stored_client.version, "9.9");
+        assert_ne!(
+            stored_client.name,
+            Implementation::default().name,
+            "the stored client must never degrade to the SDK placeholder"
         );
     }
 
