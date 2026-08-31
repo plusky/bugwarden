@@ -1952,10 +1952,42 @@ wired, `server.rs` and `main.rs` are the reference.
   even when the caller innocently echoed one, because a forgeable id is worse
   than none (#34).
 - `list_tools` names every `ListToolsResult` field: `result_type` is
-  `COMPLETE`, and the 2026-07-28 cache hints stay absent while that revision
-  is unserved. When it is adopted, `cache_scope` is `Private` — the listing is
-  pruned per deployment (I13), so a shared cache must never serve one
-  deployment's list to another — and `CacheScope::default()` is `Public`.
+  `COMPLETE`, and the SEP-2549 cache hints are gated on the request's
+  revision. **rmcp trap — the only version-shaped edit the SDK makes to a
+  served result is stripping `resultType`.** In rmcp 3.1.4
+  `ServerResult::strip_result_type_for_legacy_peer` (`model.rs`) edits that
+  one field and nothing else; the same `handle_request` version-gates other
+  things (`InputRequiredResult`, the SEP-2164 error-code swap, ping and
+  subscribe availability), but it never touches `ttl_ms`/`cache_scope`, so
+  written unconditionally they would reach every pre-2026 peer. The gate is
+  ours: `RequestContext::protocol_version()` — the request's own `_meta`
+  revision, else the session's negotiated one, `None` when neither — at least
+  `2026-07-28`, and `None` fails toward the legacy wire shape rather than
+  toward emission. That expression is a hand-copy of the one rmcp 3.1.4
+  computes `sep_2322_supported` from (`handler/server.rs`): the two agree
+  today by inspection, share no constant, and no test pins the agreement.
+  Re-read both on every rmcp bump — if upstream's predicate moves, this build
+  will keep answering the old one and nothing will fail.
+  Served, the pair is `cache_scope: Private`, `ttl_ms: 0`: the listing is
+  pruned per deployment by policy and by `--read-only` (I13) **and** per
+  credential by the bearer scope, so a shared intermediary caching one
+  context's list and serving it to another is a policy leak — and
+  `CacheScope::default()` is `Public`. A listing served from memory has
+  nothing worth caching. The exact claim, which is about listings and not
+  about peers: **no `tools/list` response this handler constructs carries the
+  SEP-2549 pair unless the request's revision is at least 2026-07-28.** Not
+  about peers because in rmcp 3.1.4 `DiscoverResult` (`model.rs`) declares
+  `ttl_ms: u64` and `cache_scope: CacheScope` as non-`Option` fields with no
+  `skip_serializing_if`, hard-coded to `0`/`Private` by both constructors,
+  and this build keeps rmcp's default `server/discover` — so a legacy peer
+  naming 2025-11-25 gets the pair from *that* surface today, whatever
+  `tools/list` does. `2026-07-28` is off `SUPPORTED_PROTOCOL_VERSIONS`, so
+  the served branch is unreachable end to end — but only because
+  `initialize` stores the NEGOTIATED revision (above): while it stored the
+  requested one, a second `initialize` reopened this branch on a live stdio
+  session. It is therefore tested in-process against a hand-built
+  `RequestContext`; the legacy branch is live and tested over real
+  streamable HTTP.
 - **rmcp trap — `input_schema` is schemars' rendering, unfiltered by rmcp.**
   `SchemaSettings::draft2020_12()` (`handler/server/common.rs`) runs zero
   transforms, so whatever schemars 1.x emits for a `#[tool]` param struct is
