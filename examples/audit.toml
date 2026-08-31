@@ -12,7 +12,7 @@
 # export"); the stream is never exposed through any MCP surface, and it is
 # never mixed into the diagnostic stderr stream.
 #
-# Format: one JSON object per line (JSONL), schema version 1. Three record
+# Format: one JSON object per line (JSONL), schema version 2. Three record
 # kinds: `tool_call` (one MCP tool invocation, request through outcome,
 # with the guard's decision), `initialize` (a client opened a session),
 # and `audit_gap` (records were lost — see fail_mode below; the gap is
@@ -99,7 +99,9 @@ rotate_keep = 8
 
 # Whether records may name the bug ids the guard suppressed from a
 # response (`guard.suppressed_ids`). With `false`, records carry only the
-# count. The trade: the ids are precisely the hidden-bug numbers this
+# counts — `guard.suppressed_ids_count` still says how many bugs were
+# withheld, and `guard.suppressed_other_count` how many id-less items
+# were. The trade: the ids are precisely the hidden-bug numbers this
 # server exists to withhold from clients, so with `true` the audit file
 # is itself sensitive — anyone who can read it can enumerate hidden bugs.
 # Keep `true` (the default) when the file stays operator-only and you
@@ -107,6 +109,8 @@ rotate_keep = 8
 # when the stream is shipped into a broader log platform where readers
 # are less trusted than the operator. The ids the bugs_quicksearch
 # window scan dropped follow this same switch — there is no second knob
-# — while the scan's counts (`guard.scan.scanned` / `guard.scan.dropped`)
-# are always recorded: counts are not ids. Default: true.
+# — while every count (`guard.suppressed_ids_count`,
+# `guard.suppressed_other_count`, `guard.scan.scanned` /
+# `guard.scan.dropped`) is always recorded: counts are not ids.
+# Default: true.
 suppressed_ids = true

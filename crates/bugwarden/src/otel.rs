@@ -1584,6 +1584,7 @@ mod tests {
                 name: Some("agent".to_owned()),
                 version: None,
                 principal: None,
+                work_context: None,
             },
             trace,
             request: RequestInfo {
@@ -1595,7 +1596,8 @@ mod tests {
                 verdict: Verdict::Denied,
                 rule: Some("embargo".to_owned()),
                 policy_hash: None,
-                suppressed_count: 1,
+                suppressed_ids_count: 1,
+                suppressed_other_count: 0,
                 suppressed_ids: vec![7],
                 redacted_fields: Vec::new(),
                 scan: None,
@@ -1697,7 +1699,8 @@ mod tests {
                     client: ClientInfo {
                         name: None,
                         version: None,
-                        principal: None
+                        principal: None,
+                        work_context: None
                     },
                     protocol_version: None,
                 })),

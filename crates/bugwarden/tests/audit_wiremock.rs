@@ -400,6 +400,17 @@ async fn every_routed_tool_writes_exactly_one_record_per_call() {
             "version too: {:?}",
             tc.client
         );
+        assert_eq!(
+            (
+                tc.client.principal.as_deref(),
+                tc.client.work_context.as_deref()
+            ),
+            (None, None),
+            "and NEITHER server-verified slot on any routed tool: no verifier \
+             exists, and nothing self-declared may be promoted into one \
+             (#32, #34): {:?}",
+            tc.client
+        );
         // Issue #118, the same blind spot at the `upstream` block: it was
         // read only off the hand-built goldens. Measured against what
         // wiremock independently served, so a hardcoded count cannot pass
@@ -713,7 +724,11 @@ async fn suppressed_ids_reach_the_log_never_the_envelope() {
         "the audit record must carry the suppressed id: {:?}",
         guard.suppressed_ids
     );
-    assert!(guard.suppressed_count >= 1);
+    assert!(guard.suppressed_ids_count >= 1);
+    assert_eq!(
+        guard.suppressed_other_count, 0,
+        "a scrubbed link is an ID suppression and lands in no other tally: {guard:?}"
+    );
     assert_eq!(
         guard.policy_hash.as_deref(),
         Some("sha256:policy-under-test"),
@@ -762,9 +777,10 @@ async fn suppressed_ids_off_records_the_count_never_the_ids() {
     let guard = tc.guard.as_ref().expect("guard info recorded");
     assert_eq!(guard.verdict, Verdict::ServedFiltered);
     assert!(
-        guard.suppressed_count >= 1,
-        "the count survives the elision: {guard:?}"
+        guard.suppressed_ids_count >= 1,
+        "the id count survives the elision: {guard:?}"
     );
+    assert_eq!(guard.suppressed_other_count, 0);
     assert!(
         guard.suppressed_ids.is_empty(),
         "ids are elided when the knob is off: {:?}",
@@ -845,11 +861,12 @@ async fn mount_mixed_suppression(mock: &MockServer) {
 }
 
 #[tokio::test]
-async fn suppressed_count_totals_both_populations_in_one_call() {
-    // Issue #68: one call suppresses three id-less private comments AND
-    // two duplicate-marker bug ids. The count is the TOTAL — five — not
-    // the larger tally, which would report three beside a two-id list and
-    // silently lose two withheld items.
+async fn split_counters_report_both_populations_in_one_call() {
+    // Issue #68 at schema v2: one call suppresses three id-less private
+    // comments AND two duplicate-marker bug ids, and each population is
+    // reported as itself. THE SEPARATING FIXTURE — 3 and 2 are different
+    // numbers on purpose, so swapping the two fields fails here; a single
+    // summed field structurally could not catch that.
     let mock = MockServer::start().await;
     mount_mixed_suppression(&mock).await;
     let audited = audited_client_for(HIDE_SECRET_POLICY, &mock, "test-key").await;
@@ -881,21 +898,26 @@ async fn suppressed_count_totals_both_populations_in_one_call() {
          count that one comment in both tallies"
     );
     assert_eq!(
-        guard.suppressed_count, 5,
-        "three id-less comments plus two withheld ids: {guard:?}"
+        guard.suppressed_ids_count, 2,
+        "the two withheld ids, counted as themselves: {guard:?}"
     );
-    assert!(
-        guard.suppressed_ids.len() < guard.suppressed_count as usize,
-        "the count is authoritative and outruns the id list it may not be \
-         inferred from: {guard:?}"
+    assert_eq!(
+        guard.suppressed_other_count, 3,
+        "the three id-less private comments, counted as themselves: {guard:?}"
+    );
+    assert_eq!(
+        guard.suppressed_ids.len() as u64,
+        guard.suppressed_ids_count,
+        "the id list accounts for its own tally exactly, and for the other \
+         one not at all: {guard:?}"
     );
 }
 
 #[tokio::test]
-async fn summarize_bug_records_the_same_total_as_bug_comments() {
+async fn summarize_bug_records_the_same_split_as_bug_comments() {
     // summarize_bug filters and scrubs the same comments as bug_comments
     // and notes both tallies from its own call site (server.rs), so this
-    // diff changes the number it records too — it needs its own record,
+    // diff changes the numbers it records too — it needs its own record,
     // not bug_comments' by analogy.
     let mock = MockServer::start().await;
     mount_mixed_suppression(&mock).await;
@@ -926,17 +948,22 @@ async fn summarize_bug_records_the_same_total_as_bug_comments() {
         "the same two ids bug_comments names, and 668 no more than it does"
     );
     assert_eq!(
-        guard.suppressed_count, 5,
-        "three id-less comments plus two withheld ids: {guard:?}"
+        guard.suppressed_ids_count, 2,
+        "the same two ids, in the same field: {guard:?}"
+    );
+    assert_eq!(
+        guard.suppressed_other_count, 3,
+        "and the same three id-less comments: {guard:?}"
     );
 }
 
 #[tokio::test]
-async fn suppressed_count_totals_both_populations_with_the_ids_elided() {
+async fn split_counters_survive_the_ids_config() {
     // The same call under `suppressed_ids = false`, which is the case the
-    // issue calls out: with no id list at all, the count is the operator's
-    // ONLY signal that anything was withheld (I3 keeps it from the
-    // client), so it must still total both populations.
+    // issue calls out: with no id list at all the two counts are the
+    // operator's ONLY signal that anything was withheld (I3 keeps it from
+    // the client). `suppressed_ids_count` must therefore come from the id
+    // SET and not from the vector this switch empties.
     let mock = MockServer::start().await;
     mount_mixed_suppression(&mock).await;
     let audited = audited_client_with(HIDE_SECRET_POLICY, &mock, "test-key", false).await;
@@ -953,8 +980,13 @@ async fn suppressed_count_totals_both_populations_with_the_ids_elided() {
         guard.suppressed_ids
     );
     assert_eq!(
-        guard.suppressed_count, 5,
-        "the elided ids still count, and the id-less comments add to them: {guard:?}"
+        guard.suppressed_ids_count, 2,
+        "the elided ids still COUNT — this is the operator's only remaining \
+         statement that two bugs were withheld: {guard:?}"
+    );
+    assert_eq!(
+        guard.suppressed_other_count, 3,
+        "and the id-less tally is untouched by that switch: {guard:?}"
     );
 }
 
@@ -984,7 +1016,8 @@ async fn bug_comments_with_nothing_filtered_stays_served_and_counts_zero() {
         "the fixture's only comment is public and names no bug, so nothing \
          was withheld: {guard:?}"
     );
-    assert_eq!(guard.suppressed_count, 0);
+    assert_eq!(guard.suppressed_ids_count, 0);
+    assert_eq!(guard.suppressed_other_count, 0);
     assert!(guard.suppressed_ids.is_empty());
     assert_eq!(
         guard.rule.as_deref(),
@@ -1072,7 +1105,8 @@ async fn summarize_bug_with_nothing_filtered_stays_served_and_counts_zero() {
         "every comment is public and the only bug they name is disclosable, \
          so nothing was withheld: {guard:?}"
     );
-    assert_eq!(guard.suppressed_count, 0);
+    assert_eq!(guard.suppressed_ids_count, 0);
+    assert_eq!(guard.suppressed_other_count, 0);
     assert!(guard.suppressed_ids.is_empty());
     assert_eq!(
         guard.rule.as_deref(),
@@ -1113,7 +1147,8 @@ async fn bug_info_with_every_link_disclosable_stays_served_and_redacts_nothing()
         Verdict::Served,
         "bug 7 is served whole and its only link was disclosable: {guard:?}"
     );
-    assert_eq!(guard.suppressed_count, 0);
+    assert_eq!(guard.suppressed_ids_count, 0);
+    assert_eq!(guard.suppressed_other_count, 0);
     assert!(guard.suppressed_ids.is_empty());
     assert!(
         guard.redacted_fields.is_empty(),
@@ -1212,7 +1247,8 @@ async fn bug_history_windowing_records_the_omission_it_applied() {
          no rule decided the omission: {guard:?}"
     );
     assert_eq!(
-        guard.suppressed_count, 0,
+        (guard.suppressed_ids_count, guard.suppressed_other_count),
+        (0, 0),
         "nothing else was withheld, so the window is the ONLY thing the \
          filtered verdict can have come from: {guard:?}"
     );
@@ -1266,7 +1302,8 @@ async fn bug_history_window_that_omits_nothing_stays_silent() {
         "and the window note stays silent when nothing was omitted: {:?}",
         guard.redacted_fields
     );
-    assert_eq!(guard.suppressed_count, 0);
+    assert_eq!(guard.suppressed_ids_count, 0);
+    assert_eq!(guard.suppressed_other_count, 0);
     assert!(guard.suppressed_ids.is_empty());
 }
 
@@ -1349,7 +1386,8 @@ async fn bug_info_over_a_summary_view_records_the_redaction_it_applied() {
         "and the restrict rule that granted the summary decided the call"
     );
     assert_eq!(
-        guard.suppressed_count, 0,
+        (guard.suppressed_ids_count, guard.suppressed_other_count),
+        (0, 0),
         "nothing else was withheld, so the summary view is the ONLY thing \
          the filtered verdict can have come from: {guard:?}"
     );
@@ -1427,8 +1465,12 @@ async fn list_attachments_counts_the_private_metadata_it_dropped() {
     let guard = tc.guard.as_ref().expect("guard info recorded");
     assert_eq!(guard.verdict, Verdict::ServedFiltered);
     assert_eq!(
-        guard.suppressed_count, 2,
-        "both dropped attachments are counted: {guard:?}"
+        guard.suppressed_other_count, 2,
+        "both dropped attachments are counted, id-lessly: {guard:?}"
+    );
+    assert_eq!(
+        guard.suppressed_ids_count, 0,
+        "attachment metadata names no bug, so the id tally stays empty: {guard:?}"
     );
     assert!(
         guard.suppressed_ids.is_empty(),
@@ -1479,7 +1521,8 @@ async fn list_attachments_with_nothing_private_stays_served_and_counts_zero() {
         Verdict::Served,
         "a listing that withheld nothing is a clean serve: {guard:?}"
     );
-    assert_eq!(guard.suppressed_count, 0);
+    assert_eq!(guard.suppressed_ids_count, 0);
+    assert_eq!(guard.suppressed_other_count, 0);
     assert!(guard.suppressed_ids.is_empty());
     assert!(
         guard.redacted_fields.is_empty(),
@@ -1658,7 +1701,11 @@ async fn quicksearch_scan_accounting_reaches_the_record_never_the_envelope() {
         vec![2, 4],
         "the dropped ids ride the suppressed-ids machinery"
     );
-    assert_eq!(guard.suppressed_count, 2);
+    assert_eq!(guard.suppressed_ids_count, 2);
+    assert_eq!(
+        guard.suppressed_other_count, 0,
+        "a dropped search row carries its own id, so nothing lands id-less"
+    );
 }
 
 #[tokio::test]
@@ -1774,7 +1821,8 @@ async fn quicksearch_drop_count_survives_the_suppressed_ids_knob() {
     let scan = guard.scan.expect("a search records its scan");
     assert_eq!(scan.dropped, 1, "the count survives the elision");
     assert_eq!(scan.scanned, 3);
-    assert!(guard.suppressed_count >= 1, "so does suppressed_count");
+    assert!(guard.suppressed_ids_count >= 1, "so does the id count");
+    assert_eq!(guard.suppressed_other_count, 0);
     assert!(
         guard.suppressed_ids.is_empty(),
         "ids are elided when the knob is off: {:?}",
@@ -1804,7 +1852,8 @@ async fn quicksearch_clean_scan_records_zero_drops_and_stays_served() {
     );
     assert_eq!(guard.verdict, Verdict::Served, "a clean scan stays served");
     assert!(guard.suppressed_ids.is_empty());
-    assert_eq!(guard.suppressed_count, 0);
+    assert_eq!(guard.suppressed_ids_count, 0);
+    assert_eq!(guard.suppressed_other_count, 0);
 }
 
 #[tokio::test]
@@ -1868,7 +1917,8 @@ async fn quicksearch_over_summary_views_records_the_redaction_it_applied() {
         }),
         "and it is not the scan that filtered it — every row was kept"
     );
-    assert_eq!(guard.suppressed_count, 0);
+    assert_eq!(guard.suppressed_ids_count, 0);
+    assert_eq!(guard.suppressed_other_count, 0);
     assert!(guard.suppressed_ids.is_empty());
 }
 
@@ -2075,7 +2125,8 @@ async fn bug_comments_window_keeps_the_named_rule_that_granted_the_call() {
         Some("allow-openSUSE"),
         "the granting rule by name, so a fallback to `default` fails here: {guard:?}"
     );
-    assert_eq!(guard.suppressed_count, 0);
+    assert_eq!(guard.suppressed_ids_count, 0);
+    assert_eq!(guard.suppressed_other_count, 0);
 }
 
 #[tokio::test]
@@ -2108,9 +2159,10 @@ async fn bug_comments_window_beside_an_i5_suppression_records_no_rule() {
     assert_eq!(guard.redacted_fields, vec!["comments_window".to_string()]);
     assert_eq!(guard.verdict, Verdict::ServedFiltered);
     assert_eq!(
-        guard.suppressed_count, 1,
+        guard.suppressed_other_count, 1,
         "the private comment is counted, id-lessly: {guard:?}"
     );
+    assert_eq!(guard.suppressed_ids_count, 0);
     assert_eq!(
         guard.rule, None,
         "a GUARD suppression upgraded the verdict, so the rule goes with \

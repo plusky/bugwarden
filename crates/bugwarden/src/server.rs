@@ -349,14 +349,16 @@ fn allowlisted(params: Option<&JsonObject>) -> BTreeMap<String, Value> {
 }
 
 /// The calling client as it introduced itself in the handshake, for an
-/// audit record. Self-declared, therefore untrusted; `principal` stays
-/// `None` (reserved for a future authenticated identity).
+/// audit record. Self-declared, therefore untrusted; `principal` and
+/// `work_context` stay `None` — both are server-verified slots and this
+/// build has no verifier to fill either.
 fn client_of(ctx: &RequestContext<RoleServer>) -> audit::ClientInfo {
     let peer = ctx.peer.peer_info();
     audit::ClientInfo {
         name: peer.as_ref().map(|p| p.client_info.name.clone()),
         version: peer.as_ref().map(|p| p.client_info.version.clone()),
         principal: None,
+        work_context: None,
     }
 }
 
@@ -2574,7 +2576,8 @@ impl BugWarden {
                 // LOAD-BEARING: harvest from the FILTERED list, never the raw
                 // one. A dropped private comment is already counted id-less
                 // below; naming its marker id too would put one comment in
-                // both tallies, and guard.suppressed_count sums them (#68).
+                // both tallies, which the record ships as two disjoint
+                // fields for a reader to add (#68).
                 let named = Guard::duplicate_marker_ids(&filtered);
                 let disclosable = self
                     .guard
@@ -2742,8 +2745,8 @@ impl BugWarden {
             // and rows dropped by verdict. A dropping scan upgrades the
             // verdict to served_filtered inside note_scan; the dropped
             // ids ride the existing suppressed-ids machinery below —
-            // config gate, suppressed_count, and the BTreeSet union with
-            // the I14-scrubbed link ids (overlap dedupes, a feature).
+            // config gate, suppressed_ids_count, and the BTreeSet union
+            // with the I14-scrubbed link ids (overlap dedupes, a feature).
             cell.note_scan(u64::from(scanned), dropped.len() as u64);
             if !dropped.is_empty() {
                 cell.note_suppressed(dropped.iter().copied());
@@ -3901,8 +3904,8 @@ impl BugWarden {
         // scrubbed there just asks for a summary instead (I14).
         // LOAD-BEARING, as in bug_comments: `comments` is already the
         // FILTERED list here. Harvesting marker ids from the pre-filter one
-        // would count a dropped private comment in both tallies, and
-        // guard.suppressed_count sums them (#68).
+        // would count a dropped private comment in both tallies, which the
+        // record ships as two disjoint fields for a reader to add (#68).
         let named = Guard::duplicate_marker_ids(&comments);
         let disclosable = self
             .guard
@@ -3939,7 +3942,8 @@ impl BugWarden {
 // is load-bearing: the instance router has the write tools / disabled
 // tools removed (I13); the macro default, `Self::tool_router()`, would
 // rebuild an unpruned router. `list_tools` is not audited: no event kind
-// exists for a listing — deliberate for schema v1.
+// exists for a listing — deliberate, and schema v2's growth rule would let
+// one be added without a version bump.
 impl ServerHandler for BugWarden {
     async fn initialize(
         &self,
@@ -3975,6 +3979,7 @@ impl ServerHandler for BugWarden {
                     name: Some(request.client_info.name.clone()),
                     version: Some(request.client_info.version.clone()),
                     principal: None,
+                    work_context: None,
                 },
                 protocol_version: Some(info.protocol_version.as_str().to_string()),
             });
@@ -4024,6 +4029,7 @@ impl ServerHandler for BugWarden {
                         name: None,
                         version: None,
                         principal: None,
+                        work_context: None,
                     },
                     trace: None,
                     request: audit::RequestInfo {
@@ -4122,7 +4128,8 @@ impl ServerHandler for BugWarden {
                     verdict: Verdict::Refused,
                     rule: None,
                     policy_hash: audit.policy_hash.clone(),
-                    suppressed_count: 0,
+                    suppressed_ids_count: 0,
+                    suppressed_other_count: 0,
                     suppressed_ids: Vec::new(),
                     redacted_fields: Vec::new(),
                     // The guard never ran, so no window scan did either.
@@ -4250,7 +4257,7 @@ impl ServerHandler for BugWarden {
         // Refused on the same terms as a tool call: the listing is pruned
         // per deployment (I13), so answering one of these would disclose
         // which tools this policy removed. Unrecorded, as
-        // every listing is — schema v1 has no event kind for one.
+        // every listing is — the schema has no event kind for one.
         if skips_the_handshake(&context) {
             return Err(handshake_required());
         }
@@ -6259,6 +6266,10 @@ mod tests {
         assert_eq!(
             calls[0].client.principal, None,
             "a deployment credential is not a caller (#32)"
+        );
+        assert_eq!(
+            calls[0].client.work_context, None,
+            "and it binds the call to no work item either (#34)"
         );
     }
 
