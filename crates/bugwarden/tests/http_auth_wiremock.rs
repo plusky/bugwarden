@@ -169,8 +169,15 @@ async fn serve_guarded(mock: &MockServer, env: &HttpEnv, insecure: bool) -> Sock
         .await
         .expect("bind an ephemeral port");
     let addr = listener.local_addr().expect("bound address");
+    // `into_make_service_with_connect_info`, as main.rs serves it: a harness
+    // that drops it serves a listener no deployment runs, and every record
+    // it writes silently loses `session.remote`.
     tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
+        let _ = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
     });
     addr
 }
@@ -509,6 +516,140 @@ async fn a_read_scope_write_call_is_refused_as_unrouted_and_reaches_no_bugzilla(
         unknown.to_string(),
         "a write tool must look exactly like a tool that does not exist"
     );
+}
+
+// ---------- the handshake-free lifecycle behind the gate (#34) ----------
+
+/// The revision whose requests carry their own context instead of
+/// negotiating one.
+const PER_REQUEST_REVISION: &str = "2026-07-28";
+
+/// One raw 2026-07-28 per-request POST, presenting `token` when given.
+///
+/// Raw rather than an rmcp client because no rmcp client sends this shape
+/// with `ClientLifecycleMode::Initialize`, which is what `serve` uses.
+/// Every header is refused-before-any-handler load-bearing:
+/// `MCP-Protocol-Version` must equal the `_meta` revision, and SEP-2243
+/// makes `Mcp-Method` — plus `Mcp-Name` for a `tools/call` — mandatory once
+/// that header names 2026-07-28 or newer.
+async fn per_request_post(
+    addr: SocketAddr,
+    token: Option<&str>,
+    method: &str,
+    mut params: Value,
+) -> reqwest::Response {
+    params["_meta"] = json!({
+        "io.modelcontextprotocol/protocolVersion": PER_REQUEST_REVISION,
+        "io.modelcontextprotocol/clientCapabilities": {},
+    });
+    let mut builder = reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .header("ApiKey", "test-key")
+        .header("MCP-Protocol-Version", PER_REQUEST_REVISION)
+        .header("Mcp-Method", method.to_owned());
+    if let Some(name) = params.get("name").and_then(Value::as_str) {
+        builder = builder.header("Mcp-Name", name.to_owned());
+    }
+    if let Some(token) = token {
+        builder = builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    builder
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
+        .send()
+        .await
+        .expect("the server must answer")
+}
+
+#[tokio::test]
+async fn the_gate_and_its_scopes_cover_the_handshake_free_path() {
+    // The gate wraps the whole router, so it runs before rmcp decides which
+    // lifecycle a POST belongs to — and the scope split lives in the
+    // handler, which the handshake-free path reaches by a different route
+    // than a session does. Neither was pinned for a request that carries no
+    // handshake. Three rows, in the order a caller would try them:
+    // unauthenticated, read-scope write, read-scope listing.
+    let mock = MockServer::start().await;
+    mount_bug(&mock, 7).await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .named("a scope-refused write call must POST nothing")
+        .mount(&mock)
+        .await;
+    let addr = serve_guarded(&mock, &both_tokens(), false).await;
+
+    let stranger = per_request_post(
+        addr,
+        None,
+        "tools/call",
+        json!({ "name": "bug_info", "arguments": { "bug_ids": [7] } }),
+    )
+    .await;
+    assert_eq!(
+        stranger.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the gate precedes the lifecycle routing, so a handshake-free \
+         request from a stranger is refused like any other"
+    );
+
+    // The read scope really does reach this path, so the refusal below is
+    // about the scope and not about the request shape being broken.
+    let served = per_request_post(
+        addr,
+        Some(READ_TOKEN),
+        "tools/call",
+        json!({ "name": "bug_info", "arguments": { "bug_ids": [7] } }),
+    )
+    .await
+    .text()
+    .await
+    .expect("a body");
+    assert!(
+        served.contains("a plain bug"),
+        "the read scope must reach a read tool here too: {served}"
+    );
+
+    let refused = per_request_post(
+        addr,
+        Some(READ_TOKEN),
+        "tools/call",
+        json!({ "name": "add_comment", "arguments": { "bug_id": 7, "comment": "hi" } }),
+    )
+    .await;
+    let refused = (refused.status(), refused.text().await.expect("a body"));
+    // Against the router's OWN answer for a name it does not route, not a
+    // literal: a scope-hidden tool must be indistinguishable from one that
+    // does not exist, and that stays true across rmcp bumps.
+    let unknown = per_request_post(
+        addr,
+        Some(READ_TOKEN),
+        "tools/call",
+        json!({ "name": "no_such_tool_at_all", "arguments": {} }),
+    )
+    .await;
+    let unknown = (unknown.status(), unknown.text().await.expect("a body"));
+    assert_eq!(
+        refused, unknown,
+        "a write tool must look exactly like a tool that does not exist"
+    );
+
+    let listing = per_request_post(addr, Some(READ_TOKEN), "tools/list", json!({}))
+        .await
+        .text()
+        .await
+        .expect("a body");
+    assert!(
+        listing.contains("\"bug_info\""),
+        "the read scope is offered the read tools: {listing}"
+    );
+    for write_tool in ["add_comment", "create_bug", "update_bug_status"] {
+        assert!(
+            !listing.contains(write_tool),
+            "{write_tool} must not appear in a read-scope listing: {listing}"
+        );
+    }
 }
 
 #[tokio::test]

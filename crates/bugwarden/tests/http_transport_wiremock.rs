@@ -131,8 +131,15 @@ async fn serve_http(
         .await
         .expect("bind an ephemeral port");
     let addr = listener.local_addr().expect("bound address");
+    // `into_make_service_with_connect_info`, as main.rs serves it: without
+    // it no record carries `session.remote`, which is the whole of
+    // cross-call grouping on the handshake-free path.
     tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
+        let _ = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
     });
     addr
 }
@@ -552,14 +559,15 @@ async fn a_handshake_free_call_is_refused_and_never_names_a_client() {
     // rmcp 3.1.4 routes to its handshake-free lifecycle when the request's
     // revision is 2026-07-28 or newer, or `_meta` carries BOTH
     // `protocolVersion` and `clientCapabilities`, synthesising the peer with
-    // the SDK's own build
-    // identity. The body below sends both keys at 2025-11-25 deliberately:
-    // that is the one shape still reachable on a revision this build serves
-    // — a tool with no `initialize` behind it, recorded as `rmcp`/<sdk
-    // version>, a client the server never spoke to. Drop `clientCapabilities`
-    // and it takes the session path instead, proving nothing.
-    // Narrowing SUPPORTED_PROTOCOL_VERSIONS cannot close it either, the
-    // routing never consults it, so the handler refuses the request.
+    // the SDK's own build identity. The body below sends both keys at
+    // 2025-11-25 deliberately: serving 2026-07-28 did not close that second
+    // shape — a PRE-2026 revision with both keys still reaches a handler with
+    // no `initialize` behind it and a peer named `rmcp`/<sdk version>, a
+    // client the server never spoke to, and it declares a lifecycle its own
+    // revision does not define. Drop `clientCapabilities` and it takes the
+    // session path instead, proving nothing. Narrowing
+    // SUPPORTED_PROTOCOL_VERSIONS cannot close it either, the routing never
+    // consults it, so the handler refuses the request.
     let mock = MockServer::start().await;
     mount_bug_for_key(&mock, world_readable_bug(7), "srv-key").await;
 
@@ -1188,9 +1196,11 @@ async fn a_forged_session_id_is_not_copied_into_a_refusal_record() {
 
     let victim = raw_initialize(addr, "real-client").await;
 
-    // The one handshake-free shape still reachable on a revision this build
-    // serves (see `a_handshake_free_call_is_refused_and_never_names_a_client`),
-    // wearing the live session's id.
+    // The refused half of the forgery pair; the served half is
+    // `a_forged_session_id_is_not_copied_into_a_served_record`. This shape
+    // — a sub-2026 revision with both keys (see
+    // `a_handshake_free_call_is_refused_and_never_names_a_client`) — wears
+    // the live session's id.
     let response = mcp_post(addr, Some(&victim))
         .header("MCP-Protocol-Version", "2025-11-25")
         .json(&json!({
@@ -1237,9 +1247,9 @@ async fn a_forged_session_id_is_not_copied_into_a_refusal_record() {
 #[tokio::test]
 async fn a_refused_call_in_a_session_keeps_its_session_anchor() {
     // The refused class spans BOTH arrivals, and only this one has a
-    // session to name. `skips_the_handshake` fires on any `_meta` protocol
+    // session to name. `lifecycle_of` refuses any sub-2026 `_meta` protocol
     // declaration, which is deliberately broader than rmcp's stateless
-    // routing: a sub-2026 declaration without `clientCapabilities` stays on
+    // routing: such a declaration without `clientCapabilities` stays on
     // the session branch (see that function's rustdoc), so the refusal is
     // recorded with the real minted id and joins its own `initialize` —
     // the join #180 newly makes possible, since that anchor had no id
@@ -1277,7 +1287,7 @@ async fn a_refused_call_in_a_session_keeps_its_session_anchor() {
         .expect("the declaring call must reach the server");
     let body = response.text().await.expect("a body");
     assert!(
-        body.contains("requires the initialize handshake"),
+        body.contains("served only for a revision this server serves at 2026-07-28 or later"),
         "the declaration must be refused by the handler, not served or \
          turned away by the transport: {body}"
     );
@@ -1310,5 +1320,538 @@ async fn a_refused_call_in_a_session_keeps_its_session_anchor() {
     assert_eq!(
         record.session.id, anchor.session.id,
         "and so joins the initialize that anchors it"
+    );
+}
+
+// ---------- the 2026-07-28 per-request lifecycle (#34 stage 2) ----------
+
+/// The revision whose requests carry their own context instead of
+/// negotiating one.
+const PER_REQUEST_REVISION: &str = "2026-07-28";
+
+/// One raw 2026-07-28 per-request POST, answered as the server answers it.
+///
+/// Every header is load-bearing and rmcp refuses the request before any
+/// handler without it: `MCP-Protocol-Version` must be present AND equal the
+/// `_meta` revision (-32020 otherwise), and SEP-2243 makes `Mcp-Method` —
+/// plus `Mcp-Name` naming the tool, for a `tools/call` — mandatory as soon
+/// as that header names 2026-07-28 or newer. `initialize` is exempt from
+/// the second pair and declares its revision in the body instead.
+///
+/// `clientInfo` is deliberately NOT among the keys the protocol requires,
+/// which is what makes "a request naming no client at all" a servable
+/// shape — and the shape no rmcp client can be made to send.
+async fn per_request_post(
+    addr: SocketAddr,
+    session: Option<&str>,
+    method: &str,
+    mut params: Value,
+    client: Option<Value>,
+) -> reqwest::Response {
+    if method != "initialize" {
+        let mut meta = json!({
+            "io.modelcontextprotocol/protocolVersion": PER_REQUEST_REVISION,
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        if let Some(client) = client {
+            meta["io.modelcontextprotocol/clientInfo"] = client;
+        }
+        params["_meta"] = meta;
+    }
+    let mut builder = mcp_post(addr, session)
+        .header("MCP-Protocol-Version", PER_REQUEST_REVISION)
+        .header("Mcp-Method", method.to_owned());
+    if let Some(name) = params.get("name").and_then(Value::as_str) {
+        builder = builder.header("Mcp-Name", name.to_owned());
+    }
+    builder
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
+        .send()
+        .await
+        .expect("the per-request POST must reach the server")
+}
+
+/// A per-request `bug_info` for bug 7, as body text.
+async fn per_request_bug_7(addr: SocketAddr, client: Option<Value>) -> String {
+    per_request_post(
+        addr,
+        None,
+        "tools/call",
+        json!({ "name": "bug_info", "arguments": { "bug_ids": [7] } }),
+        client,
+    )
+    .await
+    .text()
+    .await
+    .expect("a body")
+}
+
+/// Serve an audited deployment against `mock` with bug 7 mounted, and
+/// return its address plus the audit file.
+async fn served_with_audit(
+    mock: &MockServer,
+    dir: &tempfile::TempDir,
+    key: &tempfile::NamedTempFile,
+) -> (SocketAddr, std::path::PathBuf) {
+    mount_bug_for_key(mock, world_readable_bug(7), "srv-key").await;
+    let audit_path = dir.path().join("audit.jsonl");
+    let cli = http_cli(mock, Some(key.path()));
+    let addr = serve_http(cli, "", mock, Some(audit_to(&audit_path))).await;
+    (addr, audit_path)
+}
+
+#[tokio::test]
+async fn a_per_request_call_naming_no_client_is_served_and_names_no_placeholder() {
+    // The acceptance criterion of #34, at the only level that can state it:
+    // a tools/call with no `clientInfo` ANYWHERE — no handshake behind it
+    // and none in `_meta` — is served, and the record names nobody rather
+    // than rmcp. No rmcp client builds this request, so raw HTTP is the
+    // only harness in which it exists.
+    //
+    // The mutation this kills is `client_of` reading `ctx.client_info()` or
+    // `peer_info()` on this path: rmcp synthesises the stateless peer with
+    // `Implementation::default()`, so either would put
+    // `{"name":"rmcp","version":"3.1.4"}` into the record — not a missing
+    // field but a plausible wrong one. The whole file is checked for the
+    // string, not just this record's field, because a placeholder that
+    // leaked into any other record would be the same defect.
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("audit temp dir");
+    let file = key_file("srv-key\n");
+    let (addr, audit_path) = served_with_audit(&mock, &dir, &file).await;
+
+    let body = per_request_bug_7(addr, None).await;
+    assert!(
+        body.contains("a plain bug"),
+        "a 2026-07-28 per-request call is served: {body}"
+    );
+
+    let raw = std::fs::read_to_string(&audit_path).expect("audit file must be readable");
+    assert!(
+        !raw.contains("\"rmcp\""),
+        "no record may name the SDK as the calling client: {raw}"
+    );
+    let events = audit_events(&audit_path);
+    let calls: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e.kind, AuditEventKind::ToolCall(_)))
+        .collect();
+    assert_eq!(calls.len(), 1, "a served call is recorded exactly once");
+    let AuditEventKind::ToolCall(event) = &calls[0].kind else {
+        unreachable!("filtered above")
+    };
+    assert_eq!(event.client.name, None, "the request declared no client");
+    assert_eq!(event.client.version, None, "and so declared no version");
+    assert!(
+        event.guard.is_some(),
+        "the call really reached the guard, so absence is not just a refusal"
+    );
+    // No handshake, so no session: the id would have to come from the
+    // forgeable request header, and a forgeable id is worse than none.
+    assert_eq!(calls[0].session.id, None, "the path opens no session");
+    assert!(
+        calls[0].session.remote.is_some(),
+        "`remote` plus nothing is the whole of grouping here"
+    );
+    // Nothing else opened a session either: no anchor exists to join to.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, AuditEventKind::Initialize(_))),
+        "a per-request call performs no handshake"
+    );
+}
+
+#[tokio::test]
+async fn a_per_request_call_records_the_client_it_declares() {
+    // The other half, and the one the test above cannot see: an
+    // unconditional `(None, None)` in the per-request arm passes there and
+    // fails here. Recorded verbatim, capped but not otherwise touched —
+    // self-declared at the same trust level as a handshake identity.
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("audit temp dir");
+    let file = key_file("srv-key\n");
+    let (addr, audit_path) = served_with_audit(&mock, &dir, &file).await;
+
+    let body = per_request_bug_7(
+        addr,
+        Some(json!({ "name": "wire-client", "version": "9.9" })),
+    )
+    .await;
+    assert!(
+        body.contains("a plain bug"),
+        "a declaring per-request call is served too: {body}"
+    );
+
+    let events = audit_events(&audit_path);
+    let record = tool_call_of(&events, "wire-client");
+    let AuditEventKind::ToolCall(event) = &record.kind else {
+        unreachable!("selected by kind")
+    };
+    assert_eq!(
+        event.client.version.as_deref(),
+        Some("9.9"),
+        "the declared version rides with the declared name"
+    );
+    assert_eq!(
+        event.client.principal, None,
+        "nothing self-declared is ever promoted into the verified slot"
+    );
+    assert_eq!(event.client.work_context, None);
+    assert_eq!(
+        record.session.id, None,
+        "declaring a client mints no session"
+    );
+}
+
+#[tokio::test]
+async fn a_forged_session_id_is_not_copied_into_a_served_record() {
+    // The C3 hazard, widened by adoption from refusals to SERVED calls: on
+    // the stateless branch rmcp validates `mcp-session-id` nowhere
+    // (`has_session` runs only on the session branch) and injects the
+    // request Parts verbatim, so the header is client free text. A caller
+    // that never handshook could otherwise file its own served calls under
+    // a live session's id — which is worse than the refusal case, because
+    // the forged records now describe work that actually happened.
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("audit temp dir");
+    let file = key_file("srv-key\n");
+    let (addr, audit_path) = served_with_audit(&mock, &dir, &file).await;
+
+    let victim = raw_initialize(addr, "real-client").await;
+    let served = raw_call_in_session(addr, &victim, "bug_info", json!({ "bug_ids": [7] })).await;
+    assert!(
+        served.contains("a plain bug"),
+        "the victim's own session must really be live: {served}"
+    );
+
+    let response = per_request_post(
+        addr,
+        Some(&victim),
+        "tools/call",
+        json!({ "name": "bug_info", "arguments": { "bug_ids": [7] } }),
+        Some(json!({ "name": "forging-client", "version": "1" })),
+    )
+    .await;
+    let body = response.text().await.expect("a body");
+    assert!(
+        body.contains("a plain bug"),
+        "the forged call is SERVED — this is not the refusal case: {body}"
+    );
+
+    let events = audit_events(&audit_path);
+    let forged = tool_call_of(&events, "forging-client");
+    assert_eq!(
+        forged.session.id, None,
+        "a client-supplied session id must never become a record's id; \
+         the forged value was {victim}"
+    );
+    // The victim's own records are untouched: only the forger loses an id.
+    assert_eq!(
+        initialize_of(&events, "real-client").session.id.as_deref(),
+        Some(victim.as_str()),
+        "the handshake that really happened keeps its anchor"
+    );
+    assert_eq!(
+        tool_call_of(&events, "real-client").session.id.as_deref(),
+        Some(victim.as_str()),
+        "and so does the call that really ran inside it"
+    );
+}
+
+#[tokio::test]
+async fn an_out_of_contract_listing_is_refused_and_discloses_no_tool() {
+    // `list_tools` refuses the same shape `call_tool` does, and for its own
+    // reason: the listing is pruned per deployment (I13) and per credential,
+    // so answering a caller with no handshake behind it would disclose which
+    // tools this policy removed. Unrecorded, as every listing is — the
+    // schema has no event kind for one — which is why nothing else in the
+    // suite could notice the arm being deleted.
+    let mock = MockServer::start().await;
+    let file = key_file("srv-key\n");
+    let cli = http_cli(&mock, Some(file.path()));
+    let addr = serve_http(cli, "", &mock, None).await;
+
+    // The same reachable pre-2026 shape the call-side test uses: both
+    // `_meta` keys at a revision this build serves.
+    let body = mcp_post(addr, None)
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2025-11-25",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("the listing request must reach the server")
+        .text()
+        .await
+        .expect("a body");
+
+    assert!(
+        body.contains("served only for a revision this server serves at 2026-07-28 or later"),
+        "the declaration must be refused by the handler: {body}"
+    );
+    assert!(
+        !body.contains("bug_info"),
+        "a refused listing must name no tool at all: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_per_request_listing_carries_the_cache_hints() {
+    // The wire companion to the in-process rows in server.rs: end to end,
+    // a 2026-07-28 request really does reach the enabled half of the
+    // SEP-2549 gate. Substring assertions hold because no served schema,
+    // description or annotation spells either field.
+    let mock = MockServer::start().await;
+    let file = key_file("srv-key\n");
+    let cli = http_cli(&mock, Some(file.path()));
+    let addr = serve_http(cli, "", &mock, None).await;
+
+    let body = per_request_post(addr, None, "tools/list", json!({}), None)
+        .await
+        .text()
+        .await
+        .expect("a body");
+    assert!(
+        body.contains("\"bug_info\""),
+        // A named tool, not the `"tools"` key: that key is present even for
+        // an empty listing or a scope that reaches nothing.
+        "the per-request caller must be served a real listing: {body}"
+    );
+    assert!(
+        body.contains("\"ttlMs\":0"),
+        "a memory-served listing is stale on arrival: {body}"
+    );
+    assert!(
+        body.contains("\"cacheScope\":\"private\""),
+        "a per-deployment, per-credential listing is never publicly cacheable: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_per_request_initialize_is_answered_without_minting_a_session() {
+    // The asymmetry adoption creates, pinned where it is observable: rmcp
+    // routes a 2026-07-28 `initialize` down the STATELESS path, so over
+    // http it is answered and audited but opens nothing — no
+    // `mcp-session-id` on the response, no id in the record. (Over stdio
+    // the same request is an ordinary handshake and does open a session.)
+    // The record is written anyway: recording every handshake
+    // unconditionally is the invariant, and joins are on id equality — an
+    // anchor with no id anchors nothing, and gathers nothing belonging to
+    // another session either.
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("audit temp dir");
+    let file = key_file("srv-key\n");
+    let (addr, audit_path) = served_with_audit(&mock, &dir, &file).await;
+
+    let response = per_request_post(
+        addr,
+        None,
+        "initialize",
+        json!({
+            "protocolVersion": PER_REQUEST_REVISION,
+            "capabilities": {},
+            "clientInfo": { "name": "modern-client", "version": "2" }
+        }),
+        None,
+    )
+    .await;
+    assert!(
+        response.status().is_success(),
+        "the per-request initialize must be answered, got {}",
+        response.status()
+    );
+    assert!(
+        response.headers().get("mcp-session-id").is_none(),
+        "the stateless path mints no session id"
+    );
+    let body = response.text().await.expect("a body");
+    assert!(
+        body.contains(&format!("\"protocolVersion\":\"{PER_REQUEST_REVISION}\"")),
+        "the revision this build now serves must be echoed: {body}"
+    );
+
+    let events = audit_events(&audit_path);
+    let anchor = initialize_of(&events, "modern-client");
+    let AuditEventKind::Initialize(event) = &anchor.kind else {
+        unreachable!("selected by kind")
+    };
+    assert_eq!(
+        event.protocol_version.as_deref(),
+        Some(PER_REQUEST_REVISION),
+        "the record names the revision the exchange spoke"
+    );
+    assert_eq!(
+        event.client.version.as_deref(),
+        Some("2"),
+        "the record names the REQUEST's client, never the synthesised peer"
+    );
+    assert_eq!(
+        anchor.session.id, None,
+        "there is no session for the anchor to name"
+    );
+}
+
+#[tokio::test]
+async fn a_header_only_2026_declaration_is_refused_by_the_transport() {
+    // The `Handshake` arm leans on this being the sole barrier: a request
+    // that names 2026-07-28 in the HTTP header alone carries no `_meta`, so
+    // `lifecycle_of` would read it as an ordinary in-session request and
+    // `client_of` would fall back to a peer that never handshook. rmcp
+    // refuses it first (-32602, `validate_request_protocol_version_meta`),
+    // before any handler — pinned here because nothing else does, and
+    // because the day it stops being true the identity source silently
+    // changes.
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("audit temp dir");
+    let file = key_file("srv-key\n");
+    let (addr, audit_path) = served_with_audit(&mock, &dir, &file).await;
+
+    let response = mcp_post(addr, None)
+        .header("MCP-Protocol-Version", PER_REQUEST_REVISION)
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", "bug_info")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "bug_info", "arguments": { "bug_ids": [7] } }
+        }))
+        .send()
+        .await
+        .expect("the header-only request must reach the server");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "the transport refuses before any handler"
+    );
+    let body = response.text().await.expect("a body");
+    assert!(
+        body.contains("-32602"),
+        "refused as missing required request metadata: {body}"
+    );
+    assert!(
+        !std::path::Path::new(&audit_path).exists() || audit_events(&audit_path).is_empty(),
+        "a request the handler never saw records nothing"
+    );
+    let upstream = mock.received_requests().await.unwrap_or_default();
+    assert!(upstream.is_empty(), "and contacts no upstream");
+}
+
+#[tokio::test]
+async fn a_per_request_call_cannot_reach_a_tool_the_deployment_pruned_i13() {
+    // I13 under the handshake-free lifecycle: the pruned INSTANCE router is
+    // what dispatch goes through on this path too, so a write tool
+    // `--read-only` removed and a name that never existed must be
+    // indistinguishable — byte-identical status and body, since anything
+    // that differed would enumerate the deployment's policy.
+    let mock = MockServer::start().await;
+    mount_bug_for_key(&mock, world_readable_bug(7), "srv-key").await;
+    let file = key_file("srv-key\n");
+    let cli = http_cli(&mock, Some(file.path()));
+    // Read-only through the POLICY, which is where `BugWarden::new` reads
+    // it: main folds `--read-only` in there (I9 — the flag may only tighten
+    // the policy, never loosen it), so a harness setting the Cli field
+    // alone would serve a deployment no operator can configure.
+    let addr = serve_http(cli, "[global]\nread_only = true\n", &mock, None).await;
+
+    // Served first, so the deployment is demonstrably alive and reachable
+    // on this path — otherwise two identical failures prove nothing.
+    let served = per_request_bug_7(addr, None).await;
+    assert!(
+        served.contains("a plain bug"),
+        "the read tool is served: {served}"
+    );
+
+    let mut answers = Vec::new();
+    for name in ["create_bug", "no_such_tool_at_all"] {
+        let response = per_request_post(
+            addr,
+            None,
+            "tools/call",
+            json!({ "name": name, "arguments": {} }),
+            None,
+        )
+        .await;
+        let status = response.status();
+        answers.push((status, response.text().await.expect("a body")));
+    }
+    assert_eq!(
+        answers[0], answers[1],
+        "a pruned tool and a nonexistent one must be byte-identical (I13)"
+    );
+    assert!(
+        answers[0].1.contains("\"error\""),
+        "and both must be REFUSED, not two identical successes: {:?}",
+        answers[0]
+    );
+    let upstream = mock.received_requests().await.unwrap_or_default();
+    assert!(
+        upstream
+            .iter()
+            .all(|r| !r.url.path().contains("/rest/bug/")),
+        "no unrouted call may reach Bugzilla"
+    );
+}
+
+#[tokio::test]
+async fn a_per_request_denial_is_uniform_with_a_nonexistent_bug_i2() {
+    // I2 under the handshake-free lifecycle: with no session to attribute a
+    // refusal to, the refusal text must still not say which of the two
+    // reasons applied. Bug 7 is hidden by policy; bug 8 does not exist.
+    let mock = MockServer::start().await;
+    let mut secret = world_readable_bug(7);
+    secret["product"] = json!("SecretSauce");
+    mount_bug_for_key(&mock, secret, "srv-key").await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "8"))
+        .and(query_param("api_key", "srv-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .mount(&mock)
+        .await;
+
+    let file = key_file("srv-key\n");
+    let cli = http_cli(&mock, Some(file.path()));
+    let addr = serve_http(
+        cli,
+        concat!(
+            "[[rule]]\nname = \"hide-secret\"\naction = \"deny\"\n",
+            "[rule.match]\nproducts = [\"Secret*\"]\n",
+        ),
+        &mock,
+        None,
+    )
+    .await;
+
+    let mut answers = Vec::new();
+    for id in [7, 8] {
+        let response = per_request_post(
+            addr,
+            None,
+            "tools/call",
+            json!({ "name": "bug_comments", "arguments": { "id": id } }),
+            None,
+        )
+        .await;
+        let body = response.text().await.expect("a body");
+        assert!(
+            body.contains(&format!("Bug {id} is not accessible through this server")),
+            "the uniform denial text, for bug {id}: {body}"
+        );
+        // Only the id the caller already knows may differ.
+        answers.push(body.replace(&format!("Bug {id} "), "Bug _ "));
+    }
+    assert_eq!(
+        answers[0], answers[1],
+        "a policy-denied bug and a nonexistent one must be indistinguishable (I2)"
     );
 }

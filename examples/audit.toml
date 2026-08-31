@@ -14,9 +14,11 @@
 #
 # Format: one JSON object per line (JSONL), schema version 2. Three record
 # kinds: `tool_call` (one MCP tool invocation, request through outcome,
-# with the guard's decision), `initialize` (a client opened a session),
-# and `audit_gap` (records were lost — see fail_mode below; the gap is
-# reported in the stream itself, so silent loss is impossible to miss).
+# with the guard's decision), `initialize` (a client sent an `initialize` —
+# usually opening a session, though a 2026-07-28 `initialize` over http
+# opens none and its record then carries no session id), and `audit_gap`
+# (records were lost — see fail_mode below; the gap is reported in the
+# stream itself, so silent loss is impossible to miss).
 #
 # The schema is closed: fixed structs, fixed vocabularies, and no
 # dedicated field for the Bugzilla API key, request headers, or free-text

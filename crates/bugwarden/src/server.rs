@@ -34,18 +34,24 @@ use crate::http_auth::{self, Scope};
 /// The MCP revisions this build actually implements, newest last.
 ///
 /// Deliberately not `ProtocolVersion::KNOWN_VERSIONS`: the SDK knows more
-/// revisions than it can serve through this handler, and both the rmcp
-/// default for `supported_protocol_versions` and the handshake below
-/// would otherwise accept `2026-07-28` — a revision whose stateless
-/// requests carry no handshake, so audit records would name a client the
-/// server never spoke to (issue #34). A client asking for it gets the
-/// server default instead, and every rmcp bump has to widen this list
-/// deliberately, never by inheriting a longer one.
+/// revisions than this handler serves, so every rmcp bump has to widen
+/// this list deliberately rather than by inheriting a longer one. What
+/// the list bounds is precisely which DECLARED revisions `initialize`,
+/// per-request `_meta` and `server/discover` may agree to; it does not
+/// decide which request lifecycle the transport routes to — see
+/// [`lifecycle_of`].
+///
+/// `2026-07-28` is served as of issue #34 stage 2. Its handshake-free
+/// requests carry the calling client in their own `_meta`, which
+/// [`client_of`] reads, so a record on that path names the caller or names
+/// nobody — never the SDK placeholder rmcp synthesises for a peer that
+/// never handshook (#34 §3c).
 const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
     ProtocolVersion::V_2024_11_05,
     ProtocolVersion::V_2025_03_26,
     ProtocolVersion::V_2025_06_18,
     ProtocolVersion::V_2025_11_25,
+    ProtocolVersion::V_2026_07_28,
 ];
 
 /// The revision offered when a client asks for one this build cannot
@@ -328,6 +334,20 @@ fn truncated(value: &Value) -> Value {
     }
 }
 
+/// `value` truncated to [`PARAM_VALUE_MAX_CHARS`] characters — the cap
+/// [`truncated`] applies to an audited parameter, applied to a recorded
+/// client identity. The single helper is the discipline: every site that
+/// writes `ClientInfo::name`/`version` goes through it.
+fn capped(value: String) -> String {
+    // A string of at most 1024 BYTES has at most 1024 chars; the cheap
+    // length check skips the char walk for the common case.
+    if value.len() > PARAM_VALUE_MAX_CHARS {
+        value.chars().take(PARAM_VALUE_MAX_CHARS).collect()
+    } else {
+        value
+    }
+}
+
 /// Project a tool call's arguments through [`PARAM_ALLOWLIST`] into the
 /// audit record's `params` map.
 fn allowlisted(params: Option<&JsonObject>) -> BTreeMap<String, Value> {
@@ -348,15 +368,46 @@ fn allowlisted(params: Option<&JsonObject>) -> BTreeMap<String, Value> {
         .collect()
 }
 
-/// The calling client as it introduced itself in the handshake, for an
-/// audit record. Self-declared, therefore untrusted; `principal` and
-/// `work_context` stay `None` — both are server-verified slots and this
-/// build has no verifier to fill either.
+/// The calling client as it declared itself, for an audit record.
+/// Self-declared at every source and therefore untrusted; `principal` and
+/// `work_context` stay `None` — both are server-verified slots, this build
+/// has no verifier to fill either, and nothing carried in `_meta` is ever
+/// promoted into them.
+///
+/// The source is the request's [`Lifecycle`], read here rather than passed
+/// in, so identity cannot diverge from routing by call-site ordering:
+///
+/// * [`Lifecycle::PerRequest`] — the request's own `_meta`. **Never
+///   `ctx.client_info()`**: that convenience accessor falls back to
+///   `peer_info().client_info` unless `request_metadata_required()`, which
+///   rmcp 3.1.4 sets only on the stdio handshake-free path
+///   (`service/server.rs`), so over streamable http it IS the
+///   `{"name":"rmcp",…}` placeholder rmcp synthesises for a peer that
+///   never handshook (`peer_info_for_stateless_request`, #34 §3c) — and
+///   never `peer_info()` here for the same reason. `ctx.meta.client_info()`
+///   decodes all-or-nothing, so a `clientInfo` missing `version`, or not an
+///   object at all, yields nothing rather than half an identity:
+///   fail-to-absent comes free.
+/// * [`Lifecycle::Handshake`] — the peer rmcp populated at `initialize`.
+///   The client this server actually greeted.
+/// * [`Lifecycle::OutOfContract`] — nobody; the call is refused anyway.
+///
+/// Both fields are [`capped`]: per-request sourcing repeats a
+/// client-controlled string into EVERY record where the handshake wrote it
+/// once per session.
 fn client_of(ctx: &RequestContext<RoleServer>) -> audit::ClientInfo {
-    let peer = ctx.peer.peer_info();
+    let declared = match lifecycle_of(ctx) {
+        Lifecycle::PerRequest => ctx.meta.client_info().map(|i| (i.name, i.version)),
+        Lifecycle::Handshake => ctx
+            .peer
+            .peer_info()
+            .map(|p| (p.client_info.name.clone(), p.client_info.version.clone())),
+        Lifecycle::OutOfContract => None,
+    };
+    let (name, version) = declared.unzip();
     audit::ClientInfo {
-        name: peer.as_ref().map(|p| p.client_info.name.clone()),
-        version: peer.as_ref().map(|p| p.client_info.version.clone()),
+        name: name.map(capped),
+        version: version.map(capped),
         principal: None,
         work_context: None,
     }
@@ -422,39 +473,86 @@ fn max_request_body_bytes(max_attachment_bytes: u64) -> usize {
         .clamp(MAX_REQUEST_BODY_FLOOR, MAX_REQUEST_BODY_CEILING)
 }
 
-/// Whether this request declares its own protocol revision in `_meta`.
+/// Which lifecycle a request belongs to.
 ///
-/// rmcp 3.1.4 routes on `_meta` shape, not on the negotiated revision and
-/// not on [`SUPPORTED_PROTOCOL_VERSIONS`]: the stateless path takes a
-/// request naming `2026-07-28` or newer, or one carrying BOTH
-/// `io.modelcontextprotocol/protocolVersion` and `…/clientCapabilities`.
-/// So excluding `2026-07-28` does not keep a request off that path — a
-/// client naming a revision this build does serve, with both keys, reaches
-/// the handler with no `initialize` behind it, and rmcp synthesises its peer
-/// with the SDK's own build identity as `client_info`. Served, such a call
-/// would put a client the server never spoke to into the audit stream, with
-/// no session record anchoring it — a plausible wrong attribution, which is
-/// the one an audit trail can least afford.
-///
-/// No revision this build serves defines that lifecycle, so the declaration
-/// is out of contract and is refused wherever it arrives. Broader than the
-/// routing on purpose: a sub-2026 declaration lacking `clientCapabilities`
-/// takes the session path, so this also fires on requests that did complete a
-/// handshake. Separately, the routing reads more than `_meta` — the
-/// `MCP-Protocol-Version` header, and `initialize`'s own `protocolVersion` —
-/// but neither needs cover here: a header-only `2026-07-28` is refused by the
-/// transport before any handler, and an `initialize` naming it does take the
-/// stateless path but is recorded from `request.client_info`, never from the
-/// synthesized peer.
-fn skips_the_handshake(ctx: &RequestContext<RoleServer>) -> bool {
-    ctx.meta.protocol_version().is_some()
+/// Decided on the revision the request DECLARES in its own `_meta`, never
+/// on the session's negotiated one: a 2026-07-28 session's ordinary
+/// requests carry no `_meta` at all and belong to [`Lifecycle::Handshake`],
+/// where their peer identity is the real one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lifecycle {
+    /// No per-request declaration. Usually an `initialize` handshake stands
+    /// behind the request, and `peer_info` then names the client this server
+    /// greeted. A session served directly lands here too, with no
+    /// `peer_info` at all — nothing was greeted, so the identity is absent
+    /// rather than wrong.
+    Handshake,
+    /// The 2026-07-28 handshake-free lifecycle: the request carries its own
+    /// revision and client capabilities, optionally its own identity, and
+    /// over http no session exists to carry them instead.
+    PerRequest,
+    /// A per-request declaration this build will not serve on that
+    /// lifecycle: a revision below `2026-07-28`, which negotiates through
+    /// the handshake instead and so mixes two contracts, or one at or above
+    /// it that this build does not serve at all. Refused either way, and
+    /// nothing in such a request can be attributed.
+    OutOfContract,
 }
 
-/// The uniform refusal for a request that skipped the handshake. Names no
-/// tool, bug or policy — it is a statement about the request's shape.
-fn handshake_required() -> McpError {
+/// The [`Lifecycle`] of `ctx`.
+///
+/// One decision shared by `call_tool`, `list_tools` and [`client_of`], so
+/// what gets served and who gets recorded cannot diverge by call-site
+/// ordering.
+///
+/// rmcp 3.1.4 routes on `_meta` shape, not on the negotiated revision and
+/// not on [`SUPPORTED_PROTOCOL_VERSIONS`]: `is_legacy_request`
+/// (`transport/streamable_http_server/tower.rs`) sends a POST down the
+/// stateless path when the request's revision is `2026-07-28` or newer, or
+/// when a non-`initialize` request carries BOTH
+/// `io.modelcontextprotocol/protocolVersion` and `…/clientCapabilities`.
+/// That second shape is why the refusal arm still exists after adoption: a
+/// pre-2026 revision sent with both keys reaches the handler with no
+/// `initialize` behind it, and rmcp synthesises its peer with the SDK's own
+/// build identity as `client_info` — a client the server never spoke to.
+/// The arm is broader than the routing on purpose: a sub-2026 declaration
+/// lacking `clientCapabilities` takes the session path, so it fires on
+/// requests that DID complete a handshake too.
+///
+/// The `contains` clause is defence in depth: rmcp refuses a `_meta`
+/// revision outside `supported_protocol_versions()` first
+/// (`handler/server.rs`, -32022), but every rmcp version comparison is
+/// lexical and this repo has already been bitten by a fabricated
+/// `"9999-01-01"` outranking every real revision.
+fn lifecycle_of(ctx: &RequestContext<RoleServer>) -> Lifecycle {
+    match ctx.meta.protocol_version() {
+        None => Lifecycle::Handshake,
+        Some(v)
+            if v.as_str() >= ProtocolVersion::V_2026_07_28.as_str()
+                && SUPPORTED_PROTOCOL_VERSIONS.contains(&v) =>
+        {
+            Lifecycle::PerRequest
+        }
+        Some(_) => Lifecycle::OutOfContract,
+    }
+}
+
+/// The uniform refusal for a [`Lifecycle::OutOfContract`] request. Names no
+/// tool, bug or policy — it states which declarations this build serves on
+/// that lifecycle, and both halves of that are public anyway:
+/// `server/discover` advertises the served list and rmcp's own -32022 quotes
+/// it back.
+///
+/// Covers BOTH arms the predicate refuses, which an earlier wording did not:
+/// a revision below the threshold, and one at or above it that this build
+/// does not serve — the `"9999-01-01"` case, reachable here only if rmcp's
+/// -32022 ever stops running first, which is the scenario the `contains`
+/// clause exists for.
+fn mixed_lifecycle_refused() -> McpError {
     McpError::invalid_request(
-        "this server requires the initialize handshake; per-request protocol negotiation is not served",
+        "a per-request protocol declaration is served only for a revision this \
+         server serves at 2026-07-28 or later; earlier revisions negotiate \
+         through the initialize handshake",
         None,
     )
 }
@@ -3981,13 +4079,18 @@ impl ServerHandler for BugWarden {
         negotiated.protocol_version = info.protocol_version.clone();
         context.peer.set_peer_info(negotiated);
         if let Some(audit) = &self.audit {
-            // Every session start is recorded, unconditionally — no
+            // Every `initialize` is recorded, unconditionally — no
             // configuration knob: a stream that could omit session
-            // starts could not anchor its tool records to a client.
+            // starts could not anchor its tool records to a client. Over
+            // http a 2026-07-28 `initialize` takes the stateless route
+            // and opens no session, so the anchor is written with no id;
+            // unconditional is still the invariant, and joins are on id
+            // equality, so a record with no id matches nothing rather than
+            // the wrong thing.
             let event = audit::AuditEventKind::Initialize(audit::InitializeEvent {
                 client: audit::ClientInfo {
-                    name: Some(request.client_info.name.clone()),
-                    version: Some(request.client_info.version.clone()),
+                    name: Some(capped(request.client_info.name.clone())),
+                    version: Some(capped(request.client_info.version.clone())),
                     principal: None,
                     work_context: None,
                 },
@@ -4021,7 +4124,7 @@ impl ServerHandler for BugWarden {
         mut context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let started = Instant::now();
-        if skips_the_handshake(&context) {
+        if lifecycle_of(&context) == Lifecycle::OutOfContract {
             // Recorded before it is refused, like every other turned-away
             // call: a stream that went quiet for a whole request class
             // could not be read as a complete account. `client` is absent
@@ -4030,7 +4133,7 @@ impl ServerHandler for BugWarden {
             // identity, and one refusal class must not be recorded two
             // ways. `session.id` is still present when there is one:
             // this refusal is broader than rmcp's stateless routing (see
-            // `skips_the_handshake`), so a declaration that took the
+            // `lifecycle_of`), so a declaration that took the
             // session branch arrives with its real id stamped, while a
             // stateless one had no session to stamp (#180).
             if let Some(audit) = self.audit.clone() {
@@ -4059,7 +4162,7 @@ impl ServerHandler for BugWarden {
                 let session = self.session_info(&context, &audit);
                 let _ = record_event(&audit, event, session).await;
             }
-            return Err(handshake_required());
+            return Err(mixed_lifecycle_refused());
         }
         // Bearer scope gate (issue #32): a tool this credential does not
         // reach is refused as unrouted, so the read scope hides the write
@@ -4268,8 +4371,8 @@ impl ServerHandler for BugWarden {
         // per deployment (I13), so answering one of these would disclose
         // which tools this policy removed. Unrecorded, as
         // every listing is — the schema has no event kind for one.
-        if skips_the_handshake(&context) {
-            return Err(handshake_required());
+        if lifecycle_of(&context) == Lifecycle::OutOfContract {
+            return Err(mixed_lifecycle_refused());
         }
         // Filtered, not listed-then-refused: the write tools are simply not
         // there for a read-scope credential, which is I13's shape applied to
@@ -4812,9 +4915,10 @@ mod tests {
             "the handler must advertise this build's list, never inherit the SDK's"
         );
         assert!(
-            !SUPPORTED_PROTOCOL_VERSIONS.contains(&ProtocolVersion::V_2026_07_28),
-            "2026-07-28 requests carry no handshake, so their records could not \
-             name the calling client (issue #34)"
+            SUPPORTED_PROTOCOL_VERSIONS.contains(&ProtocolVersion::V_2026_07_28),
+            "the handshake-free revision is served: its records name the calling \
+             client from the request's own `_meta`, never rmcp's synthesised \
+             peer (issue #34 stage 2)"
         );
         assert!(
             SUPPORTED_PROTOCOL_VERSIONS.contains(&DEFAULT_PROTOCOL_VERSION),
@@ -6451,6 +6555,343 @@ mod tests {
             .clone()
     }
 
+    /// The `_meta` a 2026-07-28 request carries: the two keys rmcp's
+    /// `missing_required_keys` demands, plus a `clientInfo` when one is
+    /// declared. The identity goes in as raw JSON under the literal wire
+    /// key, so a MALFORMED declaration is expressible — the shape no rmcp
+    /// client builds and the one `client_of` must fail to absent on.
+    fn per_request_meta(version: ProtocolVersion, client: Option<Value>) -> RequestMetaObject {
+        let mut meta = RequestMetaObject::new();
+        meta.set_protocol_version(version);
+        meta.set_client_capabilities(ClientCapabilities::default());
+        if let Some(client) = client {
+            meta.insert("io.modelcontextprotocol/clientInfo".to_string(), client);
+        }
+        meta
+    }
+
+    /// `bug_url` for bug 7 — the one tool that contacts nothing, so a
+    /// direct call needs no upstream and records exactly one event.
+    fn local_call() -> CallToolRequestParams {
+        let Value::Object(args) = json!({ "bug_id": 7 }) else {
+            panic!("tool arguments must be a JSON object");
+        };
+        CallToolRequestParams::new("bug_url".to_string()).with_arguments(args)
+    }
+
+    #[tokio::test]
+    async fn a_per_request_identity_comes_from_meta_and_never_from_the_peer() {
+        // The trap #34 §3(c) names, sharpened to the line that decides it.
+        // The peer here is a REAL handshaken one whose stored `client_info`
+        // IS `Implementation::default()` — rmcp's own crate name and
+        // version, exactly the value the http handshake-free path
+        // synthesises (`peer_info_for_stateless_request`). So `client_of`
+        // reaching for `peer_info()`, or for the convenience
+        // `ctx.client_info()` — which falls back to it unless
+        // `request_metadata_required()`, never set over streamable http —
+        // records `rmcp` on every row below. The precondition is asserted,
+        // not assumed: were rmcp to stop seeding that value, this test
+        // would go on passing while proving nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz)
+            .expect("server must build")
+            .with_audit(Arc::clone(&audit));
+        let peer = peer_of(&server).await;
+        assert_eq!(
+            peer.peer_info()
+                .expect("the duplex handshake stores peer info")
+                .client_info
+                .name,
+            Implementation::default().name,
+            "the sharpener needs a peer whose stored identity is the placeholder"
+        );
+
+        // (row, the declared `clientInfo`, the name the record must carry)
+        let rows: [(&str, Option<Value>, Option<&str>); 4] = [
+            ("no clientInfo at all", None, None),
+            ("a malformed clientInfo", Some(json!("banana")), None),
+            (
+                "a clientInfo missing its version",
+                Some(json!({ "name": "half" })),
+                None,
+            ),
+            (
+                "a well-formed clientInfo",
+                Some(json!({ "name": "wire-client", "version": "9.9" })),
+                Some("wire-client"),
+            ),
+        ];
+        for (row, client, _) in &rows {
+            let mut context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer.clone());
+            context.meta = per_request_meta(ProtocolVersion::V_2026_07_28, client.clone());
+            ServerHandler::call_tool(&server, local_call(), context)
+                .await
+                .unwrap_or_else(|e| panic!("{row}: a per-request call is served: {e}"));
+        }
+
+        let events = read_audit_events(&audit_path);
+        let calls = tool_calls(&events);
+        assert_eq!(
+            calls.len(),
+            rows.len(),
+            "one record per call, in call order"
+        );
+        for (call, (row, _, expected)) in calls.iter().zip(rows) {
+            assert_eq!(
+                call.client.name.as_deref(),
+                expected,
+                "{row}: the record must name the request's own client, or nobody"
+            );
+            // All-or-nothing: `decode_value` yields neither field or both,
+            // so a half-declared identity is never half-recorded.
+            assert_eq!(
+                call.client.version.is_some(),
+                expected.is_some(),
+                "{row}: name and version must be absent or present together"
+            );
+        }
+    }
+
+    /// A peer from a real handshake in which the client called itself
+    /// `name`, so a recorded identity can be told apart from the SDK's
+    /// placeholder AND from anything the request smuggled.
+    async fn peer_greeted_as(server: &BugWarden, name: &str) -> rmcp::service::Peer<RoleServer> {
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let serving = server.clone();
+        let task = tokio::spawn(async move { serving.serve(server_io).await });
+        let _client = InitializeRequestParams::new(
+            ClientCapabilities::default(),
+            Implementation::new(name.to_owned(), "1"),
+        )
+        .serve(client_io)
+        .await
+        .expect("MCP handshake must succeed");
+        task.await
+            .expect("serve task must not panic")
+            .expect("server must serve")
+            .peer()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn a_handshake_identity_is_never_displaced_by_a_smuggled_meta_client() {
+        // The other side of the same trap, and the one a per-request test
+        // cannot reach. `_meta` carrying `clientInfo` but NO
+        // `protocolVersion` stays on the handshake arm — `lifecycle_of`
+        // reads the version key alone — yet it is a shape rmcp will happily
+        // deliver over the wire. `ctx.client_info()` prefers `_meta` before
+        // falling back to the peer, so a handshake arm written with the
+        // convenience accessor records the SMUGGLED identity while every
+        // ordinary session keeps working: it survives the whole suite
+        // otherwise. The peer is greeted under a distinct name so the two
+        // candidate answers cannot be confused.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz)
+            .expect("server must build")
+            .with_audit(Arc::clone(&audit));
+        let peer = peer_greeted_as(&server, "greeted-client").await;
+
+        let mut context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer);
+        let mut meta = RequestMetaObject::new();
+        meta.insert(
+            "io.modelcontextprotocol/clientInfo".to_string(),
+            json!({ "name": "smuggled-client", "version": "9.9" }),
+        );
+        context.meta = meta;
+        assert!(
+            context.meta.protocol_version().is_none(),
+            "no version key, so this request belongs to the handshake arm"
+        );
+
+        ServerHandler::call_tool(&server, local_call(), context)
+            .await
+            .expect("an ordinary in-session call is served");
+
+        let events = read_audit_events(&audit_path);
+        let calls = tool_calls(&events);
+        assert_eq!(calls.len(), 1, "exactly the direct call is recorded");
+        assert_eq!(
+            calls[0].client.name.as_deref(),
+            Some("greeted-client"),
+            "the handshake arm names the client the server GREETED, never one \
+             the request smuggled into `_meta`"
+        );
+        assert_eq!(calls[0].client.version.as_deref(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn a_stdio_per_request_call_keeps_the_process_session_id() {
+        // The deliberate stdio/http asymmetry, which was documented and
+        // pinned by nothing. Over http the per-request path records no
+        // `session.id` because the only candidate is a forgeable request
+        // header; over stdio the id is minted from the process, so there is
+        // nothing to forge and the record keeps it. Scoping the absence to
+        // http is the whole decision, and dropping the id here — the
+        // obvious "make both paths agree" edit — survived the entire suite
+        // before this row.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
+        let (cfg, guard, bz) = parts("");
+        assert_eq!(
+            cfg.transport,
+            Transport::Stdio,
+            "the asymmetry only exists on a stdio deployment"
+        );
+        let server = BugWarden::new(cfg, guard, bz)
+            .expect("server must build")
+            .with_audit(Arc::clone(&audit));
+        let peer = peer_of(&server).await;
+
+        let mut context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer);
+        context.meta = per_request_meta(
+            ProtocolVersion::V_2026_07_28,
+            Some(json!({ "name": "stdio-client", "version": "1" })),
+        );
+        ServerHandler::call_tool(&server, local_call(), context)
+            .await
+            .expect("a per-request call is served over stdio too");
+
+        let events = read_audit_events(&audit_path);
+        let calls: Vec<&AuditEvent> = events
+            .iter()
+            .filter(|e| matches!(e.kind, AuditEventKind::ToolCall(_)))
+            .collect();
+        assert_eq!(calls.len(), 1, "exactly the direct call is recorded");
+        assert_eq!(
+            calls[0].session.transport,
+            audit::TransportKind::Stdio,
+            "the row is only meaningful on the stdio transport"
+        );
+        assert_eq!(
+            calls[0].session.id.as_deref(),
+            Some(audit.stdio_session_id.as_str()),
+            "a stdio per-request call keeps the process-scoped id: it is minted, \
+             not read off a request, so the http rationale does not apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn both_recording_sites_cap_a_declared_client_identity() {
+        // A client name is client-controlled text headed for an append-only
+        // file, so it is capped exactly like an audited parameter value.
+        // Both sites, because one helper covers both and because the
+        // per-request one is the reason the cap is needed at all: the
+        // handshake wrote its string once per session, `_meta` repeats it
+        // into every record of every call.
+        let long_name = "n".repeat(PARAM_VALUE_MAX_CHARS * 3);
+        let long_version = "v".repeat(PARAM_VALUE_MAX_CHARS + 1);
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz)
+            .expect("server must build")
+            .with_audit(Arc::clone(&audit));
+
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let serving = server.clone();
+        let task = tokio::spawn(async move { serving.serve(server_io).await });
+        let _client = InitializeRequestParams::new(
+            ClientCapabilities::default(),
+            Implementation::new(long_name.clone(), long_version.clone()),
+        )
+        .serve(client_io)
+        .await
+        .expect("MCP handshake must succeed");
+        let peer = task
+            .await
+            .expect("serve task must not panic")
+            .expect("server must serve")
+            .peer()
+            .clone();
+
+        let mut context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer);
+        context.meta = per_request_meta(
+            ProtocolVersion::V_2026_07_28,
+            Some(json!({ "name": long_name, "version": long_version })),
+        );
+        ServerHandler::call_tool(&server, local_call(), context)
+            .await
+            .expect("a per-request call is served");
+
+        let events = read_audit_events(&audit_path);
+        let recorded: Vec<&audit::ClientInfo> = events
+            .iter()
+            .map(|e| match &e.kind {
+                AuditEventKind::Initialize(ev) => &ev.client,
+                AuditEventKind::ToolCall(ev) => &ev.client,
+                AuditEventKind::AuditGap(_) => panic!("no gap may occur here"),
+            })
+            .collect();
+        assert_eq!(recorded.len(), 2, "the handshake and the call are recorded");
+        for client in recorded {
+            assert_eq!(
+                client.name.as_deref().map(|n| n.chars().count()),
+                Some(PARAM_VALUE_MAX_CHARS),
+                "an over-long name is truncated to the cap, not stored whole"
+            );
+            assert_eq!(
+                client.version.as_deref().map(|v| v.chars().count()),
+                Some(PARAM_VALUE_MAX_CHARS),
+                "the version is capped too — it is client text on the same terms"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_meta_declaration_is_served_only_at_a_revision_this_build_serves() {
+        // The three-way predicate, at the handler, on one axis: the
+        // declared revision. BOTH conjuncts are load-bearing, and the name
+        // says so because an earlier one ("only a sub-2026 declaration is
+        // refused") was disproved by this test's own second row. A blanket
+        // refusal fails the served row, a blanket serve fails the refused
+        // ones, and dropping the `contains` guard fails the fabricated one
+        // — `"9999-01-01"` outranks 2026-07-28 lexically, which is how a
+        // version comparison alone lets an unserved revision through.
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz).expect("server must build");
+        let peer = peer_of(&server).await;
+
+        // (declared revision, whether the call is served)
+        let rows = [
+            ("2025-11-25", false),
+            ("9999-01-01", false),
+            ("2026-07-28", true),
+        ];
+        for (declared, served) in rows {
+            let version: ProtocolVersion =
+                serde_json::from_value(json!(declared)).expect("a wire revision parses");
+            let mut context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer.clone());
+            context.meta = per_request_meta(version, None);
+            let answer = ServerHandler::call_tool(&server, local_call(), context).await;
+            assert_eq!(
+                answer.is_ok(),
+                served,
+                "{declared}: served={served}, got {answer:?}"
+            );
+            if let Err(error) = answer {
+                // One text for both refused rows: it must describe the
+                // fabricated-future one as well as the sub-2026 one, which
+                // a "below 2026-07-28" wording did not.
+                assert!(
+                    error.message.contains("2026-07-28")
+                        && error.message.contains("a revision this server serves"),
+                    "{declared}: the refusal must fit this row too: {error:?}"
+                );
+            }
+        }
+
+        // And a request declaring nothing keeps the handshake arm: the
+        // session's own revision never routes a request per-request.
+        let context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer);
+        ServerHandler::call_tool(&server, local_call(), context)
+            .await
+            .expect("an ordinary in-session call is served");
+    }
+
     #[tokio::test]
     async fn a_failing_sink_never_tells_a_read_scope_which_names_this_build_routes() {
         // The audit gate answers a refused call with that TOOL's own failure
@@ -6602,60 +7043,80 @@ mod tests {
 
     #[tokio::test]
     async fn a_2026_request_gets_private_immediately_stale_cache_hints() {
-        // The enabled half of the gate. Unreachable over any transport
-        // while `2026-07-28` is off `SUPPORTED_PROTOCOL_VERSIONS`: no
-        // request may declare it and no session may negotiate it. The
-        // enabler here is therefore the HAND-BUILT peer, not the direct
-        // call — `Service::handle_request` would dispatch this same context
-        // and serve the hints; it is bypassed only because routing through
-        // it would test rmcp rather than the gate.
+        // The enabled half of the gate, from BOTH of its two sources —
+        // `RequestContext::protocol_version()` reads the request's own
+        // `_meta` first and the session's negotiated revision second.
+        //
+        // The second row is the one that carries weight. A mutant reading
+        // only `peer_info().protocol_version` survives every wire test:
+        // over http the handshake-free path's SYNTHESISED peer is stamped
+        // with the same 2026-07-28 the `_meta` names
+        // (`peer_info_for_stateless_request`), so the two sources agree
+        // there and the request half is never observed alone. A bare peer
+        // with no `peer_info` at all is the only shape that separates
+        // them, and rmcp really does hand one out — its stdio
+        // handshake-free lifecycle builds the peer with `None`
+        // (`service/server.rs`). Its wire-level companion is
+        // `a_per_request_listing_carries_the_cache_hints` in
+        // http_transport_wiremock.
         let (cfg, guard, bz) = parts("");
         let server = BugWarden::new(cfg, guard, bz).expect("server must build");
-        let peer = peer_of(&server).await;
-        peer.set_peer_info(
+
+        let negotiated = peer_of(&server).await;
+        negotiated.set_peer_info(
             ClientInfo::default().with_protocol_version(ProtocolVersion::V_2026_07_28),
         );
-        // Empty meta is mandatory: any `_meta` revision, 2026-07-28
-        // included, is refused by `skips_the_handshake` above the gate.
-        let context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer);
+        let session_row = RequestContext::<RoleServer>::new(RequestId::Number(1), negotiated);
         assert!(
-            context.meta.protocol_version().is_none(),
+            session_row.meta.protocol_version().is_none(),
             "the session's revision, not the request's, must open the gate here"
         );
 
-        let listed = ServerHandler::list_tools(&server, None, context)
-            .await
-            .expect("a 2026 session lists tools");
-        // On the JSON, not the enum: the wire spelling is what a caching
-        // intermediary reads, and `CacheScope` renames lowercase.
-        let json = serde_json::to_value(&listed).expect("the listing must serialize");
-        assert_eq!(
-            json["cacheScope"],
-            json!("private"),
-            "a per-deployment, per-credential listing is never publicly cacheable"
-        );
-        assert_eq!(
-            json["ttlMs"],
-            json!(0),
-            "a memory-served listing is stale on arrival"
-        );
+        let (client_io, _server_io) = tokio::io::duplex(1 << 16);
+        let running: RunningService<RoleServer, BugWarden> =
+            rmcp::service::serve_directly(server.clone(), client_io, None);
+        let bare = running.peer().clone();
         assert!(
-            !listed.tools.is_empty(),
-            "the hints must ride a real listing, not a refusal or an empty one"
+            bare.peer_info().is_none(),
+            "the request row must have no session revision to fall back to"
         );
+        let mut request_row = RequestContext::<RoleServer>::new(RequestId::Number(1), bare);
+        request_row.meta = per_request_meta(ProtocolVersion::V_2026_07_28, None);
+
+        for (row, context) in [("negotiated session", session_row), ("_meta", request_row)] {
+            let listed = ServerHandler::list_tools(&server, None, context)
+                .await
+                .expect("a 2026 listing is served");
+            // On the JSON, not the enum: the wire spelling is what a caching
+            // intermediary reads, and `CacheScope` renames lowercase.
+            let json = serde_json::to_value(&listed).expect("the listing must serialize");
+            assert_eq!(
+                json["cacheScope"],
+                json!("private"),
+                "{row}: a per-deployment, per-credential listing is never publicly cacheable"
+            );
+            assert_eq!(
+                json["ttlMs"],
+                json!(0),
+                "{row}: a memory-served listing is stale on arrival"
+            );
+            assert!(
+                !listed.tools.is_empty(),
+                "{row}: the hints must ride a real listing, not a refusal or an empty one"
+            );
+        }
     }
 
     #[tokio::test]
     async fn cache_hints_stay_absent_below_2026_and_with_no_peer_info() {
         // `skip_serializing_if` makes absence the only observable. The
         // first row is every client alive today. The second is the `None`
-        // arm, which a production stdio session really can produce —
-        // rmcp's handshake-free lifecycle builds its peer with no info
-        // (`service/server.rs`) — but never at this line: that lifecycle
-        // mandates per-request `_meta`, so `protocol_version()` is `Some`
-        // and `skips_the_handshake` refuses the request above the gate.
-        // Pinned anyway: a handler with no revision to read must fail
-        // toward the legacy wire shape, never toward emission.
+        // arm — no `_meta` revision and no session revision either, which
+        // rmcp's handshake-free lifecycle really does build
+        // (`service/server.rs`), though its own contract then mandates
+        // per-request `_meta` on every request that follows. Pinned
+        // anyway: a handler with no revision to read must fail toward the
+        // legacy wire shape, never toward emission.
         let (cfg, guard, bz) = parts("");
         let server = BugWarden::new(cfg, guard, bz).expect("server must build");
 
@@ -6705,14 +7166,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_never_echoes_a_revision_this_build_cannot_serve() {
-        // A dual-revision client probing for 2026-07-28 must be handed
-        // the server default instead. Both halves of the negotiation are
-        // exercised here: this handler's own test against
-        // `SUPPORTED_PROTOCOL_VERSIONS`, and the SDK's, which runs after
-        // the handler returns and takes the handler's value as its
-        // fallback — so a handler that echoed the request would make the
-        // SDK echo it too.
+    async fn initialize_echoes_exactly_the_revisions_this_build_serves() {
+        // Both halves of the negotiation, in both directions. This
+        // handler tests the request against `SUPPORTED_PROTOCOL_VERSIONS`;
+        // the SDK negotiates again after the handler returns, taking the
+        // handler's value as its fallback — so a handler that echoed an
+        // unsupported request would make the SDK echo it too, and a
+        // handler that refused a supported one would silently downgrade
+        // every modern client.
+        //
+        // `"9999-01-01"` carries the refusing row because widening the
+        // list left no KNOWN-but-unserved revision: rmcp's
+        // `KNOWN_VERSIONS` now equals what this build serves. It is not a
+        // typo — `ProtocolVersion` deserializes an unknown string through
+        // and every rmcp comparison is lexical, so a fabricated future
+        // date outranks every real revision.
         use clap::Parser as _;
         let mock = MockServer::start().await;
         let dir = tempfile::tempdir().unwrap();
@@ -6737,42 +7205,67 @@ mod tests {
             .expect("server must build")
             .with_audit(Arc::clone(&audit));
 
-        let (client_io, server_io) = tokio::io::duplex(1 << 16);
-        tokio::spawn(async move {
-            if let Ok(running) = server.serve(server_io).await {
-                let _ = running.waiting().await;
-            }
-        });
-        // rmcp serves a `ClientInfo` as its own handler, so this value is
-        // what the client asks for on the wire.
-        let probe = ClientInfo::default().with_protocol_version(ProtocolVersion::V_2026_07_28);
-        let client = probe
-            .serve(client_io)
-            .await
-            .expect("the handshake must succeed");
+        // (client name, requested revision, the revision the session must speak)
+        let rows = [
+            (
+                "fabricating-client",
+                "9999-01-01",
+                DEFAULT_PROTOCOL_VERSION.as_str(),
+            ),
+            (
+                "modern-client",
+                ProtocolVersion::V_2026_07_28.as_str(),
+                ProtocolVersion::V_2026_07_28.as_str(),
+            ),
+        ];
+        for (name, requested, expected) in rows {
+            let (client_io, server_io) = tokio::io::duplex(1 << 16);
+            let serving = server.clone();
+            tokio::spawn(async move {
+                if let Ok(running) = serving.serve(server_io).await {
+                    let _ = running.waiting().await;
+                }
+            });
+            let asked: ProtocolVersion =
+                serde_json::from_value(json!(requested)).expect("a wire revision parses");
+            // rmcp serves a `ClientInfo` as its own handler, so this value
+            // is what the client asks for on the wire.
+            let probe = InitializeRequestParams::new(
+                ClientCapabilities::default(),
+                Implementation::new(name, "1"),
+            )
+            .with_protocol_version(asked);
+            let client = probe
+                .serve(client_io)
+                .await
+                .expect("the handshake must succeed");
 
-        assert_eq!(
-            client
-                .peer_info()
-                .expect("the server answers initialize")
-                .protocol_version,
-            DEFAULT_PROTOCOL_VERSION,
-            "a revision this build cannot serve must not be echoed back"
-        );
+            assert_eq!(
+                client
+                    .peer_info()
+                    .expect("the server answers initialize")
+                    .protocol_version
+                    .as_str(),
+                expected,
+                "{requested}: the session must speak the negotiated revision"
+            );
 
-        let events = read_audit_events(&audit_path);
-        let recorded = events
-            .iter()
-            .find_map(|e| match &e.kind {
-                AuditEventKind::Initialize(ev) => ev.protocol_version.clone(),
-                AuditEventKind::ToolCall(_) | AuditEventKind::AuditGap(_) => None,
-            })
-            .expect("the handshake is recorded");
-        assert_eq!(
-            recorded,
-            DEFAULT_PROTOCOL_VERSION.as_str(),
-            "the record names the revision the session speaks, not the one requested"
-        );
+            let events = read_audit_events(&audit_path);
+            let recorded = events
+                .iter()
+                .find_map(|e| match &e.kind {
+                    AuditEventKind::Initialize(ev) if ev.client.name.as_deref() == Some(name) => {
+                        ev.protocol_version.clone()
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{requested}: the handshake is recorded"));
+            assert_eq!(
+                recorded, expected,
+                "{requested}: the record names the revision the session speaks, \
+                 not the one requested"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6818,33 +7311,32 @@ mod tests {
         // "9999-01-01" is not a typo: `ProtocolVersion` deserializes an
         // unknown string through, and every version comparison in rmcp is
         // lexical, so a fabricated future date outranks every real
-        // revision. It must be refused by the same arm 2026-07-28 is.
-        for probe in ["2026-07-28", "9999-01-01"] {
-            let asked: ProtocolVersion =
-                serde_json::from_value(json!(probe)).expect("a wire revision parses");
-            let answered = client
-                .peer()
-                .send_request(ClientRequest::InitializeRequest(InitializeRequest::new(
-                    ClientInfo::default().with_protocol_version(asked),
-                )))
-                .await
-                .expect("a second initialize is answered, not dropped");
-            let ServerResult::InitializeResult(answered) = answered else {
-                panic!("initialize answers with an InitializeResult")
-            };
-            assert_eq!(
-                answered.protocol_version, DEFAULT_PROTOCOL_VERSION,
-                "{probe}: the answer must name the negotiated revision"
-            );
-            // The half that was wrong: the answer already said 2025-11-25
-            // while the stored value said otherwise, so no client-visible
-            // assertion could catch it.
-            assert_eq!(
-                stored(),
-                DEFAULT_PROTOCOL_VERSION,
-                "{probe}: the stored revision must be the negotiated one, not the requested one"
-            );
-        }
+        // revision. Since #34 stage 2 it is the ONLY refusable probe left —
+        // 2026-07-28 is served, and moves the session in the last row.
+        let asked: ProtocolVersion =
+            serde_json::from_value(json!("9999-01-01")).expect("a wire revision parses");
+        let answered = client
+            .peer()
+            .send_request(ClientRequest::InitializeRequest(InitializeRequest::new(
+                ClientInfo::default().with_protocol_version(asked),
+            )))
+            .await
+            .expect("a second initialize is answered, not dropped");
+        let ServerResult::InitializeResult(answered) = answered else {
+            panic!("initialize answers with an InitializeResult")
+        };
+        assert_eq!(
+            answered.protocol_version, DEFAULT_PROTOCOL_VERSION,
+            "a fabricated revision must be answered with the negotiated one"
+        );
+        // The half that was wrong: the answer already said 2025-11-25
+        // while the stored value said otherwise, so no client-visible
+        // assertion could catch it.
+        assert_eq!(
+            stored(),
+            DEFAULT_PROTOCOL_VERSION,
+            "the stored revision must be the negotiated one, not the requested one"
+        );
 
         // The other direction, and the only place the store is observable
         // at all: rmcp overwrites whatever this handler put there on the
@@ -6852,48 +7344,50 @@ mod tests {
         // store at all. A second `initialize` naming a DIFFERENT supported
         // revision legitimately moves the session — that is what
         // `set_peer_info` is for — and the failure to catch here is the
-        // mirror of the one fixed: stored disagreeing with answered.
-        let answered = client
-            .peer()
-            .send_request(ClientRequest::InitializeRequest(InitializeRequest::new(
-                InitializeRequestParams::new(
-                    ClientCapabilities::default(),
-                    Implementation::new("renegotiating-client", "9.9"),
-                )
-                .with_protocol_version(ProtocolVersion::V_2024_11_05),
-            )))
-            .await
-            .expect("a supported renegotiation is answered");
-        let ServerResult::InitializeResult(answered) = answered else {
-            panic!("initialize answers with an InitializeResult")
-        };
-        assert_eq!(
-            answered.protocol_version,
-            ProtocolVersion::V_2024_11_05,
-            "a supported revision is echoed, so the session really does move"
-        );
-        assert_eq!(
-            stored(),
-            answered.protocol_version,
-            "the stored revision must equal the one the server answered"
-        );
-        let stored_client = running
-            .peer()
-            .peer_info()
-            .expect("the handshake stores peer info")
-            .client_info
-            .clone();
-        // The identity is re-declared wholesale, so it must follow — and it
-        // must not be the SDK's own build identity, which is what
-        // `Implementation::default()` is and what #34 §3(c) calls the
-        // plausible wrong value an audit trail can least afford.
-        assert_eq!(stored_client.name, "renegotiating-client");
-        assert_eq!(stored_client.version, "9.9");
-        assert_ne!(
-            stored_client.name,
-            Implementation::default().name,
-            "the stored client must never degrade to the SDK placeholder"
-        );
+        // mirror of the one fixed: stored disagreeing with answered. Both
+        // ends of the served range, so a list that lost either end fails.
+        for probe in [ProtocolVersion::V_2024_11_05, ProtocolVersion::V_2026_07_28] {
+            let answered = client
+                .peer()
+                .send_request(ClientRequest::InitializeRequest(InitializeRequest::new(
+                    InitializeRequestParams::new(
+                        ClientCapabilities::default(),
+                        Implementation::new("renegotiating-client", "9.9"),
+                    )
+                    .with_protocol_version(probe.clone()),
+                )))
+                .await
+                .expect("a supported renegotiation is answered");
+            let ServerResult::InitializeResult(answered) = answered else {
+                panic!("initialize answers with an InitializeResult")
+            };
+            assert_eq!(
+                answered.protocol_version, probe,
+                "{probe}: a supported revision is echoed, so the session really does move"
+            );
+            assert_eq!(
+                stored(),
+                answered.protocol_version,
+                "{probe}: the stored revision must equal the one the server answered"
+            );
+            let stored_client = running
+                .peer()
+                .peer_info()
+                .expect("the handshake stores peer info")
+                .client_info
+                .clone();
+            // The identity is re-declared wholesale, so it must follow — and
+            // it must not be the SDK's own build identity, which is what
+            // `Implementation::default()` is and what #34 §3(c) calls the
+            // plausible wrong value an audit trail can least afford.
+            assert_eq!(stored_client.name, "renegotiating-client");
+            assert_eq!(stored_client.version, "9.9");
+            assert_ne!(
+                stored_client.name,
+                Implementation::default().name,
+                "{probe}: the stored client must never degrade to the SDK placeholder"
+            );
+        }
     }
 
     #[test]
