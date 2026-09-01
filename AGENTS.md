@@ -172,6 +172,11 @@ A release is one push of an annotated tag; nothing is released by hand.
   finally the crates.io publish — `bugwarden-core` before `bugwarden`,
   because the binary crate resolves its dependency from the index and cannot
   be packaged before core is there.
+- The same tag also ships the multi-arch container image
+  `ghcr.io/plusky/bugwarden` (jobs `container`, `container-manifest`).
+  `container` is a sibling of `publish`, not upstream of it — a broken image
+  build must not hold back the crates.io release of a tag whose binaries
+  already shipped.
 - The `.deb`/`.rpm` come from `cargo-deb` and `cargo-generate-rpm`, both
   pinned to an exact version and installed `--locked`, reading
   `[package.metadata.deb]` / `[package.metadata.generate-rpm]` in
