@@ -319,32 +319,28 @@ const PARAM_ALLOWLIST: &[&str] = &[
 const PARAM_VALUE_MAX_CHARS: usize = 1024;
 
 /// An allowlisted value with every string (top level or inside a list)
-/// truncated to [`PARAM_VALUE_MAX_CHARS`] characters. No marker is
-/// appended; the cap is documented at the allowlist.
+/// [`capped`]. No marker is appended; the cap is documented at the
+/// allowlist.
 fn truncated(value: &Value) -> Value {
     match value {
-        // A string of at most 1024 BYTES has at most 1024 chars; the
-        // cheap length check skips the char walk for the common case.
-        Value::String(s) if s.len() > PARAM_VALUE_MAX_CHARS => {
-            let capped: String = s.chars().take(PARAM_VALUE_MAX_CHARS).collect();
-            Value::String(capped)
-        }
+        Value::String(s) => Value::String(capped(s)),
         Value::Array(items) => Value::Array(items.iter().map(truncated).collect()),
         other => other.clone(),
     }
 }
 
-/// `value` truncated to [`PARAM_VALUE_MAX_CHARS`] characters — the cap
-/// [`truncated`] applies to an audited parameter, applied to a recorded
-/// client identity. The single helper is the discipline: every site that
-/// writes `ClientInfo::name`/`version` goes through it.
-fn capped(value: String) -> String {
+/// `value` truncated to [`PARAM_VALUE_MAX_CHARS`] characters — the ONE
+/// place the cap is applied, to an audited parameter leaf ([`truncated`])
+/// and to a recorded client identity alike. Two copies of the rule would
+/// have to be remembered together (#191); every site that records an
+/// audited string goes through this instead.
+fn capped(value: &str) -> String {
     // A string of at most 1024 BYTES has at most 1024 chars; the cheap
     // length check skips the char walk for the common case.
     if value.len() > PARAM_VALUE_MAX_CHARS {
         value.chars().take(PARAM_VALUE_MAX_CHARS).collect()
     } else {
-        value
+        value.to_string()
     }
 }
 
@@ -406,8 +402,8 @@ fn client_of(ctx: &RequestContext<RoleServer>) -> audit::ClientInfo {
     };
     let (name, version) = declared.unzip();
     audit::ClientInfo {
-        name: name.map(capped),
-        version: version.map(capped),
+        name: name.as_deref().map(capped),
+        version: version.as_deref().map(capped),
         principal: None,
         work_context: None,
     }
@@ -4089,8 +4085,8 @@ impl ServerHandler for BugWarden {
             // the wrong thing.
             let event = audit::AuditEventKind::Initialize(audit::InitializeEvent {
                 client: audit::ClientInfo {
-                    name: Some(capped(request.client_info.name.clone())),
-                    version: Some(capped(request.client_info.version.clone())),
+                    name: Some(capped(&request.client_info.name)),
+                    version: Some(capped(&request.client_info.version)),
                     principal: None,
                     work_context: None,
                 },
@@ -6078,6 +6074,41 @@ mod tests {
         // A short value is passed through untouched.
         let obj: JsonObject = serde_json::from_value(json!({ "query": "kernel" })).unwrap();
         assert_eq!(allowlisted(Some(&obj))["query"], json!("kernel"));
+    }
+
+    #[test]
+    fn a_param_value_and_a_client_name_share_one_1024_char_boundary() {
+        // #191: the param leaf and the client identity are the same rule
+        // for the same reason, and only this row says so — it fails the
+        // moment one of them grows its own count again. Multi-byte on
+        // purpose: an ASCII probe cannot tell a char cap from a byte one.
+        // That both identity sites reach `capped` is
+        // `both_recording_sites_cap_a_declared_client_identity`.
+        let recorded_param = |s: &str| {
+            let obj: JsonObject = serde_json::from_value(json!({ "query": s })).unwrap();
+            allowlisted(Some(&obj))["query"]
+                .as_str()
+                .expect("an allowlisted string is recorded as a string")
+                .to_string()
+        };
+        let over = "é".repeat(PARAM_VALUE_MAX_CHARS + 1);
+        assert_eq!(
+            recorded_param(&over).chars().count(),
+            PARAM_VALUE_MAX_CHARS,
+            "1025 chars recorded as a param come back at exactly the cap"
+        );
+        assert_eq!(
+            recorded_param(&over),
+            capped(&over),
+            "the same 1025 chars recorded as a client name come back identical"
+        );
+        let at_cap = "é".repeat(PARAM_VALUE_MAX_CHARS);
+        assert_eq!(
+            recorded_param(&at_cap),
+            at_cap,
+            "at the cap, nothing is cut"
+        );
+        assert_eq!(capped(&at_cap), at_cap, "and neither path cuts it");
     }
 
     // The fail-mode scope tests below drive a REAL sink into failure via
