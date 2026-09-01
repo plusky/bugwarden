@@ -168,7 +168,8 @@ jobs:
         with:
           manifest-path: Cargo.toml
           command: check
-          # Empty arguments: do not force --all-features.
+          # Empty arguments: the action defaults to --all-features;
+          # deny.toml's [graph] owns feature selection instead.
           arguments: ""
 
   rust-msrv:

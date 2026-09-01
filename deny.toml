@@ -7,7 +7,9 @@
 # workspace Cargo.toml.
 
 [graph]
-all-features = false
+# `gen` is off by default but its output (man page, completions) ships in the
+# .deb/.rpm, so the gen-only deps must be scanned too.
+all-features = true
 no-default-features = false
 
 [advisories]
