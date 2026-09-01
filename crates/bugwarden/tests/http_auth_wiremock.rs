@@ -36,7 +36,6 @@ use bugwarden::server::{BugWarden, USER_AGENT, WRITE_TOOLS};
 use bugwarden_core::client::BugzillaClient;
 use bugwarden_core::guard::Guard;
 use bugwarden_core::policy::Policy;
-use clap::Parser as _;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -52,6 +51,21 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 #[path = "common/raw_post.rs"]
 mod raw_post;
 
+#[path = "common/pinned_cli.rs"]
+mod pinned_cli;
+
+use pinned_cli::pinned;
+
+/// The pin's own self-check, run in each binary that relies on it so a
+/// single-binary `cargo test --test ...` still proves what its harness
+/// claims. Both halves assert with their own message, so folding them into
+/// one test costs no diagnosis.
+#[test]
+fn the_environment_pin_holds() {
+    pinned_cli::assert_the_pin_drops_every_fallback::<Cli>();
+    pinned_cli::assert_the_pin_neutralises_a_flag_added_later::<Cli>();
+}
+
 /// 32 printable non-space characters each, and distinct.
 const WRITE_TOKEN: &str = "0123456789abcdef0123456789abcdef";
 const READ_TOKEN: &str = "fedcba9876543210fedcba9876543210";
@@ -61,7 +75,8 @@ const READ_TOKEN: &str = "fedcba9876543210fedcba9876543210";
 const EXIT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Every environment variable the binary reads, cleared before each spawn:
-/// an ambient value would change exactly what is under test.
+/// an ambient value would change exactly what is under test. The spawned
+/// leg only; `pinned` above covers the in-process one.
 const AMBIENT_VARS: &[&str] = &[
     "BUGZILLA_SERVER",
     "BUGZILLA_API_KEY",
@@ -132,17 +147,15 @@ fn the_scrub_list_covers_every_environment_fallback() {
 /// no test can exercise a differently-guarded server than the deployment
 /// serves.
 async fn serve_guarded(mock: &MockServer, env: &HttpEnv, insecure: bool) -> SocketAddr {
-    let mut cli = Cli::parse_from([
+    // No `--api-key`/`--api-key-file`, so custody stays per-request and the
+    // tests send the key with each request.
+    let cli: Cli = pinned(&[
         "bugwarden",
         "--bugzilla-server",
         &mock.uri(),
         "--transport",
         "http",
     ]);
-    // Both key fields explicitly cleared, so the ambient environment cannot
-    // leak into what these tests resolve; the tests send the key per request.
-    cli.api_key = None;
-    cli.api_key_file = None;
     let guard = Arc::new(Guard {
         policy: Policy::default(),
     });

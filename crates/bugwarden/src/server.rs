@@ -4721,11 +4721,11 @@ mod tests {
     }
 
     use super::*;
+    use crate::pinned_cli::pinned;
     use bugwarden_core::policy::Policy;
 
     fn parts(policy: &str) -> (Arc<Cli>, Arc<Guard>, Arc<BugzillaClient>) {
-        use clap::Parser as _;
-        let mut cli = Cli::parse_from([
+        let cfg: Arc<Cli> = Arc::new(pinned(&[
             "bugwarden",
             "--bugzilla-server",
             "https://bugzilla.example.com",
@@ -4733,11 +4733,7 @@ mod tests {
             "stdio",
             "--api-key",
             "test-key",
-        ]);
-        // The ambient environment (BUGZILLA_API_KEY_FILE) must not leak into
-        // what these tests resolve.
-        cli.api_key_file = None;
-        let cfg = Arc::new(cli);
+        ]));
         let guard = Arc::new(Guard {
             policy: Policy::from_toml_str(policy).expect("test policy must parse"),
         });
@@ -4767,17 +4763,15 @@ mod tests {
         // Key custody is resolved by BugWarden::new on every construction
         // path: stdio without any key source must fail at startup, never at
         // the first request. main.rs no longer duplicates this bail.
-        use clap::Parser as _;
-        let mut cli = Cli::parse_from([
+        // No key source in the argv, and the pin keeps the environment
+        // from supplying one.
+        let cli: Cli = pinned(&[
             "bugwarden",
             "--bugzilla-server",
             "https://bugzilla.example.com",
             "--transport",
             "stdio",
         ]);
-        // The ambient environment must not decide this test.
-        cli.api_key = None;
-        cli.api_key_file = None;
         let guard = Arc::new(Guard {
             policy: Policy::from_toml_str("").expect("empty policy parses"),
         });
@@ -4799,7 +4793,6 @@ mod tests {
         // account that owns the key, so a created_by_me policy written for
         // per-request custody silently changes meaning — construction must
         // say so. A policy that never consults identity stays quiet.
-        use clap::Parser as _;
         use std::io::Write as _;
         let mut file = tempfile::NamedTempFile::new().expect("temp key file");
         file.write_all(b"srv-key\n").expect("write key file");
@@ -4808,14 +4801,13 @@ mod tests {
             "[rule.match]\ncreated_by_me = true\n",
         );
         for (policy, expect_warn) in [(identity_policy, true), ("", false)] {
-            let mut cli = Cli::parse_from([
+            let mut cli: Cli = pinned(&[
                 "bugwarden",
                 "--bugzilla-server",
                 "https://bugzilla.example.com",
                 "--transport",
                 "http",
             ]);
-            cli.api_key = None;
             cli.api_key_file = Some(file.path().to_path_buf());
             let guard = Arc::new(Guard {
                 policy: Policy::from_toml_str(policy).expect("test policy must parse"),
@@ -4846,16 +4838,15 @@ mod tests {
         // Per-request http custody holds no server-side key at all, so
         // there is nothing for the declared login to describe — this must
         // be a hard startup error, unlike whoami's warn-and-continue.
-        use clap::Parser as _;
-        let mut cli = Cli::parse_from([
+        // No key source in the argv, and none from the environment: custody
+        // stays per-request.
+        let cli: Cli = pinned(&[
             "bugwarden",
             "--bugzilla-server",
             "https://bugzilla.example.com",
             "--transport",
             "http",
         ]);
-        cli.api_key = None;
-        cli.api_key_file = None; // stays per-request: no server-held key
         let guard = Arc::new(Guard {
             policy: Policy::from_toml_str(concat!(
                 "[global]\n",
@@ -4883,8 +4874,7 @@ mod tests {
     fn new_allows_declared_identity_under_server_held_custody() {
         // The companion positive case: a server-held key is exactly what a
         // declared login describes, so construction must succeed.
-        use clap::Parser as _;
-        let cli = Cli::parse_from([
+        let cli: Cli = pinned(&[
             "bugwarden",
             "--bugzilla-server",
             "https://bugzilla.example.com",
@@ -6179,8 +6169,7 @@ mod tests {
         mock_uri: &str,
         audit: Option<Arc<AuditState>>,
     ) -> RunningService<RoleClient, ()> {
-        use clap::Parser as _;
-        let mut cli = Cli::parse_from([
+        let cfg: Arc<Cli> = Arc::new(pinned(&[
             "bugwarden",
             "--bugzilla-server",
             mock_uri,
@@ -6188,10 +6177,7 @@ mod tests {
             "stdio",
             "--api-key",
             "test-key",
-        ]);
-        // The ambient environment (BUGZILLA_API_KEY_FILE) must not leak in.
-        cli.api_key_file = None;
-        let cfg = Arc::new(cli);
+        ]));
         let guard = Arc::new(Guard {
             policy: Policy::from_toml_str(policy).expect("test policy must parse"),
         });
@@ -7244,13 +7230,12 @@ mod tests {
         // meta is empty — killing a mutant that reads only `context.meta`
         // (behavior-preserving over every serialized transport, so no
         // other test can).
-        use clap::Parser as _;
         let mock = MockServer::start().await;
         mount_bug7(&mock).await;
         let dir = tempfile::tempdir().unwrap();
         let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
 
-        let mut cli = Cli::parse_from([
+        let cli: Cli = pinned(&[
             "bugwarden",
             "--bugzilla-server",
             &mock.uri(),
@@ -7259,7 +7244,6 @@ mod tests {
             "--api-key",
             "test-key",
         ]);
-        cli.api_key_file = None;
         let guard = Arc::new(Guard {
             policy: Policy::from_toml_str("").expect("test policy must parse"),
         });
@@ -7451,11 +7435,10 @@ mod tests {
         // typo — `ProtocolVersion` deserializes an unknown string through
         // and every rmcp comparison is lexical, so a fabricated future
         // date outranks every real revision.
-        use clap::Parser as _;
         let mock = MockServer::start().await;
         let dir = tempfile::tempdir().unwrap();
         let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
-        let mut cli = Cli::parse_from([
+        let cli: Cli = pinned(&[
             "bugwarden",
             "--bugzilla-server",
             &mock.uri(),
@@ -7464,7 +7447,6 @@ mod tests {
             "--api-key",
             "test-key",
         ]);
-        cli.api_key_file = None;
         let guard = Arc::new(Guard {
             policy: Policy::from_toml_str("").expect("test policy must parse"),
         });
@@ -7764,18 +7746,15 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let cli = {
-            use clap::Parser as _;
-            Cli::parse_from([
-                "bugwarden",
-                "--bugzilla-server",
-                &mock.uri(),
-                "--transport",
-                "stdio",
-                "--api-key",
-                "test-key",
-            ])
-        };
+        let cli: Cli = pinned(&[
+            "bugwarden",
+            "--bugzilla-server",
+            &mock.uri(),
+            "--transport",
+            "stdio",
+            "--api-key",
+            "test-key",
+        ]);
         let bz = bugzilla_client(&cli).expect("client must build");
         bz.version("test-key").await.expect("version must parse");
 
@@ -7907,8 +7886,7 @@ mod tests {
     }
 
     fn http_server_with(hosts: Vec<String>, api_key: Option<String>) -> BugWarden {
-        use clap::Parser as _;
-        let mut cli = Cli::parse_from([
+        let mut cli: Cli = pinned(&[
             "bugwarden",
             "--bugzilla-server",
             "https://bugzilla.example.com",
@@ -7916,7 +7894,6 @@ mod tests {
             "http",
         ]);
         cli.api_key = api_key;
-        cli.api_key_file = None;
         cli.allowed_hosts = hosts;
         let guard = Arc::new(Guard {
             policy: Policy::default(),

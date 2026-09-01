@@ -28,13 +28,27 @@ use bugwarden::server::{BugWarden, USER_AGENT, WRITE_TOOLS};
 use bugwarden_core::client::BugzillaClient;
 use bugwarden_core::guard::Guard;
 use bugwarden_core::policy::Policy;
-use clap::Parser as _;
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::ServiceExt as _;
 use serde_json::{json, Value};
 use wiremock::matchers::{body_partial_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[path = "common/pinned_cli.rs"]
+mod pinned_cli;
+
+use pinned_cli::pinned;
+
+/// The pin's own self-check, run in each binary that relies on it so a
+/// single-binary `cargo test --test ...` still proves what its harness
+/// claims. Both halves assert with their own message, so folding them into
+/// one test costs no diagnosis.
+#[test]
+fn the_environment_pin_holds() {
+    pinned_cli::assert_the_pin_drops_every_fallback::<Cli>();
+    pinned_cli::assert_the_pin_neutralises_a_flag_added_later::<Cli>();
+}
 
 /// The uniform create refusal (`Guard::create_denial`), pinned by value so a
 /// wording change in either path breaks a test instead of passing silently.
@@ -43,7 +57,7 @@ const CREATE_DENIAL: &str = "Filing this bug is not permitted through this serve
 /// Serve a [`BugWarden`] built from `policy` against `mock`, and connect an
 /// MCP client to it over an in-memory duplex transport.
 async fn client_for(policy: &str, mock: &MockServer) -> RunningService<RoleClient, ()> {
-    let mut cli = Cli::parse_from([
+    let cfg: Arc<Cli> = Arc::new(pinned(&[
         "bugwarden",
         "--bugzilla-server",
         &mock.uri(),
@@ -51,11 +65,7 @@ async fn client_for(policy: &str, mock: &MockServer) -> RunningService<RoleClien
         "stdio",
         "--api-key",
         "test-key",
-    ]);
-    // The ambient environment (BUGZILLA_API_KEY_FILE) must not leak into
-    // what these tests resolve.
-    cli.api_key_file = None;
-    let cfg = Arc::new(cli);
+    ]));
     let guard = Arc::new(Guard {
         policy: Policy::from_toml_str(policy).expect("test policy must parse"),
     });
@@ -2513,7 +2523,7 @@ async fn whoami_transport_error_does_not_leak_the_api_key_i12() {
     // api_key=... in it. Nothing the client sees may contain the key.
     let base = common::refused_base_url();
 
-    let mut cli = Cli::parse_from([
+    let cfg: Arc<Cli> = Arc::new(pinned(&[
         "bugwarden",
         "--bugzilla-server",
         &base,
@@ -2521,9 +2531,7 @@ async fn whoami_transport_error_does_not_leak_the_api_key_i12() {
         "stdio",
         "--api-key",
         "SUPERSECRETKEY123",
-    ]);
-    cli.api_key_file = None; // the ambient environment must not leak in
-    let cfg = Arc::new(cli);
+    ]));
     let guard = Arc::new(Guard {
         policy: Policy::from_toml_str(IDENTITY_POLICY).expect("test policy must parse"),
     });

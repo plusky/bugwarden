@@ -22,13 +22,27 @@ use bugwarden::server::{BugWarden, USER_AGENT};
 use bugwarden_core::client::BugzillaClient;
 use bugwarden_core::guard::Guard;
 use bugwarden_core::policy::Policy;
-use clap::Parser as _;
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::ServiceExt as _;
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[path = "common/pinned_cli.rs"]
+mod pinned_cli;
+
+use pinned_cli::pinned;
+
+/// The pin's own self-check, run in each binary that relies on it so a
+/// single-binary `cargo test --test ...` still proves what its harness
+/// claims. Both halves assert with their own message, so folding them into
+/// one test costs no diagnosis.
+#[test]
+fn the_environment_pin_holds() {
+    pinned_cli::assert_the_pin_drops_every_fallback::<Cli>();
+    pinned_cli::assert_the_pin_neutralises_a_flag_added_later::<Cli>();
+}
 
 const TRACEPARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
 const TRACE_ID: [u8; 16] = [
@@ -235,7 +249,7 @@ async fn server_with_sinks(
     };
     let audit = Arc::new(AuditState::new(sink, fail_mode, None));
 
-    let mut cli = Cli::parse_from([
+    let cfg: Arc<Cli> = Arc::new(pinned(&[
         "bugwarden",
         "--bugzilla-server",
         &mock.uri(),
@@ -243,9 +257,7 @@ async fn server_with_sinks(
         "stdio",
         "--api-key",
         "test-key",
-    ]);
-    cli.api_key_file = None;
-    let cfg = Arc::new(cli);
+    ]));
     let guard = Arc::new(Guard {
         policy: Policy::default(),
     });

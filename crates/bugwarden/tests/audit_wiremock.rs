@@ -21,13 +21,27 @@ use bugwarden::server::{BugWarden, USER_AGENT};
 use bugwarden_core::client::BugzillaClient;
 use bugwarden_core::guard::Guard;
 use bugwarden_core::policy::Policy;
-use clap::Parser as _;
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::ServiceExt as _;
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[path = "common/pinned_cli.rs"]
+mod pinned_cli;
+
+use pinned_cli::pinned;
+
+/// The pin's own self-check, run in each binary that relies on it so a
+/// single-binary `cargo test --test ...` still proves what its harness
+/// claims. Both halves assert with their own message, so folding them into
+/// one test costs no diagnosis.
+#[test]
+fn the_environment_pin_holds() {
+    pinned_cli::assert_the_pin_drops_every_fallback::<Cli>();
+    pinned_cli::assert_the_pin_neutralises_a_flag_added_later::<Cli>();
+}
 
 /// A served, audited server plus the handles the assertions need.
 struct Audited {
@@ -69,7 +83,7 @@ async fn audited_client_with(
         Some("sha256:policy-under-test".to_string()),
     ));
 
-    let mut cli = Cli::parse_from([
+    let cfg: Arc<Cli> = Arc::new(pinned(&[
         "bugwarden",
         "--bugzilla-server",
         &mock.uri(),
@@ -77,10 +91,7 @@ async fn audited_client_with(
         "stdio",
         "--api-key",
         api_key,
-    ]);
-    // The ambient environment (BUGZILLA_API_KEY_FILE) must not leak in.
-    cli.api_key_file = None;
-    let cfg = Arc::new(cli);
+    ]));
     let guard = Arc::new(Guard {
         policy: Policy::from_toml_str(policy).expect("test policy must parse"),
     });
@@ -106,7 +117,7 @@ async fn audited_client_with(
 
 /// An un-audited server over the same transport, for comparisons.
 async fn plain_client_for(policy: &str, mock: &MockServer) -> RunningService<RoleClient, ()> {
-    let mut cli = Cli::parse_from([
+    let cfg: Arc<Cli> = Arc::new(pinned(&[
         "bugwarden",
         "--bugzilla-server",
         &mock.uri(),
@@ -114,10 +125,7 @@ async fn plain_client_for(policy: &str, mock: &MockServer) -> RunningService<Rol
         "stdio",
         "--api-key",
         "test-key",
-    ]);
-    // The ambient environment (BUGZILLA_API_KEY_FILE) must not leak in.
-    cli.api_key_file = None;
-    let cfg = Arc::new(cli);
+    ]));
     let guard = Arc::new(Guard {
         policy: Policy::from_toml_str(policy).expect("test policy must parse"),
     });
