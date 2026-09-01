@@ -151,6 +151,19 @@ jobs:
           esac
       - name: Clippy (beta)
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Doc (beta)
+        # The rustdoc gate is -D warnings so it picks up future
+        # warn-by-default rustdoc lints by itself; without a leg here the
+        # first one to land fires in the required `rust` job instead.
+        # Per-step env, like that job: job-level would leak into a doctest
+        # collection.
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --document-private-items --locked
+      - name: Doc (beta, gen tool)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p bugwarden --features gen --no-deps --document-private-items --locked
       - name: Test (beta)
         run: cargo test --workspace --all-targets --locked
 
