@@ -17,3 +17,11 @@ pub mod server;
 
 #[cfg(test)]
 mod testlog;
+
+// The environment pin the integration tests share, so the crate's own unit
+// tests parse a `Cli` the same way (#214). `#[path]` rather than a module
+// of `tests/common/mod.rs`: that one compiles into every binary saying `mod
+// common;`, where a helper only some of them use is `dead_code` (#167).
+#[cfg(test)]
+#[path = "../tests/common/pinned_cli.rs"]
+mod pinned_cli;

@@ -382,21 +382,29 @@ mod tests {
     use std::io::Write as _;
 
     use super::*;
+    use crate::pinned_cli::pinned;
 
-    /// A `Cli` for `transport` with both key sources explicitly cleared, so
-    /// the ambient environment (`BUGZILLA_API_KEY`, `BUGZILLA_API_KEY_FILE`)
-    /// cannot leak into what a test resolves.
+    /// The pin's own self-check, run in each binary that relies on it so a
+    /// single-binary `cargo test ...` still proves what its harness claims.
+    /// Both halves assert with their own message, so folding them into one
+    /// test costs no diagnosis.
+    #[test]
+    fn the_environment_pin_holds() {
+        crate::pinned_cli::assert_the_pin_drops_every_fallback::<Cli>();
+        crate::pinned_cli::assert_the_pin_neutralises_a_flag_added_later::<Cli>();
+    }
+
+    /// A `Cli` for `transport` carrying no key source, so what a test
+    /// resolves is decided by the test and not by the ambient
+    /// `BUGZILLA_API_KEY` / `BUGZILLA_API_KEY_FILE`.
     fn base_cli(transport: &str) -> Cli {
-        let mut cli = Cli::parse_from([
+        pinned(&[
             "bugwarden",
             "--bugzilla-server",
             "https://bugzilla.example.com",
             "--transport",
             transport,
-        ]);
-        cli.api_key = None;
-        cli.api_key_file = None;
-        cli
+        ])
     }
 
     fn key_file(content: &str) -> tempfile::NamedTempFile {
@@ -521,7 +529,7 @@ mod tests {
         // "unset" idiom) must behave exactly like an unset variable: the
         // parser accepts the empty value and resolution ignores it —
         // mirroring the empty --api-key convention.
-        let mut cli = Cli::parse_from([
+        let cli: Cli = pinned(&[
             "bugwarden",
             "--bugzilla-server",
             "https://bugzilla.example.com",
@@ -530,7 +538,6 @@ mod tests {
             "--api-key-file",
             "",
         ]);
-        cli.api_key = None;
         let custody = cli.resolve_key_custody().expect("http resolves");
         assert!(
             matches!(custody, KeyCustody::PerRequest),
@@ -606,7 +613,7 @@ mod tests {
         // and both sources feed the one field — so the normalization the
         // environment needs is proven here, on the flag. Whitespace around
         // commas is trimmed; whitespace is not itself a separator.
-        let cli = Cli::parse_from([
+        let cli: Cli = pinned(&[
             "bugwarden",
             "--bugzilla-server",
             "https://bugzilla.example.com",
@@ -624,7 +631,7 @@ mod tests {
 
         // An entry naming no host leaves validation off — `MCP_ALLOWED_HOSTS=`
         // is unset, not "allow nothing" (see `resolved_allowed_hosts`).
-        let cli = Cli::parse_from([
+        let cli: Cli = pinned(&[
             "bugwarden",
             "--bugzilla-server",
             "https://bugzilla.example.com",
@@ -648,7 +655,7 @@ mod tests {
         // `a b.example` is a missing-dot typo, not two hosts. Splitting on
         // whitespace would manufacture a single-label `a` (meaningful in a
         // k8s namespace) and hide the typo.
-        let cli = Cli::parse_from([
+        let cli: Cli = pinned(&[
             "bugwarden",
             "--bugzilla-server",
             "https://bugzilla.example.com",
