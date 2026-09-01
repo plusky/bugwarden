@@ -1,3 +1,5 @@
+//! Operator-facing audit event stream: record schema and JSONL file sink.
+//!
 //! bugwarden places an operator-written guard policy between an MCP client
 //! and Bugzilla. On the client side that guard is invisible by design: a
 //! hidden bug is indistinguishable from a nonexistent one, filtered search

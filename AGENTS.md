@@ -99,6 +99,11 @@ are never a justification for undoing them.
   cloning to resolve a lifetime issue by default.
 - Public items need rustdoc that explains purpose, relevant errors, and
   behavioral constraints. Keep crate documentation accurate.
+- Module docs live in the module's own `//!`, never as a `///` on the `mod`
+  declaration: one outer line there makes rustdoc resolve the *whole* merged
+  block's intra-doc links in the parent scope, and the `unresolved link` error
+  prints no file or line — only the offending doc text, which is the module's,
+  never `lib.rs`.
 - Return errors with actionable context (`anyhow` with context in the
   core crate). Do not use `unwrap`, `expect`, or panics in recoverable
   production paths.
