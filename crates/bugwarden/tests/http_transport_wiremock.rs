@@ -1,11 +1,18 @@
-//! End-to-end tests of API key custody over REAL streamable HTTP.
+//! End-to-end tests of the streamable-HTTP transport: what holds only once
+//! a request has crossed a real socket. API key custody is one such
+//! property, not the file's subject — it also pins Host validation, the
+//! 2026-07-28 handshake-free lifecycle, the audit session anchor, the
+//! per-revision cache hints, `_meta` propagation into the audit record, the
+//! POST body cap, the identity `server/discover` answers with, and guard
+//! parity with stdio.
 //!
-//! Each test builds a [`BugWarden`] with `--transport http`, serves it over
-//! an actual TCP listener through `StreamableHttpService`, and connects an
-//! rmcp client through reqwest — the only harness in which the per-request
-//! key header physically exists. The wiremock upstream plays Bugzilla; the
-//! key reaches it as the `api_key` query parameter, so a `query_param`
-//! matcher proves WHICH key served a request.
+//! A test builds a [`BugWarden`] with `--transport http` and serves it over
+//! an actual TCP listener through `StreamableHttpService`, wiremock playing
+//! Bugzilla; the one startup-error leg stops at `http_server_config` and
+//! binds nothing. The client is whatever the property needs: an rmcp client
+//! through reqwest, raw reqwest where the wire shape is itself the point
+//! (the handshake-free lifecycle, the minted session id), or a raw TCP
+//! socket for the body cap, whose 413 lands mid-write.
 //!
 //! Coverage contract (each of these mutations must fail at least one test):
 //! - server-held mode falling back to the client's header when one is sent;
@@ -28,9 +35,12 @@
 //! - handing an unparsable `--allowed-hosts` entry (`*`, a URL) to rmcp
 //!   instead of refusing it at `http_server_config`;
 //! - the POST body cap going back to a fixed value, which refuses uploads
-//!   the operator's `global.max_attachment_bytes` permits, or losing its
-//!   4 MiB floor, which would let a policy shrink the transport's memory
-//!   bound (or remove it entirely at `0`);
+//!   the operator's `global.max_attachment_bytes` permits (losing the
+//!   4 MiB floor is NOT killed here: the default 2 MiB cap derives
+//!   3,844,780 bytes, still under the 5 MiB probe, so that leg's 413
+//!   stands with or without the clamp — the floor and its `0` case are
+//!   killed by the `max_request_body_bytes` unit tests in server.rs
+//!   instead);
 //! - `session_info` taking the audit `session.id` from the `mcp-session-id`
 //!   REQUEST header again, which leaves every `initialize` record without
 //!   the id that would join it to its own session and lets a stateless
@@ -147,6 +157,9 @@ async fn serve_http(
 /// Connect an MCP client to `addr` over streamable HTTP. With
 /// `header_value`, every request carries `ApiKey: <value>` (a reqwest
 /// default header); without, no key header exists anywhere in the session.
+/// That distinction is what the custody tests turn on, and only http can
+/// draw it: stdio resolves one key at startup and carries no per-request
+/// header at all.
 async fn connect(addr: SocketAddr, header_value: Option<&str>) -> RunningService<RoleClient, ()> {
     let mut builder = reqwest::Client::builder();
     if let Some(value) = header_value {
@@ -719,8 +732,10 @@ async fn discover_names_this_build_and_reaches_nothing_else() {
         "the SDK's discover serves cacheScope unconditionally: {body}"
     );
     // It answers `get_info` and nothing else: no tool, no guard, no
-    // upstream. That is what makes an unauthenticated pre-request surface
-    // acceptable while #32 is open.
+    // upstream. Says nothing about auth: this harness serves the bare
+    // router, while `main` wraps that router in the bearer gate — which
+    // `server/discover` needs like any other request (DESIGN.md, "HTTP
+    // bearer authentication"), and which http_auth_wiremock.rs pins.
     let upstream = mock.received_requests().await.unwrap_or_default();
     assert!(
         upstream.is_empty(),
