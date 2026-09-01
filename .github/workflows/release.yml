@@ -261,15 +261,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tags="$(sed -n 's/^FROM rust:\([0-9][0-9.]*\)-alpine.*/\1/p' Dockerfile)"
+          # Any rust stage a per-line pattern can catch: indented, lowercase,
+          # --flag=value, registry-qualified, any tag, a bare digest, or none
+          # (`T` drops non-matches; an untagged stage is the rust:latest it
+          # really is). ARG indirection and continuations stay out of reach.
+          tags="$(sed -nE 's/^[[:space:]]*FROM[[:space:]]+(--[^[:space:]]+[[:space:]]+)*([^[:space:]]*\/)?rust([:@]([^[:space:]]+))?([[:space:]].*)?$/\4/I; T; s/^$/latest/; p' Dockerfile)"
           channel="$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)"
           if [ -z "$tags" ] || [ -z "$channel" ]; then
             echo "::error::cannot read the Rust version: Dockerfile FROM tags '$tags', rust-toolchain.toml channel '$channel'"
             exit 1
           fi
-          # Check every rust stage, so a second one cannot drift past the guard.
+          # Check every stage found above, so a second one cannot drift past.
           while IFS= read -r tag; do
-            if [ "$tag" != "$channel" ]; then
+            tag="${tag%%@*}"  # the digest pins the image, not the toolchain
+            if [ "${tag%%-*}" != "$channel" ]; then
               echo "::error::toolchain drift: Dockerfile builds on rust:$tag but rust-toolchain.toml pins channel $channel -- bump both together"
               exit 1
             fi
