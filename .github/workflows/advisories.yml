@@ -1,0 +1,49 @@
+---
+name: advisories
+on:
+  schedule:
+    # Weekly like codeql, in a different slot; off the hour, since the top of
+    # one is GitHub's most contended and most-dropped minute.
+    - cron: '47 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  # No PR event to supersede here: let a hand-fired run finish rather than
+  # have the next cron cancel it.
+  cancel-in-progress: false
+
+jobs:
+  advisories:
+    # `cargo deny check advisories` against a freshly fetched advisory-db.
+    # Config: deny.toml, same file ci.yml's rust-deny uses.
+    #
+    # Its own workflow, not a `schedule:` on ci.yml: that trigger is
+    # workflow-level and would run every ci.yml job weekly. And deliberately
+    # NOT the gating rust-deny job — keep this off the required contexts, so
+    # a RustSec advisory published today fails here rather than reddening
+    # main or whichever stranger's PR arrives next.
+    #
+    # Surfacing is GitHub's failed-run email to the repo owner. Nothing
+    # pages, nothing files an issue. GitHub also disables crons after 60 days
+    # of repo inactivity, so silence is not by itself proof of a clean tree.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: cargo-deny (advisories)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25  # v2
+        with:
+          manifest-path: Cargo.toml
+          command: check
+          # `arguments` land before the subcommand, `command-arguments`
+          # after it — the check name is the latter. Empty arguments: the
+          # action defaults to --all-features; deny.toml's [graph] owns
+          # feature selection instead.
+          arguments: ""
+          command-arguments: advisories
