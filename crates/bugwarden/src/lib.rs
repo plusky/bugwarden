@@ -8,14 +8,10 @@
 //! as a unit. The supported product remains the `bugwarden` binary; this
 //! API carries no stability promise of its own.
 
-/// Operator-facing audit event stream: record schema and JSONL file sink.
 pub mod audit;
 pub mod config;
-/// Bearer authentication for the streamable-HTTP transport.
 pub mod http_auth;
 pub mod http_session;
-/// OTLP export of the audit stream (load-bearing) and of the server's
-/// own diagnostics (best-effort).
 pub mod otel;
 pub mod server;
 
