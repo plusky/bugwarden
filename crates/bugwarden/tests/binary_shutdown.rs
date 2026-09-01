@@ -16,6 +16,15 @@
 //! - stdio wrapping only `serve` and not `waiting()`;
 //! - HTTP SIGTERM returning without `ct.cancel()`, leaving an open MCP
 //!   session to outlive the shutdown.
+//!
+//! Both races this file used to lose (#173) were readiness barriers that
+//! did not prove what they had to, and both are answered in `main`:
+//! the port is the kernel's choice, read back from the child's own startup
+//! line, so no stranger holding a guessed port can answer for the child;
+//! and `shutdown_signal` arms the handlers *before* that line is logged, so
+//! a signal sent the instant it appears cannot land on the kernel's default
+//! disposition and kill the process. Waiting on the line is the whole
+//! barrier — a sleep would only trade a fast flake for a slow one.
 
 #![cfg(unix)]
 
@@ -31,7 +40,10 @@ use rmcp::ServiceExt as _;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
+use tokio::io::Lines;
 use tokio::process::Child;
+use tokio::process::ChildStderr;
+use tokio::process::ChildStdin;
 use tokio::process::Command;
 
 /// Bounded so a binary that ignores the signal fails this test rather than
@@ -97,40 +109,167 @@ fn the_scrub_list_covers_every_environment_fallback() {
     );
 }
 
-/// A port to hand the child, chosen by binding and releasing an ephemeral
-/// one. Racy in principle; the child's readiness poll below turns a lost
-/// race into a test failure rather than a hang.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
+/// The line the http transport logs once it is bound *and* its signal
+/// handlers are armed; the address that follows is the one the kernel
+/// assigned, which with `--port 0` is the only way to learn it.
+const HTTP_READY: &str = "Starting Bugzilla MCP server on ";
+
+/// The same, for stdio, which has no address.
+const STDIO_READY: &str = "Starting Bugzilla MCP server on stdio";
+
+/// A spawned binary, its pipes, and every stderr line it has written.
+struct Server {
+    child: Child,
+    /// Held until the process exits, never dropped early: `Child::wait`
+    /// closes the child's stdin, and EOF there unblocks a stdio child's
+    /// read — which would let a handshake arm that merely returned pass
+    /// the pre-handshake test.
+    stdin: Option<ChildStdin>,
+    /// One reader for the process's whole life. A `BufReader` built per
+    /// wait throws away whatever it buffered past the line it matched,
+    /// which can swallow the line a later assertion needs.
+    stderr: Lines<BufReader<ChildStderr>>,
+    /// Every stderr line read so far, for the assertions and diagnostics.
+    log: String,
 }
 
-fn send_signal(pid: u32, signal: &str) {
-    let status = std::process::Command::new("kill")
-        .args(["-s", signal, &pid.to_string()])
-        .status()
-        .expect("kill must be executable");
-    assert!(status.success(), "kill -s {signal} {pid} failed: {status}");
-}
-
-/// Spawn the shipped binary. Stdin is piped so a stdio child does not see
-/// EOF the moment we start; stderr is piped so tests can wait on the
-/// startup line. `kill_on_drop` reaps a child if the assertion panics.
-fn spawn_binary(args: &[&str]) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_bugwarden"));
-    cmd.args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for var in AMBIENT_VARS {
-        cmd.env_remove(var);
+impl Server {
+    /// Spawn the shipped binary with every environment fallback scrubbed.
+    /// `kill_on_drop` reaps the child if an assertion panics.
+    fn spawn(args: &[&str]) -> Self {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_bugwarden"));
+        cmd.args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for var in AMBIENT_VARS {
+            cmd.env_remove(var);
+        }
+        cmd.env("RUST_LOG", "info");
+        cmd.kill_on_drop(true);
+        let mut child = cmd.spawn().expect("the built binary must start");
+        let stdin = child.stdin.take();
+        let stderr = BufReader::new(child.stderr.take().expect("stderr is piped")).lines();
+        Self {
+            child,
+            stdin,
+            stderr,
+            log: String::new(),
+        }
     }
-    cmd.env("RUST_LOG", "info");
-    cmd.kill_on_drop(true);
-    cmd.spawn().expect("the built binary must start")
+
+    /// Read stderr until a line contains `needle`, and return that line.
+    /// The startup lines are the readiness barriers: see the module docs.
+    async fn wait_for_stderr(&mut self, needle: &str) -> String {
+        let found = tokio::time::timeout(EXIT_TIMEOUT, async {
+            while let Some(line) = self.next_stderr_line().await {
+                if line.contains(needle) {
+                    return Some(line);
+                }
+            }
+            None
+        })
+        .await;
+        match found {
+            Ok(Some(line)) => line,
+            Ok(None) => panic!(
+                "the child's stderr ended before {needle:?}: {log}",
+                log = self.log
+            ),
+            Err(_) => panic!(
+                "timed out waiting for {needle:?} on the child's stderr: {log}",
+                log = self.log
+            ),
+        }
+    }
+
+    /// Next stderr line, recorded in `log`; `None` at EOF.
+    async fn next_stderr_line(&mut self) -> Option<String> {
+        let line = self
+            .stderr
+            .next_line()
+            .await
+            .expect("the child's stderr must be readable")?;
+        self.log.push_str(&line);
+        self.log.push('\n');
+        Some(line)
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id().expect("the child has a pid")
+    }
+
+    fn signal(&self, signal: &str) {
+        let pid = self.pid();
+        let status = std::process::Command::new("kill")
+            .args(["-s", signal, &pid.to_string()])
+            .status()
+            .expect("kill must be executable");
+        assert!(status.success(), "kill -s {signal} {pid} failed: {status}");
+    }
+
+    /// The process exits 0 — not a signal-kill, not an error — and its
+    /// stderr shows the shutdown path ran.
+    async fn assert_graceful_exit(mut self, what: &str) {
+        let status = tokio::time::timeout(EXIT_TIMEOUT, self.child.wait())
+            .await
+            .unwrap_or_else(|_| panic!("{what}: the process must exit within {EXIT_TIMEOUT:?}"))
+            .expect("the child must be waitable");
+        // The tail of stderr: the exit raced the writes, so read to EOF
+        // rather than assert on whatever had arrived by then.
+        let _ = tokio::time::timeout(EXIT_TIMEOUT, async {
+            while self.next_stderr_line().await.is_some() {}
+        })
+        .await;
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{what}: SIGTERM/SIGINT must be a clean exit 0, not a signal-kill \
+             (code=None) or an error: status={status:?} stderr={log}",
+            log = self.log
+        );
+        assert!(
+            self.log.contains("received shutdown signal"),
+            "{what}: the shutdown path must log that it ran: {log}",
+            log = self.log
+        );
+    }
+}
+
+/// Spawn the http transport and return the address it actually bound.
+///
+/// `--port 0` leaves the choice to the kernel, which assigns the port to
+/// the process that then keeps it: unlike bind-then-drop there is no window
+/// for anything else on the host to take it (#173), the pattern
+/// `tests/common/mod.rs` documents as known-bad. The address comes back
+/// from the child's own startup line, which is also a stronger readiness
+/// barrier than a connect probe — a stranger holding a guessed port would
+/// have answered that probe on the child's behalf.
+async fn spawn_http() -> (Server, SocketAddr) {
+    let mut server = Server::spawn(&[
+        "--bugzilla-server",
+        "https://bugzilla.example.invalid",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--insecure-no-auth",
+    ]);
+    let line = server.wait_for_stderr(HTTP_READY).await;
+    let (_, addr) = line
+        .split_once(HTTP_READY)
+        .expect("wait_for_stderr matched the needle");
+    let addr: SocketAddr = addr
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("the startup line must name the bound address: {line}: {e}"));
+    assert!(
+        addr.ip().is_loopback() && addr.port() != 0,
+        "the startup line must carry the loopback address the kernel \
+         assigned, not the requested port 0: {line}"
+    );
+    wait_for_tcp(addr).await;
+    (server, addr)
 }
 
 async fn wait_for_tcp(addr: SocketAddr) {
@@ -146,49 +285,6 @@ async fn wait_for_tcp(addr: SocketAddr) {
     assert!(ready.is_ok(), "the binary must start serving on {addr}");
 }
 
-/// Block until `needle` appears on the child's stderr, so a signal is not
-/// delivered before `shutdown_signal` is armed.
-async fn wait_for_stderr(child: &mut Child, needle: &str) {
-    let stderr = child.stderr.as_mut().expect("stderr is piped");
-    let mut lines = BufReader::new(stderr).lines();
-    let found = tokio::time::timeout(EXIT_TIMEOUT, async {
-        loop {
-            let line = lines
-                .next_line()
-                .await
-                .expect("stderr must be readable")
-                .expect("the server must log the startup line before EOF");
-            if line.contains(needle) {
-                return;
-            }
-        }
-    })
-    .await;
-    assert!(
-        found.is_ok(),
-        "timed out waiting for {needle:?} on the child's stderr"
-    );
-}
-
-async fn assert_graceful_exit(child: Child, what: &str) {
-    let output = tokio::time::timeout(EXIT_TIMEOUT, child.wait_with_output())
-        .await
-        .unwrap_or_else(|_| panic!("{what}: the process must exit within {EXIT_TIMEOUT:?}"))
-        .expect("the child must be waitable");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "{what}: SIGTERM/SIGINT must be a clean exit 0, not a signal-kill \
-         (code=None) or an error: status={status:?} stderr={stderr}",
-        status = output.status
-    );
-    assert!(
-        stderr.contains("received shutdown signal"),
-        "{what}: the shutdown path must log that it ran: {stderr}"
-    );
-}
-
 async fn connect_insecure(addr: SocketAddr) -> RunningService<RoleClient, ()> {
     let transport = StreamableHttpClientTransport::with_client(
         reqwest::Client::new(),
@@ -201,40 +297,16 @@ async fn connect_insecure(addr: SocketAddr) -> RunningService<RoleClient, ()> {
 
 #[tokio::test]
 async fn http_sigterm_exits_zero_on_an_idle_listener() {
-    let port = free_port();
-    let child = spawn_binary(&[
-        "--bugzilla-server",
-        "https://bugzilla.example.invalid",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        &port.to_string(),
-        "--insecure-no-auth",
-    ]);
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-    wait_for_tcp(addr).await;
-    let pid = child.id().expect("the child has a pid");
-    send_signal(pid, "TERM");
-    assert_graceful_exit(child, "http idle SIGTERM").await;
+    let (server, _addr) = spawn_http().await;
+    server.signal("TERM");
+    server.assert_graceful_exit("http idle SIGTERM").await;
 }
 
 #[tokio::test]
 async fn http_sigint_still_exits_zero() {
-    let port = free_port();
-    let child = spawn_binary(&[
-        "--bugzilla-server",
-        "https://bugzilla.example.invalid",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        &port.to_string(),
-        "--insecure-no-auth",
-    ]);
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-    wait_for_tcp(addr).await;
-    let pid = child.id().expect("the child has a pid");
-    send_signal(pid, "INT");
-    assert_graceful_exit(child, "http idle SIGINT").await;
+    let (server, _addr) = spawn_http().await;
+    server.signal("INT");
+    server.assert_graceful_exit("http idle SIGINT").await;
 }
 
 #[tokio::test]
@@ -242,29 +314,19 @@ async fn http_sigterm_cancels_a_live_session() {
     // axum's graceful shutdown waits for in-flight connections. A live
     // streamable-HTTP session is one: without `ct.cancel()` the process
     // stays up until this test's timeout, which is the mutation.
-    let port = free_port();
-    let child = spawn_binary(&[
-        "--bugzilla-server",
-        "https://bugzilla.example.invalid",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        &port.to_string(),
-        "--insecure-no-auth",
-    ]);
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-    wait_for_tcp(addr).await;
+    let (server, addr) = spawn_http().await;
     let _session = connect_insecure(addr).await;
-    let pid = child.id().expect("the child has a pid");
-    send_signal(pid, "TERM");
-    assert_graceful_exit(child, "http live-session SIGTERM").await;
+    server.signal("TERM");
+    server
+        .assert_graceful_exit("http live-session SIGTERM")
+        .await;
 }
 
 #[tokio::test]
 async fn stdio_sigterm_during_the_handshake_wait_exits_zero() {
     // `serve(stdio())` blocks on initialize. A stdio container that no
     // client has spoken to yet is in this wait, not in `waiting()`.
-    let mut child = spawn_binary(&[
+    let mut server = Server::spawn(&[
         "--transport",
         "stdio",
         "--bugzilla-server",
@@ -272,28 +334,19 @@ async fn stdio_sigterm_during_the_handshake_wait_exits_zero() {
         "--api-key",
         "test-key",
     ]);
-    wait_for_stderr(&mut child, "Starting Bugzilla MCP server on stdio").await;
-    // Keep stdin open: wait_with_output drops it and EOF-unblocks the
-    // child's blocking read, so a handshake arm that only `return Ok(())`
-    // would go green. Matching the post-initialize test, take stdin and
-    // wait() instead.
-    let _stdin = child.stdin.take();
-    let pid = child.id().expect("the child has a pid");
-    send_signal(pid, "TERM");
-    let status = tokio::time::timeout(EXIT_TIMEOUT, child.wait())
-        .await
-        .expect("stdio pre-handshake SIGTERM: the process must exit")
-        .expect("the child must be waitable");
-    assert_eq!(
-        status.code(),
-        Some(0),
-        "stdio pre-handshake SIGTERM: clean exit 0, not a signal-kill: {status:?}"
-    );
+    // `Server` holds stdin open for the whole test: EOF there unblocks the
+    // child's read, so a handshake arm that only `return Ok(())` would go
+    // green.
+    server.wait_for_stderr(STDIO_READY).await;
+    server.signal("TERM");
+    server
+        .assert_graceful_exit("stdio pre-handshake SIGTERM")
+        .await;
 }
 
 #[tokio::test]
 async fn stdio_sigterm_after_initialize_exits_zero() {
-    let mut child = spawn_binary(&[
+    let mut server = Server::spawn(&[
         "--transport",
         "stdio",
         "--bugzilla-server",
@@ -301,10 +354,10 @@ async fn stdio_sigterm_after_initialize_exits_zero() {
         "--api-key",
         "test-key",
     ]);
-    wait_for_stderr(&mut child, "Starting Bugzilla MCP server on stdio").await;
+    server.wait_for_stderr(STDIO_READY).await;
 
-    let mut stdin = child.stdin.take().expect("stdin is piped");
-    let stdout = child.stdout.take().expect("stdout is piped");
+    let stdin = server.stdin.as_mut().expect("stdin is piped");
+    let stdout = server.child.stdout.take().expect("stdout is piped");
     let mut stdout = BufReader::new(stdout).lines();
     stdin
         .write_all(
@@ -328,16 +381,8 @@ async fn stdio_sigterm_after_initialize_exits_zero() {
     let _drain =
         tokio::spawn(async move { while stdout.next_line().await.ok().flatten().is_some() {} });
 
-    let pid = child.id().expect("the child has a pid");
-    send_signal(pid, "TERM");
-    // stdin/stdout already taken; wait() not wait_with_output.
-    let status = tokio::time::timeout(EXIT_TIMEOUT, child.wait())
-        .await
-        .expect("stdio post-handshake SIGTERM: the process must exit")
-        .expect("the child must be waitable");
-    assert_eq!(
-        status.code(),
-        Some(0),
-        "stdio post-handshake SIGTERM: clean exit 0, not a signal-kill: {status:?}"
-    );
+    server.signal("TERM");
+    server
+        .assert_graceful_exit("stdio post-handshake SIGTERM")
+        .await;
 }
