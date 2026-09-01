@@ -173,7 +173,7 @@ jobs:
           arguments: ""
 
   rust-msrv:
-    # Build with the minimum supported Rust version (rust-version in
+    # Compile with the minimum supported Rust version (rust-version in
     # Cargo.toml) so MSRV cannot silently drift.
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -223,8 +223,16 @@ jobs:
               exit 1
               ;;
           esac
-      - name: Build (MSRV)
-        run: cargo build --workspace --locked
+      - name: Check (MSRV)
+        # --all-targets, not a build: an MSRV break in test code or a
+        # dev-dependency otherwise passes here and only bites a contributor
+        # on the MSRV when they run AGENTS.md's verification block.
+        run: cargo check --workspace --all-targets --locked
+      - name: Check (MSRV, gen tool)
+        # --all-targets skips bins whose required-features are off, and that
+        # block compiles the generator too; same split as the rust job's
+        # clippy/doc legs.
+        run: cargo check -p bugwarden --features gen --all-targets --locked
 
   rust-assets-drift:
     # Regenerate the committed man page + shell completions from the clap CLI
