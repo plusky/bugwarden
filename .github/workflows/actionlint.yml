@@ -1,0 +1,55 @@
+---
+name: actionlint
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded PR runs, but let main runs finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  actionlint:
+    # Workflow syntax, expression and `run:` shell checks over
+    # .github/workflows/. Its own workflow, not a ci.yml job: a malformed
+    # ci.yml is one of the things this has to report, and GitHub runs no job
+    # from a workflow it cannot parse. No .github/actionlint.yaml: the
+    # defaults pass on every workflow here as it stands.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install actionlint
+        # Upstream ships no action, so the pin is the release tarball's
+        # digest (from actionlint_<version>_checksums.txt) rather than a
+        # commit SHA — it binds the binary, which a pinned download script
+        # would not. Dependabot cannot see this pin: bump both env values
+        # together, by hand.
+        shell: bash
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  # linux_amd64
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+      - name: Lint workflows
+        # actionlint drops a rule whose external tool is missing and still
+        # exits 0. Its embedded shellcheck is most of the value here, so
+        # assert the binary rather than trust the runner image to keep it.
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/actionlint" -version
+          shellcheck --version
+          "$RUNNER_TEMP/actionlint" -color
