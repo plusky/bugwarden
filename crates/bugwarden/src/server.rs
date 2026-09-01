@@ -318,13 +318,22 @@ const PARAM_ALLOWLIST: &[&str] = &[
 /// Cap on recorded string values; see [`PARAM_ALLOWLIST`].
 const PARAM_VALUE_MAX_CHARS: usize = 1024;
 
-/// An allowlisted value with every string (top level or inside a list)
-/// [`capped`]. No marker is appended; the cap is documented at the
+/// An allowlisted value with every string [`capped`], at ANY depth: the
+/// client picks the JSON shape, so the bound must not depend on it (#211).
+/// Object VALUES only — a long key still records whole, accepted because
+/// capping keys would silently collide two that share a 1024-char prefix
+/// into one entry. No marker is appended; the cap is documented at the
 /// allowlist.
 fn truncated(value: &Value) -> Value {
     match value {
         Value::String(s) => Value::String(capped(s)),
         Value::Array(items) => Value::Array(items.iter().map(truncated).collect()),
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), truncated(value)))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
@@ -6071,6 +6080,22 @@ mod tests {
             serde_json::from_value(json!({ "keywords": ["k".repeat(2000)] })).unwrap();
         let params = allowlisted(Some(&obj));
         assert_eq!(params["keywords"][0].as_str().unwrap().len(), 1024);
+        // #211: and inside an object, at the top level or under a list —
+        // the client picks the shape, so the shape must not pick the bound.
+        let obj: JsonObject = serde_json::from_value(json!({
+            "groups": { "g": "o".repeat(3000) },
+            "keywords": [{ "k": [{ "deep": "d".repeat(3000) }] }],
+        }))
+        .unwrap();
+        let params = allowlisted(Some(&obj));
+        assert_eq!(params["groups"]["g"].as_str().unwrap().len(), 1024);
+        assert_eq!(
+            params["keywords"][0]["k"][0]["deep"]
+                .as_str()
+                .unwrap()
+                .len(),
+            1024
+        );
         // A short value is passed through untouched.
         let obj: JsonObject = serde_json::from_value(json!({ "query": "kernel" })).unwrap();
         assert_eq!(allowlisted(Some(&obj))["query"], json!("kernel"));
@@ -7026,6 +7051,64 @@ mod tests {
                 "the version is capped too — it is client text on the same terms"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_object_valued_param_reaches_a_record_and_is_capped_there() {
+        // #211's reachability half, pinned: the `Object` arm is not dead
+        // code. Two independent reasons it is reachable, and this call
+        // exercises both — no tool params struct carries
+        // `deny_unknown_fields`, so serde IGNORES the off-schema `groups`
+        // and the call SUCCEEDS; and `allowlisted` runs on the raw
+        // arguments BEFORE dispatch, so a struct that did reject them
+        // would still be recorded. Asserting the success is the point:
+        // a refused call would prove nothing about the served path.
+        let long = "z".repeat(PARAM_VALUE_MAX_CHARS * 4);
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz)
+            .expect("server must build")
+            .with_audit(Arc::clone(&audit));
+        let peer = peer_of(&server).await;
+        let context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer);
+        let Value::Object(args) = json!({
+            "bug_id": 7,
+            "groups": { "g": long },
+        }) else {
+            panic!("tool arguments must be a JSON object");
+        };
+        ServerHandler::call_tool(
+            &server,
+            CallToolRequestParams::new("bug_url".to_string()).with_arguments(args),
+            context,
+        )
+        .await
+        .expect("an off-schema object key is ignored, not rejected");
+
+        let events = read_audit_events(&audit_path);
+        let calls: Vec<&audit::ToolCallEvent> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                AuditEventKind::ToolCall(ev) => Some(&**ev),
+                _ => None,
+            })
+            .collect();
+        let [call] = calls.as_slice() else {
+            panic!("exactly one tool-call record, got {}", calls.len());
+        };
+        assert_eq!(
+            call.outcome.class,
+            audit::OutcomeClass::Ok,
+            "the served path, not a refusal"
+        );
+        assert_eq!(
+            call.request.params["groups"]["g"]
+                .as_str()
+                .map(|s| s.chars().count()),
+            Some(PARAM_VALUE_MAX_CHARS),
+            "a string under an object-valued allowlisted param is capped like any other"
+        );
     }
 
     #[tokio::test]
