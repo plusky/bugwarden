@@ -52,6 +52,9 @@
 //! - the handshake refusal clearing `session.id`, which would unanchor the
 //!   refusals that DID open a session — invisible to every other test,
 //!   because the stateless refusal's id is absent either way.
+//! - parsing the harness `Cli` through a command that still carries its
+//!   `env` fallbacks, which lets the runner's environment decide what a
+//!   test resolves (#190).
 
 use std::io::Write as _;
 use std::net::SocketAddr;
@@ -64,7 +67,7 @@ use bugwarden::server::{BugWarden, USER_AGENT};
 use bugwarden_core::client::BugzillaClient;
 use bugwarden_core::guard::Guard;
 use bugwarden_core::policy::Policy;
-use clap::Parser as _;
+use clap::FromArgMatches as _;
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -78,28 +81,122 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 #[path = "common/raw_post.rs"]
 mod raw_post;
 
+/// Drop every `env` fallback from `cmd`, so parsing it consults only argv.
+///
+/// `Arg::env` snapshots the variable when the command is built, so the
+/// reset covers fields added to `Cli` after this line was written — which
+/// is the point. The sibling `AMBIENT_VARS` list in `http_auth_wiremock.rs`
+/// solves the other half of the same problem and is deliberately not
+/// shared: it scrubs the environment of a *spawned* binary, and doing that
+/// in-process would race every other test in this binary (`env_config.rs`).
+fn pin_environment(cmd: clap::Command) -> clap::Command {
+    cmd.mut_args(|arg| arg.env(None::<&'static str>))
+}
+
+/// Parse `argv` through the binary's own clap command with the environment
+/// pinned out, giving the clap defaults for everything argv omits.
+///
+/// Two drifts nothing below catches: a test here calling `Cli::parse_from`
+/// instead of this, and an env-backed arg on a future subcommand —
+/// `mut_args` and `get_arguments` both walk top-level args only.
+fn pinned_cli(argv: &[&str]) -> Cli {
+    let matches = pin_environment(bugwarden::config::command())
+        .try_get_matches_from(argv)
+        .expect("the harness command line must parse");
+    Cli::from_arg_matches(&matches).expect("the harness command line must build a Cli")
+}
+
 /// Build the http-transport `Cli` against `mock`, with `key_file` when the
-/// test runs in server-held mode. Every field an ambient environment
-/// variable could set behind the fixed arguments below is then assigned
-/// explicitly — the two key sources (`BUGZILLA_API_KEY`,
-/// `BUGZILLA_API_KEY_FILE`) and the Host allowlist (`MCP_ALLOWED_HOSTS`,
-/// which would otherwise refuse the loopback authority the harness dials).
-/// A new environment-backed flag that changes what a test resolves belongs
-/// here too.
+/// test runs in server-held mode.
+///
+/// No clap `env` fallback reaches this `Cli`: [`pinned_cli`] drops them
+/// wholesale rather than overwriting a list of named fields — the list is
+/// what drifted in #190, having lost `read_only` while still claiming to be
+/// complete. That is the whole of the claim; the rest of the environment
+/// still reaches these tests, and `http_proxy` alone fails most of them,
+/// since neither reqwest client here sets `.no_proxy()`. `key_file` is then
+/// the only field a caller varies.
 fn http_cli(mock: &MockServer, key_file: Option<&std::path::Path>) -> Arc<Cli> {
-    let mut cli = Cli::parse_from([
+    let uri = mock.uri();
+    let mut cli = pinned_cli(&[
         "bugwarden",
         "--bugzilla-server",
-        &mock.uri(),
+        &uri,
         "--transport",
         "http",
         "--api-key-header",
         "ApiKey",
     ]);
-    cli.api_key = None;
     cli.api_key_file = key_file.map(std::path::Path::to_path_buf);
-    cli.allowed_hosts = Vec::new();
     Arc::new(cli)
+}
+
+/// The pin is worth its doc comment only if the command really keeps no
+/// fallback, and only if the unpinned command still has some — a check over
+/// an already-empty set can never fail.
+#[test]
+fn the_pinned_command_keeps_no_environment_fallback() {
+    let mut pinned = pin_environment(bugwarden::config::command());
+    pinned.build();
+    let leaking: Vec<String> = pinned
+        .get_arguments()
+        .filter_map(clap::Arg::get_env)
+        .map(|env| env.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        leaking.is_empty(),
+        "these environment fallbacks still reach the harness: {leaking:?}"
+    );
+
+    let mut real = bugwarden::config::command();
+    real.build();
+    assert!(
+        real.get_arguments().any(|arg| arg.get_env().is_some()),
+        "the binary declares no environment fallback at all, so the assertion \
+         above proves nothing"
+    );
+}
+
+/// The drift the pin exists to survive: a `Cli` field added later, with an
+/// `env` fallback whose variable is set in the runner's environment. Any
+/// variable this process already carries reproduces it, so the test never
+/// mutates the environment libtest shares across threads.
+#[test]
+fn the_pin_neutralises_an_environment_backed_flag_added_later() {
+    let (name, value) = std::env::vars_os()
+        .next()
+        .expect("the test process must carry at least one environment variable");
+    // clap only accepts a `'static` variable name without its `string`
+    // feature; one leaked name per run is cheaper than turning that on.
+    let name: &'static std::ffi::OsStr = Box::leak(name.into_boxed_os_str());
+    let added_later = || {
+        clap::Arg::new("added-later")
+            .long("added-later")
+            .env(name)
+            .value_parser(clap::builder::OsStringValueParser::new())
+    };
+    let argv = ["bugwarden", "--bugzilla-server", "https://bugzilla.example"];
+
+    // Only the probe keeps a fallback: a malformed ambient value for a real
+    // one (`MCP_PORT=notanumber`) would otherwise fail this test.
+    let ambient = pin_environment(bugwarden::config::command())
+        .arg(added_later())
+        .try_get_matches_from(argv)
+        .expect("the probe command line must parse");
+    assert_eq!(
+        ambient.get_one::<std::ffi::OsString>("added-later"),
+        Some(&value),
+        "the probe variable must reach an unpinned field, or this proves nothing"
+    );
+
+    let pinned = pin_environment(bugwarden::config::command().arg(added_later()))
+        .try_get_matches_from(argv)
+        .expect("the probe command line must parse");
+    assert_eq!(
+        pinned.get_one::<std::ffi::OsString>("added-later"),
+        None,
+        "{name:?} reached a pinned field"
+    );
 }
 
 /// Serve a [`BugWarden`] built from `cli` and `policy` over a real TCP
@@ -114,6 +211,8 @@ async fn serve_http(
     let guard = Arc::new(Guard {
         policy: Policy::from_toml_str(policy).expect("test policy must parse"),
     });
+    // Not `server::bugzilla_client(&cli)`: the `false` is hard-coded, so
+    // `cli.use_auth_header` is inert here whatever the environment says.
     let bz =
         Arc::new(BugzillaClient::new(&mock.uri(), false, USER_AGENT).expect("client must build"));
     let mut server = BugWarden::new(cli, guard, bz).expect("server must build");
