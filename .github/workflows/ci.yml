@@ -423,13 +423,20 @@ jobs:
               - '.github/workflows/release.yml'
 
   docker:
-    # Build-only proof that the image still builds; release.yml owns the
-    # push. amd64 only — the arm64 leg needs a native runner and exists
-    # there.
+    # Builds the image and then RUNS it. `push: false` alone only proved the
+    # image still assembles: nothing started it, so the distroless base, the
+    # nonroot uid, the ENV defaults and the BUGWARDEN_POLICY refuse-to-start
+    # path all shipped unverified (#202). #114 was a defect of exactly that
+    # shape. release.yml owns the push. amd64 only — the arm64 leg needs a
+    # native runner and exists there.
     needs: changes
     if: needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # Local-daemon tag; nothing is pushed under it.
+      IMAGE: bugwarden:ci
+      CTR: bugwarden-smoke
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -440,3 +447,169 @@ jobs:
           context: .
           platforms: linux/amd64
           push: false
+          # What is built is unchanged; `load` only exports the result to the
+          # local daemon, which `push: false` on its own does not — it leaves
+          # the image in the builder's cache where nothing can run it. Safe
+          # because this builds one platform: `load` refuses a multi-platform
+          # result rather than silently picking a leg.
+          load: true
+          tags: ${{ env.IMAGE }}
+
+      - name: Serve behind the bearer gate with a mounted policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Deliberately identity-free: a policy consulting created_by_me
+          # makes startup preflight GET /rest/whoami, and this container
+          # reaches no Bugzilla. 0644 so uid 65532 can read the bind mount.
+          cat > "$RUNNER_TEMP/policy.toml" <<'EOF'
+          default_action = "deny"
+          EOF
+          # Generated rather than written down: the gate refuses anything
+          # under 32 characters, and a literal would be a secret scanner's
+          # problem for no gain. Worthless by construction — it guards a
+          # server holding no Bugzilla credential.
+          token="$(openssl rand -hex 32)"
+          echo "TOKEN=$token" >> "$GITHUB_ENV"
+          docker run -d --name "$CTR" \
+            -p 127.0.0.1:8000:8000 \
+            -v "$RUNNER_TEMP/policy.toml:/etc/bugwarden/policy.toml:ro" \
+            -e BUGZILLA_SERVER=https://bugzilla.invalid \
+            -e BUGWARDEN_HTTP_TOKEN="$token" \
+            "$IMAGE"
+          # Nothing here passes --transport, --host or --port, so an answer on
+          # the published port is the assertion on the image's ENV block: the
+          # CLI's own defaults bind 127.0.0.1, which no port mapping reaches,
+          # and a stdio or off-by-one-port default reaches it no better. The
+          # `:ro` mount is compose.yaml's, since the guard reads the policy
+          # once and nothing may reach it afterwards.
+          code=000
+          for _ in $(seq 1 100); do
+            if [ "$(docker inspect -f '{{.State.Running}}' "$CTR")" != "true" ]; then
+              echo "::error::the container exited during startup"
+              docker logs "$CTR"
+              exit 1
+            fi
+            code="$(curl -s -o /dev/null -m 2 -w '%{http_code}' -X POST http://127.0.0.1:8000/mcp || true)"
+            [ "$code" = "000" ] || break
+            sleep 0.2
+          done
+          # The gate wraps the whole router, so an unauthenticated POST is
+          # refused before rmcp sees it: the 401 is both the readiness signal
+          # and the proof the door is locked.
+          if [ "$code" != "401" ]; then
+            echo "::error::an unauthenticated POST /mcp answered $code, expected 401"
+            docker logs "$CTR"
+            exit 1
+          fi
+          body="$(curl -sS -m 10 -X POST http://127.0.0.1:8000/mcp \
+            -H "Authorization: Bearer $token" \
+            -H 'Accept: application/json, text/event-stream' \
+            -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci-smoke","version":"1"}}}' || true)"
+          # serverInfo names this crate and not the SDK (#53), so the
+          # handshake identifies which process answered, not merely that one
+          # did.
+          if ! grep -qF '"serverInfo"' <<< "$body" || ! grep -qF '"name":"bugwarden"' <<< "$body"; then
+            echo "::error::the handshake was not answered by bugwarden: $body"
+            docker logs "$CTR"
+            exit 1
+          fi
+
+      - name: Run as the nonroot uid the deployment docs pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The number, not `docker inspect .Config.User`'s "nonroot:nonroot"
+          # name: compose.yaml and the README tell operators to chown the key
+          # file and the audit directory to 65532, so a base whose nonroot
+          # resolves to a different uid breaks every documented deployment
+          # while the name still reads correctly.
+          uids="$(docker top "$CTR" -o uid,pid | awk 'NR > 1 { print $1 }' | sort -u)"
+          if [ "$uids" != "65532" ]; then
+            echo "::error::the container runs as uid '$uids', expected 65532"
+            exit 1
+          fi
+
+      - name: Stop gracefully on SIGTERM as PID 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          # #114: PID 1 gets no default SIGTERM action from the kernel, so a
+          # binary listening only for ctrl_c survives `docker stop` until the
+          # grace period expires and SIGKILL lands — exit 137, never 0.
+          # binary_shutdown.rs pins the handlers in the binary; this is the
+          # only thing that runs them at PID 1 in the distroless image.
+          start="$(date +%s)"
+          docker stop -t 10 "$CTR" > /dev/null
+          elapsed="$(( $(date +%s) - start ))"
+          status="$(docker inspect -f '{{.State.ExitCode}}' "$CTR")"
+          if [ "$status" != "0" ]; then
+            echo "::error::the container exited $status on SIGTERM (137 = ignored it and was killed)"
+            docker logs "$CTR"
+            exit 1
+          fi
+          # Not binary_shutdown.rs's 5s: `date +%s` quantizes, and a loaded
+          # runner has stopped a healthy container in 6s where steady state
+          # is under a second. Still inside the 10s grace, past which SIGKILL
+          # lands and the exit-code arm above catches it instead.
+          if [ "$elapsed" -ge 8 ]; then
+            echo "::error::SIGTERM took ${elapsed}s to stop the container"
+            exit 1
+          fi
+
+      - name: Refuse to start with no policy mounted
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The image presets BUGWARDEN_POLICY precisely so an unmounted
+          # /etc/bugwarden/policy.toml is a startup error instead of the
+          # binary's allow-all fallback. Both variables below are supplied on
+          # purpose: clap rejects a missing --server and the bearer gate
+          # resolves before the policy loads, so omitting either would make
+          # this exit nonzero for a reason that is not the one under test.
+          set +e
+          out="$(timeout 30 docker run --rm \
+            -e BUGZILLA_SERVER=https://bugzilla.invalid \
+            -e BUGWARDEN_HTTP_TOKEN="$TOKEN" \
+            "$IMAGE" 2>&1)"
+          status=$?
+          set -e
+          echo "$out"
+          # Before the exit status, because a container that served instead of
+          # refusing is killed by `timeout` and exits nonzero too.
+          if grep -qF 'Starting Bugzilla MCP server' <<< "$out"; then
+            echo "::error::the image served with no policy mounted"
+            exit 1
+          fi
+          if [ "$status" -eq 0 ]; then
+            echo "::error::the image started with no policy mounted"
+            exit 1
+          fi
+          if ! grep -qF 'failed to load guard policy from /etc/bugwarden/policy.toml' <<< "$out"; then
+            echo "::error::it refused, but not over the missing policy"
+            exit 1
+          fi
+
+      - name: Ship no shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Control first: without it a broken --entrypoint or a wrong tag
+          # would make the refusals below pass for the wrong reason.
+          version="$(docker run --rm --entrypoint /usr/local/bin/bugwarden "$IMAGE" --version)"
+          case "$version" in
+            'bugwarden '*) ;;
+            *)
+              echo "::error::--version printed '$version'"
+              exit 1
+              ;;
+          esac
+          # A base swapped for a debugging-friendly one (alpine, debian) is
+          # the regression this catches; distroless static carries no /bin.
+          for sh in /bin/sh /bin/bash; do
+            if docker run --rm --entrypoint "$sh" "$IMAGE" -c 'exit 0' 2> /dev/null; then
+              echo "::error::$sh runs in the image, so the base is no longer distroless"
+              exit 1
+            fi
+          done
