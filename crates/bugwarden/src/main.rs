@@ -220,8 +220,9 @@ async fn main() -> anyhow::Result<()> {
             Transport::Stdio => {
                 // Two stages: an unused stdio container sits in `serve`
                 // (handshake). After initialize it sits in `waiting`.
-                // Handlers register on the first poll of `shutdown`, which
-                // is this `select!` immediately after the startup line.
+                // Load-bearing order: `shutdown_signal` arms the handlers
+                // in the call, so the startup line below cannot be read by
+                // anything that then races an unhandled signal (#173).
                 let shutdown = shutdown_signal();
                 tokio::pin!(shutdown);
                 tracing::info!("Starting Bugzilla MCP server on stdio");
@@ -284,10 +285,19 @@ async fn main() -> anyhow::Result<()> {
                     auth,
                 );
                 let addr = format!("{}:{}", cfg.host, cfg.port);
-                tracing::info!("Starting Bugzilla MCP server on {addr}");
+                // Armed before the bind, so nothing that can reach the port
+                // can outrun the handlers; see `shutdown_signal` (#173).
+                let shutdown = shutdown_signal();
                 let tcp_listener = tokio::net::TcpListener::bind(&addr)
                     .await
                     .with_context(|| format!("failed to bind {addr}"))?;
+                // The bound address, not the requested one: `--port 0` asks
+                // the kernel for a free port, and the operator (or a test)
+                // has no other way to learn which.
+                let bound = tcp_listener
+                    .local_addr()
+                    .with_context(|| format!("failed to read the local address of {addr}"))?;
+                tracing::info!("Starting Bugzilla MCP server on {bound}");
                 // Connect-info makes the remote peer address available in the
                 // request extensions, where the audit session info reads it.
                 axum::serve(
@@ -295,7 +305,7 @@ async fn main() -> anyhow::Result<()> {
                     router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
                 )
                 .with_graceful_shutdown(async move {
-                    shutdown_signal().await;
+                    shutdown.await;
                     tracing::info!("received shutdown signal");
                     // Tear the live streamable-HTTP transport down with the
                     // listener: axum's graceful shutdown alone waits for
@@ -329,38 +339,66 @@ async fn flush_otel_and_exit(otel: Option<&Pipeline>) -> ! {
     std::process::exit(0);
 }
 
-/// Wait until the process should stop serving.
+/// Arm the shutdown signals; the returned future resolves when one arrives.
 ///
-/// `SIGINT` (`ctrl_c`) and, on Unix, `SIGTERM`. As container PID 1 the
-/// kernel does not apply SIGTERM's default terminate action, so without
-/// this waiter `docker stop` / `podman stop` wait out the runtime grace
-/// period and SIGKILL (issue #114). Both signals take the same path: the
-/// caller then cancels whatever is serving (the HTTP transport token, or
-/// the stdio `select!`). A failed SIGTERM install is logged and the
-/// waiter falls back to SIGINT only — refusing to start would be worse
-/// than a container that still needs `--init`.
-async fn shutdown_signal() {
-    let ctrl_c = tokio::signal::ctrl_c();
-    #[cfg(unix)]
-    {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    _ = ctrl_c => {}
-                    _ = term.recv() => {}
-                }
-            }
-            Err(err) => {
+/// `SIGINT` and, on Unix, `SIGTERM`. As container PID 1 the kernel does not
+/// apply SIGTERM's default terminate action, so without this waiter `docker
+/// stop` / `podman stop` wait out the runtime grace period and SIGKILL
+/// (issue #114). Both signals take the same path: the caller then cancels
+/// whatever is serving (the HTTP transport token, or the stdio `select!`).
+///
+/// Arming happens in the call, not on the first poll of the returned future
+/// — an `async fn` body runs nothing until polled, so a signal delivered in
+/// the gap between "serving" and that first poll still got the kernel's
+/// default action, which is a kill rather than the graceful exit this exists
+/// for (#173). Both callers therefore call this *before* they announce
+/// readiness, which is what lets anything waiting on the startup line signal
+/// immediately. Arm no earlier than that needs: everything ahead of the call
+/// (policy load, preflight, OTLP probe) keeps the default disposition, so a
+/// signal during a slow startup still stops the process at once.
+///
+/// A signal whose handler will not install is logged and dropped from the
+/// set — refusing to start would be worse than a container that still needs
+/// `--init`. If neither installs, the future stays pending: resolving would
+/// shut down a healthy server instead of failing to stop a doomed one.
+#[cfg(unix)]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    use tokio::signal::unix::{signal, Signal, SignalKind};
+
+    fn arm(kind: SignalKind, name: &str) -> Option<Signal> {
+        signal(kind)
+            .inspect_err(|err| {
                 tracing::error!(
                     error = %err,
-                    "failed to install SIGTERM handler; only SIGINT will stop the process"
+                    "failed to install the {name} handler; {name} will not stop the process"
                 );
-                let _ = ctrl_c.await;
+            })
+            .ok()
+    }
+
+    let interrupt = arm(SignalKind::interrupt(), "SIGINT");
+    let terminate = arm(SignalKind::terminate(), "SIGTERM");
+    async move {
+        match (interrupt, terminate) {
+            (Some(mut interrupt), Some(mut terminate)) => {
+                tokio::select! {
+                    _ = interrupt.recv() => {}
+                    _ = terminate.recv() => {}
+                }
             }
+            (Some(mut only), None) | (None, Some(mut only)) => {
+                only.recv().await;
+            }
+            (None, None) => std::future::pending::<()>().await,
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = ctrl_c.await;
+}
+
+/// Non-Unix fallback: ctrl-c only, and installed on the first poll — the
+/// arming contract above is Unix-only.
+#[cfg(not(unix))]
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    async {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }

@@ -2953,10 +2953,13 @@ wired, `server.rs` and `main.rs` are the reference.
   live streamable-HTTP session still exits `0` in the same bound, which is
   what `ct.cancel()` is for (axum's graceful shutdown alone waits for that
   connection); stdio SIGTERM during the initialize wait (where an unused
-  stdio container sits) and after a completed handshake both exit `0` with
-  the child's stdin still held, so wrapping only `serve` or only `waiting`
-  fails, and a handshake arm that only `return Ok(())` cannot go green
-  via `wait_with_output` dropping the pipe.
+  stdio container sits) and after a completed handshake both exit `0` and
+  log `received shutdown signal` too, with the child's stdin still held,
+  so wrapping only `serve` or only `waiting` fails, and a handshake arm
+  that only `return Ok(())` cannot go green on an EOF the harness handed
+  it: the test's `Server` takes stdin out of the `Child` at spawn and
+  holds it past `Child::wait`, which closes whatever stdin the `Child`
+  still owns.
 - Unit tests (#[cfg(test)] in crates/bugwarden/src/otel.rs): configuration
   resolution — an unset, emptied or blank endpoint resolves to NO
   configuration and a bad protocol beside it is therefore not an error,
