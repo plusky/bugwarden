@@ -177,6 +177,14 @@ A release is one push of an annotated tag; nothing is released by hand.
   finally the crates.io publish — `bugwarden-core` before `bugwarden`,
   because the binary crate resolves its dependency from the index and cannot
   be packaged before core is there.
+- Every released artifact is attested with
+  `actions/attest-build-provenance` in the `release` job, between the
+  artifact download and `gh release create`: a provenance failure must cost
+  the tag rather than leave a published release nobody can verify. Subjects
+  are `dist/*` less the `.sha256` files, so a new artifact is covered
+  without editing the step. Verify with `gh attestation verify <file>
+  --repo plusky/bugwarden`. crates.io gets its own provenance from Trusted
+  Publishing; the container image has none yet.
 - The same tag also ships the multi-arch container image
   `ghcr.io/plusky/bugwarden` (jobs `container`, `container-manifest`).
   `container` is a sibling of `publish`, not upstream of it — a broken image
