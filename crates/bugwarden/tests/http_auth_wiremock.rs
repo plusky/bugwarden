@@ -45,6 +45,9 @@ use rmcp::transport::streamable_http_server::{
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::ServiceExt as _;
 use serde_json::{json, Value};
+use tokio::io::AsyncBufReadExt as _;
+use tokio::io::BufReader;
+use tokio::process::Child;
 use wiremock::matchers::{any, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -801,15 +804,60 @@ async fn every_startup_misconfiguration_refuses_before_the_port_is_bound() {
     drop(occupied);
 }
 
-/// A port to hand the child, chosen by binding and releasing an ephemeral
-/// one. Racy in principle; the child's readiness poll below is what turns a
-/// lost race into a test failure rather than a hang.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
+/// The line the http transport logs once it is bound; the address that
+/// follows is the one the kernel assigned, which under `--port 0` is the
+/// only way to learn it.
+const HTTP_READY: &str = "Starting Bugzilla MCP server on ";
+
+/// Wait for the child's own startup line and return the address it bound.
+///
+/// The barrier this replaces was a bind-then-drop `free_port()` plus a
+/// connect probe (#222, after #173): a stranger taking the released port
+/// before the child bound it answered that probe *for* the child, so the
+/// barrier passed while the child was dying of `failed to bind`, and the
+/// handshake then hung on a listener that was never the child.
+/// `--port 0` has no window at all — the kernel gives the port to the
+/// process that keeps it — and a line only the child can write is the
+/// readiness proof the probe was not.
+async fn bound_addr(child: &mut Child) -> SocketAddr {
+    let mut stderr = BufReader::new(child.stderr.take().expect("stderr is piped")).lines();
+    let mut log = String::new();
+    let found = tokio::time::timeout(EXIT_TIMEOUT, async {
+        while let Some(line) = stderr
+            .next_line()
+            .await
+            .expect("the child's stderr must be readable")
+        {
+            log.push_str(&line);
+            log.push('\n');
+            if line.contains(HTTP_READY) {
+                return Some(line);
+            }
+        }
+        None
+    })
+    .await;
+    let line = match found {
+        Ok(Some(line)) => line,
+        Ok(None) => panic!("the child's stderr ended before it bound a port: {log}"),
+        Err(_) => panic!("timed out waiting for the child's startup line: {log}"),
+    };
+    // Nothing reads stderr after this, but the child keeps logging and a
+    // full pipe would block it mid-request: one reader for its whole life.
+    tokio::spawn(async move { while matches!(stderr.next_line().await, Ok(Some(_))) {} });
+    let addr: SocketAddr = line
+        .split_once(HTTP_READY)
+        .expect("the wait matched the needle")
+        .1
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("the startup line must name the bound address: {line}: {e}"));
+    assert!(
+        addr.ip().is_loopback() && addr.port() != 0,
+        "the startup line must carry the loopback address the kernel \
+         assigned, not the requested port 0: {line}"
+    );
+    addr
 }
 
 #[tokio::test]
@@ -819,32 +867,24 @@ async fn the_shipped_binary_wires_the_read_token_to_the_read_surface() {
     // one call leaves them all green while every deployed read token gets
     // the write surface. This drives the REAL executable end to end.
     let mock = MockServer::start().await;
-    let port = free_port();
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_bugwarden"));
     cmd.args(["--bugzilla-server", &mock.uri()])
-        .args(["--host", "127.0.0.1", "--port", &port.to_string()])
+        .args(["--host", "127.0.0.1", "--port", "0"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        // Piped, not null: the startup line is both the readiness barrier
+        // and the only report of the port the kernel chose.
+        .stderr(Stdio::piped());
     for var in AMBIENT_VARS {
         cmd.env_remove(var);
     }
     cmd.env("BUGWARDEN_HTTP_TOKEN", WRITE_TOKEN)
-        .env("BUGWARDEN_HTTP_READ_TOKEN", READ_TOKEN);
+        .env("BUGWARDEN_HTTP_READ_TOKEN", READ_TOKEN)
+        // AMBIENT_VARS scrubbed RUST_LOG; the barrier needs that line.
+        .env("RUST_LOG", "info");
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn().expect("the built binary must start");
-
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-    let ready = tokio::time::timeout(EXIT_TIMEOUT, async {
-        loop {
-            if tokio::net::TcpStream::connect(addr).await.is_ok() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await;
-    assert!(ready.is_ok(), "the binary must start serving");
+    let addr = bound_addr(&mut child).await;
 
     let read = listed_tools(&connect(addr, Some(READ_TOKEN)).await).await;
     let write = listed_tools(&connect(addr, Some(WRITE_TOKEN)).await).await;
