@@ -121,6 +121,10 @@ fn the_scrub_list_covers_every_environment_fallback() {
         .filter(|env| !AMBIENT_VARS.contains(&env.as_str()))
         .collect();
     assert!(
+        !AMBIENT_VARS.is_empty() && cmd.get_arguments().any(|arg| arg.get_env().is_some()),
+        "the check is only evidence while both lists are non-empty"
+    );
+    assert!(
         unscrubbed.is_empty(),
         "these environment fallbacks reach the spawned binary: {unscrubbed:?}"
     );
