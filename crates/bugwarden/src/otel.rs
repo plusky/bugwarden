@@ -1940,6 +1940,378 @@ mod tests {
         encode_request("bugwarden", std::slice::from_ref(entry))
     }
 
+    // -- protobuf, read back by an independent decoder -----------------------
+
+    /// The OTLP messages `wire` emits, transcribed as prost derives from
+    /// `opentelemetry/proto/{collector/logs,logs,common,resource}/v1/*.proto`
+    /// — the same files `wire`'s own doc comment cites. No `.proto` ships
+    /// here, so no build script and no `protoc`: the field numbers and types
+    /// below are the whole schema.
+    ///
+    /// The point is that none of this shares a line with `wire`. prost reads
+    /// the varints and length prefixes, so a misreading of the encoding spec
+    /// that the encoder and the `fields`/`read_varint` helpers above happen
+    /// to share still fails here. Those helpers are also blind three ways
+    /// this is not: they select a field by number and ignore its WIRE TYPE
+    /// (a varint payload comes back as the same eight little-endian bytes a
+    /// fixed64 would); they only look for the fields they expect, so a
+    /// duplicated or undeclared one passes unseen; and `read_varint` accepts
+    /// non-canonical encodings `put_varint` never emits, so a padded zero
+    /// round-trips clean.
+    mod otlp {
+        // collector/logs/v1/logs_service.proto
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        pub(super) struct ExportLogsServiceRequest {
+            #[prost(message, repeated, tag = "1")]
+            pub(super) resource_logs: Vec<ResourceLogs>,
+        }
+
+        // logs/v1/logs.proto
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        pub(super) struct ResourceLogs {
+            #[prost(message, optional, tag = "1")]
+            pub(super) resource: Option<Resource>,
+            #[prost(message, repeated, tag = "2")]
+            pub(super) scope_logs: Vec<ScopeLogs>,
+            #[prost(string, tag = "3")]
+            pub(super) schema_url: String,
+        }
+
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        pub(super) struct ScopeLogs {
+            #[prost(message, optional, tag = "1")]
+            pub(super) scope: Option<InstrumentationScope>,
+            #[prost(message, repeated, tag = "2")]
+            pub(super) log_records: Vec<LogRecord>,
+            #[prost(string, tag = "3")]
+            pub(super) schema_url: String,
+        }
+
+        /// Field 4 is reserved in the proto and is deliberately absent: prost
+        /// skips fields it does not know, so the guarantee that nothing is
+        /// written there comes from the byte-identity test, not from this.
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        pub(super) struct LogRecord {
+            #[prost(fixed64, tag = "1")]
+            pub(super) time_unix_nano: u64,
+            #[prost(int32, tag = "2")]
+            pub(super) severity_number: i32,
+            #[prost(string, tag = "3")]
+            pub(super) severity_text: String,
+            #[prost(message, optional, tag = "5")]
+            pub(super) body: Option<AnyValue>,
+            #[prost(message, repeated, tag = "6")]
+            pub(super) attributes: Vec<KeyValue>,
+            #[prost(uint32, tag = "7")]
+            pub(super) dropped_attributes_count: u32,
+            #[prost(fixed32, tag = "8")]
+            pub(super) flags: u32,
+            #[prost(bytes = "vec", tag = "9")]
+            pub(super) trace_id: Vec<u8>,
+            #[prost(bytes = "vec", tag = "10")]
+            pub(super) span_id: Vec<u8>,
+            #[prost(fixed64, tag = "11")]
+            pub(super) observed_time_unix_nano: u64,
+        }
+
+        // resource/v1/resource.proto
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        pub(super) struct Resource {
+            #[prost(message, repeated, tag = "1")]
+            pub(super) attributes: Vec<KeyValue>,
+            #[prost(uint32, tag = "2")]
+            pub(super) dropped_attributes_count: u32,
+        }
+
+        // common/v1/common.proto
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        pub(super) struct InstrumentationScope {
+            #[prost(string, tag = "1")]
+            pub(super) name: String,
+            #[prost(string, tag = "2")]
+            pub(super) version: String,
+            #[prost(message, repeated, tag = "3")]
+            pub(super) attributes: Vec<KeyValue>,
+            #[prost(uint32, tag = "4")]
+            pub(super) dropped_attributes_count: u32,
+        }
+
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        pub(super) struct KeyValue {
+            #[prost(string, tag = "1")]
+            pub(super) key: String,
+            #[prost(message, optional, tag = "2")]
+            pub(super) value: Option<AnyValue>,
+        }
+
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        pub(super) struct AnyValue {
+            #[prost(oneof = "AnyValueKind", tags = "1, 2, 3, 4, 5, 6, 7")]
+            pub(super) value: Option<AnyValueKind>,
+        }
+
+        /// The `AnyValue` oneof. Variant names are the proto's own field
+        /// names, hence the shared suffix.
+        #[allow(clippy::enum_variant_names)]
+        #[derive(Clone, PartialEq, ::prost::Oneof)]
+        pub(super) enum AnyValueKind {
+            #[prost(string, tag = "1")]
+            StringValue(String),
+            #[prost(bool, tag = "2")]
+            BoolValue(bool),
+            #[prost(int64, tag = "3")]
+            IntValue(i64),
+            #[prost(double, tag = "4")]
+            DoubleValue(f64),
+            #[prost(message, tag = "5")]
+            ArrayValue(ArrayValue),
+            #[prost(message, tag = "6")]
+            KvlistValue(KeyValueList),
+            #[prost(bytes = "vec", tag = "7")]
+            BytesValue(Vec<u8>),
+        }
+
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        pub(super) struct ArrayValue {
+            #[prost(message, repeated, tag = "1")]
+            pub(super) values: Vec<AnyValue>,
+        }
+
+        #[derive(Clone, PartialEq, ::prost::Message)]
+        pub(super) struct KeyValueList {
+            #[prost(message, repeated, tag = "1")]
+            pub(super) values: Vec<KeyValue>,
+        }
+    }
+
+    /// Parse the encoder's output with prost, or fail the test.
+    fn decode_request(bytes: &[u8]) -> otlp::ExportLogsServiceRequest {
+        <otlp::ExportLogsServiceRequest as prost::Message>::decode(bytes)
+            .expect("the emitted bytes must parse as an OTLP ExportLogsServiceRequest")
+    }
+
+    /// The one `LogRecord` of a single-entry request.
+    fn decode_record(bytes: &[u8]) -> otlp::LogRecord {
+        let request = decode_request(bytes);
+        let [resource_logs] = &request.resource_logs[..] else {
+            panic!("exactly one ResourceLogs");
+        };
+        let [scope_logs] = &resource_logs.scope_logs[..] else {
+            panic!("exactly one ScopeLogs");
+        };
+        let [record] = &scope_logs.log_records[..] else {
+            panic!("exactly one LogRecord");
+        };
+        record.clone()
+    }
+
+    fn any(value: &Option<otlp::AnyValue>) -> Option<otlp::AnyValueKind> {
+        value.as_ref().and_then(|v| v.value.clone())
+    }
+
+    /// A body of `len` bytes and one attribute, with a nonzero stamp: a zero
+    /// `time_unix_nano` is the one value `wire` writes and prost omits, which
+    /// would fail the byte-identity check for a reason that is not a defect.
+    fn padded_entry(len: usize) -> LogEntry {
+        LogEntry {
+            time_unix_nano: 1_755_000_000_000_000_000,
+            severity: Severity::Info,
+            body: "x".repeat(len),
+            attrs: vec![("bugwarden.pad", AttrValue::Str("y".repeat(len)))],
+            trace: None,
+        }
+    }
+
+    #[test]
+    fn varints_are_byte_for_byte_what_prost_writes_and_reads() {
+        // Both sides of every 7-bit group boundary: each is a place where a
+        // continuation byte appears or a length prefix grows a byte.
+        let mut values = vec![0u64, 300, u64::MAX];
+        for shift in 0..64 {
+            values.push(1u64 << shift);
+            values.push((1u64 << shift) - 1);
+        }
+        for value in values {
+            let mut ours = Vec::new();
+            wire::put_varint(&mut ours, value);
+            let mut theirs = Vec::new();
+            prost::encoding::encode_varint(value, &mut theirs);
+            assert_eq!(ours, theirs, "varint encoding of {value}");
+            let mut cursor = ours.as_slice();
+            assert_eq!(
+                prost::encoding::decode_varint(&mut cursor).ok(),
+                Some(value),
+                "prost must read back {value}"
+            );
+            assert!(cursor.is_empty(), "{value} must use no spare bytes");
+        }
+    }
+
+    #[test]
+    fn an_independent_decoder_reads_back_the_whole_request() {
+        let entry = audit_entry(
+            &event(tool_call(Some(TraceContext {
+                trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_owned(),
+                span_id: "00f067aa0ba902b7".to_owned(),
+            }))),
+            br#"{"seq":42}"#,
+        );
+        let bytes = encode_request("bugwarden-edge", std::slice::from_ref(&entry));
+        let request = decode_request(&bytes);
+
+        let [resource_logs] = &request.resource_logs[..] else {
+            panic!("exactly one ResourceLogs");
+        };
+        let resource = resource_logs.resource.as_ref().expect("a Resource");
+        let [service] = &resource.attributes[..] else {
+            panic!("exactly one resource attribute");
+        };
+        assert_eq!(service.key, "service.name");
+        assert_eq!(
+            any(&service.value),
+            Some(otlp::AnyValueKind::StringValue("bugwarden-edge".to_owned()))
+        );
+
+        let [scope_logs] = &resource_logs.scope_logs[..] else {
+            panic!("exactly one ScopeLogs");
+        };
+        let scope = scope_logs.scope.as_ref().expect("an InstrumentationScope");
+        assert_eq!(scope.name, SCOPE_NAME);
+        assert_eq!(scope.version, env!("CARGO_PKG_VERSION"));
+
+        let [record] = &scope_logs.log_records[..] else {
+            panic!("exactly one LogRecord");
+        };
+        assert_eq!(record.severity_number, i32::from(Severity::Info as u8));
+        assert_eq!(record.severity_text, "INFO");
+        assert_eq!(
+            any(&record.body),
+            Some(otlp::AnyValueKind::StringValue(r#"{"seq":42}"#.to_owned()))
+        );
+        // Both stamps must be fixed64, not varints of the same number. prost
+        // refuses the wrong wire type outright; `only(record, 1)` cannot tell
+        // the two apart, because it hands a decoded varint back as the same
+        // eight little-endian bytes.
+        assert_eq!(record.time_unix_nano, entry.time_unix_nano);
+        assert_eq!(record.observed_time_unix_nano, entry.time_unix_nano);
+        assert_eq!(record.trace_id.len(), 16);
+        assert_eq!(record.span_id.len(), 8);
+        assert_eq!(record.trace_id[0], 0x4b);
+        assert_eq!(record.span_id[1], 0xf0);
+
+        // Every attribute, in order, with its AnyValue variant — the type is
+        // half the contract: an int written as a string still decodes.
+        let decoded: Vec<(&str, otlp::AnyValueKind)> = record
+            .attributes
+            .iter()
+            .map(|kv| {
+                (
+                    kv.key.as_str(),
+                    any(&kv.value).expect("an attribute must carry a value"),
+                )
+            })
+            .collect();
+        let expected: Vec<(&str, otlp::AnyValueKind)> = entry
+            .attrs
+            .iter()
+            .map(|(key, value)| {
+                let value = match value {
+                    AttrValue::Str(s) => otlp::AnyValueKind::StringValue(s.clone()),
+                    AttrValue::Int(i) => otlp::AnyValueKind::IntValue(*i),
+                };
+                (*key, value)
+            })
+            .collect();
+        assert!(!expected.is_empty(), "the fixture must carry attributes");
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn re_encoding_the_decoded_request_reproduces_every_byte() {
+        // prost writes fields in tag order and omits defaults, which is what
+        // `wire` does, so equality means more than a round trip: every byte
+        // emitted belonged to a field the schema declares, at a canonical
+        // length, with nothing duplicated and nothing trailing. `only`/`all`
+        // see none of that — they look up the fields they expect and let the
+        // rest of the buffer be. An encoder that legitimately reordered its
+        // fields would have to relax this to a decode-and-compare.
+        let entries = vec![
+            audit_entry(&event(tool_call(None)), b"{}"),
+            audit_entry(
+                &event(tool_call(Some(TraceContext {
+                    trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_owned(),
+                    span_id: "00f067aa0ba902b7".to_owned(),
+                }))),
+                br#"{"seq":42}"#,
+            ),
+            audit_entry(
+                &event(AuditEventKind::AuditGap(crate::audit::AuditGapEvent {
+                    dropped: 2,
+                    reason: crate::audit::GapReason::WriteError,
+                })),
+                b"{}",
+            ),
+        ];
+        let bytes = encode_request("bugwarden", &entries);
+        assert_eq!(
+            prost::Message::encode_to_vec(&decode_request(&bytes)),
+            bytes,
+            "the request must contain nothing but the fields OTLP declares"
+        );
+    }
+
+    #[test]
+    fn length_prefixes_hold_on_both_sides_of_every_boundary() {
+        // A wrong length prefix is not an error at the collector — the record
+        // is silently dropped — and the prefix is a varint, so the widths it
+        // steps through are where it would go wrong. Cheap enough to check
+        // exhaustively at each step rather than sample.
+        for len in [
+            0usize, 1, 126, 127, 128, 129, 16_382, 16_383, 16_384, 16_385,
+        ] {
+            let entry = padded_entry(len);
+            let bytes = encode_request("bugwarden", std::slice::from_ref(&entry));
+            assert_eq!(
+                any(&decode_record(&bytes).body),
+                Some(otlp::AnyValueKind::StringValue(entry.body.clone())),
+                "a body of {len} bytes"
+            );
+            assert_eq!(
+                prost::Message::encode_to_vec(&decode_request(&bytes)),
+                bytes,
+                "a body of {len} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn attribute_integers_survive_the_signed_varint_extremes() {
+        // `int_value` is a proto3 `int64`; `wire` reaches it by casting to
+        // u64, which is what makes a negative a ten-byte varint rather than
+        // a wrong one. Nothing in the audit stream is negative today —
+        // `bugwarden.seq` counts up and `bugwarden.response_bytes` is
+        // clamped — so this pins the cast before something needs it.
+        for value in [0i64, 1, -1, 127, 128, -128, i64::MAX, i64::MIN] {
+            let mut entry = padded_entry(0);
+            entry.attrs = vec![("bugwarden.response_bytes", AttrValue::Int(value))];
+            let bytes = encode_request("bugwarden", std::slice::from_ref(&entry));
+            let record = decode_record(&bytes);
+            let [attribute] = &record.attributes[..] else {
+                panic!("exactly one attribute");
+            };
+            assert_eq!(
+                any(&attribute.value),
+                Some(otlp::AnyValueKind::IntValue(value)),
+                "{value} must survive the wire"
+            );
+            assert_eq!(
+                prost::Message::encode_to_vec(&decode_request(&bytes)),
+                bytes,
+                "{value}"
+            );
+        }
+    }
+
     // -- drop accounting ----------------------------------------------------
 
     #[test]
