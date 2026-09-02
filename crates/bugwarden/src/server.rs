@@ -346,10 +346,19 @@ fn truncated(value: &Value) -> Value {
 }
 
 /// `value` truncated to [`PARAM_VALUE_MAX_CHARS`] characters — the ONE
-/// place the cap is applied, to an audited parameter leaf ([`truncated`])
-/// and to a recorded client identity alike. Two copies of the rule would
-/// have to be remembered together (#191); every site that records an
-/// audited string goes through this instead.
+/// place the cap is applied, to an audited parameter leaf ([`truncated`]),
+/// to an over-cap key's prefix ([`recorded_object`]), to a recorded client
+/// identity and to a recorded TOOL NAME alike. Two copies of the rule
+/// would have to be remembered together (#191); every site that records
+/// an audited string goes through this instead.
+///
+/// The tool name is capped in the RECORD only (#243): a call the router
+/// will not serve is recorded like any other, so the name is client text
+/// of any length, while routing, the fail-mode gate and [`WRITE_TOOLS`]
+/// keep matching the raw one. No served name is near the cap, so no
+/// served record moves and only an unknown name is ever shortened — and
+/// "an unknown name of at least 1024 chars" is the whole of what such a
+/// record has to say.
 fn capped(value: &str) -> String {
     // A string of at most 1024 BYTES has at most 1024 chars; the cheap
     // length check skips the char walk for the common case.
@@ -4240,7 +4249,7 @@ impl ServerHandler for BugWarden {
                     },
                     trace: None,
                     request: audit::RequestInfo {
-                        tool: request.name.to_string(),
+                        tool: capped(&request.name),
                         id: Some(context.id.to_string()),
                         params: allowlisted(request.arguments.as_ref()),
                     },
@@ -4274,6 +4283,9 @@ impl ServerHandler for BugWarden {
                 .call(ToolCallContext::new(self, request, context))
                 .await;
         };
+        // Raw: the router, the fail-mode gate and `WRITE_TOOLS` must match
+        // the name the client actually sent. Every record site below caps
+        // it instead (#243).
         let tool = request.name.to_string();
         let session = self.session_info(&context, &audit);
         let client = client_of(&context);
@@ -4326,8 +4338,10 @@ impl ServerHandler for BugWarden {
             let event = audit::AuditEventKind::ToolCall(Box::new(audit::ToolCallEvent {
                 client,
                 trace: trace.clone(),
+                // Capped like every record site, though the `has_route`
+                // above means this one only ever sees a served name.
                 request: audit::RequestInfo {
-                    tool: tool.clone(),
+                    tool: capped(&tool),
                     id: request_id,
                     params,
                 },
@@ -4409,7 +4423,7 @@ impl ServerHandler for BugWarden {
             client,
             trace,
             request: audit::RequestInfo {
-                tool: tool.clone(),
+                tool: capped(&tool),
                 id: request_id,
                 params,
             },
@@ -7239,6 +7253,83 @@ mod tests {
                 client.version.as_deref().map(|v| v.chars().count()),
                 Some(PARAM_VALUE_MAX_CHARS),
                 "the version is capped too — it is client text on the same terms"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_record_site_caps_a_client_chosen_tool_name() {
+        // #243: a call the router will not serve is recorded like any
+        // other, so `request.tool` is client text of any length — the
+        // channel #191 closed for a declared identity and #211 for a
+        // parameter value. The BOUNDARY is pinned here because only a unit
+        // test sees `PARAM_VALUE_MAX_CHARS`: at the cap is under it, one
+        // char over is cut, and 600 multi-byte chars in 1200 bytes stay
+        // whole — a 4x-cap probe alone survives both a byte cap and a `>=`
+        // boundary. The last row is the out-of-contract site, which reads
+        // `request.name` rather than the routing copy: same channel, one
+        // site over, and it records before it refuses.
+        let over = "z".repeat(PARAM_VALUE_MAX_CHARS * 4);
+        let at_cap = "z".repeat(PARAM_VALUE_MAX_CHARS);
+        let one_over = "z".repeat(PARAM_VALUE_MAX_CHARS + 1);
+        let multibyte = "é".repeat(600);
+        let cut: String = over.chars().take(PARAM_VALUE_MAX_CHARS).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz)
+            .expect("server must build")
+            .with_audit(Arc::clone(&audit));
+        let peer = peer_of(&server).await;
+
+        let rows: [(&str, &str, bool, &str); 5] = [
+            (
+                &over,
+                &cut,
+                false,
+                "an over-cap unknown name is cut to the cap",
+            ),
+            (&at_cap, &at_cap, false, "exactly at the cap is not over it"),
+            (&one_over, &cut, false, "one char over the cap is cut"),
+            (
+                &multibyte,
+                &multibyte,
+                false,
+                "600 chars in 1200 bytes stays whole: the cap counts chars",
+            ),
+            (&over, &cut, true, "the out-of-contract site caps it too"),
+        ];
+        for (id, (sent, _, out_of_contract, _)) in rows.iter().enumerate() {
+            let mut context = RequestContext::<RoleServer>::new(
+                RequestId::Number(i64::try_from(id).expect("five rows")),
+                peer.clone(),
+            );
+            if *out_of_contract {
+                context.meta = per_request_meta(ProtocolVersion::V_2025_06_18, None);
+            }
+            ServerHandler::call_tool(
+                &server,
+                CallToolRequestParams::new((*sent).to_string()),
+                context,
+            )
+            .await
+            .expect_err("refused either way, and the refusal is not what moves");
+        }
+
+        let events = read_audit_events(&audit_path);
+        let calls = tool_calls(&events);
+        assert_eq!(
+            calls.len(),
+            rows.len(),
+            "one record per call, refused or not"
+        );
+        for (call, (sent, want, _, why)) in calls.iter().zip(rows) {
+            let got = call.request.tool.as_str();
+            assert!(
+                got == want,
+                "{why}: recorded {} chars of a {}-char name",
+                got.chars().count(),
+                sent.chars().count()
             );
         }
     }
