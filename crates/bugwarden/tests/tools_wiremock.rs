@@ -3084,6 +3084,43 @@ async fn bug_info_projected_link_fields_are_still_scrubbed() {
 }
 
 #[tokio::test]
+async fn bug_info_scalar_link_fields_are_scrubbed_like_arrays() {
+    // I14 defence in depth: the REST API documents every LINKED_ID_FIELDS
+    // slot as an id ARRAY, but an instance answering with a BARE id must not
+    // hand that id to the client. Every field at once and looped over the
+    // constant, so one added to it later is covered here too.
+    for (slot, linked, expected) in [
+        (json!(9), vec![], Value::Null),
+        (json!(9), vec![world_readable_bug(9)], json!(9)),
+        (json!("9"), vec![world_readable_bug(9)], Value::Null),
+    ] {
+        let mut bug = detailed_bug(7);
+        for field in Guard::LINKED_ID_FIELDS {
+            bug[*field] = slot.clone();
+        }
+        let mock = MockServer::start().await;
+        mount_bug_and_padding(&mock, bug).await;
+        Mock::given(method("GET"))
+            .and(path("/rest/bug"))
+            .and(query_param("id", "9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": linked })))
+            .mount(&mock)
+            .await;
+        let client = client_for("", &mock).await;
+
+        let served = call(&client, "bug_info", json!({ "bug_ids": [7] })).await;
+        assert!(!is_error(&served), "bug_info failed: {}", text_of(&served));
+        let served: Value = serde_json::from_str(&text_of(&served)).expect("bug_info returns JSON");
+        for field in Guard::LINKED_ID_FIELDS {
+            assert_eq!(
+                served["bugs"][0][*field], expected,
+                "a bare {slot} in {field} must be served as {expected} (I14)"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn bug_info_projection_never_changes_a_restricted_entry() {
     // A denied id produces the uniform restricted entry regardless of
     // projection params (I2) — the projection loop must not touch it.

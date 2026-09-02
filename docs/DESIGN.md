@@ -2538,7 +2538,13 @@ wired, `server.rs` and `main.rs` are the reference.
   silently-ignored-key class of typo), and an unknown `identity_source`
   value is rejected; `resolve_caller` under `declared` returns the login
   with ZERO HTTP requests (pinned against both `/rest/whoami` and
-  `/rest/valid_login` with `expect(0)`).
+  `/rest/valid_login` with `expect(0)`); and I14 link scrubbing — a bare
+  SCALAR in a `LINKED_ID_FIELDS` slot, which is what an instance answering
+  where the REST API documents an ARRAY gives us, is blanked unless that id
+  is disclosable and blanked outright when it is no id at all, looped over
+  the constant so a field added to it later is covered too (served
+  counterpart in `tools_wiremock.rs`; the arm was the fail-open half of
+  #244).
 - Unit tests (#[cfg(test)] in crates/bugwarden/src/server.rs): assemble_bug_info
   re-classification — a body embargoed after the verdict is refused, a body
   that now earns only summary is downgraded, a body granting neither read nor
