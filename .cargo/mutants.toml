@@ -1,0 +1,27 @@
+# cargo-mutants config; the scheduled runner is .github/workflows/mutants.yml.
+# Not a cargo config -- cargo reads only config.toml out of a project .cargo/
+# and ignores this. Unknown keys are rejected, so a typo fails loud.
+#
+# Both keys describe this test suite rather than CI, so a hand-run (which is
+# how mutation testing mostly happens here) picks them up too. Scope is
+# deliberately absent: the workflow passes its own --file.
+
+# MANDATORY, not a tuning knob. The guard lives in bugwarden-core but is
+# pinned by the integration suite in the `bugwarden` crate, which
+# cargo-mutants' default per-package test scoping never runs. Without this,
+# guard.rs reports 19 survivors; 7 are false (killed by the bugwarden crate's
+# suite), 12 are real (#244).
+test_workspace = true
+
+# A floor, because the auto-derived cap is measured against a different
+# command than the one it caps: 25.3.1 does not apply test_workspace to the
+# baseline, so it times `cargo test -p bugwarden-core` (~4s) and then caps
+# `cargo test --workspace` (~20s unmutated) at max(20s, 5x baseline) = 20s.
+# That alone reported a dozen guard.rs mutants as timeouts; most resolve at
+# 20-23s. The floor must also clear this suite's failure paths, which hold
+# deliberate multi-second barriers (an 8s bounded wait in otel_wiremock, 20s
+# child-process budgets in binary_user_agent and http_auth_wiremock) so a
+# broken build fails instead of hanging -- an additive cost no multiple of a
+# 20s happy path expresses. A floor and not --timeout, so the 5x multiplier
+# still scales past it on a slow runner or once upstream fixes the baseline.
+minimum_test_timeout = 300

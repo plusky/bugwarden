@@ -1,0 +1,158 @@
+---
+name: mutants
+on:
+  schedule:
+    # Weekly in its own slot: advisories has Mon 06:47 and codeql Wed 05:31,
+    # off the hour since the top of one is GitHub's most contended and
+    # most-dropped minute. Saturday because four jobs run for hours and would
+    # otherwise spend the account's concurrency while a PR waits on CI.
+    - cron: '19 4 * * 6'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  # No PR event to supersede, and a run is hours: let a hand-fired run finish
+  # rather than have the next cron cancel it.
+  cancel-in-progress: false
+
+jobs:
+  mutants:
+    # cargo-mutants over the guard policy engine, weekly and NON-GATING. It
+    # does not replace the hand-run discipline (#203), it catches lapses in it.
+    #
+    # NEVER a required status check; do not add it to branch protection. A run
+    # is hours and its timeouts need a human who knows what the suite is meant
+    # to pin, so requiring it would either block merges on infrastructure noise
+    # or get its scope pared back until it means nothing. Same shape and the
+    # same limits as advisories.yml: surfacing is GitHub's failed-run email to
+    # the repo owner, nothing pages, and crons stop after 60 days of repository
+    # inactivity, so silence is not proof. Being scheduled it is also inert
+    # until it reaches the default branch -- the PR adding it cannot exercise
+    # it, only a workflow_dispatch afterwards can.
+    #
+    # Not the --in-diff-on-pull_request job #203 offers as the alternative.
+    # That works, but the cost is unbounded on a diff into server.rs, and
+    # quicksearch_window holds mutants that panic inside the handler; the
+    # in-process test client then hangs until the timeout (#244): five idle
+    # minutes each, on a contributor's PR, for a verdict only a curator can
+    # read. Worth revisiting once some scheduled runs have shown
+    # the timeout floor holds.
+    runs-on: ubuntu-latest
+    # Measured at 30-46s of incremental build plus 6-23s of tests per mutant on
+    # a 32-core box; call it ~3 min on a 4-core runner, so a 31-mutant shard is
+    # ~95 min plus setup. Doubled for margin -- a shard that outruns this has
+    # itself become the finding. Unsharded, guard.rs would flirt with GitHub's
+    # 360-minute ceiling.
+    timeout-minutes: 240
+    strategy:
+      # A survivor in one shard must not cancel the rest: the run's value is
+      # the whole picture, and shards share no state.
+      fail-fast: false
+      matrix:
+        # 0-based, per cargo-mutants' k/n. The denominator is read back from
+        # strategy.job-total, so this list is the only place to change it.
+        shard: [0, 1, 2, 3]
+    env:
+      # Scope lives here, not in .cargo/mutants.toml, because it is a CI budget
+      # decision and not a property of the tree: a hand-run must stay free to
+      # point anywhere. The workspace holds ~1130 mutants and server.rs alone
+      # 377; guard.rs is 125 and is where the DESIGN.md invariants live. Grow
+      # this by adding shards, not by dropping the filter.
+      MUTANTS_SCOPE: crates/bugwarden-core/src/guard.rs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
+        with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: "1.98.0"
+      - name: Install cargo-mutants
+        # Exact version and --locked, as release.yml installs cargo-deb and
+        # cargo-generate-rpm. A crates.io version is immutable and --locked
+        # pins its dependency tree, so this binds the binary as tightly as
+        # actionlint.yml's tarball digest without a per-platform sha256 to
+        # hand-maintain, and without taiki-e/install-action (upstream's advice,
+        # but it resolves a release at run time). Dependabot cannot see this
+        # pin; bump it by hand. cargo-mutants' MSRV is 1.78, under the pin.
+        run: cargo install cargo-mutants --locked --version 25.3.1
+      # No Swatinem/rust-cache: its key is per-job, so this would write a second
+      # multi-hundred-MB entry that evicts ci.yml's by LRU once the repo is over
+      # quota -- what that job's save-if comment is about -- to save a few
+      # minutes on a job that runs for hours.
+      - name: Mutate
+        # test_workspace and the timeout floor come from .cargo/mutants.toml so
+        # a hand-run of the same scope behaves identically; only scope and
+        # shard are CI's business. Shard membership is fixed by index before
+        # any shuffle; --no-shuffle (it shuffles by default) only keeps the
+        # order within a shard, so the artifact is diffable week to week.
+        #
+        # Keep cargo-mutants' exit code rather than collapsing it: 2 (a mutant
+        # survived), 3 (one timed out, verdict unknown), 4 (the tests were
+        # already failing, so nothing was tested) and the rest (cargo-mutants
+        # broke) are four different things and only the first is a gap in the
+        # suite. The summary reads the counts instead of that code, because
+        # the code reports a timeout ahead of a survivor and would otherwise
+        # bury one behind the other: a timeout is not a survivor, and neither
+        # is allowed to hide the other.
+        shell: bash
+        env:
+          MUTANTS_SHARD: ${{ matrix.shard }}
+          MUTANTS_SHARDS: ${{ strategy.job-total }}
+        run: |
+          set -euo pipefail
+          rc=0
+          cargo mutants --no-shuffle \
+            --shard "${MUTANTS_SHARD}/${MUTANTS_SHARDS}" \
+            --file "${MUTANTS_SCOPE}" || rc=$?
+          count() {
+            if [ -f "mutants.out/$1.txt" ]; then wc -l < "mutants.out/$1.txt"; else echo 0; fi
+          }
+          missed=$(count missed)
+          timedout=$(count timeout)
+          {
+            echo "## \`${MUTANTS_SCOPE}\` shard ${MUTANTS_SHARD}/${MUTANTS_SHARDS} (exit ${rc})"
+            echo
+            if [ "$rc" -eq 4 ]; then
+              echo '- The unmutated tests failed, so nothing was mutated and this run says nothing about coverage.'
+            elif [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ] && [ "$rc" -ne 3 ]; then
+              echo '- cargo-mutants itself failed; this run says nothing about coverage.'
+            fi
+            if [ "$missed" -gt 0 ]; then
+              echo "- ${missed} survived: behaviour pinned by no test."
+            fi
+            if [ "$timedout" -gt 0 ]; then
+              echo "- ${timedout} timed out: neither caught nor survivors. Each one hung, or outran the minimum_test_timeout floor in .cargo/mutants.toml; the verdict stays unknown until somebody reproduces it by hand."
+            fi
+            if [ "$rc" -eq 0 ] && [ "$missed" -eq 0 ] && [ "$timedout" -eq 0 ]; then
+              echo '- Every mutant in this shard was caught.'
+            fi
+            echo
+            echo '| caught | missed | timeout | unviable |'
+            echo '| --- | --- | --- | --- |'
+            echo "| $(count caught) | ${missed} | ${timedout} | $(count unviable) |"
+            for class in missed timeout unviable; do
+              if [ -s "mutants.out/${class}.txt" ]; then
+                echo
+                echo "### ${class}"
+                echo '```'
+                cat "mutants.out/${class}.txt"
+                echo '```'
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+      - name: Archive mutants.out
+        # always(): the failing runs are the interesting ones, and
+        # mutants.out/log holds the per-mutant cargo output the summary above
+        # only counts. 30 days outlasts a holiday without accumulating forever.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out
+          retention-days: 30
