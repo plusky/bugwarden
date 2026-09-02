@@ -97,9 +97,10 @@ pub const LOGS_PROTOCOL_VAR: &str = "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL";
 /// Every environment variable this module reads.
 ///
 /// These are read by the module, not by `Cli`, so clap's own
-/// `get_env` sweep cannot see them. `tests/binary_user_agent.rs` holds its
-/// environment scrub list to this list as well, so a variable added here
-/// cannot go on reaching a spawned test binary from the developer's shell.
+/// `get_env` sweep cannot see them. `tests/common/scrub_env.rs` holds the
+/// shared scrub list to this list, walked from every spawning binary, so a
+/// variable added here cannot go on reaching a spawned test binary from the
+/// developer's shell.
 pub const ENV_VARS: [&str; 7] = [
     ENDPOINT_VAR,
     HEADERS_VAR,

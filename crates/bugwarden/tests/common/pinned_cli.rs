@@ -21,9 +21,9 @@ const MINIMAL_ARGV: &[&str] = &["bugwarden", "--bugzilla-server", "https://bugzi
 ///
 /// `Arg::env` snapshots the variable when the command is built, so the
 /// reset covers fields added to `Cli` after this line was written — which
-/// is the point. The sibling `AMBIENT_VARS` list in `http_auth_wiremock.rs`
-/// solves the other half of the same problem and is deliberately not
-/// shared: it scrubs the environment of a *spawned* binary, and doing that
+/// is the point. `common/scrub_env.rs` solves the other half of the same
+/// problem for every spawning binary, and the two stay separate: that list
+/// scrubs the environment of a *spawned* child, and doing the same
 /// in-process would race every other test in the binary.
 fn pin_environment(cmd: clap::Command) -> clap::Command {
     cmd.mut_args(|arg| arg.env(None::<&'static str>))

@@ -55,6 +55,9 @@ mod raw_post;
 #[path = "common/pinned_cli.rs"]
 mod pinned_cli;
 
+#[path = "common/scrub_env.rs"]
+mod scrub_env;
+
 #[path = "common/startup_line.rs"]
 mod startup_line;
 
@@ -78,70 +81,13 @@ const READ_TOKEN: &str = "fedcba9876543210fedcba9876543210";
 /// the suite until CI's own timeout kills it.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Every environment variable the binary reads, cleared before each spawn:
-/// an ambient value would change exactly what is under test. The spawned
-/// leg only; `pinned` above covers the in-process one.
-const AMBIENT_VARS: &[&str] = &[
-    "BUGZILLA_SERVER",
-    "BUGZILLA_API_KEY",
-    "BUGZILLA_API_KEY_FILE",
-    "BUGWARDEN_POLICY",
-    "BUGWARDEN_AUDIT_CONFIG",
-    "BUGWARDEN_HTTP_TOKEN",
-    "BUGWARDEN_HTTP_READ_TOKEN",
-    "BUGZILLA_USE_AUTH_HEADER",
-    "MCP_TRANSPORT",
-    "MCP_HOST",
-    "MCP_PORT",
-    "MCP_ALLOWED_HOSTS",
-    "MCP_READ_ONLY",
-    "MCP_API_KEY_HEADER",
-    "RUST_LOG",
-    "OTEL_EXPORTER_OTLP_ENDPOINT",
-    "OTEL_EXPORTER_OTLP_HEADERS",
-    "OTEL_EXPORTER_OTLP_PROTOCOL",
-    "OTEL_SERVICE_NAME",
-    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-    "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
-    "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
-];
-
-/// The scrub list is only as good as its coverage of `Cli`; a flag added
-/// with an `env` fallback would otherwise reach the spawned binary from the
-/// runner's environment and change what these tests measure. The two bearer
-/// tokens are not clap arguments, so they are checked by name.
+/// Each binary runs the walker itself, so a single-binary
+/// `cargo test --test http_auth_wiremock` still proves what its scrub claims.
 #[test]
 fn the_scrub_list_covers_every_environment_fallback() {
-    let mut cmd = bugwarden::config::command();
-    cmd.build();
-    let unscrubbed: Vec<String> = cmd
-        .get_arguments()
-        .filter_map(clap::Arg::get_env)
-        .map(|env| env.to_string_lossy().into_owned())
-        .filter(|env| !AMBIENT_VARS.contains(&env.as_str()))
-        .collect();
-    assert!(
-        !AMBIENT_VARS.is_empty() && cmd.get_arguments().any(|arg| arg.get_env().is_some()),
-        "the check is only evidence while both lists are non-empty"
-    );
-    assert!(
-        unscrubbed.is_empty(),
-        "these environment fallbacks reach the spawned binary: {unscrubbed:?}"
-    );
-    for var in [
-        bugwarden::http_auth::WRITE_TOKEN_VAR,
-        bugwarden::http_auth::READ_TOKEN_VAR,
-    ] {
-        assert!(AMBIENT_VARS.contains(&var), "{var} must be scrubbed");
-    }
-    let unscrubbed_otel: Vec<&str> = bugwarden::otel::ENV_VARS
-        .iter()
-        .copied()
-        .filter(|var| !AMBIENT_VARS.contains(var))
-        .collect();
-    assert!(
-        unscrubbed_otel.is_empty(),
-        "these OTLP variables reach the spawned binary: {unscrubbed_otel:?}"
+    scrub_env::assert_the_scrub_list_covers_every_environment_fallback(
+        scrub_env::AMBIENT_VARS,
+        scrub_env::HTTP_TOKEN_VARS,
     );
 }
 
@@ -696,7 +642,7 @@ async fn run_binary(args: &[&str], env: &[(&str, &str)]) -> (Option<i32>, String
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    for var in AMBIENT_VARS {
+    for var in scrub_env::AMBIENT_VARS {
         cmd.env_remove(var);
     }
     for (key, value) in env {
@@ -850,12 +796,12 @@ async fn the_shipped_binary_wires_the_read_token_to_the_read_surface() {
         // Piped, not null: the startup line is both the readiness barrier
         // and the only report of the port the kernel chose.
         .stderr(Stdio::piped());
-    for var in AMBIENT_VARS {
+    for var in scrub_env::AMBIENT_VARS {
         cmd.env_remove(var);
     }
     cmd.env("BUGWARDEN_HTTP_TOKEN", WRITE_TOKEN)
         .env("BUGWARDEN_HTTP_READ_TOKEN", READ_TOKEN)
-        // AMBIENT_VARS scrubbed RUST_LOG; the barrier needs that line.
+        // The scrub took RUST_LOG with it; the barrier needs that line.
         .env("RUST_LOG", "info");
     cmd.kill_on_drop(true);
     let mut child = cmd.spawn().expect("the built binary must start");

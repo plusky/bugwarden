@@ -2750,8 +2750,9 @@ wired, `server.rs` and `main.rs` are the reference.
   refuses, with `Ok(true)`/`Ok(false)` anchors so the parity assertion
   cannot pass on two flags that are both unset. Two structural siblings
   keep it from rotting: a `config.rs` unit test fails when any argument
-  lacks an `env` fallback, and `binary_user_agent.rs` holds its child-env
-  scrub list to that same set.
+  lacks an `env` fallback, and `tests/common/scrub_env.rs` holds the
+  shared child-env scrub list to that same set, asserted from every
+  spawning binary.
 - Audit tests (crates/bugwarden/tests/audit_wiremock.rs + #[cfg(test)] in
   server.rs and audit.rs): one record per call for EVERY routed tool,
   refusal paths and protocol errors included; the refusal map is total
