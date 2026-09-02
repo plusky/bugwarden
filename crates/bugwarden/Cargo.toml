@@ -88,6 +88,12 @@ rmcp = { version = "3.1", features = [
     "reqwest",
 ] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+# An independent protobuf decoder for the hand-rolled OTLP encoder in
+# `otel.rs`: the tests transcribe the opentelemetry-proto messages as
+# `prost::Message` derives, so no `.proto`, no build script and no protoc.
+# Adds four crates (prost, prost-derive, itertools, either) to the dev graph
+# and nothing to the shipped binary.
+prost = "0.14"
 tempfile = "3"
 # `process` and `time`: binary_user_agent spawns the shipped executable
 # and reads its answers under a timeout, so a hung handler fails the test

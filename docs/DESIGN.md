@@ -1815,13 +1815,23 @@ names an endpoint.
   processor logs the transport error itself, with the endpoint URL at debug
   level. Against that, the whole OTLP logs schema this module needs is one
   request message, four nested messages and a varint writer, and going
-  without adds ZERO crates to the lock file for a security-guard product —
-  the SDK route added 17 (`prost` and `prost-derive`,
+  without adds ZERO crates to the SHIPPED BINARY for a security-guard
+  product — the SDK route added 17 (`prost` and `prost-derive`,
   `opentelemetry-proto`, and their own transitive tail), proc macros among
-  them. `cargo deny` therefore has nothing new to judge, and `Cargo.lock`
-  is unchanged by this feature. The cost is owned protobuf encoding, which the
-  unit tests pin field by field and the integration tests decode off the
-  wire.
+  them. The runtime dependency graph is unchanged by this feature.
+  `Cargo.lock` and `cargo deny`'s scope are NOT: the tests take `prost` as a
+  DEV-dependency (issue #201), four lock entries — `prost`, `prost-derive`,
+  `itertools`, `either` — under already-allowed licenses, adding no new
+  duplicate and no normal edge. The cost is owned protobuf encoding, which
+  the unit tests pin field by field and the integration tests decode off the
+  wire. That dev-dependency is what makes those unit tests an oracle rather
+  than a mirror: their hand-written extractor shares its author's reading of
+  the encoding spec with the encoder, and selects fields by number alone, so
+  it cannot see a wrong wire type, a duplicated or undeclared field, or a
+  non-canonical varint — and a wrong length prefix is not an error at the
+  collector, it is a record dropped in silence. No `.proto`, build script or
+  protoc: the messages are transcribed as `prost::Message` derives in the
+  test module.
 - **Invariants.** I15 is untouched: the pipeline is reachable through no
   MCP tool, resource or prompt, and no client can turn it on, off, or
   inspect it. I9 is untouched: nothing here reaches the guard or loosens
