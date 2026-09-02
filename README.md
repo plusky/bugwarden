@@ -981,7 +981,13 @@ through an allowlist of client-authored keys: allowlisted values are
 recorded verbatim (strings truncated at 1024 characters), and every other
 parameter — `comment`, `summary`, `description`, `url`, `whiteboard`,
 `custom_fields`, attachment `data` — is recorded as `{"_len": N}`, its
-presence and size but never its content.
+presence and size but never its content. Key NAMES are bounded on the
+same 1024-character boundary, but relocated rather than truncated: an
+over-cap key never becomes a key in the record, it moves into its
+object's server-reserved `_overlong_keys` array, whose shape is
+`[{"prefix": <the first 1024 chars>, "key_chars": N, "value": …}]`. A
+client key spelled `_overlong_keys` is routed into that array too rather
+than passed through, so the name is only ever server-written.
 
 ```json
 {"v":2,"ts":"2026-02-03T04:05:06.789Z","seq":7,"session":{"id":"sess-1","transport":"http","remote":"192.0.2.7:52611"},"event":"tool_call","client":{"name":"example-agent","version":"1.4.2"},"request":{"tool":"bugs_quicksearch","id":"3","params":{"limit":50,"offset":0,"query":"kernel panic","status":"ALL"}},"guard":{"verdict":"served_filtered","policy_hash":"sha256:58013baa090cf77630373ab50cc5eaf2d679ec5a06e8a336600fc89b23bb8604","suppressed_ids_count":2,"suppressed_other_count":0,"suppressed_ids":[1290040,1290041],"redacted_fields":[],"scan":{"scanned":50,"dropped":2}},"upstream":{"requests":3,"status":200,"latency_ms":48},"outcome":{"class":"ok","duration_ms":52,"response_bytes":6218}}
