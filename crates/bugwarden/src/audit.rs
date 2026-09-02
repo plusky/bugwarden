@@ -58,10 +58,11 @@
 //! account of what it did rather than a claim about anybody, so the
 //! tiering question does not arise for it. ONE EXCEPTION, and it is the
 //! case a future field is likeliest to hit: [`RequestInfo::params`] is
-//! verbatim CLIENT-authored content, not the server's account of
-//! anything, so a value read out of it is a correlation hint at best and
-//! never an identity — a grouping handle a client was given and handed
-//! back included.
+//! CLIENT-authored content wherever the allowlist passes it verbatim —
+//! the `_len` and `_overlong_keys` reductions beside it are the
+//! server's — not the server's account of anything, so a value read out
+//! of it is a correlation hint at best and never an identity — a
+//! grouping handle a client was given and handed back included.
 //!
 //! # What can never appear in a record
 //!
@@ -800,9 +801,10 @@ pub struct RequestInfo {
     pub id: Option<String>,
     /// CLIENT-authored request parameters, passed through an allowlist
     /// by the recording call site: identifiers, projections, switches —
-    /// parameters whose values the client chose. Bug content fetched
-    /// from Bugzilla must never be placed here; a tool result is not a
-    /// parameter.
+    /// parameters whose values the client chose. Verbatim only where
+    /// allowlisted: the `_len` and `_overlong_keys` reductions are
+    /// server-written. Bug content fetched from Bugzilla must never be
+    /// placed here; a tool result is not a parameter.
     pub params: BTreeMap<String, serde_json::Value>,
 }
 

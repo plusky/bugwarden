@@ -1173,7 +1173,31 @@ Decisions, all deliberate:
   the API key or free-text bug content; client
   parameters pass a key allowlist (identifiers and routing/vocabulary
   fields by value, strings capped at 1024 chars) and every other key is
-  recorded as `{"_len": N}` — presence and size, never content.
+  recorded as `{"_len": N}` — presence and size, never content. KEY NAMES
+  are bounded on that same 1024-char boundary at every depth (#220): an
+  over-cap key never becomes a map key, it moves into the enclosing
+  object's reserved `_overlong_keys` array as
+  `{"prefix": <capped>, "key_chars": N, "value": …}`. An array, because as
+  map keys two names sharing a 1024-char prefix collide last-wins, and a
+  record that MISREPORTS which key was sent is worse for an audit trail
+  than a large one — which is why #211 left keys uncapped rather than
+  truncate them. The prefix, not a bare length, because which parameter
+  was oversized is the diagnostic params are recorded for. A client key
+  spelled `_overlong_keys` routes into the array too, carrying its own
+  true (short) `key_chars`, so the reserved name is only ever
+  server-written.
+- **The params caps bound content, not record size — and a total cap is a
+  decided no** (#220). Array element and map entry counts are uncapped, so
+  an allowlisted value's SHAPE can still make a large record; what bounds
+  one is the transport — over http the POST body cap (4 MiB floor), over
+  stdio nothing (#234, open) — not the allowlist. Capping the
+  params map's total serialized size instead is DECIDED AGAINST on the
+  `tracestate` terms below: it bounds one field of a record nothing else
+  bounds, so it advertises a guarantee it does not give, and it buys even
+  that by dropping the legitimate identifiers of exactly the oversized
+  calls an operator most needs to read. A cap on the key COUNT proves
+  less still: it touches neither content nor length, and one giant key
+  passes it. Reopening either needs a new argument, not a number.
 - **Fail modes** (`fail_mode` in audit.toml): `open` keeps serving and
   accounts for the outage with an `audit_gap` record; `closed_writes_denials`
   refuses writes and any call where the guard suppressed, denied, or
@@ -2746,7 +2770,14 @@ wired, `server.rs` and `main.rs` are the reference.
   (pre-dispatch gate proven by upstream request counts) via the sink's
   cfg(test) fault injection; the transport-derived
   fail-mode defaults bound to their documented wording; the params
-  allowlist (free text to `_len`, 1024-char truncation); and trace
+  allowlist (free text to `_len`, 1024-char truncation of values, and
+  over-cap key names RELOCATED at both levels — an end-to-end served
+  call carrying an over-cap key top level and under an allowlisted
+  object, plus a prefix-sharing pair at each level, asserted per level
+  so half a fix fails; a client key spelled like the reserved marker
+  routed rather than passed through; the boundary itself, in chars not
+  bytes and with at-cap under it; and an ordinary record growing no
+  marker, #220); and trace
   enrichment (issue #28) — the strict traceparent parser (the canonical
   W3C value and its flags-00 variant parse into their ids; empty,
   54-byte, 56-byte, and ~1 MiB values, uppercase hex, versions other

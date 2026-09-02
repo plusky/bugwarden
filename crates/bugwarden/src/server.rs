@@ -265,7 +265,14 @@ fn audit_refusal(tool: &str) -> CallToolResult {
 /// lists never appear by value — a non-allowlisted key is recorded as
 /// `{"_len": <serialized byte length>}`, so presence and size are loggable
 /// while content is not. Allowlisted string values are truncated to 1024
-/// characters.
+/// characters. KEY NAMES are bounded on the same boundary but RELOCATED,
+/// never truncated in place: a client-chosen key over the cap does not
+/// enter the map as a key at any depth, it moves to the reserved
+/// `_overlong_keys` array behind a capped prefix ([`recorded_object`]).
+/// Neither cap bounds the record's SIZE — element and entry counts are
+/// uncapped, so an allowlisted value's shape can still make a large
+/// record; each bounds the length of any ONE verbatim string, not their
+/// total.
 const PARAM_ALLOWLIST: &[&str] = &[
     "assignee",
     "attachment_id",
@@ -315,25 +322,24 @@ const PARAM_ALLOWLIST: &[&str] = &[
     "version",
 ];
 
-/// Cap on recorded string values; see [`PARAM_ALLOWLIST`].
+/// Cap on recorded string values AND on object key names; see
+/// [`PARAM_ALLOWLIST`].
 const PARAM_VALUE_MAX_CHARS: usize = 1024;
+
+/// Reserved key under which one recorded object holds its over-cap key
+/// names; see [`recorded_object`].
+const OVERLONG_KEYS: &str = "_overlong_keys";
 
 /// An allowlisted value with every string [`capped`], at ANY depth: the
 /// client picks the JSON shape, so the bound must not depend on it (#211).
-/// Object VALUES only — a long key still records whole, accepted because
-/// capping keys would silently collide two that share a 1024-char prefix
-/// into one entry. No marker is appended; the cap is documented at the
-/// allowlist.
+/// Keys are bounded by [`recorded_object`] on the way in (#220).
 fn truncated(value: &Value) -> Value {
     match value {
         Value::String(s) => Value::String(capped(s)),
         Value::Array(items) => Value::Array(items.iter().map(truncated).collect()),
-        Value::Object(fields) => Value::Object(
-            fields
-                .iter()
-                .map(|(key, value)| (key.clone(), truncated(value)))
-                .collect(),
-        ),
+        Value::Object(fields) => {
+            Value::Object(recorded_object(fields, |_, value| truncated(value)))
+        }
         other => other.clone(),
     }
 }
@@ -353,24 +359,66 @@ fn capped(value: &str) -> String {
     }
 }
 
+/// Assemble one level of a recorded params object: `record` says what
+/// each VALUE becomes, this says which key names may be map keys at all.
+///
+/// A key longer than [`PARAM_VALUE_MAX_CHARS`] never becomes one. Copied
+/// verbatim it is an unbounded client-chosen free-text channel into the
+/// operator's append-only file and its OTLP export — exactly what the
+/// allowlist denies values (#220). It moves instead into the reserved
+/// [`OVERLONG_KEYS`] array as
+/// `{"prefix": capped(key), "key_chars": N, "value": <recorded>}`. Array
+/// elements cannot collide, so two keys sharing a 1024-char prefix stay
+/// two faithful entries; plain truncation would fold them into one and
+/// MISREPORT which key was sent, which is why #211 left keys uncapped
+/// rather than truncate them. A client key equal to [`OVERLONG_KEYS`]
+/// routes there too, carrying its own true (short) `key_chars`, so the
+/// reserved name is only ever server-written. Both levels of the map go
+/// through here so the rule cannot drift between them (#191).
+fn recorded_object<'a, M: FromIterator<(String, Value)>>(
+    fields: impl IntoIterator<Item = (&'a String, &'a Value)>,
+    record: impl Fn(&str, &Value) -> Value,
+) -> M {
+    let mut entries: Vec<(String, Value)> = Vec::new();
+    let mut overlong: Vec<Value> = Vec::new();
+    for (key, value) in fields {
+        let recorded = record(key, value);
+        let key_chars = key.chars().count();
+        if key_chars > PARAM_VALUE_MAX_CHARS || key.as_str() == OVERLONG_KEYS {
+            overlong.push(json!({
+                "prefix": capped(key),
+                "key_chars": key_chars,
+                "value": recorded,
+            }));
+        } else {
+            entries.push((key.clone(), recorded));
+        }
+    }
+    if !overlong.is_empty() {
+        entries.push((OVERLONG_KEYS.to_string(), Value::Array(overlong)));
+    }
+    entries.into_iter().collect()
+}
+
 /// Project a tool call's arguments through [`PARAM_ALLOWLIST`] into the
 /// audit record's `params` map.
+///
+/// An over-cap top-level key is by construction NOT allowlisted (every
+/// [`PARAM_ALLOWLIST`] entry is short), so the `value` beside it in
+/// [`OVERLONG_KEYS`] is already the `{"_len": N}` reduction: the key name
+/// is the only thing #220 had left to bound here.
 fn allowlisted(params: Option<&JsonObject>) -> BTreeMap<String, Value> {
     let Some(params) = params else {
         return BTreeMap::new();
     };
-    params
-        .iter()
-        .map(|(key, value)| {
-            let recorded = if PARAM_ALLOWLIST.contains(&key.as_str()) {
-                truncated(value)
-            } else {
-                let len = serde_json::to_vec(value).map(|b| b.len()).unwrap_or(0);
-                json!({ "_len": len })
-            };
-            (key.clone(), recorded)
-        })
-        .collect()
+    recorded_object(params, |key, value| {
+        if PARAM_ALLOWLIST.contains(&key) {
+            truncated(value)
+        } else {
+            let len = serde_json::to_vec(value).map(|b| b.len()).unwrap_or(0);
+            json!({ "_len": len })
+        }
+    })
 }
 
 /// The calling client as it declared itself, for an audit record.
@@ -6126,6 +6174,121 @@ mod tests {
         assert_eq!(capped(&at_cap), at_cap, "and neither path cuts it");
     }
 
+    #[test]
+    fn an_over_cap_key_never_becomes_a_key_in_a_recorded_map() {
+        // #220: the key half of #211's value cap. Multi-byte on purpose —
+        // an ASCII probe cannot tell a char cap from a byte one.
+        let over = "é".repeat(PARAM_VALUE_MAX_CHARS + 1);
+        let mut args = JsonObject::new();
+        args.insert(over.clone(), json!("v"));
+        let params = allowlisted(Some(&args));
+        assert!(!params.contains_key(&over), "the key is not a map key");
+        let Some([marker]) = params
+            .get(OVERLONG_KEYS)
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+        else {
+            panic!("one over-cap key, one entry under {OVERLONG_KEYS}");
+        };
+        assert_eq!(
+            marker["prefix"],
+            json!(capped(&over)),
+            "the marker carries capped(key) — which param was oversized is \
+             the diagnostic params exist for; a bare length would lose it"
+        );
+        assert_eq!(marker["key_chars"], json!(PARAM_VALUE_MAX_CHARS + 1));
+        assert!(
+            marker["value"].get("_len").is_some(),
+            "no PARAM_ALLOWLIST entry is over-cap, so an over-cap top-level \
+             key is non-allowlisted and its value already reduced"
+        );
+
+        // Where the routing boundary sits, at both levels: the cap counts
+        // CHARS, not bytes, and at the cap is under it. Without these a
+        // byte-length test (600 é = 1200 bytes) and a `>=` boundary
+        // both pass the probe above.
+        let under = "é".repeat(600);
+        let at_cap = "z".repeat(PARAM_VALUE_MAX_CHARS);
+        let over_by_one = "z".repeat(PARAM_VALUE_MAX_CHARS + 1);
+        let mut args = JsonObject::new();
+        for key in [&under, &at_cap, &over_by_one] {
+            args.insert(key.clone(), json!(1));
+        }
+        let top = allowlisted(Some(&args));
+        let nested = truncated(&Value::Object(args));
+        let top_keys: Vec<String> = top.keys().cloned().collect();
+        let nested_keys: Vec<String> = nested
+            .as_object()
+            .expect("truncated keeps an object an object")
+            .keys()
+            .cloned()
+            .collect();
+        for (level, keys) in [("top level", top_keys), ("nested", nested_keys)] {
+            assert!(
+                keys.contains(&under),
+                "{level}: 600 chars in 1200 bytes stays a map key — the cap \
+                 counts chars, and only the REPORT counting them is not enough"
+            );
+            assert!(
+                keys.contains(&at_cap),
+                "{level}: exactly at the cap is not over it"
+            );
+            assert!(
+                !keys.contains(&over_by_one),
+                "{level}: one char over the cap is routed"
+            );
+        }
+    }
+
+    #[test]
+    fn two_over_cap_keys_sharing_a_prefix_stay_two_entries() {
+        // The reason #211 refused to truncate keys: as MAP keys these
+        // collide last-wins, and a record that misreports which key was
+        // sent is worse than a large one. As array elements they cannot.
+        let shared = "z".repeat(PARAM_VALUE_MAX_CHARS);
+        let mut nested = JsonObject::new();
+        nested.insert(format!("{shared}-a"), json!("x"));
+        nested.insert(format!("{shared}--bb"), json!("y"));
+        let recorded = truncated(&Value::Object(nested));
+        let entries = recorded
+            .get(OVERLONG_KEYS)
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("both keys are recorded under {OVERLONG_KEYS}"));
+        assert_eq!(entries.len(), 2, "collapsing them would leave one");
+        let mut lengths: Vec<u64> = entries
+            .iter()
+            .map(|e| e["key_chars"].as_u64().unwrap())
+            .collect();
+        lengths.sort_unstable();
+        assert_eq!(
+            lengths,
+            vec![
+                PARAM_VALUE_MAX_CHARS as u64 + 2,
+                PARAM_VALUE_MAX_CHARS as u64 + 4
+            ],
+            "each keeps its own true length behind the identical prefix"
+        );
+    }
+
+    #[test]
+    fn a_client_key_named_like_the_marker_cannot_forge_it() {
+        // The reserved name is only ever server-written: a client key
+        // spelled the same routes into the array with its true (short)
+        // key_chars. Odd-looking, but no collision and no lie.
+        let mut nested = JsonObject::new();
+        nested.insert(OVERLONG_KEYS.to_string(), json!("mine"));
+        let recorded = truncated(&Value::Object(nested));
+        let Some([entry]) = recorded
+            .get(OVERLONG_KEYS)
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+        else {
+            panic!("the client's own key is routed, not passed through");
+        };
+        assert_eq!(entry["key_chars"], json!(OVERLONG_KEYS.chars().count()));
+        assert_eq!(entry["value"], json!("mine"));
+    }
+
     // The fail-mode scope tests below drive a REAL sink into failure via
     // its cfg(test) injection hook, which integration tests cannot reach;
     // everything else is the production path: a real MCP session over an
@@ -7094,6 +7257,165 @@ mod tests {
                 .map(|s| s.chars().count()),
             Some(PARAM_VALUE_MAX_CHARS),
             "a string under an object-valued allowlisted param is capped like any other"
+        );
+        // #220: an ordinary record grows no marker. Asserted here because
+        // this is the one served record with no over-cap key at either
+        // level; without it an unconditional push is invisible.
+        assert!(
+            !call.request.params.contains_key(OVERLONG_KEYS),
+            "top level: {OVERLONG_KEYS} appears only when a key is over-cap"
+        );
+        assert!(
+            call.request.params["groups"].get(OVERLONG_KEYS).is_none(),
+            "nested: same, under an allowlisted object"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_over_cap_param_key_reaches_no_record_at_either_level() {
+        // #220, on the served path #211 pinned: the same call carries an
+        // over-cap key top level (allowlisted's `(key, _)`) and under an
+        // allowlisted object (truncated's Object arm), plus at each level
+        // two more sharing a 1024-char prefix. One assert per level, so
+        // half a fix fails; the prefix pairs kill truncate-and-collide.
+        let shared = "z".repeat(PARAM_VALUE_MAX_CHARS);
+        let huge = "z".repeat(PARAM_VALUE_MAX_CHARS * 4);
+        let a = format!("{shared}-a");
+        let bb = format!("{shared}--bb");
+        let mut nested = JsonObject::new();
+        for key in [&huge, &a, &bb] {
+            nested.insert(key.clone(), json!(1));
+        }
+        let mut args = JsonObject::new();
+        args.insert("bug_id".to_string(), json!(7));
+        args.insert("groups".to_string(), Value::Object(nested));
+        for key in [&huge, &a, &bb] {
+            args.insert(key.clone(), json!(1));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz)
+            .expect("server must build")
+            .with_audit(Arc::clone(&audit));
+        let peer = peer_of(&server).await;
+        let context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer);
+        ServerHandler::call_tool(
+            &server,
+            CallToolRequestParams::new("bug_url".to_string()).with_arguments(args),
+            context,
+        )
+        .await
+        .expect("off-schema keys are ignored, not rejected");
+
+        let events = read_audit_events(&audit_path);
+        let calls: Vec<&audit::ToolCallEvent> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                AuditEventKind::ToolCall(ev) => Some(&**ev),
+                _ => None,
+            })
+            .collect();
+        let [call] = calls.as_slice() else {
+            panic!("exactly one tool-call record, got {}", calls.len());
+        };
+        assert_eq!(
+            call.outcome.class,
+            audit::OutcomeClass::Ok,
+            "the served path, not a refusal"
+        );
+        assert_eq!(
+            call.request.params.get("bug_id"),
+            Some(&json!(7)),
+            "the legitimate params of an oversized call are still recorded"
+        );
+
+        /// Every map key at or below `value`, at any depth.
+        fn keys(value: &Value, out: &mut Vec<String>) {
+            match value {
+                Value::Object(fields) => {
+                    for (key, value) in fields {
+                        out.push(key.clone());
+                        keys(value, out);
+                    }
+                }
+                Value::Array(items) => items.iter().for_each(|v| keys(v, out)),
+                _ => {}
+            }
+        }
+        let over_cap = |names: &[String]| -> usize {
+            names
+                .iter()
+                .filter(|n| n.chars().count() > PARAM_VALUE_MAX_CHARS)
+                .count()
+        };
+        let top: Vec<String> = call.request.params.keys().cloned().collect();
+        assert_eq!(over_cap(&top), 0, "top level: allowlisted's key rule");
+        let mut deep = Vec::new();
+        for value in call.request.params.values() {
+            keys(value, &mut deep);
+        }
+        assert_eq!(over_cap(&deep), 0, "nested: truncated's Object arm");
+
+        let faithful = |entries: &Value, level: &str| {
+            let entries = entries
+                .as_array()
+                .unwrap_or_else(|| panic!("{level}: _overlong_keys is an array"));
+            assert_eq!(
+                entries.len(),
+                3,
+                "{level}: three over-cap keys stay three entries"
+            );
+            for entry in entries {
+                assert_eq!(
+                    entry["prefix"].as_str(),
+                    Some(shared.as_str()),
+                    "{level}: the marker carries capped(key), never the key"
+                );
+            }
+            let mut lengths: Vec<u64> = entries
+                .iter()
+                .map(|e| e["key_chars"].as_u64().expect("key_chars is a number"))
+                .collect();
+            lengths.sort_unstable();
+            assert_eq!(
+                lengths,
+                vec![
+                    PARAM_VALUE_MAX_CHARS as u64 + 2,
+                    PARAM_VALUE_MAX_CHARS as u64 + 4,
+                    PARAM_VALUE_MAX_CHARS as u64 * 4
+                ],
+                "{level}: two keys sharing the prefix keep their own lengths"
+            );
+        };
+        let recorded_under = |parent: &Value, level: &str| -> Value {
+            parent
+                .get(OVERLONG_KEYS)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{level}: over-cap keys belong under {OVERLONG_KEYS}, \
+                            not truncated into map keys"
+                    )
+                })
+                .clone()
+        };
+        let top_marker = recorded_under(
+            &Value::Object(call.request.params.clone().into_iter().collect()),
+            "top level",
+        );
+        let nested_marker = recorded_under(&call.request.params["groups"], "nested");
+        faithful(&top_marker, "top level");
+        faithful(&nested_marker, "nested");
+        assert!(
+            top_marker[0]["value"]["_len"].is_number(),
+            "top level: an over-cap key cannot be allowlisted, so its value \
+             is the _len reduction"
+        );
+        assert_eq!(
+            nested_marker[0]["value"],
+            json!(1),
+            "nested: the value keeps the level's own rule, truncated()"
         );
     }
 
