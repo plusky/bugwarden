@@ -325,7 +325,8 @@ const PARAM_ALLOWLIST: &[&str] = &[
 ];
 
 /// Cap on recorded string values AND on object key names; see
-/// [`PARAM_ALLOWLIST`].
+/// [`PARAM_ALLOWLIST`]. Also on every tracing field that formats a client
+/// string ([`Capped`], #240).
 const PARAM_VALUE_MAX_CHARS: usize = 1024;
 
 /// Reserved key under which one recorded object holds its over-cap and
@@ -350,13 +351,14 @@ fn truncated(value: &Value) -> Value {
     }
 }
 
-/// `value` truncated to [`PARAM_VALUE_MAX_CHARS`] characters — the one
-/// rule every RECORDED string obeys: an audited parameter leaf
-/// ([`truncated`]), an over-cap key's prefix ([`recorded_object`]), a
-/// recorded client identity, a recorded TOOL NAME and a recorded
-/// JSON-RPC REQUEST ID alike. A second copy of the rule would have to be
-/// remembered beside it (#191); every site that records an audited
-/// string goes through this instead.
+/// `value` truncated to [`PARAM_VALUE_MAX_CHARS`] characters, owned —
+/// the one rule every recorded CLIENT string obeys, `trace` aside
+/// (parsed, never capped): an audited parameter leaf ([`truncated`]), an
+/// over-cap key's prefix ([`recorded_object`]), a recorded client
+/// identity, a recorded TOOL NAME and a recorded JSON-RPC REQUEST ID
+/// alike. The cut itself is [`Capped::as_str`] (#191, #240): tracing
+/// fields take [`Capped`], every site that records a client string takes
+/// this.
 ///
 /// The tool name is capped in the RECORD only (#243): a call the router
 /// will not serve is recorded like any other, so the name is client text
@@ -370,12 +372,47 @@ fn truncated(value: &Value) -> Value {
 /// the reply to its request by it, and the reply is rmcp's — written off
 /// the id it parsed, which no code of ours touches.
 fn capped(value: &str) -> String {
-    // A string of at most 1024 BYTES has at most 1024 chars; the cheap
-    // length check skips the char walk for the common case.
-    if value.len() > PARAM_VALUE_MAX_CHARS {
-        value.chars().take(PARAM_VALUE_MAX_CHARS).collect()
-    } else {
-        value.to_string()
+    Capped(value).as_str().to_string()
+}
+
+/// [`capped`] as a tracing field: `%Capped(&p.query)` formats the first
+/// [`PARAM_VALUE_MAX_CHARS`] characters in place, allocating nothing.
+///
+/// The tracing path reaches the same operator and the same collector as
+/// the audit record, so a client string left raw there undoes the bar
+/// `call_tool`'s record enforces on the same call (#240). It cuts
+/// SILENTLY, no marker, exactly as the record's own cut does. [`capped`]
+/// delegates here, so there is one cut to remember (#191); the unit
+/// tests pin both at the boundary.
+struct Capped<'a>(&'a str);
+
+impl<'a> Capped<'a> {
+    /// The leading at-most-[`PARAM_VALUE_MAX_CHARS`]-char slice.
+    fn as_str(&self) -> &'a str {
+        // A string of at most 1024 BYTES has at most 1024 chars; the cheap
+        // length check skips the char walk for the common case.
+        if self.0.len() <= PARAM_VALUE_MAX_CHARS {
+            return self.0;
+        }
+        match self.0.char_indices().nth(PARAM_VALUE_MAX_CHARS) {
+            Some((end, _)) => &self.0[..end],
+            // Over the byte bound but under the char one: multi-byte text.
+            None => self.0,
+        }
+    }
+}
+
+impl std::fmt::Display for Capped<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// So an `Option<Capped>` field keeps the `Some("…")` / `None` shape the
+/// bare `?p.resolution` printed before the cap.
+impl std::fmt::Debug for Capped<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
     }
 }
 
@@ -825,6 +862,13 @@ fn too_many_ids(ids: &[u64]) -> Option<CallToolResult> {
             Guard::MAX_ASSESS_IDS
         ))
     })
+}
+
+/// The head of a client-sized id array that belongs on a tracing line: at
+/// most [`Guard::MAX_ASSESS_IDS`], the bound `too_many_ids` refuses past.
+/// Log it beside a `_len` count of the whole array (#240, #258).
+fn logged_ids(ids: &[u64]) -> &[u64] {
+    &ids[..ids.len().min(Guard::MAX_ASSESS_IDS)]
 }
 
 /// Keep the first `head` and last `tail` items of a list, dropping the
@@ -2502,9 +2546,6 @@ impl BugWarden {
         Parameters(p): Parameters<BugInfoParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        tracing::info!(bug_ids = ?p.bug_ids, "tool: bug_info");
-        let key = self.api_key(&ctx)?;
-
         // Deduplicate while preserving request order.
         let mut seen = BTreeSet::new();
         let ids: Vec<u64> = p
@@ -2513,6 +2554,15 @@ impl BugWarden {
             .copied()
             .filter(|id| seen.insert(*id))
             .collect();
+        // The first `MAX_ASSESS_IDS` distinct ids: exactly the set served,
+        // or the head of a call refused whole (`too_many_ids`); the count
+        // is the raw array's, which is client-sized (#240).
+        tracing::info!(
+            bug_ids_len = p.bug_ids.len(),
+            bug_ids = ?logged_ids(&ids),
+            "tool: bug_info"
+        );
+        let key = self.api_key(&ctx)?;
         if ids.is_empty() {
             note_refused(&ctx);
             return Ok(err_text("At least one bug id must be provided"));
@@ -2858,12 +2908,12 @@ impl BugWarden {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(
-            query = %p.query,
-            status = %p.status,
-            include_fields = %p.include_fields,
+            query = %Capped(&p.query),
+            status = %Capped(&p.status),
+            include_fields = %Capped(&p.include_fields),
             limit = p.limit,
             offset = p.offset,
-            group_by = p.group_by.as_deref().unwrap_or(""),
+            group_by = ?Capped(p.group_by.as_deref().unwrap_or("")),
             "tool: bugs_quicksearch"
         );
         // Validated before the upstream call: a malformed projection should
@@ -3009,8 +3059,8 @@ impl BugWarden {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(
-            product = %p.product,
-            component = %p.component,
+            product = %Capped(&p.product),
+            component = %Capped(&p.component),
             custom_field_count = p.custom_fields.as_ref().map_or(0, |cf| cf.len()),
             "tool: create_bug"
         );
@@ -3085,7 +3135,7 @@ impl BugWarden {
             // 0 decides nothing — caller identity is deliberately None so
             // the refused path keeps costing exactly one upstream request.
             let _ = self.assess(&key, &[0], None).await;
-            tracing::info!(product = %p.product, "guard denied bug creation");
+            tracing::info!(product = %Capped(&p.product), "guard denied bug creation");
             note_refused(&ctx);
             return Ok(err_text(Guard::create_denial()));
         }
@@ -3122,7 +3172,7 @@ impl BugWarden {
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(
             bug_id = p.bug_id,
-            file_name = %p.file_name,
+            file_name = %Capped(&p.file_name),
             is_private = p.is_private,
             "tool: add_attachment"
         );
@@ -3220,8 +3270,8 @@ impl BugWarden {
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(
             bug_id = p.bug_id,
-            status = %p.status,
-            resolution = ?p.resolution,
+            status = %Capped(&p.status),
+            resolution = ?p.resolution.as_deref().map(Capped),
             "tool: update_bug_status"
         );
         let key = self.api_key(&ctx)?;
@@ -3264,7 +3314,11 @@ impl BugWarden {
         Parameters(p): Parameters<AssignBugParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        tracing::info!(bug_id = p.bug_id, assignee = %p.assignee, "tool: assign_bug");
+        tracing::info!(
+            bug_id = p.bug_id,
+            assignee = %Capped(&p.assignee),
+            "tool: assign_bug"
+        );
         let key = self.api_key(&ctx)?;
         let caller = self.guard.resolve_caller(&self.bz, &key).await;
         if let Some(denied) = self
@@ -3301,15 +3355,15 @@ impl BugWarden {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         // priority/severity/resolution are benign instance vocabulary and
-        // stay value-logged; every other param is logged as presence or
-        // count only — summaries, whiteboards and URLs can carry embargoed
-        // content, and the server log must not become a content sink (the
-        // audit stream's boundary rule, applied to tracing).
+        // stay value-logged (capped, #240); every other param is logged as
+        // presence or count only — summaries, whiteboards and URLs can carry
+        // embargoed content, and the server log must not become a content
+        // sink (the audit stream's boundary rule, applied to tracing).
         tracing::info!(
             bug_id = p.bug_id,
-            priority = ?p.priority,
-            severity = ?p.severity,
-            resolution = ?p.resolution,
+            priority = ?p.priority.as_deref().map(Capped),
+            severity = ?p.severity.as_deref().map(Capped),
+            resolution = ?p.resolution.as_deref().map(Capped),
             summary = p.summary.is_some(),
             url = p.url.is_some(),
             whiteboard = p.whiteboard.is_some(),
@@ -3446,12 +3500,20 @@ impl BugWarden {
         Parameters(p): Parameters<UpdateBugDependenciesParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        // Four client-sized arrays sharing one `MAX_ASSESS_IDS` budget,
+        // and `too_many_ids` refuses only further down: a count plus a head
+        // no longer than that budget keeps the line bounded by its fields
+        // (#258).
         tracing::info!(
             bug_id = p.bug_id,
-            blocks_add = ?p.blocks_add,
-            blocks_remove = ?p.blocks_remove,
-            depends_on_add = ?p.depends_on_add,
-            depends_on_remove = ?p.depends_on_remove,
+            blocks_add_len = p.blocks_add.as_ref().map_or(0, Vec::len),
+            blocks_add = ?p.blocks_add.as_deref().map(logged_ids),
+            blocks_remove_len = p.blocks_remove.as_ref().map_or(0, Vec::len),
+            blocks_remove = ?p.blocks_remove.as_deref().map(logged_ids),
+            depends_on_add_len = p.depends_on_add.as_ref().map_or(0, Vec::len),
+            depends_on_add = ?p.depends_on_add.as_deref().map(logged_ids),
+            depends_on_remove_len = p.depends_on_remove.as_ref().map_or(0, Vec::len),
+            depends_on_remove = ?p.depends_on_remove.as_deref().map(logged_ids),
             "tool: update_bug_dependencies"
         );
 
@@ -3552,7 +3614,11 @@ impl BugWarden {
         Parameters(p): Parameters<AddCcParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        tracing::info!(bug_id = p.bug_id, cc_email = %p.cc_email, "tool: add_cc_to_bug");
+        tracing::info!(
+            bug_id = p.bug_id,
+            cc_email = %Capped(&p.cc_email),
+            "tool: add_cc_to_bug"
+        );
         let key = self.api_key(&ctx)?;
         let caller = self.guard.resolve_caller(&self.bz, &key).await;
         if let Some(denied) = self
@@ -4176,7 +4242,7 @@ impl ServerHandler for BugWarden {
             info.protocol_version = request.protocol_version.clone();
         } else {
             tracing::warn!(
-                client_requested = %request.protocol_version,
+                client_requested = %Capped(request.protocol_version.as_str()),
                 server_fallback = %info.protocol_version,
                 "client requested unsupported protocol version; falling back to server default"
             );
@@ -6242,6 +6308,31 @@ mod tests {
             "at the cap, nothing is cut"
         );
         assert_eq!(capped(&at_cap), at_cap, "and neither path cuts it");
+    }
+
+    #[test]
+    fn a_tracing_field_cuts_at_the_audited_1024_char_boundary() {
+        // #240: `capped` delegates to `Capped`, so pinning the wrapper
+        // either side of the boundary — not just over it — is what holds
+        // the tracing path to the record's cap. Multi-byte on purpose: an
+        // ASCII probe cannot tell a char cap from a byte one.
+        for chars in [
+            PARAM_VALUE_MAX_CHARS - 1,
+            PARAM_VALUE_MAX_CHARS,
+            PARAM_VALUE_MAX_CHARS + 1,
+        ] {
+            let value = "é".repeat(chars);
+            assert_eq!(
+                Capped(&value).to_string().chars().count(),
+                chars.min(PARAM_VALUE_MAX_CHARS),
+                "{chars} chars must be cut at the cap in chars, never at a byte boundary"
+            );
+        }
+        // Silently, with no marker of its own, as an audited string is cut.
+        let over = "z".repeat(PARAM_VALUE_MAX_CHARS + 1);
+        assert_eq!(Capped(&over).to_string(), "z".repeat(PARAM_VALUE_MAX_CHARS));
+        // Debug keeps the shape a `?p.resolution` field printed uncapped.
+        assert_eq!(format!("{:?}", Some(Capped("FIXED"))), "Some(\"FIXED\")");
     }
 
     #[test]

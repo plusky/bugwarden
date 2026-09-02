@@ -118,6 +118,9 @@ are never a justification for undoing them.
   process calls. Bound network operations with the client's configured
   timeout.
 - Tracing goes to stderr always — stdout belongs to the stdio transport.
+  A client string in a tracing field goes through `Capped`, on the audit
+  record's 1024-char boundary; a client-sized id array is logged as a count
+  plus a `MAX_ASSESS_IDS` head.
 
 ## Tests and Dependencies
 

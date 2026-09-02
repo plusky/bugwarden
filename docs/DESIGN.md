@@ -1207,6 +1207,14 @@ Decisions, all deliberate:
   off the frame. With it every client-chosen string a record carries is
   bounded: capped at 1024 characters, or, for `trace`, parsed to
   fixed-width hex ids.
+
+  The server's own `tracing` lines answer to the same 1024-char bound
+  (#240): every field formatting a client string goes through `Capped`,
+  which shares one cut with `capped`, and `bug_info` and
+  `update_bug_dependencies` log their id arrays as a count plus a head no
+  longer than `MAX_ASSESS_IDS`. Same operator, same collector — a bound
+  the record enforces and the handler's own `info!` line undoes is not a
+  bound.
 - **The params caps bound content, not record size — and a total cap is a
   decided no** (#220). Array element and map entry counts are uncapped, so
   an allowlisted value's SHAPE can still make a large record; what bounds
@@ -1771,10 +1779,12 @@ names an endpoint.
   peak (three copies of the batch's bytes); at the ceiling, ≈192 GiB and
   ≈256 GiB. Over stdio the same `max_request_body_bytes` bounds a frame
   (`BoundedLines`, #234), so the per-stream figures are identical. The
-  diagnostics queue is the same shape and not smaller — at the default
-  `info` level `bug_info` debug-formats the client's whole `bug_ids`
-  array — but it DROPS what it cannot hold, where the audit queue refuses
-  and closes the fail-mode gate.
+  diagnostics queue is the same shape and not smaller. Since #240 the
+  server's OWN lines are bounded by their field count rather than by the
+  call (`error = %e` aside, #261), but rmcp's are not — its handshake and
+  notification lines print the client's frame whole (#260) — so the queue
+  stays unsized by record too. It DROPS what it cannot hold, where the audit queue refuses and
+  closes the fail-mode gate.
 - **Decided-no: byte-bounding the queue (#235).** A byte budget (a
   `Semaphore` acquired per record in `accept`, released when the batch
   drops) would refuse audit records — and so close the gate for the whole
