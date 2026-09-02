@@ -31,6 +31,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/pinned_cli.rs"]
 mod pinned_cli;
+#[path = "common/refused.rs"]
+mod refused;
 
 use pinned_cli::pinned;
 
@@ -527,23 +529,19 @@ async fn the_exported_body_is_the_file_record_byte_for_byte() {
     );
 }
 
-/// A port nothing listens on: bind it, learn the number, drop it.
-fn dead_endpoint() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
-    let addr = listener.local_addr().expect("an address");
-    drop(listener);
-    format!("http://{addr}")
-}
-
 #[tokio::test]
 async fn a_dead_collector_fails_the_sink_and_open_mode_accounts_with_gaps() {
     // Revised 2026-08-18: a configured collector is load-bearing. Under
     // the `open` fail mode (the stdio default) serving continues — as it
     // does for a failing FILE — but the sink reports failure and the
     // undelivered window lands in `audit_gap` records, never silently.
+    // The endpoint refuses by construction: the bind-then-drop ephemeral
+    // port this used to take could be won by a stranger, and one answering
+    // 2xx keeps the sink healthy — the outage this test is about never
+    // happens (#229).
     let mock = MockServer::start().await;
     mount_bugzilla(&mock).await;
-    let served = exporting_server(&mock, Some(&dead_endpoint())).await;
+    let served = exporting_server(&mock, Some(&refused::refused_base_url())).await;
 
     let result = call(&served.client, "bug_info", json!({ "bug_ids": [7] }), None).await;
     assert_ne!(
