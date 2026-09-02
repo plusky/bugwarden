@@ -49,7 +49,16 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 futures-core = "0.3"
 # Same crate rmcp uses to parse Host authorities (`parse_allowed_authority`).
 http = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
+# `io-std`: the stdio transport is built here now (`server::stdio_transport`
+# wraps `tokio::io::stdin()`), not inherited from rmcp's `stdio()`.
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "net",
+    "time",
+    "io-std",
+] }
 tokio-util = "0.7"
 # OTLP/HTTP export (issue #31) posts protobuf with the same rustls stack
 # bugwarden-core already resolves for Bugzilla, so this adds no crate to the

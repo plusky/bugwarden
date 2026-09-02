@@ -14,6 +14,7 @@ pub mod http_auth;
 pub mod http_session;
 pub mod otel;
 pub mod server;
+pub mod stdio;
 
 #[cfg(test)]
 mod testlog;

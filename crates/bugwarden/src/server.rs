@@ -30,6 +30,7 @@ use serde_json::{json, Value};
 use crate::audit::{self, AuditCell, AuditState, FailMode, TransportKind, Verdict};
 use crate::config::{Cli, KeyCustody, Transport};
 use crate::http_auth::{self, Scope};
+use crate::stdio::BoundedLines;
 
 /// The MCP revisions this build actually implements, newest last.
 ///
@@ -466,22 +467,29 @@ fn client_of(ctx: &RequestContext<RoleServer>) -> audit::ClientInfo {
     }
 }
 
-/// The POST body cap this build pinned before it was derived from policy,
+/// The request cap this build pinned before it was derived from policy,
 /// and the floor it never goes below.
 const MAX_REQUEST_BODY_FLOOR: usize = 4 * 1024 * 1024;
 
-/// The largest POST body this build will buffer, whatever the policy says.
+/// The largest request this build will buffer, whatever the policy says.
 ///
-/// The transport collects a body before anything inspects it, so the cap is
-/// a memory bound first and an attachment allowance second. 64 MiB carries
+/// A request is a POST body over http and one newline-delimited frame over
+/// stdio; the cap bounds both. The transport collects one before anything
+/// inspects it, so the cap is a memory bound first and an attachment
+/// allowance second. 64 MiB carries
 /// every decoded `max_attachment_bytes` up to ~47 MiB, far above any
 /// plausible Bugzilla attachment limit, while keeping the bound finite for
 /// the values that are not a considered number at all — an "unlimited"
 /// spelled as a huge integer, or a typo with too many digits.
 const MAX_REQUEST_BODY_CEILING: usize = 64 * 1024 * 1024;
 
-/// The transport's POST body cap for a policy whose decoded attachment
-/// ceiling is `max_attachment_bytes` (`0` = no policy cap).
+/// The transport's request cap — the POST body over http, one
+/// newline-delimited frame over stdio — for a policy whose decoded
+/// attachment ceiling is `max_attachment_bytes` (`0` = no policy cap).
+///
+/// Reached through `BugWarden::request_body_cap`, which is what both
+/// transports call: this is one number with two enforcement points, not a
+/// per-transport limit (#234).
 ///
 /// Sized so that every upload the guard would allow fits through the
 /// transport: `add_attachment` takes its payload base64-encoded, which
@@ -502,13 +510,13 @@ const MAX_REQUEST_BODY_CEILING: usize = 64 * 1024 * 1024;
 ///   ordinary requests. `0` returns the floor too: it means "the guard
 ///   imposes no attachment ceiling", not "the transport imposes no memory
 ///   bound";
-/// * never above `MAX_REQUEST_BODY_CEILING` — over HTTP an unbounded body
-///   is an unbounded-memory lever for anyone who can reach the port, and no
-///   policy value may hand that out, whether it is `0` or a number so large
-///   the derivation would saturate. The honest consequence: a policy cap
-///   above ~47 MiB decoded is NOT honored over HTTP, exactly as `0` is not
-///   honored as "unlimited" there. Both are deliberate, and recorded in
-///   DESIGN.md.
+/// * never above `MAX_REQUEST_BODY_CEILING` — an unbounded request is an
+///   unbounded-memory lever for anyone who can reach the port (http) or
+///   the pipe (stdio), and no policy value may hand that out, whether it is
+///   `0` or a number so large the derivation would saturate. The honest
+///   consequence: a policy cap above ~47 MiB decoded is NOT honored on
+///   either transport, exactly as `0` is not honored as "unlimited". Both
+///   are deliberate, and recorded in DESIGN.md.
 ///
 /// Saturating throughout: `max_attachment_bytes` is operator input and may
 /// be `u64::MAX`, where the derivation must clamp rather than panic in
@@ -2089,12 +2097,14 @@ impl BugWarden {
     ///   base64 expansion alone put every decoded cap above ~3 MiB out of
     ///   reach, and the upload the operator had permitted was refused by
     ///   the transport (issue #52). It is therefore derived from this
-    ///   server's policy by `max_request_body_bytes` — `ceil(cap / 3) * 4`
+    ///   server's policy by `request_body_cap` — `ceil(cap / 3) * 4`
     ///   for the encoding plus 1 MiB of framing headroom, clamped to
     ///   `MAX_REQUEST_BODY_FLOOR` (4 MiB, which `0` also returns) and
     ///   `MAX_REQUEST_BODY_CEILING` (64 MiB, so no policy value can ask
     ///   this transport to buffer without bound). Derived, not inherited:
-    ///   an SDK bump still must not move an operator-visible limit.
+    ///   an SDK bump still must not move an operator-visible limit. This is
+    ///   the http half of one request cap; `stdio_transport` enforces the
+    ///   same number on a stdio frame (#234).
     ///
     /// A body over that cap is refused by rmcp's tower layer with a bare
     /// `413`, which reaches neither `call_tool` nor the guard — so it
@@ -2104,7 +2114,8 @@ impl BugWarden {
     /// An operator diagnosing a 413 therefore has to compare the request
     /// body's size with the cap derived here from
     /// `global.max_attachment_bytes`, since nothing on the server side will
-    /// have recorded the attempt. That the boundary is observable to an
+    /// have recorded the attempt — though rmcp's own refusal body prints
+    /// the number outright. That the boundary is observable to an
     /// unauthenticated client, and what it discloses, is recorded in
     /// DESIGN.md under "rmcp 3.1 usage notes".
     ///
@@ -2127,9 +2138,7 @@ impl BugWarden {
     pub fn http_server_config(&self) -> anyhow::Result<StreamableHttpServerConfig> {
         let config = StreamableHttpServerConfig::default()
             .disable_allowed_hosts()
-            .with_max_request_body_bytes(max_request_body_bytes(
-                self.guard.policy.global.max_attachment_bytes,
-            ));
+            .with_max_request_body_bytes(self.request_body_cap());
         // `checked_allowed_hosts` is what decides on/off: an empty list is
         // the disabled state; an unparsable entry is a startup error so it
         // cannot leave validation on with nothing matchable (see config.rs).
@@ -2143,6 +2152,38 @@ impl BugWarden {
                 Ok(config.with_allowed_hosts(hosts.iter().copied()))
             }
         }
+    }
+
+    /// The largest request this server buffers, derived from its own guard
+    /// policy by [`max_request_body_bytes`].
+    ///
+    /// The single read of `global.max_attachment_bytes` for both
+    /// transports: [`Self::http_server_config`] hands it to rmcp's tower
+    /// layer and [`Self::stdio_transport`] to [`BoundedLines`], so the two
+    /// cannot size their buffers from different numbers (#234).
+    fn request_body_cap(&self) -> usize {
+        max_request_body_bytes(self.guard.policy.global.max_attachment_bytes)
+    }
+
+    /// The stdio transport pair to serve, in place of rmcp's bare
+    /// `stdio()`.
+    ///
+    /// Stdin is wrapped in [`BoundedLines`] at `request_body_cap`:
+    /// rmcp reads a frame into an unbounded `Vec` (#234), so without this
+    /// the transport buffers whatever a peer writes before a newline.
+    /// Stdout is untouched — it carries this server's own output, which the
+    /// `FramedWrite` half already frames.
+    ///
+    /// An over-cap frame closes the transport rather than being skipped,
+    /// and `main` turns that into exit 1 through
+    /// [`BoundedLines::over_cap`]. Stdio has no equivalent of the http
+    /// `413`: nothing answers the peer, because the request id was inside
+    /// the frame that was never parsed.
+    pub fn stdio_transport(&self) -> (BoundedLines<tokio::io::Stdin>, tokio::io::Stdout) {
+        (
+            BoundedLines::new(tokio::io::stdin(), self.request_body_cap()),
+            tokio::io::stdout(),
+        )
     }
 
     /// Turn a silent identity blackout into a loud startup failure.
@@ -8201,6 +8242,53 @@ mod tests {
             MAX_REQUEST_BODY_CEILING
         );
         assert_eq!(max_request_body_bytes(u64::MAX), MAX_REQUEST_BODY_CEILING);
+    }
+
+    fn server_with_attachment_cap(max_attachment_bytes: u64) -> BugWarden {
+        let cli: Cli = pinned(&[
+            "bugwarden",
+            "--bugzilla-server",
+            "https://bugzilla.example.com",
+            "--transport",
+            "http",
+        ]);
+        let mut policy = Policy::default();
+        policy.global.max_attachment_bytes = max_attachment_bytes;
+        let guard = Arc::new(Guard { policy });
+        let bz = Arc::new(
+            BugzillaClient::new("https://bugzilla.example.com", false, USER_AGENT)
+                .expect("client must build"),
+        );
+        BugWarden::new(Arc::new(cli), guard, bz).expect("server must build")
+    }
+
+    #[test]
+    fn both_transports_are_sized_from_the_same_request_cap() {
+        // The seam #234 added: one derivation, two enforcement points. A
+        // stdio cap written as its own constant would pass every other test
+        // in this file and drift from the http one on the next policy
+        // change.
+        for max_attachment_bytes in [0, 2 * 1024 * 1024, 8 * 1024 * 1024, u64::MAX] {
+            let server = server_with_attachment_cap(max_attachment_bytes);
+            let cap = server.request_body_cap();
+            assert_eq!(
+                cap,
+                max_request_body_bytes(max_attachment_bytes),
+                "the shared cap must be the derivation, at {max_attachment_bytes}"
+            );
+            let (config, _logs) = crate::testlog::capture_logs(|| server.http_server_config());
+            let config = config.expect("no allowed hosts, so no startup error");
+            assert_eq!(
+                config.max_request_body_bytes, cap,
+                "http must serve the shared cap, at {max_attachment_bytes}"
+            );
+            let (stdin, _stdout) = server.stdio_transport();
+            assert_eq!(
+                stdin.cap(),
+                cap,
+                "stdio must serve the shared cap, at {max_attachment_bytes}"
+            );
+        }
     }
 
     fn http_server_with_hosts(hosts: Vec<String>) -> BugWarden {

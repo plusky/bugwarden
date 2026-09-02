@@ -1747,8 +1747,8 @@ names an endpoint.
   64 MiB ceiling). At the floor that is ≈12 GiB per stream sustained
   (2048 queued + 512 batched + 512 encoded) and ≈16 GiB at the encoder's
   peak (three copies of the batch's bytes); at the ceiling, ≈192 GiB and
-  ≈256 GiB. Over stdio rmcp reads a line with `read_until(b'\n')` and
-  caps nothing, the peer being a process the operator started. The
+  ≈256 GiB. Over stdio the same `max_request_body_bytes` bounds a frame
+  (`BoundedLines`, #234), so the per-stream figures are identical. The
   diagnostics queue is the same shape and not smaller — at the default
   `info` level `bug_info` debug-formats the client's whole `bug_ids`
   array — but it DROPS what it cannot hold, where the audit queue refuses
@@ -2242,9 +2242,9 @@ wired, `server.rs` and `main.rs` are the reference.
   operator's `global.max_attachment_bytes` — at the SDK's 4 MiB, base64
   expansion alone put every decoded cap above ~3 MiB out of reach (#52). It is
   therefore **derived** from the policy, in `max_request_body_bytes`
-  (server.rs), which `BugWarden::http_server_config` calls with its own
-  guard's value — one place reads the policy field, so a deployment and its
-  tests cannot size the transport from different numbers.
+  (server.rs), reached through `BugWarden::request_body_cap` — one place
+  reads the policy field, so a deployment and its tests cannot size the
+  transport from different numbers.
   `ceil(max_attachment_bytes / 3) * 4` for the base64 expansion, plus 1 MiB
   of headroom for the JSON-RPC framing and the call's other arguments,
   **clamped to [4 MiB, 64 MiB]** and saturating at every step (the policy
@@ -2262,20 +2262,68 @@ wired, `server.rs` and `main.rs` are the reference.
   every decoded cap up to ~47 MiB, far above any plausible Bugzilla
   attachment limit, and refuses to let a policy number remove the bound.
   Honest consequence, the mirror of the `0` case: a policy cap above ~47 MiB
-  decoded is not honored over HTTP. A body over the cap is refused by rmcp's
-  tower layer with a bare `413` that reaches neither `call_tool` nor the
-  guard, so it is **unrecordable** in the audit stream — the same class as a
-  bearer refusal, which the layer in front of the service turns away and
-  which is likewise only counted in the log, and accepted on the same terms;
-  an operator diagnosing a 413 compares the body size against the derived
-  cap, because nothing server-side recorded the attempt.
+  decoded is not honored on either transport.
 
-  That boundary is also observable to an unauthenticated client, which is
-  **ACCEPTED**: whenever the derivation exceeds the floor (a decoded cap above
-  ~2.25 MiB) the 413 threshold is a function of `max_attachment_bytes`, so
-  binary-searching body sizes recovers it — a value the add_attachment row
-  above and the download refusal deliberately do not disclose, neither the
-  size nor the cap. It is accepted for three reasons. Below ~2.25 MiB —
+  **That number is the request cap, not an HTTP one, and it has two
+  enforcement points** (#234). Over http rmcp's tower layer measures the POST
+  body in `expect_json` and answers a bare `413`. Over stdio the same
+  number bounds one newline-delimited frame, in `crate::stdio::BoundedLines`
+  — an `AsyncRead` wrapper `BugWarden::stdio_transport` puts around stdin,
+  counting the bytes since the last `\n` and failing the read past the cap
+  (`<= cap` accepted, mirroring http's `<= max_bytes`; overshoot bounded by
+  one 8 KiB `BufReader` chunk, since the count can only be taken on bytes
+  already delivered). Without it rmcp's `read_until(b'\n', &mut line_buf)`
+  grows an unbounded `Vec` for a peer that never sends a delimiter: the http
+  half was bounded and the stdio half was not. The stdio peer is the process
+  that spawned bugwarden and already owns its stdin, so this is a
+  self-inflicted OOM rather than a remote one — closed for symmetry, because
+  "the transport bounds what we buffer" should be true of both transports,
+  not as a vulnerability. Reusing the derived number rather than minting a
+  constant is the right coupling: the same `add_attachment` upload has to
+  fit either way. The consequences differ by transport and neither is a
+  choice:
+
+  * http answers the caller and keeps serving. A body over the cap is
+    refused by rmcp's tower layer with a bare `413` that reaches neither
+    `call_tool` nor the guard, so it is **unrecordable** in the audit
+    stream — the same class as a bearer refusal, which the layer in front of
+    the service turns away and which is likewise only counted in the log,
+    and accepted on the same terms.
+  * stdio answers nothing and **closes**. The request id is inside the frame
+    that was never parsed, so no response could name it; and rmcp clients set
+    no default request timeout, so a server that discarded the frame and
+    resumed would leave the peer waiting forever — worse than a dead server.
+    The read fails with `io::ErrorKind::InvalidData` (rmcp's own mapping for
+    its codec's `MaxLineLengthExceeded`) and is sticky, so nothing hands the
+    tail of a refused frame to the parser as a fresh one. Equally
+    unrecordable, and on the same terms: no tool name, no caller, no guard
+    verdict.
+
+  The stdio trace is a log line and an exit code: bugwarden's own `error!`
+  naming the cap, deliberately not rmcp's `Error reading from stream`, and
+  exit `1` at BOTH stages. Pre-handshake the refusal already propagates out
+  of `serve`; post-handshake rmcp maps the read error to `receive() -> None`,
+  which the service reports as `QuitReason::Closed` — the same `Ok` a clean
+  peer hangup produces — so `main` reads a shared over-cap flag after
+  `waiting()` and bails on it, or the same refusal would exit `0` at one
+  stage and `1` at the other. An operator diagnosing either refusal compares
+  the request size against the derived cap, because nothing server-side
+  recorded the attempt.
+
+  Not done, deliberately: emitting a null-id `-32700` on stdout before
+  closing. It is new stdout-after-close behaviour bought for a nicety, and
+  the peer has no id to correlate it with anyway.
+
+  The http 413 boundary is also observable to an unauthenticated client,
+  which is **ACCEPTED**: whenever the derivation exceeds the floor (a decoded cap above
+  ~2.25 MiB) the 413 threshold is a function of `max_attachment_bytes` — and
+  rmcp's refusal body is `Payload Too Large: request body exceeds
+  {max_bytes} bytes` (server_side_http.rs), so ONE over-cap response prints
+  the derived number; no binary search is needed. Over stdio nothing is
+  disclosed, because nothing is answered. This is a value the
+  add_attachment row above and the download refusal deliberately do not
+  disclose, neither the size nor the cap. It is accepted for three reasons.
+  Below ~2.25 MiB —
   including the 2 MiB default and `0` — the cap is the constant 4 MiB floor
   and discloses nothing about the policy at all. What leaks above it is a
   memory-tuning number, not bug data: no rule name, no match criterion, no
@@ -2379,7 +2427,8 @@ wired, `server.rs` and `main.rs` are the reference.
   update_bug_fields, update_bug_dependencies, add_cc_to_bug, mark_as_duplicate,
   create_bug, add_attachment.
 - API key resolution: a match on `key_custody` (resolved once at startup, see Key custody — never re-read per request): `Server(key)` => the server's key, without touching the request at all; `PerRequest` => `ctx.extensions.get::<axum::http::request::Parts>()`, then `parts.headers.get(lowercased_header_name)`.
-- HTTP serving: `let config = server.http_server_config()?.with_cancellation_token(ct.child_token());` — built while `server` can still be borrowed, since the body cap comes from its own guard policy; errors on an unparsable `--allowed-hosts` entry and logs the effective Host-validation state — then `StreamableHttpService::new(move || Ok(server.clone()), LocalSessionManager::default().into(), config)`, never a bare `StreamableHttpServerConfig::default()`, see the field table above — then `axum::Router::new().nest_service("/mcp", service)`, `tokio::net::TcpListener::bind`, graceful shutdown on SIGINT or SIGTERM cancelling `ct` (`shutdown_signal` in main.rs; issue #114). Stdio uses the same waiter across `serve` (the handshake wait an unused stdio container sits in) and `waiting`; a signal at either stage flushes the OTLP queue (when export is on) then `process::exit(0)`s, because rmcp's stdio transport reads stdin via `spawn_blocking` and that read does not unblock while the client holds the pipe — returning from `main` drops the runtime onto that thread.
+- HTTP serving: `let config = server.http_server_config()?.with_cancellation_token(ct.child_token());` — built while `server` can still be borrowed, since the body cap comes from its own guard policy; errors on an unparsable `--allowed-hosts` entry and logs the effective Host-validation state — then `StreamableHttpService::new(move || Ok(server.clone()), AuditedSessionManager::default().into(), config)` — the wrapper since #180, not a bare `LocalSessionManager`, because the audit session id comes from its stamp and nowhere else — never a bare `StreamableHttpServerConfig::default()`, see the field table above — then `axum::Router::new().nest_service("/mcp", service)`, `tokio::net::TcpListener::bind`, graceful shutdown on SIGINT or SIGTERM cancelling `ct` (`shutdown_signal` in main.rs; issue #114).
+- Stdio serving: `let (stdin, stdout) = server.stdio_transport();` then `server.serve((stdin, stdout))`, never a bare `stdio()` — the same rule, and for the same reason, as never a bare `StreamableHttpServerConfig::default()`: rmcp's default reads a frame into an unbounded `Vec`, and the pair is built while `server` can still be borrowed because the frame cap comes from its own guard policy (#234, "rmcp 3.1 usage notes"). Stdio uses the same waiter across `serve` (the handshake wait an unused stdio container sits in) and `waiting`; a signal at either stage flushes the OTLP queue (when export is on) then `process::exit(0)`s, because rmcp's stdio transport reads stdin via `spawn_blocking` and that read does not unblock while the client holds the pipe — returning from `main` drops the runtime onto that thread. An over-cap frame is NOT that case and needs none of it: the refusal happens in a `poll_read` that just took a delivered chunk, so the blocking reader is idle with no `read(2)` outstanding and `main` returns normally, exit `1`, with the OTLP flush on the ordinary path.
 - Request `_meta` (SEP-414, e.g. `traceparent`): over every serialized
   transport the wire `params._meta` does NOT arrive in the params struct
   (`CallToolRequestParams.meta` stays `None`) — the SDK's custom
@@ -3024,7 +3073,8 @@ wired, `server.rs` and `main.rs` are the reference.
   `WRITE_TOOLS` is additionally pinned against every tool's own
   `read_only_hint` annotation, so the read scope cannot drift from what
   clients are told.
-- Process-shutdown tests (crates/bugwarden/tests/binary_shutdown.rs, the
+- Process-shutdown and stdio frame-cap tests
+  (crates/bugwarden/tests/binary_shutdown.rs, the
   SHIPPED BINARY, Unix only): SIGTERM and SIGINT on an idle HTTP listener
   both exit `0` within 5s and log `received shutdown signal` — an unhandled
   SIGTERM still kills a non-PID-1 child, but with `code() == None`, so
@@ -3038,7 +3088,33 @@ wired, `server.rs` and `main.rs` are the reference.
   that only `return Ok(())` cannot go green on an EOF the harness handed
   it: the test's `Server` takes stdin out of the `Child` at spawn and
   holds it past `Child::wait`, which closes whatever stdin the `Child`
-  still owns.
+  still owns. The same spawned binary pins the stdio frame cap (#234): 5 MiB
+  with NO delimiter, written before the handshake and again after a
+  completed one, must exit `1` within the same bound and log bugwarden's own
+  cap line — served on a bare `stdio()` neither case exits at all, and
+  without the over-cap flag `main` checks after `waiting()` the
+  post-handshake case exits `0`, which is what rmcp's silent close makes of
+  it. The needle is bugwarden's line, not rmcp's `Error reading from
+  stream`, so an SDK reword cannot pass for the bound.
+- Unit tests (#[cfg(test)] in crates/bugwarden/src/stdio.rs) at a 16-byte
+  cap, for what the binary test cannot reach: a frame of exactly the cap is
+  accepted both whole and split across chunks (`<=`, and the split half is
+  the one a `>=` in the no-delimiter-yet branch breaks on every real
+  stream); one byte past it is refused; the count is per frame, not a
+  running total, pinned by a frame STRADDLING a chunk boundary, since within
+  one chunk the scan starts from zero whether or not it resets; a frame that
+  ends inside the tripping chunk is still refused, which counting only the
+  bytes after the chunk's last delimiter would let through; the count
+  survives a cancelled read (`tokio::io::duplex`), because rmcp keeps
+  partial bytes across cancelled polls and a per-future count would restart
+  mid-frame; the refusal is sticky; an under-cap stream passes through byte
+  for byte, `\r\n` and empty frames included. One test drives the real
+  `AsyncRwTransport::new_server` and asserts `receive()` is `None`, pinning
+  the Err-to-close contract the exit-code path rests on against the next
+  rmcp bump. `BugWarden::request_body_cap` is pinned equal to both
+  `http_server_config()?.max_request_body_bytes` and the cap
+  `stdio_transport()` hands the reader, across four policy values, so the
+  two transports cannot drift apart.
 - Unit tests (#[cfg(test)] in crates/bugwarden/src/otel.rs): configuration
   resolution — an unset, emptied or blank endpoint resolves to NO
   configuration and a bad protocol beside it is therefore not an error,
