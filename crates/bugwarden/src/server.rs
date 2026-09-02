@@ -267,9 +267,10 @@ fn audit_refusal(tool: &str) -> CallToolResult {
 /// `{"_len": <serialized byte length>}`, so presence and size are loggable
 /// while content is not. Allowlisted string values are truncated to 1024
 /// characters. KEY NAMES are bounded on the same boundary but RELOCATED,
-/// never truncated in place: a client-chosen key over the cap does not
-/// enter the map as a key at any depth, it moves to the reserved
-/// `_overlong_keys` array behind a capped prefix ([`recorded_object`]).
+/// never truncated in place: a client-chosen key over the cap — or
+/// spelling a reserved name — does not enter the map as a key at any
+/// depth, it moves to the reserved `_overlong_keys` array behind a capped
+/// prefix ([`recorded_object`]).
 /// Neither cap bounds the record's SIZE — element and entry counts are
 /// uncapped, so an allowlisted value's shape can still make a large
 /// record; each bounds the length of any ONE verbatim string, not their
@@ -327,9 +328,13 @@ const PARAM_ALLOWLIST: &[&str] = &[
 /// [`PARAM_ALLOWLIST`].
 const PARAM_VALUE_MAX_CHARS: usize = 1024;
 
-/// Reserved key under which one recorded object holds its over-cap key
-/// names; see [`recorded_object`].
+/// Reserved key under which one recorded object holds its over-cap and
+/// reserved-name keys; see [`recorded_object`].
 const OVERLONG_KEYS: &str = "_overlong_keys";
+
+/// Reserved key carrying a non-allowlisted value's size in place of its
+/// content; written by [`allowlisted`], reserved by [`recorded_object`].
+const RESERVED_LEN: &str = "_len";
 
 /// An allowlisted value with every string [`capped`], at ANY depth: the
 /// client picks the JSON shape, so the bound must not depend on it (#211).
@@ -386,9 +391,11 @@ fn capped(value: &str) -> String {
 /// elements cannot collide, so two keys sharing a 1024-char prefix stay
 /// two faithful entries; plain truncation would fold them into one and
 /// MISREPORT which key was sent, which is why #211 left keys uncapped
-/// rather than truncate them. A client key equal to [`OVERLONG_KEYS`]
-/// routes there too, carrying its own true (short) `key_chars`, so the
-/// reserved name is only ever server-written. Both levels of the map go
+/// rather than truncate them. A client key equal to either reserved name
+/// — [`OVERLONG_KEYS`] or [`RESERVED_LEN`] — routes there too at every
+/// depth, carrying its own true (short) `key_chars`, so neither name is
+/// ever client-written (#241: a withheld-content marker must not be
+/// forgeable by content). Both call sites — top level and nested — go
 /// through here so the rule cannot drift between them (#191).
 fn recorded_object<'a, M: FromIterator<(String, Value)>>(
     fields: impl IntoIterator<Item = (&'a String, &'a Value)>,
@@ -399,7 +406,8 @@ fn recorded_object<'a, M: FromIterator<(String, Value)>>(
     for (key, value) in fields {
         let recorded = record(key, value);
         let key_chars = key.chars().count();
-        if key_chars > PARAM_VALUE_MAX_CHARS || key.as_str() == OVERLONG_KEYS {
+        if key_chars > PARAM_VALUE_MAX_CHARS || matches!(key.as_str(), OVERLONG_KEYS | RESERVED_LEN)
+        {
             overlong.push(json!({
                 "prefix": capped(key),
                 "key_chars": key_chars,
@@ -431,7 +439,7 @@ fn allowlisted(params: Option<&JsonObject>) -> BTreeMap<String, Value> {
             truncated(value)
         } else {
             let len = serde_json::to_vec(value).map(|b| b.len()).unwrap_or(0);
-            json!({ "_len": len })
+            json!({ RESERVED_LEN: len })
         }
     })
 }
@@ -6349,6 +6357,72 @@ mod tests {
         };
         assert_eq!(entry["key_chars"], json!(OVERLONG_KEYS.chars().count()));
         assert_eq!(entry["value"], json!("mine"));
+    }
+
+    #[test]
+    fn a_client_sent_len_marker_cannot_forge_the_reduction() {
+        // #241: `_len` means "content withheld by the server". Under an
+        // allowlisted key the value is copied verbatim, so without the
+        // reservation `{"_len": 5}` records byte-identically to the
+        // reduction a NON-allowlisted key gets, and only PARAM_ALLOWLIST
+        // — which the record does not carry and which moves between
+        // builds — told them apart.
+        let obj: JsonObject = serde_json::from_value(json!({
+            "groups": { RESERVED_LEN: 5 },
+            "custom_fields": { RESERVED_LEN: 5 },
+            "keywords": { RESERVED_LEN: { RESERVED_LEN: 1 } },
+        }))
+        .unwrap();
+        let params = allowlisted(Some(&obj));
+
+        // Allowlisted: the client's key is routed, exactly as a client key
+        // spelled `_overlong_keys` already was (#220).
+        assert!(
+            params["groups"].get(RESERVED_LEN).is_none(),
+            "a verbatim {RESERVED_LEN} would be indistinguishable from the reduction"
+        );
+        let Some([entry]) = params["groups"]
+            .get(OVERLONG_KEYS)
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+        else {
+            panic!("the client's own {RESERVED_LEN} key belongs under {OVERLONG_KEYS}");
+        };
+        assert_eq!(entry["prefix"], json!(RESERVED_LEN));
+        assert_eq!(entry["key_chars"], json!(RESERVED_LEN.chars().count()));
+        assert_eq!(entry["value"], json!(5), "the value itself is not lost");
+
+        // Non-allowlisted: the reduction is untouched, and it is the ONLY
+        // way `_len` reaches a record — same name, one definition.
+        let len = serde_json::to_vec(&json!({ RESERVED_LEN: 5 }))
+            .unwrap()
+            .len();
+        assert_eq!(params["custom_fields"], json!({ RESERVED_LEN: len }));
+
+        // Routed at every depth, and by the NAME alone: this one's value
+        // is an object, whose own `_len` key is routed while the value is
+        // recorded.
+        assert!(
+            params["keywords"].get(RESERVED_LEN).is_none(),
+            "nested: same rule"
+        );
+        let Some([nested]) = params["keywords"]
+            .get(OVERLONG_KEYS)
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+        else {
+            panic!("the nested {RESERVED_LEN} key belongs under {OVERLONG_KEYS}");
+        };
+        assert_eq!(nested["key_chars"], json!(RESERVED_LEN.chars().count()));
+        assert_eq!(
+            nested["value"],
+            json!({ OVERLONG_KEYS: [{
+                "prefix": RESERVED_LEN,
+                "key_chars": RESERVED_LEN.chars().count(),
+                "value": 1,
+            }] }),
+            "the client's nested key is routed too, one level further down"
+        );
     }
 
     // The fail-mode scope tests below drive a REAL sink into failure via
