@@ -1,4 +1,8 @@
 # Rust / Cargo
 /target/
+# cargo-mutants writes here at the workspace root, rotating the previous run
+# to .old
+/mutants.out/
+/mutants.out.old/
 *.rs.bk
 Cargo.lock.bak
