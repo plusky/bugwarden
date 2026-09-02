@@ -5,6 +5,7 @@
 //! live in the `bugwarden` library crate (`config`, `server`) so integration
 //! tests can drive the tools without a process boundary.
 
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Context;
@@ -18,10 +19,7 @@ use bugwarden::otel::{self, OtelEnv, Pipeline};
 use bugwarden::{config, server};
 use bugwarden_core::{guard::Guard, policy::Policy};
 use clap::Parser;
-use rmcp::{
-    transport::{stdio, streamable_http_server::StreamableHttpService},
-    ServiceExt,
-};
+use rmcp::{transport::streamable_http_server::StreamableHttpService, ServiceExt};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::EnvFilter;
@@ -225,9 +223,19 @@ async fn main() -> anyhow::Result<()> {
                 // anything that then races an unhandled signal (#173).
                 let shutdown = shutdown_signal();
                 tokio::pin!(shutdown);
+                // Bounded stdin, never rmcp's bare `stdio()`: it reads a
+                // frame into an unbounded `Vec` (#234). Built here for the
+                // same reason `http_server_config()` is built in the other
+                // arm — the cap comes from `server`'s own policy, and
+                // `serve` takes it by value.
+                let (stdin, stdout) = server.stdio_transport();
+                // rmcp maps the over-cap read error to `receive() -> None`,
+                // which the service reports as an ordinary close, so this
+                // flag is the only thing that tells the two apart below.
+                let over_cap = stdin.over_cap();
                 tracing::info!("Starting Bugzilla MCP server on stdio");
                 let service = tokio::select! {
-                    result = server.serve(stdio()) => {
+                    result = server.serve((stdin, stdout)) => {
                         result.inspect_err(|e| {
                             tracing::error!("serving error: {:?}", e);
                         })?
@@ -246,6 +254,16 @@ async fn main() -> anyhow::Result<()> {
                 tokio::select! {
                     result = service.waiting() => {
                         result?;
+                        // A refused frame closes the transport exactly like
+                        // a peer hangup, and `waiting()` reports both as
+                        // `Ok`. Without this the post-handshake half exits
+                        // 0 while the pre-handshake half exits 1 — the same
+                        // refusal, two different exit codes.
+                        if over_cap.load(Ordering::Acquire) {
+                            anyhow::bail!(
+                                "stdio transport closed: an inbound frame exceeded the request cap"
+                            );
+                        }
                     }
                     () = shutdown => {
                         tracing::info!("received shutdown signal");
