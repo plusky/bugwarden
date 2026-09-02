@@ -120,12 +120,21 @@ const DEFAULT_SERVICE_NAME: &str = "bugwarden";
 /// specification for `OTEL_EXPORTER_OTLP_ENDPOINT`.
 const LOGS_PATH: &str = "/v1/logs";
 
-/// Records the queue holds before it starts dropping. Bounded on purpose:
-/// an unreachable collector must cost a bounded amount of memory and a
-/// counter, never unbounded growth behind a socket nobody is reading.
+/// Records — a COUNT, not a byte budget — each queue holds before it
+/// refuses (audit) or drops (diagnostics), so an unreachable collector
+/// costs a bounded backlog and a counter rather than unbounded growth
+/// behind a socket nobody is reading.
+///
+/// The memory that implies is 2048 (plus `MAX_BATCH` batched and again
+/// encoded, in flight) times a record, and a record is as large as the
+/// call it describes: nothing caps one below the transport's own request
+/// cap. Still a count on purpose — DESIGN.md, "OTLP export", has the
+/// bytes and the rejected byte budget (#235).
 const QUEUE_CAPACITY: usize = 2048;
 
-/// Most records in one export request.
+/// Most records in one export request. The drain task holds the batch
+/// while the request is in flight, so it is up to 512 records outside
+/// what the queue holds.
 const MAX_BATCH: usize = 512;
 
 /// How long the exporter waits for a batch to fill before sending what it
