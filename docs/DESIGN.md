@@ -65,10 +65,12 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
   that was DENIED must not be whitelisted, or asking about a hidden bug
   reveals it through the links of one the client may read.
   Known limits, deliberate: free-text comments naming a bug number are not
-  touched (unfixable without destroying comments); the duplicate-marker match
-  covers both stock templates but not localised/customised ones; and an
-  instance reachable under a second hostname is not recognised in see_also
-  (scheme and case are).
+  touched (unfixable without destroying comments); a history change to a
+  free-text field (summary, whiteboard) is not touched either, since
+  `is_id_bearing_history_field` decides what gets scrubbed; the
+  duplicate-marker match covers both stock templates but not
+  localised/customised ones; and an instance reachable under a second
+  hostname is not recognised in see_also (scheme and case are).
 - **I5** Private content (`is_private: true`) is returned only when policy
   `global.allow_private_comments = true` AND the call sets
   `include_private = true`. This one switch governs private comments,
@@ -2587,12 +2589,22 @@ wired, `server.rs` and `main.rs` are the reference.
   not read as end-of-results and the scan keeps going to fill the window, a
   1-row page cap still bounds the scan at 10 requests, id-less rows are dropped,
   rows repeated across chunks are served once, exhaustion and scan truncation look alike, zero limit
-  touches nothing (and accounts for nothing), the returned objects are the
-  classified ones, and the scan accounting (issue #29) — `scanned` counts
-  every upstream row examined and `dropped` is exactly the verdict-dropped
-  ids, overshoot-region denials included, id-less rows and deduped repeats
-  excluded, and both accumulate across chunks (a multi-chunk corpus with a
-  drop in each chunk pins the per-chunk `extend`/`+=`);
+  touches nothing (and accounts for nothing) at a non-zero offset as well as at
+  0 — where `needed` is non-zero, so the limit test alone stops the scan — a
+  full chunk of visible bugs fills the quantised target in exactly ONE request,
+  the 2000-row ceiling binds on its own against a server free to answer with
+  more rows than it was asked for (four 500-row pages, well inside the
+  10-request bound), no request asks for more rows than the budget has left
+  (`limit` 200, then 50 once 1950 of the 2000 rows are scanned), the
+  withheld-bugs debug line is emitted when and only when the scan dropped
+  something (its count never reaches the client, I3 — the log and the audit
+  record's `guard.scan` are where an operator sees it), `disclosable` cuts 201
+  linked ids to the MAX_ASSESS_IDS * 8 = 200 fan-out bound in ONE request, the
+  returned objects are the classified ones, and the scan accounting (issue #29)
+  — `scanned` counts every upstream row examined and `dropped` is exactly the
+  verdict-dropped ids, overshoot-region denials included, id-less rows and
+  deduped repeats excluded, and both accumulate across chunks (a multi-chunk
+  corpus with a drop in each chunk pins the per-chunk `extend`/`+=`);
   assess() deny for embargoed group; min-age deny; one request per distinct
   id whatever the answer (nonexistent vs withheld cost the same), repeated
   ids fetched once, no batch to poison; per-id
