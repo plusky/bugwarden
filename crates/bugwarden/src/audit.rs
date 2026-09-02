@@ -59,14 +59,15 @@
 //! tiering question does not arise for it. TWO EXCEPTIONS, and the first
 //! is the case a future field is likeliest to hit: [`RequestInfo::params`]
 //! is CLIENT-authored content wherever the allowlist passes it verbatim —
-//! the `_len` and `_overlong_keys` reductions beside it are the
-//! server's — not the server's account of anything, so a value read out
-//! of it is a correlation hint at best and never an identity — a
-//! grouping handle a client was given and handed back included. The
-//! second: [`RequestInfo::tool`] is that account only while the name is
-//! one this server serves, since a call it will not serve is recorded
-//! too — an unknown name is the client's own text, capped for that
-//! reason (#243), and groups records by nothing but itself.
+//! the `_len` and `_overlong_keys` reductions beside it are the server's
+//! (both names reserved at every depth, #241) — not the server's account
+//! of anything, so a value read out of it is a correlation hint at best
+//! and never an identity — a grouping handle a client was given and
+//! handed back included. The second: [`RequestInfo::tool`] is that
+//! account only while the name is one this server serves, since a call
+//! it will not serve is recorded too — an unknown name is the client's
+//! own text, capped for that reason (#243), and groups records by
+//! nothing but itself.
 //!
 //! # What can never appear in a record
 //!
@@ -823,8 +824,10 @@ pub struct RequestInfo {
     /// by the recording call site: identifiers, projections, switches —
     /// parameters whose values the client chose. Verbatim only where
     /// allowlisted: the `_len` and `_overlong_keys` reductions are
-    /// server-written. Bug content fetched from Bugzilla must never be
-    /// placed here; a tool result is not a parameter.
+    /// server-written, both names reserved at every depth so a client
+    /// key spelling either is relocated, never passed through (#241).
+    /// Bug content fetched from Bugzilla must never be placed here; a
+    /// tool result is not a parameter.
     pub params: BTreeMap<String, serde_json::Value>,
 }
 

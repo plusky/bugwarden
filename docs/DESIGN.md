@@ -1189,9 +1189,11 @@ Decisions, all deliberate:
   than a large one — which is why #211 left keys uncapped rather than
   truncate them. The prefix, not a bare length, because which parameter
   was oversized is the diagnostic params are recorded for. A client key
-  spelled `_overlong_keys` routes into the array too, carrying its own
-  true (short) `key_chars`, so the reserved name is only ever
-  server-written. `request.tool` is bounded on that same boundary
+  spelled `_overlong_keys` — or `_len`, the reduction marker itself
+  (#241) — routes into the array too, at every depth, carrying its own
+  true (short) `key_chars`, so neither reserved name is ever
+  client-written: a marker meaning "content withheld" must not be
+  forgeable by content. `request.tool` is bounded on that same boundary
   (#243), by plain truncation: a call the router will not serve is
   recorded before it is refused, so an unknown name is client text of any
   length, while routing, the fail-mode gate and `WRITE_TOOLS` keep
@@ -2869,17 +2871,19 @@ wired, `server.rs` and `main.rs` are the reference.
   over-cap key names RELOCATED at both levels — an end-to-end served
   call carrying an over-cap key top level and under an allowlisted
   object, plus a prefix-sharing pair at each level, asserted per level
-  so half a fix fails; a client key spelled like the reserved marker
-  routed rather than passed through; the boundary itself, in chars not
-  bytes and with at-cap under it; and an ordinary record growing no
-  marker, #220); the recorded tool name truncated on that same boundary
-  at both reachable record sites, in chars not bytes and with at-cap
-  under it, while the every-routed-tool walk above pins each served name
-  byte-identical (#243); the recorded request id truncated on the same
-  boundary at both derivations — over-cap cut to exactly the cap, at-cap
-  kept, chars not bytes, the out-of-contract site too — and end-to-end a
-  4x-cap string id sent by raw per-request POST records exactly 1024
-  chars while the reply echoes the whole id (#248); and trace
+  so half a fix fails; a client key spelled like either reserved marker
+  routed rather than passed through — `_overlong_keys`, and the `_len`
+  reduction itself, that one end to end as well (#241); the boundary
+  itself, in chars not bytes and with at-cap under it; and an ordinary
+  record growing no marker, #220); the recorded tool name truncated on
+  that same boundary at both reachable record sites, in chars not bytes
+  and with at-cap under it, while the every-routed-tool walk above pins
+  each served name byte-identical (#243); the recorded request id
+  truncated on the same boundary at both derivations — over-cap cut to
+  exactly the cap, at-cap kept, chars not bytes, the out-of-contract site
+  too — and end-to-end a 4x-cap string id sent by raw per-request POST
+  records exactly 1024 chars while the reply echoes the whole id (#248);
+  and trace
   enrichment (issue #28) — the strict traceparent parser (the canonical
   W3C value and its flags-00 variant parse into their ids; empty,
   54-byte, 56-byte, and ~1 MiB values, uppercase hex, versions other

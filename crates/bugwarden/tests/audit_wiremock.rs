@@ -2078,6 +2078,69 @@ async fn canary_content_never_reaches_the_audit_file() {
 }
 
 #[tokio::test]
+async fn a_client_sent_len_marker_is_distinguishable_on_the_served_path() {
+    // #241, end to end: one call carries `{"_len": 5}` under an
+    // allowlisted key (copied verbatim, so forgeable without the
+    // reservation) and under a non-allowlisted one (reduced by the
+    // server). The allowlisted side must not carry a `_len` the server
+    // did not write: it is told apart by shape, never by the number.
+    // Off-schema keys on bug_url are ignored by serde, so this is the
+    // served path.
+    let mock = MockServer::start().await;
+    mount_fixture(&mock).await;
+    let audited = audited_client_for("", &mock, "test-key").await;
+
+    let _ = call(
+        &audited.client,
+        "bug_url",
+        json!({
+            "bug_id": 7,
+            "groups": { "_len": 5 },
+            "custom_fields": { "_len": 5 },
+        }),
+    )
+    .await;
+
+    let events = read_events(&audited.audit_path);
+    let calls: Vec<&bugwarden::audit::ToolCallEvent> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            AuditEventKind::ToolCall(tc) => Some(&**tc),
+            _ => None,
+        })
+        .collect();
+    let [tc] = calls.as_slice() else {
+        panic!("exactly one tool-call record, got {}", calls.len());
+    };
+    assert_eq!(tc.request.tool, "bug_url");
+    assert_eq!(tc.outcome.class, OutcomeClass::Ok, "the served path");
+
+    let allowlisted = &tc.request.params["groups"];
+    assert!(
+        allowlisted.get("_len").is_none(),
+        "a client-sent marker would be indistinguishable from the reduction"
+    );
+    let Some([entry]) = allowlisted
+        .get("_overlong_keys")
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+    else {
+        panic!("the client's own _len key belongs under _overlong_keys, alone");
+    };
+    assert_eq!(
+        entry,
+        &json!({ "prefix": "_len", "key_chars": 4, "value": 5 }),
+        "it is routed like any reserved name, keeping its true length"
+    );
+    let reduced = serde_json::to_vec(&json!({ "_len": 5 })).unwrap().len();
+    assert_eq!(
+        tc.request.params["custom_fields"],
+        json!({ "_len": reduced }),
+        "the server's own reduction, the only way _len reaches a record"
+    );
+}
+
+#[tokio::test]
 async fn initialize_writes_exactly_one_record_with_the_client_identity() {
     // Recorded unconditionally: auditing on means session starts are in
     // the stream — there is no configuration knob that turns this off.
