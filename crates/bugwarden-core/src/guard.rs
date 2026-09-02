@@ -1245,6 +1245,45 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_id_in_a_link_field_is_blanked_unless_it_is_disclosable() {
+        // Defence in depth (I14): the REST API documents these fields as id
+        // ARRAYS, but an instance answering with a bare scalar must not slip
+        // the id past the scrub. Looped over the constant, so a field added
+        // to LINKED_ID_FIELDS later is covered without editing this test.
+        let allowed: BTreeSet<u64> = [7].into_iter().collect();
+        for field in Guard::LINKED_ID_FIELDS {
+            let mut hidden = json!({ "id": 1 });
+            hidden[*field] = json!(7);
+            Guard::scrub_bug_links(&mut hidden, BASE, &BTreeSet::new());
+            assert_eq!(
+                hidden[*field],
+                Value::Null,
+                "a hidden bug named by a bare {field} must be blanked (I14)"
+            );
+            assert_eq!(hidden["id"], json!(1), "the bug's own id is untouched");
+
+            let mut shown = json!({ "id": 1 });
+            shown[*field] = json!(7);
+            Guard::scrub_bug_links(&mut shown, BASE, &allowed);
+            assert_eq!(
+                shown[*field],
+                json!(7),
+                "a disclosable bug named by a bare {field} must survive"
+            );
+
+            let mut odd = json!({ "id": 1 });
+            odd[*field] = json!("7");
+            Guard::scrub_bug_links(&mut odd, BASE, &allowed);
+            assert_eq!(
+                odd[*field],
+                Value::Null,
+                "a scalar in {field} that is no id at all cannot be cleared, so \
+                 it is blanked (I4)"
+            );
+        }
+    }
+
+    #[test]
     fn see_also_matching_is_anchored_to_this_instance() {
         // A host that merely starts with ours, or a path that merely contains
         // an id, must not be mistaken for a local bug link.
