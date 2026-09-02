@@ -1185,7 +1185,15 @@ Decisions, all deliberate:
   was oversized is the diagnostic params are recorded for. A client key
   spelled `_overlong_keys` routes into the array too, carrying its own
   true (short) `key_chars`, so the reserved name is only ever
-  server-written.
+  server-written. `request.tool` is bounded on that same boundary
+  (#243), by plain truncation: a call the router will not serve is
+  recorded before it is refused, so an unknown name is client text of any
+  length, while routing, the fail-mode gate and `WRITE_TOOLS` keep
+  matching the RAW name. Truncating is enough where a key needed
+  relocating — one string cannot collide with a sibling the way two map
+  keys sharing a prefix do — and no served name is near the cap, so no
+  served record moves and the only names ever shortened are the ones that
+  are not ours.
 - **The params caps bound content, not record size — and a total cap is a
   decided no** (#220). Array element and map entry counts are uncapped, so
   an allowlisted value's SHAPE can still make a large record; what bounds
@@ -2827,7 +2835,10 @@ wired, `server.rs` and `main.rs` are the reference.
   so half a fix fails; a client key spelled like the reserved marker
   routed rather than passed through; the boundary itself, in chars not
   bytes and with at-cap under it; and an ordinary record growing no
-  marker, #220); and trace
+  marker, #220); the recorded tool name truncated on that same boundary
+  at both reachable record sites, in chars not bytes and with at-cap
+  under it, while the every-routed-tool walk above pins each served name
+  byte-identical (#243); and trace
   enrichment (issue #28) — the strict traceparent parser (the canonical
   W3C value and its flags-00 variant parse into their ids; empty,
   54-byte, 56-byte, and ~1 MiB values, uppercase hex, versions other

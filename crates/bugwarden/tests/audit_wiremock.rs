@@ -391,6 +391,8 @@ async fn every_routed_tool_writes_exactly_one_record_per_call() {
         // `None` on every real call with the suite green. Checked here
         // because this is the one test that walks the whole router.
         let tc = last_tool_call(&events);
+        // Byte-identical for every SERVED name, which is what keeps the
+        // record cap on that same string invisible here (#243).
         assert_eq!(tc.request.tool, tool.name);
         assert!(
             tc.request.id.as_deref().is_some_and(|id| !id.is_empty()),
@@ -602,6 +604,11 @@ async fn a_default_decided_call_records_the_literal_default_rule() {
     );
 }
 
+/// `server::PARAM_VALUE_MAX_CHARS`, which is private. Mirrored rather
+/// than inferred so the end-to-end record pins the cap's VALUE (#191) and
+/// not merely the fact that something shortened the name.
+const RECORDED_MAX_CHARS: usize = 1024;
+
 #[tokio::test]
 async fn unknown_and_stripped_tools_error_identically_and_still_record() {
     let mock = MockServer::start().await;
@@ -625,6 +632,9 @@ async fn unknown_and_stripped_tools_error_identically_and_still_record() {
         format!("{without:?}"),
         "auditing must not change the protocol error"
     );
+    // Held against the oversized name below: the refusal names no tool,
+    // so it cannot vary with one.
+    let unknown_refusal = format!("{with_audit:?}");
     let events = read_events(&audited.audit_path);
     assert_eq!(events.len(), 2, "initialize + the failed call");
     let tc = last_tool_call(&events);
@@ -664,6 +674,44 @@ async fn unknown_and_stripped_tools_error_identically_and_still_record() {
     assert_eq!(tc.outcome.class, OutcomeClass::Error);
     // The comment body is not allowlisted even on this path.
     assert_eq!(tc.request.params["comment"], json!({ "_len": 4 }));
+
+    // #243: an unknown name is unbounded client text on its way into the
+    // file and the OTLP export, and it is recorded whatever it is. Four
+    // times the cap, through the real transport.
+    let huge = "z".repeat(RECORDED_MAX_CHARS * 4);
+    let with_audit = audited
+        .client
+        .call_tool(CallToolRequestParams::new(huge.clone()))
+        .await
+        .expect_err("an unknown tool is a protocol error whatever its length");
+    let without = plain
+        .call_tool(CallToolRequestParams::new(huge.clone()))
+        .await
+        .expect_err("an unknown tool is a protocol error whatever its length");
+    assert_eq!(
+        format!("{with_audit:?}"),
+        format!("{without:?}"),
+        "auditing must not change the protocol error"
+    );
+    assert_eq!(
+        format!("{with_audit:?}"),
+        unknown_refusal,
+        "and the same refusal a short unknown name gets: no echo of the name"
+    );
+    let events = read_events(&audited.audit_path);
+    assert_eq!(events.len(), 4, "one record for the oversized name too");
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.outcome.class, OutcomeClass::Error);
+    assert_eq!(
+        tc.request.tool.chars().count(),
+        RECORDED_MAX_CHARS,
+        "the recorded name is cut to the cap, not merely shortened"
+    );
+    assert_eq!(
+        tc.request.tool,
+        huge.chars().take(RECORDED_MAX_CHARS).collect::<String>(),
+        "and it is that prefix verbatim — capped() appends no marker"
+    );
 }
 
 /// Policy hiding every bug in a `Secret*` product.

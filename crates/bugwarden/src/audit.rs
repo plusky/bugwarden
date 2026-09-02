@@ -56,13 +56,17 @@
 //! reader promote a claim into a fact. The REST of a record — verdicts,
 //! rule names, counts, timings, the tool called — is the server's own
 //! account of what it did rather than a claim about anybody, so the
-//! tiering question does not arise for it. ONE EXCEPTION, and it is the
-//! case a future field is likeliest to hit: [`RequestInfo::params`] is
-//! CLIENT-authored content wherever the allowlist passes it verbatim —
+//! tiering question does not arise for it. TWO EXCEPTIONS, and the first
+//! is the case a future field is likeliest to hit: [`RequestInfo::params`]
+//! is CLIENT-authored content wherever the allowlist passes it verbatim —
 //! the `_len` and `_overlong_keys` reductions beside it are the
 //! server's — not the server's account of anything, so a value read out
 //! of it is a correlation hint at best and never an identity — a
-//! grouping handle a client was given and handed back included.
+//! grouping handle a client was given and handed back included. The
+//! second: [`RequestInfo::tool`] is that account only while the name is
+//! one this server serves, since a call it will not serve is recorded
+//! too — an unknown name is the client's own text, capped for that
+//! reason (#243), and groups records by nothing but itself.
 //!
 //! # What can never appear in a record
 //!
@@ -72,7 +76,11 @@
 //! content (summaries, comments, attachments). The one open field is
 //! [`RequestInfo::params`]: it is fed exclusively through an allowlist
 //! of client-authored parameter keys at the recording call site, and
-//! data fetched from Bugzilla never passes through it. [`AuditError`]
+//! data fetched from Bugzilla never passes through it.
+//! [`RequestInfo::tool`] is client text too whenever it names a tool
+//! this server does not serve, and is capped there (#243), as the
+//! self-declared identity is (#191); `request.id` is the one
+//! client-chosen string still recorded unbounded (#248). [`AuditError`]
 //! follows the same rule — it names the failed
 //! operation and carries the underlying I/O error, never the record that
 //! failed to be written, so it stays safe to surface in diagnostics.
@@ -783,7 +791,10 @@ impl TraceContext {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestInfo {
-    /// MCP tool name.
+    /// MCP tool name, capped at 1024 characters by the recording call
+    /// site: a call the router will not serve is recorded before it is
+    /// refused, so this is CLIENT-authored text whenever it is not one
+    /// of the served names (#243).
     pub tool: String,
     /// JSON-RPC request id, when the transport exposes one.
     ///
