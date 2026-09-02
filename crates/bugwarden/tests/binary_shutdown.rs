@@ -54,6 +54,9 @@ use tokio::process::Child;
 use tokio::process::ChildStdin;
 use tokio::process::Command;
 
+#[path = "common/scrub_env.rs"]
+mod scrub_env;
+
 #[path = "common/startup_line.rs"]
 mod startup_line;
 
@@ -64,65 +67,13 @@ use startup_line::HTTP_READY;
 /// default 10s grace, so a "it will die eventually" path cannot pass.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Every environment variable the binary reads, cleared before each spawn.
-const AMBIENT_VARS: &[&str] = &[
-    "BUGZILLA_SERVER",
-    "BUGZILLA_API_KEY",
-    "BUGZILLA_API_KEY_FILE",
-    "BUGWARDEN_POLICY",
-    "BUGWARDEN_AUDIT_CONFIG",
-    "BUGWARDEN_HTTP_TOKEN",
-    "BUGWARDEN_HTTP_READ_TOKEN",
-    "BUGZILLA_USE_AUTH_HEADER",
-    "MCP_TRANSPORT",
-    "MCP_HOST",
-    "MCP_PORT",
-    "MCP_ALLOWED_HOSTS",
-    "MCP_READ_ONLY",
-    "MCP_API_KEY_HEADER",
-    "RUST_LOG",
-    "OTEL_EXPORTER_OTLP_ENDPOINT",
-    "OTEL_EXPORTER_OTLP_HEADERS",
-    "OTEL_EXPORTER_OTLP_PROTOCOL",
-    "OTEL_SERVICE_NAME",
-    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-    "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
-    "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
-];
-
-/// The scrub list is only as good as its coverage of `Cli`.
+/// Each binary runs the walker itself, so a single-binary
+/// `cargo test --test binary_shutdown` still proves what its scrub claims.
 #[test]
 fn the_scrub_list_covers_every_environment_fallback() {
-    let mut cmd = bugwarden::config::command();
-    cmd.build();
-    let unscrubbed: Vec<String> = cmd
-        .get_arguments()
-        .filter_map(clap::Arg::get_env)
-        .map(|env| env.to_string_lossy().into_owned())
-        .filter(|env| !AMBIENT_VARS.contains(&env.as_str()))
-        .collect();
-    assert!(
-        !AMBIENT_VARS.is_empty() && cmd.get_arguments().any(|arg| arg.get_env().is_some()),
-        "the check is only evidence while both lists are non-empty"
-    );
-    assert!(
-        unscrubbed.is_empty(),
-        "these environment fallbacks reach the spawned binary: {unscrubbed:?}"
-    );
-    for var in [
-        bugwarden::http_auth::WRITE_TOKEN_VAR,
-        bugwarden::http_auth::READ_TOKEN_VAR,
-    ] {
-        assert!(AMBIENT_VARS.contains(&var), "{var} must be scrubbed");
-    }
-    let unscrubbed_otel: Vec<&str> = bugwarden::otel::ENV_VARS
-        .iter()
-        .copied()
-        .filter(|var| !AMBIENT_VARS.contains(var))
-        .collect();
-    assert!(
-        unscrubbed_otel.is_empty(),
-        "these OTLP variables reach the spawned binary: {unscrubbed_otel:?}"
+    scrub_env::assert_the_scrub_list_covers_every_environment_fallback(
+        scrub_env::AMBIENT_VARS,
+        scrub_env::HTTP_TOKEN_VARS,
     );
 }
 
@@ -170,7 +121,7 @@ impl Server {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for var in AMBIENT_VARS {
+        for var in scrub_env::AMBIENT_VARS {
             cmd.env_remove(var);
         }
         cmd.env("RUST_LOG", "info");
