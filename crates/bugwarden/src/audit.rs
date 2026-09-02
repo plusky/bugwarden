@@ -77,13 +77,17 @@
 //! [`RequestInfo::params`]: it is fed exclusively through an allowlist
 //! of client-authored parameter keys at the recording call site, and
 //! data fetched from Bugzilla never passes through it.
-//! [`RequestInfo::tool`] is client text too whenever it names a tool
-//! this server does not serve, and is capped there (#243), as the
-//! self-declared identity is (#191); `request.id` is the one
-//! client-chosen string still recorded unbounded (#248). [`AuditError`]
-//! follows the same rule — it names the failed
+//! [`AuditError`] follows the same rule — it names the failed
 //! operation and carries the underlying I/O error, never the record that
 //! failed to be written, so it stays safe to surface in diagnostics.
+//!
+//! Every client-chosen string a record does carry is bounded at the
+//! recording call site: allowlisted `params` values and over-cap key
+//! prefixes (#211, #220), the self-declared identity (#191),
+//! [`RequestInfo::tool`] — client text whenever it names a tool this
+//! server does not serve (#243) — and [`RequestInfo::id`] (#248) are
+//! capped at 1024 characters; `trace` is parsed to fixed-width hex ids
+//! instead.
 //!
 //! # Ordering, durability, and blocking
 //!
@@ -801,6 +805,11 @@ pub struct RequestInfo {
     /// CLIENT-chosen, so a correlation hint and never an identity:
     /// nothing stops two callers picking the same id, or one caller
     /// reusing one.
+    ///
+    /// A JSON-RPC string id is client text of any length, so the
+    /// recording call site caps it at 1024 characters; the reply still
+    /// echoes the full id, since the cap is on the record and never on
+    /// the wire (#248).
     ///
     /// Records are per-ATTEMPT, not per intended call. A client that
     /// loses a response and re-issues the call does so under a new id,

@@ -1539,6 +1539,92 @@ async fn a_per_request_call_records_the_client_it_declares() {
     );
 }
 
+/// The record's cap on `request.id`, in characters (#248). Not importable:
+/// `PARAM_VALUE_MAX_CHARS` is private to `server.rs`, where the unit test
+/// pins the boundary; this end-to-end pins the NUMBER a deployment writes.
+const RECORDED_ID_MAX_CHARS: usize = 1024;
+
+#[tokio::test]
+async fn a_record_caps_a_string_request_id_the_reply_still_echoes() {
+    // #248 over a real transport, which is the only place both halves are
+    // visible at once: a JSON-RPC string id is client text of any length,
+    // so the RECORD keeps its first 1024 chars, while the REPLY must
+    // still carry the whole id — JSON-RPC pairs a response to its request
+    // by it, so capping on the wire would break the client that sent it.
+    // No rmcp client can send one (`Peer` mints its ids from an
+    // `AtomicU32Provider`), hence the raw POST; the per-request lifecycle
+    // needs no handshake, so the file it writes holds exactly this call.
+    // Inlined rather than widening `per_request_post`: one caller wants
+    // an id of its own, as `per_request_call_with_canary` below wants a
+    // header of its own.
+    let sent = "z".repeat(RECORDED_ID_MAX_CHARS * 4);
+    let want = "z".repeat(RECORDED_ID_MAX_CHARS);
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("audit temp dir");
+    let file = key_file("srv-key\n");
+    let (addr, audit_path) = served_with_audit(&mock, &dir, &file).await;
+
+    let response = mcp_post(addr, None)
+        .header("MCP-Protocol-Version", PER_REQUEST_REVISION)
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", "bug_info")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": sent,
+            "method": "tools/call",
+            "params": {
+                "name": "bug_info",
+                "arguments": { "bug_ids": [7] },
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": PER_REQUEST_REVISION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            }
+        }))
+        .send()
+        .await
+        .expect("the per-request POST must reach the server");
+    assert!(
+        response.status().is_success(),
+        "an over-cap id is a servable request, got {}",
+        response.status()
+    );
+    let body = response.text().await.expect("a body");
+    assert!(
+        body.contains("a plain bug"),
+        "the call must really be served, or the record proves nothing: {body}"
+    );
+    // Honest caveat: this half pins the SDK, not our code — rmcp answers
+    // off the id it parsed, so no handler-side change in bugwarden could
+    // fail it. It guards an rmcp bump, or a response-rewriting layer that
+    // moved the cap onto the wire.
+    assert!(
+        body.contains(&format!("\"id\":\"{sent}\"")),
+        "the reply must echo the FULL id: the cap is on the record, never \
+         on the wire"
+    );
+
+    let events = audit_events(&audit_path);
+    let [record] = events.as_slice() else {
+        panic!("exactly one record for one call, got {}", events.len());
+    };
+    let AuditEventKind::ToolCall(event) = &record.kind else {
+        panic!("expected a tool_call record, got {:?}", record.kind);
+    };
+    let recorded = event
+        .request
+        .id
+        .as_deref()
+        .expect("a served record carries the request id");
+    assert_eq!(
+        recorded.chars().count(),
+        RECORDED_ID_MAX_CHARS,
+        "a {}-char id is recorded at the cap",
+        sent.chars().count()
+    );
+    assert_eq!(recorded, want, "and as the id's own prefix");
+}
+
 #[tokio::test]
 async fn a_forged_session_id_is_not_copied_into_a_served_record() {
     // The C3 hazard, widened by adoption from refusals to SERVED calls: on
