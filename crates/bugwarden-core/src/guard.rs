@@ -1132,6 +1132,65 @@ mod tests {
     }
 
     #[test]
+    fn a_change_survives_when_both_of_its_halves_do() {
+        // `anything_left` accumulates over added AND removed: two survivors
+        // must not cancel each other out and drop a change the client is
+        // entitled to see.
+        let history = json!([{
+            "when": "2026-01-01T00:00:00Z",
+            "who": "a@b",
+            "changes": [
+                { "field_name": "depends_on", "added": "10", "removed": "11" }
+            ]
+        }]);
+        let allowed: BTreeSet<u64> = [10, 11].into_iter().collect();
+        let out = Guard::scrub_history(history, BASE, &allowed);
+        assert_eq!(
+            out[0]["changes"].as_array().map(Vec::len),
+            Some(1),
+            "a change whose added AND removed both survive is kept: {out}"
+        );
+        assert_eq!(out[0]["changes"][0]["added"], json!("10"));
+        assert_eq!(out[0]["changes"][0]["removed"], json!("11"));
+    }
+
+    #[test]
+    fn a_field_that_cannot_carry_a_bug_id_is_left_alone() {
+        // Free text naming a bug number is a recorded I14 limit, not something
+        // to rewrite: treating every history field as id-bearing would edit a
+        // summary and drop a numeric field's change outright.
+        let history = json!([{
+            "when": "2026-01-01T00:00:00Z",
+            "who": "a@b",
+            "changes": [
+                { "field_name": "summary",
+                  "added": "crash when opening 666, 777",
+                  "removed": "crash on open" },
+                { "field_name": "estimated_time", "added": "666", "removed": "0" }
+            ]
+        }]);
+        let out = Guard::scrub_history(history, BASE, &BTreeSet::new());
+        let changes = out[0]["changes"]
+            .as_array()
+            .expect("the entry keeps its changes");
+        assert_eq!(
+            changes.len(),
+            2,
+            "no change on a field that cannot name a bug may be dropped: {out}"
+        );
+        assert_eq!(
+            changes[0]["added"],
+            json!("crash when opening 666, 777"),
+            "free text passes through verbatim, bug numbers and all"
+        );
+        assert_eq!(
+            changes[1]["added"],
+            json!("666"),
+            "a number in a non-id field is not a bug id"
+        );
+    }
+
+    #[test]
     fn history_ids_are_found_in_both_directions_and_in_see_also_urls() {
         let history = json!([{
             "changes": [
@@ -1281,6 +1340,19 @@ mod tests {
                  it is blanked (I4)"
             );
         }
+    }
+
+    #[test]
+    fn the_link_disclosure_fan_out_bound_is_eight_assess_batches() {
+        // Pins MAX_ASSESS_IDS itself: eight batches of it is the 200-id I14
+        // link fan-out bound. Only guard_wiremock's
+        // `disclosable_fetches_at_most_the_link_fan_out_bound` holds
+        // `Guard::disclosable` to that number, on the wire.
+        assert_eq!(
+            Guard::MAX_ASSESS_IDS * 8,
+            200,
+            "the I14 link fan-out bound is 200 ids per disclosure fetch"
+        );
     }
 
     #[test]

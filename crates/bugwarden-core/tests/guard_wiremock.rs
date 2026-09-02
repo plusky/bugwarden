@@ -1128,6 +1128,312 @@ async fn quicksearch_window_accounting_accumulates_across_chunks() {
     assert!(!ids.contains(&10) && !ids.contains(&230));
 }
 
+#[tokio::test]
+async fn quicksearch_window_zero_limit_touches_nothing_at_any_offset() {
+    // `needed` is non-zero as soon as the offset is, so at a non-zero offset
+    // the `limit == 0` test is the only thing that can stop the scan. An
+    // empty page must still cost nothing. No mock is mounted, so any
+    // upstream request fails the call outright.
+    let server = MockServer::start().await;
+    let g = guard(EMBARGO_POLICY);
+    let window = g
+        .quicksearch_window(&client(&server), KEY, &search("q", 0, 5), None)
+        .await
+        .expect("a zero limit at a non-zero offset is not an error");
+    assert!(window.bugs.is_empty());
+    assert_eq!(
+        window.scanned, 0,
+        "limit 0 scans nothing, whatever the offset"
+    );
+    assert_eq!(
+        requests_to(&server).await,
+        0,
+        "limit 0 must not contact Bugzilla, whatever the offset"
+    );
+}
+
+#[tokio::test]
+async fn quicksearch_window_stops_the_moment_the_scan_target_is_full() {
+    // One SEARCH_SCAN_CHUNK of fully visible bugs already meets the quantised
+    // target for every window inside it; a second request would be upstream
+    // load no page the client can ask for accounts for.
+    let server = MockServer::start().await;
+    corpus_counted(&server, 1_000, &[]).await;
+    let g = guard(EMBARGO_POLICY);
+    let got = g
+        .quicksearch_window(&client(&server), KEY, &search("q", 200, 0), None)
+        .await
+        .expect("search succeeds")
+        .bugs;
+    assert_eq!(ids_of(&got), (1..=200).collect::<Vec<u64>>());
+    assert_eq!(
+        requests_to(&server).await,
+        1,
+        "a full 200-row chunk fills the 200-row target in ONE request"
+    );
+}
+
+#[tokio::test]
+async fn quicksearch_window_row_bound_holds_when_pages_overrun_the_chunk() {
+    // SEARCH_SCAN_MAX has to bind on its own. Rows-per-request is the
+    // server's choice, so one that answers with more rows than it was asked
+    // for reaches 2000 examined rows in four requests — well inside the
+    // 10-request bound — and the scan must stop at the ceiling, not one
+    // request past it.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .respond_with(|req: &Request| {
+            let q: std::collections::HashMap<_, _> = req.url.query_pairs().collect();
+            let offset: u64 = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+            // 500 hidden rows whatever `limit` asked for: nothing is ever
+            // visible, so only a bound can end the scan.
+            let rows: Vec<Value> = (offset + 1..=offset + 500)
+                .map(|id| bug(id, &["embargo-security"], OLD))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({ "bugs": rows }))
+        })
+        .mount(&server)
+        .await;
+    let g = guard(EMBARGO_POLICY);
+    let window = g
+        .quicksearch_window(&client(&server), KEY, &search("q", 50, 0), None)
+        .await
+        .expect("search succeeds");
+    assert!(window.bugs.is_empty(), "everything was hidden");
+    assert_eq!(
+        window.scanned, 2_000,
+        "SEARCH_SCAN_MAX rows examined and no more"
+    );
+    assert_eq!(
+        requests_to(&server).await,
+        4,
+        "4 x 500 rows reaches the row ceiling before the request ceiling"
+    );
+}
+
+#[tokio::test]
+async fn quicksearch_window_never_asks_for_more_rows_than_its_budget() {
+    // The chunk is clamped to what is LEFT of SEARCH_SCAN_MAX, so no single
+    // request can carry the scan past the ceiling. A conformant upstream
+    // never reaches the clamp — nine requests of at most 200 rows leave
+    // `scanned` at 1800 at most, and a full 200 still fits — so only a
+    // server that overruns the chunk it was given drives `scanned` close
+    // enough for the clamp to bite, and the `limit` it then sends pins it.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .respond_with(|req: &Request| {
+            let q: std::collections::HashMap<_, _> = req.url.query_pairs().collect();
+            let offset: u64 = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+            // 1950 hidden rows whatever `limit` asked for, leaving 50 of the
+            // 2000-row budget for the next request.
+            let rows: Vec<Value> = (offset + 1..=offset + 1_950)
+                .map(|id| bug(id, &["embargo-security"], OLD))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({ "bugs": rows }))
+        })
+        .mount(&server)
+        .await;
+    let g = guard(EMBARGO_POLICY);
+    let window = g
+        .quicksearch_window(&client(&server), KEY, &search("q", 50, 0), None)
+        .await
+        .expect("search succeeds");
+    assert!(window.bugs.is_empty(), "everything was hidden");
+
+    let limits: Vec<String> = server
+        .received_requests()
+        .await
+        .expect("the mock records requests")
+        .iter()
+        .map(|r| {
+            r.url
+                .query_pairs()
+                .find(|(k, _)| k == "limit")
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(
+        limits,
+        vec!["200".to_string(), "50".to_string()],
+        "the second request may ask for only the 50 rows left of the budget"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the scan's server-side accounting line (I3: the count is never the
+// client's — this log and the audit record's `guard.scan` are where an
+// operator sees it)
+// ---------------------------------------------------------------------------
+
+/// What `quicksearch_window` logs when the scan actually withheld something.
+const WITHHELD_LINE: &str = "quicksearch: withheld policy-denied bugs";
+
+thread_local! {
+    /// Where the calling thread's capture accumulates. `None` means this
+    /// thread is not capturing and its events go on the floor.
+    static CAPTURED: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The `message` field of one event.
+struct Message(String);
+
+impl tracing::field::Visit for Message {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+/// Records the message of every `bugwarden_core` event on the capturing
+/// thread. Hand-rolled rather than pulled in from tracing-subscriber: all it
+/// has to answer is whether one line was emitted. Everything else keeps the
+/// `Interest::never()` short-circuit it had before the subscriber existed.
+struct CaptureSubscriber;
+
+impl tracing::Subscriber for CaptureSubscriber {
+    fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+        meta.target().starts_with("bugwarden_core")
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        let Message(message) = message;
+        // `try_with`: a thread may still log while its thread-locals are
+        // being torn down, and that must not panic.
+        let _ = CAPTURED.try_with(move |slot| {
+            if let Some(lines) = slot.borrow_mut().as_mut() {
+                lines.push(message);
+            }
+        });
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Install the capture as this test binary's process-wide default, once.
+///
+/// It cannot be a `with_default` scope: a callsite's `Interest` is cached the
+/// first time it is hit, from the registering thread's default subscriber, so
+/// a parallel test with no subscriber of its own can cache `Interest::never()`
+/// first and the macro then short-circuits forever after (the binary crate hit
+/// this as issue #92). The explicit rebuild fixes up whatever was cached
+/// before this ran.
+fn install_capture() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        tracing::subscriber::set_global_default(CaptureSubscriber)
+            .expect("the capture must be this test binary's only global default");
+        tracing::callsite::rebuild_interest_cache();
+    });
+}
+
+/// Run `f`, returning what this crate logged on the calling thread meanwhile.
+/// `#[tokio::test]` is single-threaded, so the whole future stays here.
+async fn messages_logged_by<T>(f: impl std::future::Future<Output = T>) -> Vec<String> {
+    install_capture();
+    CAPTURED.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let _ = f.await;
+    CAPTURED.with(|slot| slot.borrow_mut().take().unwrap_or_default())
+}
+
+#[tokio::test]
+async fn the_scan_logs_withheld_bugs_only_when_it_withheld_something() {
+    // The drop count never reaches the client (I3): this debug line and the
+    // audit record's `guard.scan` are where it surfaces. One emitted when
+    // nothing was dropped is a false report of a withholding, not a
+    // harmless extra log.
+    let hiding = MockServer::start().await;
+    corpus(&hiding, 10, &[3]).await;
+    let g = guard(EMBARGO_POLICY);
+    let logged = messages_logged_by(async {
+        g.quicksearch_window(&client(&hiding), KEY, &search("q", 5, 0), None)
+            .await
+            .expect("search succeeds");
+    })
+    .await;
+    assert!(
+        logged.iter().any(|m| m.contains(WITHHELD_LINE)),
+        "a scan that dropped a bug must say so: {logged:?}"
+    );
+
+    let clean = MockServer::start().await;
+    corpus(&clean, 10, &[]).await;
+    let logged = messages_logged_by(async {
+        g.quicksearch_window(&client(&clean), KEY, &search("q", 5, 0), None)
+            .await
+            .expect("search succeeds");
+    })
+    .await;
+    assert!(
+        !logged.iter().any(|m| m.contains(WITHHELD_LINE)),
+        "a scan that dropped nothing must not claim it did: {logged:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// disclosable: the I14 link fan-out bound
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn disclosable_fetches_at_most_the_link_fan_out_bound() {
+    // A tracker bug can name hundreds of others, so the one batched
+    // disclosure fetch takes at most MAX_ASSESS_IDS * 8 = 200 ids and the
+    // excess is simply not disclosable (I4). Nothing but the request the
+    // guard sends shows that bound, so it is pinned there.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .mount(&server)
+        .await;
+    let g = guard(EMBARGO_POLICY);
+    let ids: std::collections::BTreeSet<u64> = (1..=201).collect();
+    let out = g.disclosable(&client(&server), KEY, &ids, None).await;
+    assert!(out.is_empty(), "an empty envelope discloses nothing (I4)");
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock records requests");
+    assert_eq!(
+        requests.len(),
+        1,
+        "one batched request, whatever the id count"
+    );
+    let query: std::collections::HashMap<_, _> = requests[0].url.query_pairs().collect();
+    let sent: Vec<&str> = query
+        .get("id")
+        .expect("the disclosure fetch carries an id list")
+        .split(',')
+        .collect();
+    assert_eq!(
+        sent.len(),
+        Guard::MAX_ASSESS_IDS * 8,
+        "201 linked ids must be cut to the 200-id fan-out bound"
+    );
+    assert_eq!(
+        (sent.first(), sent.last()),
+        (Some(&"1"), Some(&"200")),
+        "the bound keeps the lowest 200 ids"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // whoami + resolve_caller (identity resolution for created_by_me)
 // ---------------------------------------------------------------------------
