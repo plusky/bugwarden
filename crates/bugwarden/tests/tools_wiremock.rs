@@ -37,6 +37,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/pinned_cli.rs"]
 mod pinned_cli;
+#[path = "common/refused.rs"]
+mod refused;
 
 use pinned_cli::pinned;
 
@@ -2521,7 +2523,7 @@ async fn whoami_transport_error_does_not_leak_the_api_key_i12() {
     // the whoami lookup (and everything after it) fails at the transport
     // level, where the unsanitized error would carry the request URL with
     // api_key=... in it. Nothing the client sees may contain the key.
-    let base = common::refused_base_url();
+    let base = refused::refused_base_url();
 
     let cfg: Arc<Cli> = Arc::new(pinned(&[
         "bugwarden",
