@@ -23,6 +23,10 @@ mod scrub_env;
 /// hanging the suite until CI's own timeout kills it.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Port 9 is discard: a child that inherited a proxy pointing here cannot
+/// reach the mock, so the two tests below fail instead of quietly passing.
+const DEAD_PROXY: &str = "http://127.0.0.1:9";
+
 /// The shared scrub list less the two HTTP bearer tokens: this file spawns
 /// stdio children, which bind no listener and ignore both
 /// (`a_stdio_start_ignores_the_bearer_tokens`). Derived rather
@@ -78,6 +82,11 @@ async fn upstream_requests_of_a_real_run(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
+    // A dead proxy, pinned in before the scrub takes it back out: without
+    // it, dropping a proxy name from `AMBIENT_VARS` breaks no test (#239).
+    for var in scrub_env::PROXY_PIN_VARS {
+        cmd.env(var, DEAD_PROXY);
+    }
     for var in scrubbed_env() {
         cmd.env_remove(var);
     }

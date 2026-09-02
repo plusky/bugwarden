@@ -1,5 +1,13 @@
 //! The ambient environment a spawned `bugwarden` must not inherit, and the
-//! walker that holds the list to every variable the binary reads (#237).
+//! walker that holds the list to the variables something can enumerate
+//! (#237).
+//!
+//! What the list is actually held to: clap's `env` fallbacks and
+//! [`bugwarden::otel::ENV_VARS`] are swept from the symbols themselves, the
+//! by-name population against a caller's own list, and the four proxy names
+//! an `http://` mock can observe are pinned behaviourally
+//! ([`PROXY_PIN_VARS`]). The remaining four proxy names and `RUST_LOG` are
+//! listed on trust — no check fails if they are dropped.
 //!
 //! Included by `#[path]` from each user rather than declared in
 //! `common/mod.rs`: that module compiles into every test binary that says
@@ -19,9 +27,17 @@ pub const HTTP_TOKEN_VARS: &[&str] = &[
     bugwarden::http_auth::READ_TOKEN_VAR,
 ];
 
+/// The proxy names a spawning test pins to a dead proxy before scrubbing,
+/// so dropping one from [`AMBIENT_VARS`] fails a test rather than nothing.
+/// Only these four: an `http://` mock never consults `https_proxy`,
+/// `HTTPS_PROXY`, `NO_PROXY` or `no_proxy`, so those stay listed on trust.
+#[allow(dead_code, reason = "only the binary_user_agent includer pins")]
+pub const PROXY_PIN_VARS: &[&str] = &["ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"];
+
 /// Every environment variable the binary reads, cleared before each spawn:
 /// an ambient value would change exactly what is under test. The spawned leg
-/// only; `pinned_cli` covers the in-process one.
+/// only, and only the child's copy — `pinned_cli` covers what an in-process
+/// parse sees, and nothing covers a harness's own reqwest client.
 ///
 /// Scrubbed as one set rather than per test — a knob inert for one
 /// transport is still a knob, and pruning is how the list falls behind
@@ -44,6 +60,21 @@ pub const AMBIENT_VARS: &[&str] = &[
     "MCP_READ_ONLY",
     "MCP_API_KEY_HEADER",
     "RUST_LOG",
+    // Read by hyper-util's proxy matcher under reqwest, not by `Cli`:
+    // neither client opts out, and bugwarden leaves them honored
+    // deliberately (DESIGN.md, TLS stack and outbound network behavior) for
+    // an operator behind a corporate proxy — so an ambient one routes a
+    // spawned child's Bugzilla calls through it, with no loopback bypass
+    // (#239). Listed in the matcher's own order and case, uppercase first,
+    // which is also its precedence.
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
     // Read by the otel module, not by `Cli`: a developer exporting to a
     // collector would otherwise have every spawned child export too, and
     // an unreachable one would slow the tests down for no reason.
@@ -68,6 +99,10 @@ pub const AMBIENT_VARS: &[&str] = &[
 /// carries them), and `by_name` — variables nothing enumerates at all.
 /// Pass [`HTTP_TOKEN_VARS`] for `by_name`, or `&[]` from a caller whose
 /// list omits them on purpose.
+///
+/// The proxy names are in none of the three — nothing enumerates them, and
+/// a by-name arm would only check the list against itself. [`PROXY_PIN_VARS`]
+/// covers the observable four instead; the other four go unchecked.
 pub fn assert_the_scrub_list_covers_every_environment_fallback(
     scrubbed: &[&str],
     by_name: &[&str],
