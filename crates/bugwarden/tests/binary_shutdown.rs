@@ -40,11 +40,14 @@ use rmcp::ServiceExt as _;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
-use tokio::io::Lines;
 use tokio::process::Child;
-use tokio::process::ChildStderr;
 use tokio::process::ChildStdin;
 use tokio::process::Command;
+
+#[path = "common/startup_line.rs"]
+mod startup_line;
+
+use startup_line::HTTP_READY;
 
 /// Bounded so a binary that ignores the signal fails this test rather than
 /// hanging the suite until CI's own timeout kills it. Well under docker's
@@ -109,12 +112,7 @@ fn the_scrub_list_covers_every_environment_fallback() {
     );
 }
 
-/// The line the http transport logs once it is bound *and* its signal
-/// handlers are armed; the address that follows is the one the kernel
-/// assigned, which with `--port 0` is the only way to learn it.
-const HTTP_READY: &str = "Starting Bugzilla MCP server on ";
-
-/// The same, for stdio, which has no address.
+/// [`HTTP_READY`]'s counterpart for stdio, which has no address to parse.
 const STDIO_READY: &str = "Starting Bugzilla MCP server on stdio";
 
 /// A spawned binary, its pipes, and every stderr line it has written.
@@ -128,7 +126,7 @@ struct Server {
     /// One reader for the process's whole life. A `BufReader` built per
     /// wait throws away whatever it buffered past the line it matched,
     /// which can swallow the line a later assertion needs.
-    stderr: Lines<BufReader<ChildStderr>>,
+    stderr: startup_line::StderrLines,
     /// Every stderr line read so far, for the assertions and diagnostics.
     log: String,
 }
@@ -149,7 +147,7 @@ impl Server {
         cmd.kill_on_drop(true);
         let mut child = cmd.spawn().expect("the built binary must start");
         let stdin = child.stdin.take();
-        let stderr = BufReader::new(child.stderr.take().expect("stderr is piped")).lines();
+        let stderr = startup_line::stderr_lines(&mut child);
         Self {
             child,
             stdin,
@@ -161,38 +159,12 @@ impl Server {
     /// Read stderr until a line contains `needle`, and return that line.
     /// The startup lines are the readiness barriers: see the module docs.
     async fn wait_for_stderr(&mut self, needle: &str) -> String {
-        let found = tokio::time::timeout(EXIT_TIMEOUT, async {
-            while let Some(line) = self.next_stderr_line().await {
-                if line.contains(needle) {
-                    return Some(line);
-                }
-            }
-            None
-        })
-        .await;
-        match found {
-            Ok(Some(line)) => line,
-            Ok(None) => panic!(
-                "the child's stderr ended before {needle:?}: {log}",
-                log = self.log
-            ),
-            Err(_) => panic!(
-                "timed out waiting for {needle:?} on the child's stderr: {log}",
-                log = self.log
-            ),
-        }
+        startup_line::wait_for_line(&mut self.stderr, &mut self.log, needle, EXIT_TIMEOUT).await
     }
 
     /// Next stderr line, recorded in `log`; `None` at EOF.
     async fn next_stderr_line(&mut self) -> Option<String> {
-        let line = self
-            .stderr
-            .next_line()
-            .await
-            .expect("the child's stderr must be readable")?;
-        self.log.push_str(&line);
-        self.log.push('\n');
-        Some(line)
+        startup_line::next_logged_line(&mut self.stderr, &mut self.log).await
     }
 
     fn pid(&self) -> u32 {
@@ -256,18 +228,7 @@ async fn spawn_http() -> (Server, SocketAddr) {
         "--insecure-no-auth",
     ]);
     let line = server.wait_for_stderr(HTTP_READY).await;
-    let (_, addr) = line
-        .split_once(HTTP_READY)
-        .expect("wait_for_stderr matched the needle");
-    let addr: SocketAddr = addr
-        .trim()
-        .parse()
-        .unwrap_or_else(|e| panic!("the startup line must name the bound address: {line}: {e}"));
-    assert!(
-        addr.ip().is_loopback() && addr.port() != 0,
-        "the startup line must carry the loopback address the kernel \
-         assigned, not the requested port 0: {line}"
-    );
+    let addr = startup_line::parse_bound_addr(&line);
     wait_for_tcp(addr).await;
     (server, addr)
 }

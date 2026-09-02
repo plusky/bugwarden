@@ -45,8 +45,6 @@ use rmcp::transport::streamable_http_server::{
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::ServiceExt as _;
 use serde_json::{json, Value};
-use tokio::io::AsyncBufReadExt as _;
-use tokio::io::BufReader;
 use tokio::process::Child;
 use wiremock::matchers::{any, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -56,6 +54,9 @@ mod raw_post;
 
 #[path = "common/pinned_cli.rs"]
 mod pinned_cli;
+
+#[path = "common/startup_line.rs"]
+mod startup_line;
 
 use pinned_cli::pinned;
 
@@ -804,11 +805,6 @@ async fn every_startup_misconfiguration_refuses_before_the_port_is_bound() {
     drop(occupied);
 }
 
-/// The line the http transport logs once it is bound; the address that
-/// follows is the one the kernel assigned, which under `--port 0` is the
-/// only way to learn it.
-const HTTP_READY: &str = "Starting Bugzilla MCP server on ";
-
 /// Wait for the child's own startup line and return the address it bound.
 ///
 /// The barrier this replaces was a bind-then-drop `free_port()` plus a
@@ -820,44 +816,19 @@ const HTTP_READY: &str = "Starting Bugzilla MCP server on ";
 /// process that keeps it — and a line only the child can write is the
 /// readiness proof the probe was not.
 async fn bound_addr(child: &mut Child) -> SocketAddr {
-    let mut stderr = BufReader::new(child.stderr.take().expect("stderr is piped")).lines();
+    let mut stderr = startup_line::stderr_lines(child);
     let mut log = String::new();
-    let found = tokio::time::timeout(EXIT_TIMEOUT, async {
-        while let Some(line) = stderr
-            .next_line()
-            .await
-            .expect("the child's stderr must be readable")
-        {
-            log.push_str(&line);
-            log.push('\n');
-            if line.contains(HTTP_READY) {
-                return Some(line);
-            }
-        }
-        None
-    })
+    let line = startup_line::wait_for_line(
+        &mut stderr,
+        &mut log,
+        startup_line::HTTP_READY,
+        EXIT_TIMEOUT,
+    )
     .await;
-    let line = match found {
-        Ok(Some(line)) => line,
-        Ok(None) => panic!("the child's stderr ended before it bound a port: {log}"),
-        Err(_) => panic!("timed out waiting for the child's startup line: {log}"),
-    };
     // Nothing reads stderr after this, but the child keeps logging and a
     // full pipe would block it mid-request: one reader for its whole life.
     tokio::spawn(async move { while matches!(stderr.next_line().await, Ok(Some(_))) {} });
-    let addr: SocketAddr = line
-        .split_once(HTTP_READY)
-        .expect("the wait matched the needle")
-        .1
-        .trim()
-        .parse()
-        .unwrap_or_else(|e| panic!("the startup line must name the bound address: {line}: {e}"));
-    assert!(
-        addr.ip().is_loopback() && addr.port() != 0,
-        "the startup line must carry the loopback address the kernel \
-         assigned, not the requested port 0: {line}"
-    );
-    addr
+    startup_line::parse_bound_addr(&line)
 }
 
 #[tokio::test]
