@@ -187,9 +187,13 @@ A release is one push of an annotated tag; nothing is released by hand.
   Publishing; the container image has none yet.
 - The same tag also ships the multi-arch container image
   `ghcr.io/plusky/bugwarden` (jobs `container`, `container-manifest`).
-  `container` is a sibling of `publish`, not upstream of it — a broken image
-  build must not hold back the crates.io release of a tag whose binaries
-  already shipped.
+  `container` runs `scripts/container-smoke.sh` — ci.yml's own assertions —
+  against the digest each architecture just pushed, so a misbehaving image
+  fails its leg and `container-manifest` publishes no tag naming it; the
+  rejected bytes stay in ghcr.io as an unreferenced digest, which
+  push-by-digest makes unavoidable. `container` is a sibling of `publish`,
+  not upstream of it — a broken image build must not hold back the crates.io
+  release of a tag whose binaries already shipped.
 - The `.deb`/`.rpm` come from `cargo-deb` and `cargo-generate-rpm`, both
   pinned to an exact version and installed `--locked`, reading
   `[package.metadata.deb]` / `[package.metadata.generate-rpm]` in

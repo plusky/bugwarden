@@ -306,8 +306,10 @@ jobs:
   container:
     # Native runners per architecture: an emulated aws-lc-sys compile under
     # QEMU takes tens of minutes, and ubuntu-24.04-arm makes it unnecessary.
-    # Sibling of `publish`, not upstream of it: a broken image build must not
-    # hold back the crates.io release of a tag whose binaries already shipped.
+    # It also runs each image, on its own architecture, before the manifest
+    # publishes. Sibling of `publish`, not upstream of it: a broken or broken-
+    # behaving image must not hold back the crates.io release of a tag whose
+    # binaries already shipped.
     needs: [release, toolchain-drift]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -315,6 +317,8 @@ jobs:
       contents: read
       # Push the per-architecture images to ghcr.io.
       packages: write
+    env:
+      CTR: bugwarden-smoke
     strategy:
       fail-fast: false
       matrix:
@@ -353,6 +357,36 @@ jobs:
           # No cache-from/cache-to: releases build hermetically, same rule as
           # the cargo-cache-free `build` job above.
           outputs: type=image,name=ghcr.io/plusky/bugwarden,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Pull the pushed image by digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Smoke the registry's bytes, not the builder's local sibling.
+          image="ghcr.io/plusky/bugwarden@${{ steps.build.outputs.digest }}"
+          docker pull "$image"
+          echo "IMAGE=$image" >>"$GITHUB_ENV"
+      # ci.yml's assertions, same script, now on both architectures and against
+      # what ghcr.io will actually serve (#223) — the arm64 image was never
+      # executed anywhere before this. The digest is in ghcr.io before any of
+      # them can run, which push-by-digest makes unavoidable; a failure fails
+      # the leg, so container-manifest never runs and no :$VERSION or :latest
+      # names it. The bytes stay behind as an unreferenced, tag-invisible
+      # digest — the same residue a failed container-manifest leaves today,
+      # and accepted as such.
+      - name: Serve behind the bearer gate with a mounted policy
+        run: scripts/container-smoke.sh serve
+      - name: Run as the nonroot uid the deployment docs pin
+        run: scripts/container-smoke.sh uid
+      - name: Stop gracefully on SIGTERM as PID 1
+        run: scripts/container-smoke.sh sigterm
+      - name: Refuse to start with no policy mounted
+        run: scripts/container-smoke.sh policy
+      - name: Ship no shell
+        run: scripts/container-smoke.sh shell
+      - name: Ship a CA bundle the binary loads
+        run: scripts/container-smoke.sh ca
+
       - name: Export digest
         shell: bash
         run: |

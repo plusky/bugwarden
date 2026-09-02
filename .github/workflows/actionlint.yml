@@ -16,10 +16,12 @@ concurrency:
 jobs:
   actionlint:
     # Workflow syntax, expression and `run:` shell checks over
-    # .github/workflows/. Its own workflow, not a ci.yml job: a malformed
-    # ci.yml is one of the things this has to report, and GitHub runs no job
-    # from a workflow it cannot parse. No .github/actionlint.yaml: the
-    # defaults pass on every workflow here as it stands.
+    # .github/workflows/, plus shellcheck over scripts/ — actionlint reads
+    # `run:` blocks and nothing else, so a script a workflow calls falls
+    # outside it. Its own workflow, not a ci.yml job: a malformed ci.yml is
+    # one of the things this has to report, and GitHub runs no job from a
+    # workflow it cannot parse. No .github/actionlint.yaml: the defaults pass
+    # on every workflow here as it stands.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -53,3 +55,12 @@ jobs:
           "$RUNNER_TEMP/actionlint" -version
           shellcheck --version
           "$RUNNER_TEMP/actionlint" -color
+      - name: Lint scripts
+        # Whole-file, which is stronger than the per-`run:` snippets actionlint
+        # feeds shellcheck: a snippet has no shebang, no function bodies to
+        # follow and no cross-line dataflow. Unquoted glob so a scripts/
+        # emptied by accident fails here rather than silently passing.
+        shell: bash
+        run: |
+          set -euo pipefail
+          shellcheck scripts/*.sh
