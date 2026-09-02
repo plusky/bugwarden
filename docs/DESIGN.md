@@ -1708,6 +1708,44 @@ names an endpoint.
   off, or failing (I15); the refusals a closed fail mode produces are the
   audit machinery's own, uniform per tool. I9 is untouched: nothing here
   reaches the guard or loosens policy.
+- **The queue bound is a COUNT, and what that costs in bytes (#235).**
+  `QUEUE_CAPACITY` is 2048 RECORDS per stream, never a byte budget, and
+  the in-flight batch is up to `MAX_BATCH` (512) more records outside
+  the queue: the drain task holds the batch in a vector while
+  `post_batch` awaits, for up to the 10 s timeout, alongside the encoded
+  body the request holds — and `encode_request`'s nested
+  length-prefixing holds two further copies of that batch's encoded bytes
+  while it builds the body. A record is as large as the call it
+  describes — `truncated()` caps each audited string at 1024 chars but
+  caps neither array length nor map entry count, so one allowlisted
+  parameter of legal SHAPE carries a whole request into one record. Over
+  http the ceiling on that is `max_request_body_bytes` (4 MiB floor,
+  64 MiB ceiling). At the floor that is ≈12 GiB per stream sustained
+  (2048 queued + 512 batched + 512 encoded) and ≈16 GiB at the encoder's
+  peak (three copies of the batch's bytes); at the ceiling, ≈192 GiB and
+  ≈256 GiB. Over stdio rmcp reads a line with `read_until(b'\n')` and
+  caps nothing, the peer being a process the operator started. The
+  diagnostics queue is the same shape and not smaller — at the default
+  `info` level `bug_info` debug-formats the client's whole `bug_ids`
+  array — but it DROPS what it cannot hold, where the audit queue refuses
+  and closes the fail-mode gate.
+- **Decided-no: byte-bounding the queue (#235).** A byte budget (a
+  `Semaphore` acquired per record in `accept`, released when the batch
+  drops) would refuse audit records — and so close the gate for the whole
+  server — after budget ÷ record size calls: sixteen 4 MiB records
+  against a 64 MiB budget, where the count bound refuses only at a real
+  backlog of 2048. That trades a memory bound for an availability one on
+  a HEALTHY collector, and it would not even be exact — the encoded body
+  an in-flight request holds is outside anything acquired per record. The
+  count bound stays and the numbers above are its price; an operator
+  whose collector stalls long enough to reach them has the larger
+  problem, and the stream says so, through `audit_gap` for the audit
+  records and the power-of-two drop line for the diagnostics. The
+  numbers are large because a record is unbounded, and #220 decided
+  against bounding one (a params-total cap) on the same terms —
+  the large records are the calls an operator most needs. This reopens
+  if a record-size cap ever lands: count × cap is then a real byte bound,
+  and the availability trade above stops being the whole argument.
 - **The drop line carries a count and a reason and nothing else.** The
   reason is a closed vocabulary (`queue_full`, `network`, `http_status`,
   `shutdown`) for the same purpose `GapReason` is one: a free-text reason
