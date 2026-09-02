@@ -345,12 +345,13 @@ fn truncated(value: &Value) -> Value {
     }
 }
 
-/// `value` truncated to [`PARAM_VALUE_MAX_CHARS`] characters — the ONE
-/// place the cap is applied, to an audited parameter leaf ([`truncated`]),
-/// to an over-cap key's prefix ([`recorded_object`]), to a recorded client
-/// identity and to a recorded TOOL NAME alike. Two copies of the rule
-/// would have to be remembered together (#191); every site that records
-/// an audited string goes through this instead.
+/// `value` truncated to [`PARAM_VALUE_MAX_CHARS`] characters — the one
+/// rule every RECORDED string obeys: an audited parameter leaf
+/// ([`truncated`]), an over-cap key's prefix ([`recorded_object`]), a
+/// recorded client identity, a recorded TOOL NAME and a recorded
+/// JSON-RPC REQUEST ID alike. A second copy of the rule would have to be
+/// remembered beside it (#191); every site that records an audited
+/// string goes through this instead.
 ///
 /// The tool name is capped in the RECORD only (#243): a call the router
 /// will not serve is recorded like any other, so the name is client text
@@ -359,6 +360,10 @@ fn truncated(value: &Value) -> Value {
 /// served record moves and only an unknown name is ever shortened — and
 /// "an unknown name of at least 1024 chars" is the whole of what such a
 /// record has to say.
+///
+/// The request id is capped in the record only (#248): JSON-RPC pairs
+/// the reply to its request by it, and the reply is rmcp's — written off
+/// the id it parsed, which no code of ours touches.
 fn capped(value: &str) -> String {
     // A string of at most 1024 BYTES has at most 1024 chars; the cheap
     // length check skips the char walk for the common case.
@@ -4250,7 +4255,7 @@ impl ServerHandler for BugWarden {
                     trace: None,
                     request: audit::RequestInfo {
                         tool: capped(&request.name),
-                        id: Some(context.id.to_string()),
+                        id: Some(capped(&context.id.to_string())),
                         params: allowlisted(request.arguments.as_ref()),
                     },
                     guard: None,
@@ -4289,7 +4294,9 @@ impl ServerHandler for BugWarden {
         let tool = request.name.to_string();
         let session = self.session_info(&context, &audit);
         let client = client_of(&context);
-        let request_id = Some(context.id.to_string());
+        // Record-only cap: rmcp answers off the id it parsed, so nothing
+        // here can shorten the reply's (#248).
+        let request_id = Some(capped(&context.id.to_string()));
         // Allowlist BEFORE dispatch: the record needs the params after
         // the router has consumed the request, and allowlisting first
         // avoids cloning free-text and blob values that would be reduced
@@ -7265,10 +7272,12 @@ mod tests {
         // parameter value. The BOUNDARY is pinned here because only a unit
         // test sees `PARAM_VALUE_MAX_CHARS`: at the cap is under it, one
         // char over is cut, and 600 multi-byte chars in 1200 bytes stay
-        // whole — a 4x-cap probe alone survives both a byte cap and a `>=`
-        // boundary. The last row is the out-of-contract site, which reads
-        // `request.name` rather than the routing copy: same channel, one
-        // site over, and it records before it refuses.
+        // whole — a 4x-cap probe alone survives a byte cap; the at-cap row
+        // pins which side the boundary falls, not a mutant (a `>=` in
+        // `capped()` cuts an at-cap value to itself). The last row is the
+        // out-of-contract site, which reads `request.name` rather than the
+        // routing copy: same channel, one site over, and it records before
+        // it refuses.
         let over = "z".repeat(PARAM_VALUE_MAX_CHARS * 4);
         let at_cap = "z".repeat(PARAM_VALUE_MAX_CHARS);
         let one_over = "z".repeat(PARAM_VALUE_MAX_CHARS + 1);
@@ -7329,6 +7338,75 @@ mod tests {
                 got == want,
                 "{why}: recorded {} chars of a {}-char name",
                 got.chars().count(),
+                sent.chars().count()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_record_site_caps_a_client_chosen_request_id() {
+        // #248: `request.id` is the JSON-RPC id the CLIENT picked, and a
+        // string one arrives off the wire at any length — the channel
+        // #243 closed for the tool name, one field over. The BOUNDARY is
+        // pinned here because only a unit test sees
+        // `PARAM_VALUE_MAX_CHARS`: an over-cap id is cut to EXACTLY the
+        // cap (an off-by-one dies on it), one at the cap is left alone,
+        // and 600 multi-byte chars in 1200 bytes stay whole, which a byte
+        // cap would cut to 512. The last row is the out-of-contract site,
+        // which builds its own `RequestInfo` and records before it
+        // refuses.
+        let over = "z".repeat(PARAM_VALUE_MAX_CHARS * 4);
+        let at_cap = "z".repeat(PARAM_VALUE_MAX_CHARS);
+        let one_over = "z".repeat(PARAM_VALUE_MAX_CHARS + 1);
+        let multibyte = "é".repeat(600);
+        let cut: String = over.chars().take(PARAM_VALUE_MAX_CHARS).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
+        let (cfg, guard, bz) = parts("");
+        let server = BugWarden::new(cfg, guard, bz)
+            .expect("server must build")
+            .with_audit(Arc::clone(&audit));
+        let peer = peer_of(&server).await;
+
+        let rows: [(&str, &str, bool, &str); 5] = [
+            (&over, &cut, false, "an over-cap id is cut to the cap"),
+            (&at_cap, &at_cap, false, "exactly at the cap is not over it"),
+            (&one_over, &cut, false, "one char over the cap is cut"),
+            (
+                &multibyte,
+                &multibyte,
+                false,
+                "600 chars in 1200 bytes stays whole: the cap counts chars",
+            ),
+            (&over, &cut, true, "the out-of-contract site caps it too"),
+        ];
+        for (sent, _, out_of_contract, _) in rows {
+            let mut context =
+                RequestContext::<RoleServer>::new(RequestId::String(Arc::from(sent)), peer.clone());
+            if out_of_contract {
+                context.meta = per_request_meta(ProtocolVersion::V_2025_06_18, None);
+            }
+            ServerHandler::call_tool(
+                &server,
+                CallToolRequestParams::new("no_such_tool".to_string()),
+                context,
+            )
+            .await
+            .expect_err("refused either way, and the refusal is not what moves");
+        }
+
+        let events = read_audit_events(&audit_path);
+        let calls = tool_calls(&events);
+        assert_eq!(
+            calls.len(),
+            rows.len(),
+            "one record per call, refused or not"
+        );
+        for (call, (sent, want, _, why)) in calls.iter().zip(rows) {
+            assert!(
+                call.request.id.as_deref() == Some(want),
+                "{why}: recorded {:?} chars of a {}-char id",
+                call.request.id.as_deref().map(|id| id.chars().count()),
                 sent.chars().count()
             );
         }

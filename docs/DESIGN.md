@@ -1197,12 +1197,18 @@ Decisions, all deliberate:
   relocating — one string cannot collide with a sibling the way two map
   keys sharing a prefix do — and no served name is near the cap, so no
   served record moves and the only names ever shortened are the ones that
-  are not ours.
+  are not ours. `request.id` is truncated on that boundary too (#248):
+  a JSON-RPC string id is client-chosen text of any length, and the cap
+  is on the RECORD only — the reply still echoes the FULL id rmcp parsed
+  off the frame. With it every client-chosen string a record carries is
+  bounded: capped at 1024 characters, or, for `trace`, parsed to
+  fixed-width hex ids.
 - **The params caps bound content, not record size — and a total cap is a
   decided no** (#220). Array element and map entry counts are uncapped, so
   an allowlisted value's SHAPE can still make a large record; what bounds
-  one is the transport — over http the POST body cap (4 MiB floor), over
-  stdio nothing (#234, open) — not the allowlist. Capping the
+  one is the transport's request cap — the POST body over http, one frame
+  over stdio (`BoundedLines`, #234), 4 MiB at the floor — not the
+  allowlist. Capping the
   params map's total serialized size instead is DECIDED AGAINST on the
   `tracestate` terms below: it bounds one field of a record nothing else
   bounds, so it advertises a guarantee it does not give, and it buys even
@@ -2851,7 +2857,11 @@ wired, `server.rs` and `main.rs` are the reference.
   marker, #220); the recorded tool name truncated on that same boundary
   at both reachable record sites, in chars not bytes and with at-cap
   under it, while the every-routed-tool walk above pins each served name
-  byte-identical (#243); and trace
+  byte-identical (#243); the recorded request id truncated on the same
+  boundary at both derivations — over-cap cut to exactly the cap, at-cap
+  kept, chars not bytes, the out-of-contract site too — and end-to-end a
+  4x-cap string id sent by raw per-request POST records exactly 1024
+  chars while the reply echoes the whole id (#248); and trace
   enrichment (issue #28) — the strict traceparent parser (the canonical
   W3C value and its flags-00 variant parse into their ids; empty,
   54-byte, 56-byte, and ~1 MiB values, uppercase hex, versions other
