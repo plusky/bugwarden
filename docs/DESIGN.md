@@ -2801,7 +2801,16 @@ wired, `server.rs` and `main.rs` are the reference.
   keep it from rotting: a `config.rs` unit test fails when any argument
   lacks an `env` fallback, and `tests/common/scrub_env.rs` holds the
   shared child-env scrub list to that same set, asserted from every
-  spawning binary.
+  spawning binary. That list also drops the eight proxy variables
+  hyper-util reads (#239), which covers a spawned child's own calls and
+  nothing else: the in-process harnesses, and the production client they
+  drive against a loopback wiremock, assume no ambient proxy without a
+  loopback bypass, stated once in `tests/common/pinned_cli.rs`. A
+  repo-wide `.cargo/config.toml` `[env] NO_PROXY` was decided against
+  (#247): cargo's `[env]` cannot override a caller's value without
+  `force`, and hyper-util reads `NO_PROXY` before `no_proxy`, so an
+  installed uppercase default would shadow a developer's lowercase list
+  under every `cargo run`.
 - Audit tests (crates/bugwarden/tests/audit_wiremock.rs + #[cfg(test)] in
   server.rs and audit.rs): one record per call for EVERY routed tool,
   refusal paths and protocol errors included; the refusal map is total
