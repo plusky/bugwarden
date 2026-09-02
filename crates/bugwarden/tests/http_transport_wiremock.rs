@@ -91,10 +91,10 @@ use pinned_cli::pinned;
 /// No clap `env` fallback reaches this `Cli`: [`pinned`] drops them
 /// wholesale rather than overwriting a list of named fields — the list is
 /// what drifted in #190, having lost `read_only` while still claiming to be
-/// complete. That is the whole of the claim; the rest of the environment
-/// still reaches these tests, and `http_proxy` alone fails most of them,
-/// since neither reqwest client here sets `.no_proxy()`. `key_file` is then
-/// the only field a caller varies.
+/// complete. That is the whole of the claim; what the rest of the
+/// environment still does to an in-process test — `http_proxy` above all —
+/// is stated once in `common/pinned_cli.rs` (#239). `key_file` is then the
+/// only field a caller varies.
 fn http_cli(mock: &MockServer, key_file: Option<&std::path::Path>) -> Arc<Cli> {
     let uri = mock.uri();
     let mut cli: Cli = pinned(&[

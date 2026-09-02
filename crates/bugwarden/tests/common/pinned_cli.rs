@@ -13,6 +13,16 @@
 //! Not `std::env::remove_var`: libtest runs a binary's tests on parallel
 //! threads, so mutating the process environment races every other test in
 //! the binary (`tests/env_config.rs`).
+//!
+//! So clap fallbacks are all this drops, and every in-process test still
+//! runs in the developer's own environment. `http_proxy` and its seven
+//! siblings are the sharp edge: bugwarden leaves them honored deliberately
+//! (DESIGN.md, TLS stack and outbound network behavior) and applies no
+//! loopback bypass, so an ambient proxy routes even a wiremock call on
+//! 127.0.0.1 and fails these harnesses loudly (#239). `common/scrub_env.rs`
+//! closes that for a *spawned* child; in-process it stays an assumption,
+//! because the paragraph above rules out the only fix inside the binary
+//! (#247 tracks the outside ones).
 
 /// A command line carrying only what `Cli` requires, for the probe below.
 const MINIMAL_ARGV: &[&str] = &["bugwarden", "--bugzilla-server", "https://bugzilla.example"];
