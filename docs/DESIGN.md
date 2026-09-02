@@ -585,12 +585,16 @@ operator-visible change from the previous release. The crypto provider is
 toolchain at build time, which the release workflow's `ubuntu-latest` and
 `macos-latest` runners provide and which the `Dockerfile`'s alpine build stage
 adds as `cmake` + `make` on top of the base image's own gcc. `system-proxy`
-keeps `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` honored exactly as 0.12 did
-unconditionally — without this feature the 0.13 default is to ignore them,
-which would be a silent regression for the corporate deployments this server
-targets. `query` is likewise required, not cosmetic: `apply_auth`'s
-`?api_key=` mode and `quicksearch_syntax_html` both call `.query(...)`, a
-compile error without the feature in 0.13.
+gates only the macOS and Windows OS proxy-settings lookups (`hyper-util`'s
+`client-proxy-system`, `matcher.rs:242-246`); `HTTPS_PROXY` / `HTTP_PROXY` /
+`NO_PROXY` are honored with or without it on every platform — reqwest sets
+`auto_sys_proxy: true` unconditionally and `from_system()` always starts from
+`from_env()`. It stays: on the Linux targets it pulls no crate and changes
+nothing, and on `aarch64-apple-darwin` it costs `system-configuration` and
+its `-sys` crate to give a macOS deployment its OS proxy settings on top of
+the env vars. `query` is likewise required, not cosmetic:
+`apply_auth`'s `?api_key=` mode and `quicksearch_syntax_html` both call
+`.query(...)`, a compile error without the feature in 0.13.
 
 The operator cost of that switch (issue #65): a deployment with no OS trust
 store fails every HTTPS request at first contact with Bugzilla, where the

@@ -27,6 +27,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "query",
     "rustls",
+    # macOS/Windows OS proxy settings; the proxy env vars are honored anyway.
     "system-proxy",
 ] }
 
