@@ -1164,6 +1164,16 @@ Decisions, all deliberate:
   extensions (verdict worst-wins merged, suppressed ids unioned). An
   unknown tool, a protocol error, or a missed enrichment still yields
   exactly one record — a poorer record is possible, an audit gap is not.
+  A handler that PANICS is no exception since #253, and used to be one: the
+  unwind is caught at the dispatch boundary, the request is answered with a
+  JSON-RPC internal error carrying a fixed, content-free text, and the
+  record is written like any other — `class: error` (its own definition
+  already reads "upstream or internal error"), no `response_bytes` because
+  there is no result to size, and whatever verdict the cell and whatever
+  upstream legs the counters had collected before the panic. Those are kept,
+  not cleared: the record describes what the call did, and a guard decision
+  taken before the panic was taken. The process keeps serving; see "rmcp
+  trap — a panicking handler answers nothing" below.
   The record is accepted by every configured sink before the response is
   returned (the file write is synchronous; the OTLP hand-off only queues).
   `initialize` is always recorded, with no configuration knob to turn it
@@ -2228,6 +2238,85 @@ wired, `server.rs` and `main.rs` are the reference.
   two sources agree there and a gate reading only the peer survives every wire
   test. Only a hand-built context with a peer carrying no info at all separates
   them.
+- **rmcp trap — a panicking handler answers nothing, and rmcp catches
+  nothing.** The serve loop dispatches each request through
+  `spawn_service_task` (`service.rs:1575`, a bare `tokio::spawn` at
+  `:1309`) and DROPS the returned `JoinHandle`; the reply is sent from
+  inside that task, at its end (`:1589`). There is no `catch_unwind`
+  anywhere in rmcp 3.1. So a tool handler that panics unwinds its own task
+  and nothing else: no error goes out, no transport closes, the session and
+  every other request stay healthy — and the request that panicked is
+  answered by nobody. An rmcp client then waits forever
+  (`PeerRequestOptions::default()` carries `timeout: None`); any other
+  client waits for whatever deadline it set. The audit consequence is the
+  sharper one, since the ordinary record is written after the dispatch
+  returns: a panic between the guard's decision and the record left no
+  record at all, and "presence, never content" assumes the record exists.
+  Found by a hand-applied mutant in `quicksearch_window` — arithmetic that
+  divides by zero — which hung the in-process test client instead of
+  failing it (#253).
+
+  **Decided: catch the unwind at bugwarden's dispatch boundary.**
+  `BugWarden::dispatch` (server.rs) is the single place `call_tool` reaches
+  the router from, audited or not, and it polls the router's future inside
+  `std::panic::catch_unwind`. A recovered panic becomes a JSON-RPC internal
+  error (`-32603`) with a fixed, content-free message and no `data`,
+  identical under every lifecycle and every fail mode; the payload is
+  dropped unformatted, because it is whatever the panicking code chose to
+  format and may quote client input or worse (I12). One ERROR-level tracing
+  line names the tool, through `Capped`, and nothing else.
+
+  Sound because a handler that panics holds nothing the process needs. The
+  guard policy is immutable behind an `Arc` (I1) and is read, never
+  mutated. The SINK's mutex is taken on BOTH sides of the dispatch — by
+  `failing()` at the pre-dispatch gate, and by `record` afterwards on a
+  blocking thread — but it is never HELD while the handler is polled, so
+  the unwind cannot poison it. The per-request CELL's mutex could be
+  poisoned in principle, but only by the cell's own bookkeeping: its guard
+  lives entirely inside `AuditCell`'s own methods and no tool code runs
+  under it. Either way that is survivable, because every production lock
+  in `audit.rs` resolves poison with `PoisonError::into_inner`, on the
+  standing argument that dropping audit coverage over a bookkeeping wobble
+  is the worse trade. Both the cell and the upstream counters live outside
+  the handler, so what they collected before the panic survives into the
+  record. The catcher polls the handler IN PLACE rather than re-spawning
+  it, because rmcp scopes `ORIGINATING_REQUEST` around every request and
+  bugwarden-core's `UPSTREAM` around the audited dispatch; a nested task
+  would lose whichever of the two is in scope. The wrapper holds a
+  `Pin<Box<F>>`, which is `Unpin` for any `F`, so the projection needs no
+  `unsafe` — the workspace forbids it.
+  No new dependency either: `FutureExt::catch_unwind` lives in
+  `futures-util`, which is in the lock through rmcp but is not a direct
+  dependency, and the `futures` facade was already declined here once (see
+  the `futures-core` comment in the manifest) for a smaller need than
+  this one.
+
+  **Rejected: `panic = "abort"`.** It keeps whatever the FILE sink already
+  wrote — that write is unbuffered, one `write(2)` per record — but the
+  OTLP sink is a bounded queue plus a batch the drain task holds, flushed
+  on a timer ("the OTLP hand-off only queues", I15 above), so an abort
+  discards every record still in flight to a collector. On top of that the
+  panicking request gets no record at all, and over http every OTHER
+  session's in-flight requests die with the process. That turns a panic a
+  client can trigger into a one-request denial of service against
+  everybody else. Fail closed for the *request*, which errors, not for the
+  process.
+
+  **Deliberately unchanged.** No panic hook is installed (there never was
+  one), so the default hook still prints `thread '…' panicked at
+  file:line:` plus the payload to stderr at panic time, before any
+  unwinding: that line is where the cause stays, and it is NOT scrubbed —
+  it never was, and scrubbing it is a separate question from this one. The
+  guard, every refusal text, the audit schema and `main.rs` are untouched;
+  the catcher invents exactly one reply, for a call that produced none, and
+  can make nothing succeed that failed before. The scope is the HANDLER, so
+  a panic in `call_tool`'s own bookkeeping after the dispatch returns —
+  building the record, `session_info`, the debug-only assert in
+  `response_bytes` — is outside the catcher and is still answered by
+  nobody. That is deliberate and not a gap being ignored: no production
+  panic site exists on that stretch today, and widening the catcher to
+  cover the recording path would mean answering a request whose record may
+  be half-built, which is the opposite of what I15 asks for.
 - **rmcp trap — `input_schema` is schemars' rendering, unfiltered by rmcp.**
   `SchemaSettings::draft2020_12()` (`handler/server/common.rs`) runs zero
   transforms, so whatever schemars 1.x emits for a `#[tool]` param struct is
@@ -2938,7 +3027,15 @@ wired, `server.rs` and `main.rs` are the reference.
   under every `cargo run`.
 - Audit tests (crates/bugwarden/tests/audit_wiremock.rs + #[cfg(test)] in
   server.rs and audit.rs): one record per call for EVERY routed tool,
-  refusal paths and protocol errors included; the refusal map is total
+  refusal paths and protocol errors included; a handler that PANICS is
+  answered `-32603` with the fixed text and no `data`, recorded once as
+  `class: error` with no `response_bytes`, and followed by a served next
+  call on the same session — audited and unaudited alike, with the panic
+  payload absent from the reply and from every captured tracing line
+  (#253; the probe is a panicking route added through rmcp's own
+  `ToolRoute::new_dyn`, so no production path carries a test-only branch,
+  and every call is bounded by a deadline so the old defect fails a test
+  instead of hanging the run); the refusal map is total
   over the full router; responses byte-identical with auditing off, on,
   and failing-open; suppressed ids in the record and never in the
   envelope; content and API-key canaries never reach the file;

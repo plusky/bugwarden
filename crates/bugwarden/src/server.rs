@@ -8,7 +8,11 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use base64::{engine::general_purpose, Engine as _};
@@ -706,6 +710,66 @@ fn read_scope_serves(tool: &str) -> bool {
 /// no oracle about which tools the deployment serves (I2).
 fn tool_not_found() -> McpError {
     McpError::invalid_params("tool not found", None)
+}
+
+/// The reply a tool handler that panicked is answered with (issue #253).
+///
+/// Fixed text, no `data`, the same under every lifecycle and every fail
+/// mode: the panic payload is client-reachable state formatted by whatever
+/// code panicked, so nothing derived from it may be echoed — not a message,
+/// not a type name, not a length (I12). It names no tool, bug or policy, so
+/// it is no oracle either. `-32603` because the failure is the server's, and
+/// a JSON-RPC error rather than a tool-level `isError` result because the
+/// call produced no result at all.
+fn handler_panicked() -> McpError {
+    McpError::internal_error("the server failed to handle this request", None)
+}
+
+/// Polls `F` inside [`std::panic::catch_unwind`], turning a panicking poll
+/// into an `Err` for the caller instead of an unwind past it.
+///
+/// Needed because rmcp answers a request from inside a task it spawns and
+/// whose `JoinHandle` it drops (`service.rs`), and it catches nothing: a
+/// handler that panics unwinds that task, `sink.send` never runs, and the
+/// request is answered by nobody while the session stays up. See "rmcp trap
+/// — a panicking handler answers nothing" in DESIGN.md.
+///
+/// The inner future is polled **in place**, not re-spawned: rmcp scopes
+/// `ORIGINATING_REQUEST` around every request and bugwarden-core's
+/// `UPSTREAM` is scoped around the audited dispatch, and a nested task
+/// would lose whichever of those is in scope.
+///
+/// `Pin<Box<F>>` is `Unpin` whatever `F` is, so the projection needs no
+/// `unsafe` (the workspace forbids it). A state machine that panicked
+/// mid-`poll` is left poisoned; this wrapper never polls it again and only
+/// drops it, which is sound.
+struct CatchUnwind<F> {
+    inner: Pin<Box<F>>,
+}
+
+impl<F: Future> CatchUnwind<F> {
+    fn new(inner: F) -> Self {
+        Self {
+            inner: Box::pin(inner),
+        }
+    }
+}
+
+impl<F: Future> Future for CatchUnwind<F> {
+    type Output = Result<F::Output, Box<dyn std::any::Any + Send>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = &mut self.get_mut().inner;
+        // `AssertUnwindSafe`: the guard policy is immutable behind an `Arc`,
+        // the audit sink's mutex is never HELD while the handler is polled,
+        // and the per-request cell's lock tolerates poison — so nothing
+        // observably half-updated survives the unwind (DESIGN.md).
+        match std::panic::catch_unwind(AssertUnwindSafe(|| inner.as_mut().poll(cx))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
+            Err(payload) => Poll::Ready(Err(payload)),
+        }
+    }
 }
 
 /// Total elapsed milliseconds since `started`, saturating.
@@ -2417,6 +2481,43 @@ impl BugWarden {
             Reach::Everything => true,
             Reach::ReadOnly => read_scope_serves(tool),
             Reach::Nothing => false,
+        }
+    }
+
+    /// Dispatch one call through the router, answering a panicking handler
+    /// with [`handler_panicked`] instead of leaving the request unanswered
+    /// (issue #253; the mechanism is on [`CatchUnwind`]).
+    ///
+    /// The single dispatch site: `call_tool` reaches the router only through
+    /// here, audited or not, so both paths answer a panic identically and
+    /// neither can drift.
+    ///
+    /// It cannot turn a failure into a success — the only reply it invents
+    /// is an internal error for a call that produced no reply at all — and
+    /// it changes nothing about a handler that returns normally.
+    async fn dispatch(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        // Kept before `request` is consumed, for the recovery line alone.
+        let tool = request.name.clone();
+        let dispatch = self
+            .tool_router
+            .call(ToolCallContext::new(self, request, context));
+        match CatchUnwind::new(dispatch).await {
+            Ok(result) => result,
+            // The payload is dropped unformatted: see `handler_panicked`.
+            // The default panic hook has already printed the panic's own
+            // file, line and message to stderr; this line is what ties it
+            // to a tool and reaches the OTLP diagnostics.
+            Err(_payload) => {
+                tracing::error!(
+                    tool = %Capped(&tool),
+                    "tool handler panicked; the request was answered with an internal error"
+                );
+                Err(handler_panicked())
+            }
         }
     }
 
@@ -4353,15 +4454,13 @@ impl ServerHandler for BugWarden {
         // here, before dispatch and before any upstream request.
         let reachable = self.reaches(&request.name, &context);
 
-        // Auditing off: byte-identical to the macro-generated dispatch.
+        // Auditing off: what the macro-generated dispatch answers, plus the
+        // panic recovery `dispatch` adds to both paths alike (#253).
         let Some(audit) = self.audit.clone() else {
             if !reachable {
                 return Err(tool_not_found());
             }
-            return self
-                .tool_router
-                .call(ToolCallContext::new(self, request, context))
-                .await;
+            return self.dispatch(request, context).await;
         };
         // Raw: the router, the fail-mode gate and `WRITE_TOOLS` must match
         // the name the client actually sent. Every record site below caps
@@ -4464,9 +4563,10 @@ impl ServerHandler for BugWarden {
         // with no guard verdict and no upstream leg, the same shape an
         // unknown tool name produces.
         let result = if reachable {
-            let dispatch = self
-                .tool_router
-                .call(ToolCallContext::new(self, request, context));
+            // `with_upstream_stats` scopes the task local OUTSIDE the
+            // catcher, so a handler that panics still had it — and the legs
+            // it managed to make are counted into the record below (#253).
+            let dispatch = self.dispatch(request, context);
             with_upstream_stats(Arc::clone(&stats), dispatch).await
         } else {
             Err(tool_not_found())
@@ -4532,6 +4632,10 @@ impl ServerHandler for BugWarden {
                 // unknown with or without auditing, and swapping the
                 // error for a tool-level refusal would CREATE a
                 // distinguisher that exists only during an audit outage.
+                // A recovered panic (#253) arrives here as one of those
+                // errors and stands for the same reasons: the handler
+                // produced no result, so there is nothing a refusal could
+                // withhold, and its text is fixed under every fail mode.
                 (_, Err(_)) => result,
                 // The sink has rate-limit-logged the failure; the gap
                 // marker accounts for the loss after recovery.
@@ -6560,6 +6664,18 @@ mod tests {
         mock_uri: &str,
         audit: Option<Arc<AuditState>>,
     ) -> RunningService<RoleClient, ()> {
+        mcp_client_routed(policy, mock_uri, audit, false).await
+    }
+
+    /// [`mcp_client`], optionally with [`panic_probe_route`] added to the
+    /// router. The probe goes in through rmcp's own extension point, so no
+    /// production path gains a test-only branch to reach a panic with.
+    async fn mcp_client_routed(
+        policy: &str,
+        mock_uri: &str,
+        audit: Option<Arc<AuditState>>,
+        panic_probe: bool,
+    ) -> RunningService<RoleClient, ()> {
         let cfg: Arc<Cli> = Arc::new(pinned(&[
             "bugwarden",
             "--bugzilla-server",
@@ -6577,6 +6693,9 @@ mod tests {
         let mut server = BugWarden::new(cfg, guard, bz).expect("server must build");
         if let Some(audit) = audit {
             server = server.with_audit(audit);
+        }
+        if panic_probe {
+            server.tool_router.add_route(panic_probe_route());
         }
         let (client_io, server_io) = tokio::io::duplex(1 << 16);
         tokio::spawn(async move {
@@ -7111,6 +7230,289 @@ mod tests {
         let guard = calls[0].guard.as_ref().expect("the gate records a guard");
         assert_eq!(guard.verdict, Verdict::Refused);
         assert_trace_is_canonical(calls[0].trace.as_ref());
+    }
+
+    // ---- a panicking tool handler (issue #253) ----------------------------
+
+    /// The panic payload. Must reach neither the reply nor a tracing field.
+    const PANIC_MARKER: &str = "panic-probe-payload-b9f1c2";
+
+    /// A waker that counts what it was told. It is what separates a `poll`
+    /// that hands the caller's `Context` down from one that substitutes a
+    /// context of its own: with a no-op waker on both sides the two are
+    /// indistinguishable by hand-polling, and in production the difference
+    /// only shows up as a future that is never woken again.
+    #[derive(Default)]
+    struct CountingWaker {
+        wakes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingWaker {
+        fn wakes(&self) -> usize {
+            self.wakes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Poll once with `waker`. The wrapper is `Unpin`, so the pin is free.
+    fn poll_once<F: Future>(
+        fut: &mut CatchUnwind<F>,
+        waker: &std::task::Waker,
+    ) -> Poll<Result<F::Output, Box<dyn std::any::Any + Send>>> {
+        let mut cx = Context::from_waker(waker);
+        Pin::new(fut).poll(&mut cx)
+    }
+
+    fn counting_waker() -> (Arc<CountingWaker>, std::task::Waker) {
+        let counter = Arc::new(CountingWaker::default());
+        let waker = std::task::Waker::from(Arc::clone(&counter));
+        (counter, waker)
+    }
+
+    async fn panics() -> u8 {
+        panic!("{PANIC_MARKER}")
+    }
+
+    #[test]
+    fn catch_unwind_hands_a_ready_value_straight_back() {
+        let (_, waker) = counting_waker();
+        let mut fut = CatchUnwind::new(std::future::ready(7u8));
+        let Poll::Ready(Ok(value)) = poll_once(&mut fut, &waker) else {
+            panic!("a ready future polls Ready(Ok(..))");
+        };
+        assert_eq!(value, 7, "the value passes through unchanged");
+    }
+
+    #[test]
+    fn catch_unwind_turns_a_panicking_poll_into_err() {
+        let (_, waker) = counting_waker();
+        let mut fut = CatchUnwind::new(panics());
+        let Poll::Ready(Err(payload)) = poll_once(&mut fut, &waker) else {
+            panic!("a panicking poll polls Ready(Err(..))");
+        };
+        // The payload is handed back intact — deciding what may be done
+        // with it belongs to the caller, which drops it unformatted.
+        let message = payload
+            .downcast_ref::<String>()
+            .expect("a formatted panic message is a String");
+        assert_eq!(message, PANIC_MARKER);
+    }
+
+    #[test]
+    fn catch_unwind_passes_pending_and_the_callers_waker_through() {
+        let (counter, waker) = counting_waker();
+        let mut polls = 0u8;
+        let inner = std::future::poll_fn(move |cx: &mut Context<'_>| {
+            polls += 1;
+            if polls == 1 {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(11u8)
+            }
+        });
+        let mut fut = CatchUnwind::new(inner);
+        assert!(
+            poll_once(&mut fut, &waker).is_pending(),
+            "Pending must pass through, not become a value"
+        );
+        assert_eq!(
+            counter.wakes(),
+            1,
+            "the inner future must be polled with the CALLER's context: a \
+             substituted waker strands it forever in production"
+        );
+        let Poll::Ready(Ok(value)) = poll_once(&mut fut, &waker) else {
+            panic!("the value arrives on the second poll");
+        };
+        assert_eq!(value, 11);
+    }
+
+    /// The probe's tool name.
+    const PANIC_PROBE: &str = "panic_probe";
+
+    /// The reply text a recovered panic is answered with, spelled out here
+    /// so a reword of the production constant has to be deliberate: this
+    /// string goes to clients.
+    const PANIC_REPLY: &str = "the server failed to handle this request";
+
+    /// A base URL nothing dials: the probe panics before it could, and the
+    /// follow-up call (`mcp_server_info`) contacts nothing either. Keeping
+    /// wiremock out makes these tests about the dispatch boundary alone.
+    const NO_BUGZILLA: &str = "http://127.0.0.1:1";
+
+    /// A handler that panics on every call. A free `fn` rather than a
+    /// closure so it satisfies `new_dyn`'s `for<'a> Fn(..) -> BoxFuture<'a,
+    /// ..>` bound by lifetime elision.
+    fn panic_probe_handler(
+        _context: ToolCallContext<'_, BugWarden>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<CallToolResponse, McpError>> + Send + '_>,
+    > {
+        Box::pin(async { panic!("{PANIC_MARKER}") })
+    }
+
+    fn panic_probe_route() -> rmcp::handler::server::router::tool::ToolRoute<BugWarden> {
+        let Value::Object(schema) = json!({ "type": "object", "properties": {} }) else {
+            panic!("an input schema is a JSON object");
+        };
+        rmcp::handler::server::router::tool::ToolRoute::new_dyn(
+            Tool::new(
+                PANIC_PROBE,
+                "test-only handler that always panics",
+                Arc::new(schema),
+            ),
+            panic_probe_handler,
+        )
+    }
+
+    /// Every call in this cluster is bounded by this. A request the server
+    /// never answers must fail one test, not hang the whole binary (#254),
+    /// and that is the exact defect under test.
+    const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Call the probe and return the protocol error the request must be
+    /// answered with.
+    async fn panic_probe_error(client: &RunningService<RoleClient, ()>) -> McpError {
+        let answered = tokio::time::timeout(
+            PROBE_DEADLINE,
+            client.call_tool(CallToolRequestParams::new(PANIC_PROBE.to_string())),
+        )
+        .await
+        .expect("a panicking handler must still answer its request");
+        match answered {
+            Err(rmcp::service::ServiceError::McpError(err)) => err,
+            other => panic!("a recovered panic is a protocol error, got {other:?}"),
+        }
+    }
+
+    /// [`call`] under [`PROBE_DEADLINE`]. The follow-up matters as much as
+    /// the panicking call: "the session survives" is a claim about a reply
+    /// arriving, so an unbounded await would turn its absence into a hang.
+    async fn call_bounded(
+        client: &RunningService<RoleClient, ()>,
+        tool: &str,
+        args: Value,
+    ) -> CallToolResult {
+        tokio::time::timeout(PROBE_DEADLINE, call(client, tool, args))
+            .await
+            .expect("the next call on the same session must still be answered")
+    }
+
+    /// The reply is fixed, carries no `data`, and nothing derived from the
+    /// payload survives into it.
+    fn assert_panic_reply(err: &McpError) {
+        assert_eq!(err.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(err.code.0, -32603, "the JSON-RPC internal error code");
+        assert_eq!(err.message, PANIC_REPLY);
+        assert!(err.data.is_none(), "no data field: {:?}", err.data);
+        let wire = serde_json::to_string(err).expect("an error serializes");
+        assert!(
+            !wire.contains(PANIC_MARKER),
+            "the panic payload must not reach the client: {wire}"
+        );
+    }
+
+    #[test]
+    fn the_panic_reply_carries_no_data_key_on_the_wire() {
+        // Absent, not null. `ErrorData::data` is
+        // `skip_serializing_if = "Option::is_none"`, and serde reads a JSON
+        // `null` back into `None` — so a `Some(Value::Null)` would ship
+        // `"data":null` and still look absent to the client-side assertion
+        // above. Checked on the serialized server-side value instead.
+        let wire = serde_json::to_value(handler_panicked()).expect("an error serializes");
+        let object = wire.as_object().expect("a JSON-RPC error is an object");
+        let keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["code", "message"], "no `data` key: {wire}");
+        assert_eq!(object["code"], json!(-32603));
+        assert_eq!(object["message"], json!(PANIC_REPLY));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_handler_is_answered_and_recorded_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
+        let client = mcp_client_routed("", NO_BUGZILLA, Some(Arc::clone(&audit)), true).await;
+
+        let err = panic_probe_error(&client).await;
+        assert_panic_reply(&err);
+
+        // The session survives the unwind: the next call is served.
+        let served = call_bounded(&client, "mcp_server_info", json!({})).await;
+        assert!(!is_error(&served), "the session must keep serving");
+
+        let events = read_audit_events(&audit_path);
+        let calls = tool_calls(&events);
+        assert_eq!(calls.len(), 2, "one record each, in order, with no gap");
+        assert_eq!(calls[0].request.tool, PANIC_PROBE);
+        assert_eq!(calls[0].outcome.class, audit::OutcomeClass::Error);
+        assert_eq!(
+            calls[0].outcome.response_bytes, None,
+            "a protocol error has no result to size"
+        );
+        assert_eq!(calls[1].request.tool, "mcp_server_info");
+        assert_eq!(calls[1].outcome.class, audit::OutcomeClass::Ok);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_handler_answers_the_same_with_auditing_off() {
+        // The `audit: None` constructor path: a different dispatch site,
+        // and it must answer byte-identically to the audited one.
+        let client = mcp_client_routed("", NO_BUGZILLA, None, true).await;
+        let err = panic_probe_error(&client).await;
+        assert_panic_reply(&err);
+        let served = call_bounded(&client, "mcp_server_info", json!({})).await;
+        assert!(!is_error(&served), "the session must keep serving");
+    }
+
+    #[test]
+    fn the_panic_recovery_line_names_the_tool_and_never_the_payload() {
+        // A current-thread runtime, whose `block_on` runs inside the
+        // capture: `capture_logs` is thread-local and the recovery line is
+        // emitted from the rmcp handler task, which this flavour runs on the
+        // capturing thread.
+        //
+        // The default panic hook's own `thread '…' panicked at file:line:`
+        // line goes straight to stderr, not through tracing, so it is
+        // invisible to this capture — that untouched line is where the cause
+        // stays, and this assertion says nothing about it.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime");
+        let (_, logs) = crate::testlog::capture_logs(|| {
+            rt.block_on(async {
+                let client = mcp_client_routed("", NO_BUGZILLA, None, true).await;
+                assert_panic_reply(&panic_probe_error(&client).await);
+            });
+        });
+        // Scoped to the recovery line itself, not to the capture. The
+        // capture runs at TRACE and rmcp's own "new event" / "received
+        // request" lines quote the whole request, tool name included, so a
+        // whole-capture search would pass with the field deleted.
+        let captured = logs.as_str();
+        let line = captured
+            .lines()
+            .find(|line| line.contains("tool handler panicked"))
+            .unwrap_or_else(|| panic!("the recovery line must be logged: {captured}"));
+        assert!(
+            line.contains(&format!("tool={PANIC_PROBE}")),
+            "the recovery line must name the tool in its own field: {line}"
+        );
+        assert!(
+            line.contains("ERROR"),
+            "a request answered by an internal error is an ERROR, not a debug aside: {line}"
+        );
+        logs.assert_not_contains(PANIC_MARKER);
     }
 
     /// A `RequestContext` carrying the HTTP request parts a served request
