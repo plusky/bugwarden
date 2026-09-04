@@ -34,11 +34,13 @@ jobs:
     # it, only a workflow_dispatch afterwards can.
     #
     # Not the --in-diff-on-pull_request job #203 offers as the alternative.
-    # That works, but the cost is unbounded on a diff into server.rs, and
-    # quicksearch_window holds mutants that panic inside the handler; the
-    # in-process test client then hangs until the timeout (#244): five idle
-    # minutes each, on a contributor's PR, for a verdict only a curator can
-    # read. Worth revisiting once some scheduled runs have shown
+    # That works, but the cost is unbounded on a diff into server.rs: minutes
+    # of build and test per mutant on a contributor's PR, for a verdict only a
+    # curator can read. The idling that used to be the other half of this
+    # reason is gone -- quicksearch_window's panicking mutants no longer hang
+    # the in-process client to the timeout floor, because a tool handler that
+    # panics is now answered with an internal error (#253) and those tests
+    # fail in seconds. Worth revisiting once some scheduled runs have shown
     # the timeout floor holds.
     runs-on: ubuntu-latest
     # Measured at 30-46s of incremental build plus 6-23s of tests per mutant on
