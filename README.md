@@ -580,6 +580,12 @@ revision it declares in its own `_meta`:
   enough, and a client naming one gets the served list back from the server
   before it ever reaches this decision.
 
+`server/discover` is a probe, and it chooses neither lifecycle. Over stdio and
+HTTP alike a client may follow it with `initialize` for a session, or with
+`_meta`-carrying requests for the handshake-free lifecycle — and a probe the
+server refuses, because it names a revision outside the list above or is
+missing its required `_meta` keys, refuses that one request and nothing else.
+
 The advertised capability set is tools only: bugwarden registers no MCP
 prompts and no MCP resources. `summarize_bug` is a tool that returns prompt
 text, not an MCP prompt.

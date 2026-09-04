@@ -765,6 +765,75 @@ async fn discover_names_this_build_and_reaches_nothing_else() {
 }
 
 #[tokio::test]
+async fn an_http_probe_never_commits_the_session_lifecycle() {
+    // The transport half of issue #267, pinned on the side that needs no
+    // fix. Over streamable http a discover POST is negotiated on its own
+    // (`serve_negotiated_request_directly` — a POST carrying
+    // `mcp-session-id` goes to its session instead), so a probe — refused
+    // or served — sets no `require_request_metadata` flag on any peer, and
+    // the session a client opens next is an ordinary legacy one. Over stdio
+    // rmcp reads the lifecycle off the first frame instead, which is why
+    // that transport wraps discover (`stdio::DiscoverAnswering`); this
+    // fails if an rmcp bump ever gives http the same behaviour.
+    let mock = MockServer::start().await;
+    let file = key_file("srv-key\n");
+    let cli = http_cli(&mock, Some(file.path()));
+    let addr = serve_http(cli, "", &mock, None).await;
+
+    // A revision this build does not serve, so the probe takes the
+    // refusing arm — the reporter's chain, and the arm that was worst over
+    // stdio, where the flag outlived even the refusal.
+    let refused = mcp_post(addr, None)
+        // rmcp's transport refuses a `_meta` revision the header does not
+        // repeat, and a 2026-07-28+ POST that does not name its method in a
+        // header (both -32020) — so the handler is only reachable with all
+        // three agreeing. That gate is http's alone; stdio has no headers.
+        .header("MCP-Protocol-Version", "2027-01-01")
+        .header("Mcp-Method", "server/discover")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": { "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2027-01-01",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }}
+        }))
+        .send()
+        .await
+        .expect("the probe must reach the server");
+    let body = refused.text().await.expect("a body");
+    let payload: Value = body
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .and_then(|data| serde_json::from_str(data).ok())
+        .unwrap_or_else(|| serde_json::from_str(&body).unwrap_or_else(|e| panic!("{body}: {e}")));
+    assert_eq!(payload["error"]["code"], json!(-32022), "{body}");
+
+    // The session the client opens afterwards must serve a `_meta`-free
+    // listing: over stdio this is exactly where the refusal used to appear.
+    let session = raw_initialize(addr, "probing-client").await;
+    let response = mcp_post(addr, Some(&session))
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .json(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }))
+        .send()
+        .await
+        .expect("the listing request must reach the server");
+    let body = response.text().await.expect("a body");
+    assert!(
+        body.contains("\"bug_info\""),
+        // A named tool, not the `"tools"` key: that key is present even for
+        // an empty listing.
+        "a probed session must still be served its listing: {body}"
+    );
+    assert!(
+        !body.contains("request _meta is missing"),
+        "the probe must not have put this session on the handshake-free \
+         lifecycle: {body}"
+    );
+}
+
+#[tokio::test]
 async fn a_legacy_session_listing_carries_no_cache_hints() {
     // The regression guard for every client alive today, at the only place
     // it is the real thing: the in-process rows serialize what the handler

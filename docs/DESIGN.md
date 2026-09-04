@@ -1958,12 +1958,15 @@ wired, `server.rs` and `main.rs` are the reference.
   the SDK default of every revision it knows. What that override bounds is
   precisely which **declared** revisions `initialize`, per-request `_meta` and
   `server/discover` may agree to; it does not decide which request *lifecycle*
-  the transport routes to (see the `_meta`-shape trap below). `2026-07-28` is
-  SERVED as of issue #34 stage 2: its handshake-free requests carry the calling
-  client in their own `_meta`, which `client_of` reads, so a record on that path
-  names the caller or names nobody. Adoption ADDED it — `2024-11-05` through
-  `2025-11-25` keep their handshakes and their sessions — so the two lifecycles
-  are served side by side and `DEFAULT_PROTOCOL_VERSION` stays `2025-11-25`.
+  the transport routes to (see the `_meta`-shape trap below). Over stdio since
+  #267 the probe is answered by `DiscoverAnswering`, which reads the constant
+  itself — `the_wrapper_reads_the_list_the_handler_advertises` pins the two
+  equal. `2026-07-28` is SERVED as of issue #34 stage 2: its handshake-free
+  requests carry the calling client in their own `_meta`, which `client_of`
+  reads, so a record on that path names the caller or names nobody. Adoption
+  ADDED it — `2024-11-05` through `2025-11-25` keep their handshakes and their
+  sessions — so the two lifecycles are served side by side and
+  `DEFAULT_PROTOCOL_VERSION` stays `2025-11-25`.
   One consequence worth stating because nothing enforces it: rmcp's
   `KNOWN_VERSIONS` now equals this list, so there is no known-but-unserved
   revision left to test the fallback with, and the negotiation tests use a
@@ -2061,23 +2064,30 @@ wired, `server.rs` and `main.rs` are the reference.
   accessor.** It falls back to `peer_info().client_info` unless
   `peer.request_metadata_required()`, which rmcp 3.1.4 sets on exactly one path
   (`service/server.rs`, the stdio first-message-is-not-`initialize` case) and
-  never over streamable http. So on the http handshake-free path that
-  convenience accessor IS the placeholder, silently. `client_of` therefore
-  reads `ctx.meta.client_info()` directly on the per-request arm and
-  `peer.peer_info()` only on the handshake arm — never the accessor, never the
-  peer on the per-request arm. `ctx.meta.client_info()` decodes
-  all-or-nothing, so a half-declared identity records as nothing at all. Both
-  recorded fields are capped at `PARAM_VALUE_MAX_CHARS`, the audited-parameter
-  cap: per-request sourcing repeats a client-controlled string into every
-  record where the handshake wrote it once per session. Grep misleads here:
+  never over streamable http. Since #267 that stdio path no longer sees a
+  `server/discover`: the transport answers it (`stdio::DiscoverAnswering`,
+  next bullet), so the flag flips only for a first request that itself carries
+  both `_meta` keys — at ANY revision, the pre-2026 shape `lifecycle_of` then
+  refuses included, since `missing_required_keys` (`model/meta.rs:518-530`)
+  never compares the revision declared against the one it validates for. So on
+  the http handshake-free path that convenience accessor IS the placeholder,
+  silently.
+  `client_of` therefore reads `ctx.meta.client_info()` directly on the
+  per-request arm and `peer.peer_info()` only on the handshake arm — never the
+  accessor, never the peer on the per-request arm. `ctx.meta.client_info()`
+  decodes all-or-nothing, so a half-declared identity records as nothing at
+  all. Both recorded fields are capped at `PARAM_VALUE_MAX_CHARS`, the
+  audited-parameter cap: per-request sourcing repeats a client-controlled
+  string into every record where the handshake wrote it once per session.
+  Grep misleads here:
   `message_has_per_request_protocol_version` tests presence alone, and inside
   the stateless arm that presence does pick a route — but nothing it decides
   gets a request INTO that arm; everywhere else it only feeds header
-  validation. `server/discover` is never answered from a session: only
-  `serve_negotiated_request_directly` serves it, and it refuses every shape
-  but a `_meta` carrying both keys at a revision this build serves. It answers
-  `get_info` only and reaches no tool, guard or router. General rule: **no
-  `_meta` key and no `Mcp-*` header may carry a security decision** — like
+  validation. Over http `server/discover` is never answered from a session:
+  only `serve_negotiated_request_directly` serves it, and it refuses every
+  shape but a `_meta` carrying both keys at a revision this build serves. It
+  answers `get_info` only and reaches no tool, guard or router. General rule:
+  **no `_meta` key and no `Mcp-*` header may carry a security decision** — like
   `KNOWN_VERSIONS`, they are the SDK's vocabulary, not this build's contract.
   Two more things to re-check on an rmcp bump, both load-bearing for the
   handshake arm: that a POST naming `2026-07-28` in the `MCP-Protocol-Version`
@@ -2087,7 +2097,73 @@ wired, `server.rs` and `main.rs` are the reference.
   never handshook — and that `request_metadata_required()` is still set on no
   http path. The first has a test
   (`a_header_only_2026_declaration_is_refused_by_the_transport`); the second
-  does not, and is why `client_of` never uses the convenience accessor.
+  has one for the discover POST only
+  (`an_http_probe_never_commits_the_session_lifecycle`, #267) and none for the
+  served per-request POST, which is why `client_of` never uses the convenience
+  accessor.
+- **rmcp trap — over stdio, `server/discover` CHOOSES the lifecycle before it is
+  answered.** `serve_server_with_ct_inner` (rmcp 3.1.4
+  `service/server.rs:510-577`) reads the session's lifecycle off the first
+  non-`ping` frame: anything that is not `initialize` is taken as a commitment
+  to the handshake-free one, and `Peer::require_request_metadata()` (`:562`) is
+  called BEFORE the handler answers. That flag is a sticky `AtomicBool` — no
+  later `initialize` clears it (a later `initialize` succeeds and stores peer
+  info, `handler/server.rs:323`, leaving it set), and both it and its reader are
+  `pub(crate)`, so nothing in this build can reset it.
+  `handler/server.rs:78-100` then refuses every subsequent request but
+  `initialize` that carries no `_meta` with -32602. A probe is exactly such a
+  frame, so a client that discovers and then opens an ordinary session found
+  every call refused (#267): the reporter's Antigravity/Go SDK 1.7 chain
+  (`mcp/client.go`: probe, retry on -32022 with a served revision, then legacy
+  `initialize`) broke on ANY probe, served or refused. Worse, a probe rmcp
+  itself refuses — no `_meta` at all — ended the PROCESS with
+  `ExpectedInitializeRequest` after answering, logging the whole frame on the
+  way out (#261). Upstream `main` still does all of this as of 2026-09-04
+  (`server.rs:616`); rmcp 3.2 is unvetted. **Decision:** a probe is a probe
+  and must not pick a lifecycle, so over stdio it is answered by the transport
+  ([`DiscoverAnswering`](../crates/bugwarden/src/stdio.rs), wrapped in `main`)
+  and never reaches rmcp's picker. rmcp's first frame is then the first one that
+  IS a commitment — `initialize` for a session, or a `_meta`-carrying request
+  that sets the flag exactly as before. Every other frame passes through
+  untouched, `ping` before `initialize` and the over-cap `None` from
+  `BoundedLines` included — though a probe no longer moves rmcp past its
+  pre-`initialize` loop, so a `ping` after one is answered `{}` there instead of
+  refused -32601 by the per-request handler (`handler/server.rs:112-118`), where
+  a probe used to leave it. The answer is QUEUED on the wrapper and driven by
+  the next `receive`, never awaited inside one: rmcp polls `receive` as one arm
+  of a `select!` (`service.rs:1395`) and drops that future whenever another arm
+  wins, so an inline await loses the reply — and the probe with it — to any
+  pipelined client (`a_pipelined_probe_is_answered_under_write_contention` and
+  its binary twin; the inner transport survives the same cancellation only
+  because it keeps its partial line in `line_buf`). **Deliberately unchanged:**
+  the answer is rmcp's own default `discover` result, byte for byte —
+  `the_wrapper_answers_what_rmcp_answered` serves the same server bare and diffs
+  its replies over eleven `_meta` shapes on both paths, so an rmcp bump that
+  changes its default `discover`, or anything it does between handler and wire
+  (`handler/server.rs:246-259`), fails there. `resultType` is NOT stripped for a
+  legacy declaration because `strip_result_type_for_legacy_peer`
+  (`model.rs:4596`) has no `DiscoverResult` arm; no audit record, no guard, no
+  router, as before; and rmcp keeps sole ownership of the per-request gate, so a
+  `_meta`-free request on a handshake-free session is still refused. One refusal
+  CODE moves: a MID-SESSION probe whose `_meta` is wrong two ways (an unserved
+  revision AND a missing required key) now draws rmcp's -32602 instead of its
+  -32022, because the wrapper keeps the pre-`initialize` order — keys first — on
+  both paths; a `_meta` missing a required key declares no lifecycle worth
+  reading a revision out of. And a probe rmcp refuses now refuses the REQUEST
+  only: the session survives it. What every probe does move is where a hangup
+  lands — rmcp is still waiting for its first committing frame, so a probe-only
+  client's EOF returns `ServerInitializeError::ConnectionClosed` from `serve`
+  where it used to return a live session. `main` reads that as the peer hangup
+  it is and exits 0, as before #267, but only where
+  `DiscoverAnswering::answered` says a probe was answered AND the frame cap is
+  untripped: an over-cap frame closes the transport the same way and stays a
+  failure exit (`stdio_a_probe_then_an_over_cap_frame_still_exits_one`). Every
+  other `ConnectionClosed` still exits 1, and
+  `a_probe_only_client_hangs_up_cleanly` pins the code and the log line. HTTP
+  needs none of this and gets none: `serve_negotiated_request_directly` answers
+  a discover per POST and sets no flag, which
+  `an_http_probe_never_commits_the_session_lifecycle` pins so an rmcp bump that
+  changed it fails loudly.
 - **rmcp trap — `mcp-session-id` is a validated header on only one of the two
   routes.** In rmcp 3.1.4 the session branch of `handle_post`
   (`transport/streamable_http_server/tower.rs`) checks the header against
@@ -2140,8 +2216,9 @@ wired, `server.rs` and `main.rs` are the reference.
   about peers because in rmcp 3.1.4 `DiscoverResult` (`model.rs`) declares
   `ttl_ms: u64` and `cache_scope: CacheScope` as non-`Option` fields with no
   `skip_serializing_if`, hard-coded to `0`/`Private` by both constructors,
-  and this build keeps rmcp's default `server/discover` — so a legacy peer
-  naming 2025-11-25 gets the pair from *that* surface today, whatever
+  and this build serves rmcp's default `server/discover` result on both
+  transports (over stdio from the transport wrapper, #267 above) — so a legacy
+  peer naming 2025-11-25 gets the pair from *that* surface today, whatever
   `tools/list` does. Since stage 2 the served branch is reachable end to end —
   a 2026-07-28 request, or a session that negotiated it — and is tested over
   real streamable HTTP as well as in-process. The in-process rows are still the
