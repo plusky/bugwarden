@@ -40,14 +40,15 @@ use crate::stdio::BoundedLines;
 /// the list bounds is precisely which DECLARED revisions `initialize`,
 /// per-request `_meta` and `server/discover` may agree to; it does not
 /// decide which request lifecycle the transport routes to — see
-/// [`lifecycle_of`].
+/// [`lifecycle_of`]. Read here and, for the stdio discover answer rmcp no
+/// longer gives, in [`crate::stdio::DiscoverAnswering`] (#267).
 ///
 /// `2026-07-28` is served as of issue #34 stage 2. Its handshake-free
 /// requests carry the calling client in their own `_meta`, which
 /// [`client_of`] reads, so a record on that path names the caller or names
 /// nobody — never the SDK placeholder rmcp synthesises for a peer that
 /// never handshook (#34 §3c).
-const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
+pub(crate) const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
     ProtocolVersion::V_2024_11_05,
     ProtocolVersion::V_2025_03_26,
     ProtocolVersion::V_2025_06_18,

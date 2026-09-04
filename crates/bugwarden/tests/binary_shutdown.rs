@@ -260,6 +260,33 @@ async fn initialize_and_drain(server: &mut Server) -> tokio::task::JoinHandle<()
     tokio::spawn(async move { while stdout.next_line().await.ok().flatten().is_some() {} })
 }
 
+/// Answer a `server/discover` probe over the child's pipes, then keep
+/// draining its stdout, as [`initialize_and_drain`] does. The probe is
+/// answered by the transport wrapper and commits no lifecycle (#267), so
+/// rmcp is still waiting for a first committing frame afterwards.
+async fn probe_and_drain(server: &mut Server) -> tokio::task::JoinHandle<()> {
+    let stdin = server.stdin.as_mut().expect("stdin is piped");
+    let stdout = server.child.stdout.take().expect("stdout is piped");
+    let mut stdout = BufReader::new(stdout).lines();
+    stdin
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+"#,
+        )
+        .await
+        .expect("the child must accept the probe");
+    let reply = tokio::time::timeout(EXIT_TIMEOUT, stdout.next_line())
+        .await
+        .expect("the probe must not hang")
+        .expect("stdout must be readable")
+        .expect("the server must answer the probe");
+    assert!(
+        reply.contains("supportedVersions"),
+        "the probe must be answered before the test acts: {reply}"
+    );
+    tokio::spawn(async move { while stdout.next_line().await.ok().flatten().is_some() {} })
+}
+
 /// Write one over-cap frame, delimiter-free, and ignore the write result:
 /// the child refuses partway through and closes the pipe, so the tail of
 /// this write is expected to fail with `BrokenPipe`. Bounded so a build
@@ -370,6 +397,21 @@ async fn stdio_an_over_cap_frame_before_the_handshake_exits_one() {
     write_an_over_cap_frame(&mut server).await;
     server
         .assert_over_cap_exit("stdio pre-handshake over-cap")
+        .await;
+}
+
+#[tokio::test]
+async fn stdio_a_probe_then_an_over_cap_frame_still_exits_one() {
+    // The one exit `main` forgives since #267 is a hangup after a probe,
+    // and only that: an over-cap frame closes the transport exactly the
+    // same way (`receive() -> None`, then rmcp's `ConnectionClosed`), so
+    // a probed session must not turn the refused frame into exit 0.
+    let mut server = spawn_stdio();
+    server.wait_for_stderr(STDIO_READY).await;
+    let _drain = probe_and_drain(&mut server).await;
+    write_an_over_cap_frame(&mut server).await;
+    server
+        .assert_over_cap_exit("stdio probed pre-handshake over-cap")
         .await;
 }
 

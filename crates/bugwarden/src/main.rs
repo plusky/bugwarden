@@ -16,6 +16,7 @@ use bugwarden::audit::{
 use bugwarden::http_auth::{self, HttpEnv};
 use bugwarden::http_session::AuditedSessionManager;
 use bugwarden::otel::{self, OtelEnv, Pipeline};
+use bugwarden::stdio::DiscoverAnswering;
 use bugwarden::{config, server};
 use bugwarden_core::{guard::Guard, policy::Policy};
 use clap::Parser;
@@ -233,13 +234,37 @@ async fn main() -> anyhow::Result<()> {
                 // which the service reports as an ordinary close, so this
                 // flag is the only thing that tells the two apart below.
                 let over_cap = stdin.over_cap();
+                // `server/discover` is answered by the transport, never by
+                // rmcp's lifecycle picker: rmcp commits the session to the
+                // handshake-free lifecycle on the first non-`initialize`
+                // frame, sticking a flag it offers no way to clear (#267).
+                // Built before `serve` consumes `server`.
+                let transport = DiscoverAnswering::framed(stdin, stdout, server.clone());
+                // An answered probe leaves rmcp waiting for the first
+                // COMMITTING frame, so a client that only probed and hung
+                // up closes the stream inside `initialize`'s wait, where
+                // rmcp reports `ConnectionClosed` rather than a clean end.
+                let probed = transport.answered();
                 tracing::info!("Starting Bugzilla MCP server on stdio");
                 let service = tokio::select! {
-                    result = server.serve((stdin, stdout)) => {
-                        result.inspect_err(|e| {
+                    result = server.serve(transport) => match result {
+                        Ok(service) => service,
+                        // A probe-only client is a peer hangup, not a
+                        // serving failure: exit 0, as before #267. Not a
+                        // refused frame though — that closes the same way
+                        // and must stay a failure exit.
+                        Err(rmcp::service::ServerInitializeError::ConnectionClosed(_))
+                            if probed.load(Ordering::Acquire)
+                                && !over_cap.load(Ordering::Acquire) =>
+                        {
+                            tracing::info!("peer hung up after a server/discover probe");
+                            return Ok(());
+                        }
+                        Err(e) => {
                             tracing::error!("serving error: {:?}", e);
-                        })?
-                    }
+                            return Err(e.into());
+                        }
+                    },
                     () = &mut shutdown => {
                         tracing::info!("received shutdown signal");
                         // serve() is already blocked in tokio::io::stdin()'s
