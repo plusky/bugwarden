@@ -67,6 +67,14 @@ async fn main() -> anyhow::Result<()> {
     } else {
         registry.init();
     }
+    // On both branches: the hook routes a panic into tracing instead of
+    // letting std write the payload to fd 2, which over stdio is the
+    // peer's pipe (#270). After the subscriber rather than before it not
+    // because the order changes where a later panic goes — the dispatcher
+    // is read at panic time — but so that a panic in the window above,
+    // during CLI parsing or OTLP resolution, is still printed by std's
+    // hook instead of vanishing into a subscriber that does not exist.
+    bugwarden::panic_hook::install();
 
     // The http bearer gate, resolved before anything else runs: over http
     // the port is the access boundary, and a half-configured credential must
