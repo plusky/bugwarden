@@ -20,8 +20,9 @@ concurrency:
 
 jobs:
   mutants:
-    # cargo-mutants over the guard policy engine, weekly and NON-GATING. It
-    # does not replace the hand-run discipline (#203), it catches lapses in it.
+    # cargo-mutants over the guard policy engine and the binary's startup
+    # wiring (the scope below), weekly and NON-GATING. It does not replace the
+    # hand-run discipline (#203), it catches lapses in it.
     #
     # NEVER a required status check; do not add it to branch protection. A run
     # is hours and its timeouts need a human who knows what the suite is meant
@@ -44,10 +45,13 @@ jobs:
     # the timeout floor holds.
     runs-on: ubuntu-latest
     # Measured at 30-46s of incremental build plus 6-23s of tests per mutant on
-    # a 32-core box; call it ~3 min on a 4-core runner, so a 31-mutant shard is
-    # ~95 min plus setup. Doubled for margin -- a shard that outruns this has
-    # itself become the finding. Unsharded, guard.rs would flirt with GitHub's
-    # 360-minute ceiling.
+    # a 32-core box -- main.rs's nine averaged 43s there, inside that band, so
+    # the startup scope costs no more per mutant than the guard one. Call it
+    # ~3 min on a 4-core runner, so a 34-mutant shard is ~102 min plus setup.
+    # Doubled for margin -- a shard that outruns this has itself become the
+    # finding. Unsharded the scope below does not fit at all: 134 x 3 min is
+    # 402, past GitHub's 360-minute ceiling, so the shards are load-bearing
+    # rather than a convenience.
     timeout-minutes: 240
     strategy:
       # A survivor in one shard must not cancel the rest: the run's value is
@@ -60,10 +64,16 @@ jobs:
     env:
       # Scope lives here, not in .cargo/mutants.toml, because it is a CI budget
       # decision and not a property of the tree: a hand-run must stay free to
-      # point anywhere. The workspace holds ~1130 mutants and server.rs alone
-      # 377; guard.rs is 125 and is where the DESIGN.md invariants live. Grow
-      # this by adding shards, not by dropping the filter.
-      MUTANTS_SCOPE: crates/bugwarden-core/src/guard.rs
+      # point anywhere. The workspace holds ~1180 mutants and server.rs alone
+      # 400; guard.rs is 125 and is where the DESIGN.md invariants live, and
+      # main.rs is 9 -- the startup wiring (the I9 --read-only tightening, the
+      # audit sink selection) that only a spawned process executes, so no
+      # in-process suite reaches it. Its five survivors came out of a hand run
+      # (#269); this job saw none of them, because until now its scope was
+      # guard.rs alone. 134 together, so ~34 a shard. Space-separated, one
+      # --file each below. Grow this by adding shards, not by dropping the
+      # filter.
+      MUTANTS_SCOPE: crates/bugwarden-core/src/guard.rs crates/bugwarden/src/main.rs
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -107,10 +117,18 @@ jobs:
           MUTANTS_SHARDS: ${{ strategy.job-total }}
         run: |
           set -euo pipefail
+          # One --file per path in MUTANTS_SCOPE: cargo-mutants takes the flag
+          # repeatedly and unions the files, and the shard split then runs over
+          # the combined list.
+          read -r -a scope <<< "${MUTANTS_SCOPE}"
+          files=()
+          for path in "${scope[@]}"; do
+            files+=(--file "${path}")
+          done
           rc=0
           cargo mutants --no-shuffle \
             --shard "${MUTANTS_SHARD}/${MUTANTS_SHARDS}" \
-            --file "${MUTANTS_SCOPE}" || rc=$?
+            "${files[@]}" || rc=$?
           count() {
             if [ -f "mutants.out/$1.txt" ]; then wc -l < "mutants.out/$1.txt"; else echo 0; fi
           }
