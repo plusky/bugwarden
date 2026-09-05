@@ -2409,7 +2409,7 @@ wired, `server.rs` and `main.rs` are the reference.
   error (`-32603`) with a fixed, content-free message and no `data`,
   identical under every lifecycle and every fail mode; the payload is
   dropped unformatted, because it is whatever the panicking code chose to
-  format and may quote client input or worse (I12). One ERROR-level tracing
+  format and may quote client input or worse (I12). One WARN-level tracing
   line names the tool, through `Capped`, and nothing else.
 
   Sound because a handler that panics holds nothing the process needs. The
@@ -2448,21 +2448,99 @@ wired, `server.rs` and `main.rs` are the reference.
   everybody else. Fail closed for the *request*, which errors, not for the
   process.
 
-  **Deliberately unchanged.** No panic hook is installed (there never was
-  one), so the default hook still prints `thread '…' panicked at
-  file:line:` plus the payload to stderr at panic time, before any
-  unwinding: that line is where the cause stays, and it is NOT scrubbed —
-  it never was, and scrubbing it is a separate question from this one. The
-  guard, every refusal text, the audit schema and `main.rs` are untouched;
-  the catcher invents exactly one reply, for a call that produced none, and
-  can make nothing succeed that failed before. The scope is the HANDLER, so
-  a panic in `call_tool`'s own bookkeeping after the dispatch returns —
-  building the record, `session_info`, the debug-only assert in
-  `response_bytes` — is outside the catcher and is still answered by
-  nobody. That is deliberate and not a gap being ignored: no production
-  panic site exists on that stretch today, and widening the catcher to
-  cover the recording path would mean answering a request whose record may
-  be half-built, which is the opposite of what I15 asks for.
+  **The panic hook (#270).** `panic_hook::install`, which `main` calls
+  immediately after the subscriber is initialized — after the `if`/`else`,
+  so both the OTLP and the plain branch get it — replaces std's default
+  hook. That matters most over stdio, where fd 2 is the pipe the MCP host
+  handed this process: the default hook writes `thread 'name' (tid)
+  panicked at file:line:col:` AND THE PAYLOAD there at panic time, before
+  any unwinding, so it hands the PEER whatever the panicking code chose to
+  format. The hook emits one tracing event instead, fixed text plus two
+  server-authored fields: `location`, the compile-time `file:line:col` std
+  records at the panic site — which may name a dependency's registry path
+  as readily as one of this workspace's files, and is the whole of what
+  makes the line actionable now that the default hook's `RUST_BACKTRACE`
+  handling is gone with it — and `thread`, the name the spawner chose
+  (`<unnamed>` when there is none, tokio's workers when there is). The
+  payload is never touched: not downcast, not its type name, not its
+  length, the same rule the reply follows (I12). Nothing was leaking
+  before — the #253 review audited both crates and found no production
+  payload that can carry the API key or a client string — so what the hook
+  buys is that the next `expect(&format!(..))` cannot change that
+  silently.
+
+  **What that trades, deliberately.** The event carries
+  `bugwarden::panic_hook` as its target and passes through the same
+  `EnvFilter` as every other diagnostic, so a panic is now reported when
+  the operator's filter admits it and not otherwise: at the default `info`
+  and at `warn` every panic, at `error` only the process's first, at `off`
+  none. The default hook wrote unconditionally, and that is exactly what
+  had to stop, because over stdio the descriptor it wrote to belongs to
+  the peer. The hook's target is its own module precisely so the trade can
+  be undone per-target: `RUST_LOG=error,bugwarden::panic_hook=warn` keeps
+  every panic on stderr under an otherwise quiet filter. README's
+  `RUST_LOG` row says so, and `tests/panic_hook.rs` pins all three
+  behaviours against a real child process's stderr rather than an
+  in-process buffer — the claim is about a file descriptor, and a hook
+  that CHAINED std's previous hook instead of replacing it would satisfy
+  any in-memory capture while still handing both payloads to the peer.
+
+  **The hook's bounds.** std aborts the process for a panic raised while a
+  hook runs (`MustAbort::PanicInHook`, ahead of any unwinding, so no
+  `catch_unwind` can contain it). The hook's own body is written so it
+  cannot be the one that panics — no `expect`, no indexing, no `Capped`,
+  and nothing on the line is client text to begin with — but that is a
+  statement about the body and not about the event, which runs the whole
+  subscriber stack. Three residual outcomes, all remote today and none of
+  them a guarantee: a panic anywhere on the event path (the fmt layer,
+  `CappedFields`, the OTLP layer, the writer) aborts and prints the NESTED
+  panic's location and payload, which is why neither production formatter
+  on that path has a panic site; a panic raised while a span's extensions
+  are write-held (`on_new_span`, `on_record`) HANGS the thread, because
+  the hook's event reads those same extensions through std's `RwLock`
+  before the unwind releases the write guard — measured, and out of reach
+  only because neither crate here creates a span or calls `Span::record`
+  and rmcp calls neither either; and `std::thread::current` panics after
+  the calling thread's local data is destroyed and has no stable
+  non-panicking equivalent (std's own default hook uses a crate-private
+  one), which aborts, though even then what std prints is the nested
+  panic's own fixed message rather than the payload.
+
+  **Log levels — the rule.** ERROR is for what an operator must act on and
+  a client cannot repeat at will; a per-request failure a client can cause
+  on demand is WARN. A panic is a server bug an operator must learn about,
+  once — so the hook's FIRST line in a process is ERROR and every later
+  one is WARN, same text and same fields, an `AtomicBool::swap` deciding
+  which. A deployment that pages on ERROR is therefore paged once for a
+  panic a client can trigger at will, rather than once per request. The
+  dispatch line above is WARN for the other half of the rule: before #270
+  it was the only per-request, client-repeatable ERROR in THIS
+  WORKSPACE's code. `server.rs`'s sole other production `tracing::error!`
+  is behind a `Once`; of the rest, `stdio.rs`'s over-cap refusal closes
+  the transport, `main.rs`'s two serving-error arms end the process,
+  `audit.rs`'s sink diagnostic is rate-limited, and `main.rs`'s
+  signal-arming failure runs at most once per signal kind at startup — so
+  none of them is a lever a client can pull twice. Whether the first of
+  those is ERROR under this rule is #272's question and stays open here.
+  The linked crates are outside the enumeration: rmcp logs at ERROR on
+  paths of its own, none shown to be client-repeatable on demand, and a
+  panic inside any dependency now routes through this hook like any
+  other. The two lines are not redundant: the hook knows the location and
+  the thread and cannot know the tool; the dispatch line knows the tool
+  and that the request WAS answered, and cannot know the location.
+
+  **Deliberately unchanged.** The guard, every refusal text and the audit
+  schema are untouched, and `main.rs` gains nothing but the hook's
+  installation; the catcher invents exactly one reply, for a call that
+  produced none, and can make nothing succeed that failed before. The
+  scope is the HANDLER, so a panic in `call_tool`'s own bookkeeping after
+  the dispatch returns — building the record, `session_info`, the
+  debug-only assert in `response_bytes` — is outside the catcher and is
+  still answered by nobody. That is deliberate and not a gap being
+  ignored: no production panic site exists on that stretch today, and
+  widening the catcher to cover the recording path would mean answering a
+  request whose record may be half-built, which is the opposite of what
+  I15 asks for.
 - **rmcp trap — `input_schema` is schemars' rendering, unfiltered by rmcp.**
   `SchemaSettings::draft2020_12()` (`handler/server/common.rs`) runs zero
   transforms, so whatever schemars 1.x emits for a `#[tool]` param struct is
@@ -3181,10 +3259,13 @@ wired, `server.rs` and `main.rs` are the reference.
   (#253; the probe is a panicking route added through rmcp's own
   `ToolRoute::new_dyn`, so no production path carries a test-only branch,
   and every call is bounded by a deadline so the old defect fails a test
-  instead of hanging the run); the refusal map is total
-  over the full router; responses byte-identical with auditing off, on,
-  and failing-open; suppressed ids in the record and never in the
-  envelope; content and API-key canaries never reach the file;
+  instead of hanging the run), and that recovery line is pinned at WARN
+  rather than ERROR (#270), which is a level decision and not a weakened
+  assertion — the same test also refuses a line that still says ERROR;
+  the refusal map is total over the full router; responses are
+  byte-identical with auditing off, on, and failing-open; suppressed ids
+  are in the record and never in the envelope; content and API-key
+  canaries never reach the file;
   download_attachment's `attachment_window` note fires only when the
   window actually CUT something — twenty lines windowed to three record
   it under verdict served_filtered, while params whose window covers the
@@ -3399,6 +3480,55 @@ wired, `server.rs` and `main.rs` are the reference.
   attribute is asserted present as an Int and absent when the record
   carries no size. The pre-#145 still-deserializes test is gone with v1,
   for the reason the pre-#29 one is ("Schema v2" under "Audit stream").
+- Panic-hook test (crates/bugwarden/tests/panic_hook.rs): one `#[test]`
+  that re-executes itself. The claim is about a FILE DESCRIPTOR — over
+  stdio fd 2 is the peer's pipe — so it is only proven by reading the
+  descriptor the panic would have been written to, and an in-process
+  capture proves nothing: a hook that CHAINED std's previous hook rather
+  than replacing it puts both payloads on the real stderr and leaves any
+  in-memory buffer spotless (measured; it is one of the file's two
+  pre-fix shapes). The function is the parent when its marker environment
+  variable is unset and the child when it is set. The child builds
+  `main`'s subscriber shape — same filter source and `info` fallback,
+  `CappedFields`, ANSI off, `std::io::stderr` — installs the hook, panics
+  a NAMED thread and then an unnamed one with distinct marker payloads,
+  and restores the previous hook before its own assertions so a failure
+  there still prints. The parent spawns it with both descriptors on pipes
+  under a 20 s budget and asserts over what arrived: two hook lines, ERROR
+  then WARN, `bugwarden::panic_hook` as the target on both, `location`
+  naming this test file (a different site each time), `thread` carrying
+  the given name and then `<unnamed>`, both markers absent from stderr AND
+  stdout, and a clean exit. Two more child runs pin the filter, which is
+  now what decides whether a panic is reported at all: `RUST_LOG=error`
+  yields exactly one line, and `error,bugwarden::panic_hook=warn` yields
+  two. One test, not several, because the ERROR-then-WARN rule is about a
+  PROCESS's first panic. Keeping the hook in the child also leaves the
+  parent's own failures legible under libtest's hook.
+
+  **No binary trigger.** `main`'s own call is pinned by reading main.rs:
+  pinning the hook's line on the SHIPPED process's stderr, the way
+  `binary_tracing_caps` pins every other line, would need a legitimate
+  CLI, environment or configuration value that makes THAT process panic,
+  and in this workspace's two crates none exists. Neither `main.rs` nor
+  `config.rs`, `http_auth.rs`, `otel.rs`, `stdio.rs` or `audit.rs` holds a
+  production `expect`, `unwrap`, `panic!` or `unreachable!`; the index and
+  slice sites that do exist there — `audit.rs`'s traceparent parser,
+  `otel.rs`'s `hex_bytes`, `stdio.rs`'s newline scan — each check the
+  length or the position before they index, so no operator or client value
+  reaches one out of bounds. The one numeric CLI value is `--port`, a
+  `u16` clap parses and no arithmetic touches; the rotation check adds the
+  live file's own length, which no operator value can drive to a `u64`
+  overflow even under the overflow checks a debug build has; and the
+  binary has no `println!` or `print!` at all, so a full stdout cannot
+  panic it either. The linked crates are a different matter — rmcp, axum,
+  hyper and serde_json were not audited, and a panic in any of them now
+  routes through the hook like any other — but none of them offers a
+  trigger this suite could reach on purpose. Adding a panic an operator
+  value can reach, so that a test could reach it too, would be a test-only
+  path in production code. Nothing is lost on the mutation side:
+  cargo-mutants generates no mutant that deletes a bare statement call, so
+  `--list --file crates/bugwarden/src/main.rs` names nothing at the
+  installation line and the scheduled job is unchanged either way.
 - Identity tests (#[cfg(test)] in crates/bugwarden/src/server.rs and
   crates/bugwarden-core/src/client.rs; crates/bugwarden/tests/
   http_transport_wiremock.rs, crates/bugwarden/tests/binary_user_agent.rs

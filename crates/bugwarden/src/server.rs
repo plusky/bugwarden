@@ -2519,11 +2519,14 @@ impl BugWarden {
         match CatchUnwind::new(dispatch).await {
             Ok(result) => result,
             // The payload is dropped unformatted: see `handler_panicked`.
-            // The default panic hook has already printed the panic's own
-            // file, line and message to stderr; this line is what ties it
-            // to a tool and reaches the OTLP diagnostics.
+            // In the shipped binary [`crate::panic_hook`] has already
+            // reported the panic's location and thread; this line is what
+            // ties it to a tool and to a request that WAS answered. WARN,
+            // not ERROR: a client can trigger a handler panic on demand,
+            // and the ERROR an operator is paged on is the hook's line for
+            // the process's FIRST panic (#270).
             Err(_payload) => {
-                tracing::error!(
+                tracing::warn!(
                     tool = %Capped(&tool),
                     "tool handler panicked; the request was answered with an internal error"
                 );
@@ -7492,10 +7495,13 @@ mod tests {
         // emitted from the rmcp handler task, which this flavour runs on the
         // capturing thread.
         //
-        // The default panic hook's own `thread '…' panicked at file:line:`
-        // line goes straight to stderr, not through tracing, so it is
-        // invisible to this capture — that untouched line is where the cause
-        // stays, and this assertion says nothing about it.
+        // No panic hook is installed here: this binary's other tests need
+        // std's default one to report their own panics. So the panic's own
+        // `thread 'name' (tid) panicked at file:line:col:` line goes to the
+        // real stderr and is invisible to this capture, and these
+        // assertions say nothing about it. What the shipped binary reports
+        // instead is `panic_hook`'s line, pinned by `tests/panic_hook.rs`
+        // in a child process of its own (#270).
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -7520,8 +7526,13 @@ mod tests {
             "the recovery line must name the tool in its own field: {line}"
         );
         assert!(
-            line.contains("ERROR"),
-            "a request answered by an internal error is an ERROR, not a debug aside: {line}"
+            line.contains("WARN"),
+            "a per-request failure a client can repeat at will is a WARN, not an \
+             ERROR an operator is paged on (#270): {line}"
+        );
+        assert!(
+            !line.contains("ERROR"),
+            "the level flipped to WARN, so nothing on this line still says ERROR: {line}"
         );
         logs.assert_not_contains(PANIC_MARKER);
     }

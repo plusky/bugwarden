@@ -13,6 +13,7 @@ pub mod config;
 pub mod http_auth;
 pub mod http_session;
 pub mod otel;
+pub mod panic_hook;
 pub mod server;
 pub mod stdio;
 pub mod tracing_fields;
