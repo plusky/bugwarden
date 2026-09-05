@@ -3337,6 +3337,36 @@ wired, `server.rs` and `main.rs` are the reference.
   post-handshake case exits `0`, which is what rmcp's silent close makes of
   it. The needle is bugwarden's line, not rmcp's `Error reading from
   stream`, so an SDK reword cannot pass for the bound.
+- Startup-wiring tests (crates/bugwarden/tests/binary_startup_policy.rs,
+  the SHIPPED BINARY): the three `main.rs` sites only a process executes,
+  which is why a hand mutation run found all three bare (#269). The I9
+  tightening `policy.global.read_only |= cli.read_only` is driven from
+  both sides. A `read_only = true` policy delists the write tools on its
+  own AND still does with `--read-only` on top, `^=` there RE-ENABLING
+  exactly the writes that policy forbade; the first of those two is not
+  decoration, since it is the only thing at binary level pinning that
+  `Policy::load` honours the field, and were the field ignored the
+  mutant's `false ^ true` would restrict and survive. That pair has no
+  one-variable control — (true, no flag) is already restricted, so the
+  listing that still carries the write tools has to come from a
+  deployment restricting nothing, and it proves only that the names exist
+  to be removed. `read_only = false` plus the flag delists them too
+  (`&=` never tightens), and there one policy file spawned twice makes
+  the flag the only thing that varies. Every restricted listing is
+  asserted EQUAL to the loosened one minus `WRITE_TOOLS`, so an empty
+  listing, or one that lost a read tool, fails as well.
+  `--audit-config` with no OTLP endpoint is the `FileOnly` arm: the
+  operator's file appears where the document's `path` put it and holds
+  the `initialize` record and EXACTLY ONE record for the served
+  `mcp_server_info` call (I15 through the shipped binary), where deleting
+  the arm substitutes `AuditConfig::fileless()` and writes nowhere.
+  `path` is the setting this test observes, not the only one a healthy
+  sink would show. The "auditing is OFF" warning is read off stderr in
+  all three deployments — http with no sink warns, http with the file
+  does not, stdio with no sink does not — which is what makes both its
+  `==` and its `&&` load-bearing. Each log is read only as far as the
+  startup line, which `main` logs after the warning on both transports,
+  so a log without it is proof and not a race.
 - Unit tests (#[cfg(test)] in crates/bugwarden/src/stdio.rs) at a 16-byte
   cap, for what the binary test cannot reach: a frame of exactly the cap is
   accepted both whole and split across chunks (`<=`, and the split half is
