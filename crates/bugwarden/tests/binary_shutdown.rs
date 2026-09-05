@@ -76,12 +76,16 @@ use tokio::process::Child;
 use tokio::process::ChildStdin;
 use tokio::process::Command;
 
+#[path = "common/deadline.rs"]
+mod deadline;
+
 #[path = "common/scrub_env.rs"]
 mod scrub_env;
 
 #[path = "common/startup_line.rs"]
 mod startup_line;
 
+use deadline::bounded;
 use startup_line::HTTP_READY;
 
 /// Bounded so a binary that ignores the signal fails this test rather than
@@ -605,7 +609,7 @@ async fn connect_insecure(addr: SocketAddr) -> RunningService<RoleClient, ()> {
         reqwest::Client::new(),
         StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")),
     );
-    ().serve(transport)
+    bounded("the MCP handshake", ().serve(transport))
         .await
         .expect("MCP handshake must succeed under --insecure-no-auth")
 }

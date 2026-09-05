@@ -35,11 +35,14 @@ use serde_json::{json, Value};
 use wiremock::matchers::{body_partial_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "common/deadline.rs"]
+mod deadline;
 #[path = "common/pinned_cli.rs"]
 mod pinned_cli;
 #[path = "common/refused.rs"]
 mod refused;
 
+use deadline::bounded;
 use pinned_cli::pinned;
 
 /// The pin's own self-check, run in each binary that relies on it so a
@@ -81,7 +84,7 @@ async fn client_for(policy: &str, mock: &MockServer) -> RunningService<RoleClien
             let _ = running.waiting().await;
         }
     });
-    ().serve(client_io)
+    bounded("the MCP handshake", ().serve(client_io))
         .await
         .expect("MCP handshake must succeed")
 }
@@ -91,10 +94,12 @@ async fn call(client: &RunningService<RoleClient, ()>, tool: &str, args: Value) 
     let Value::Object(args) = args else {
         panic!("tool arguments must be a JSON object");
     };
-    client
-        .call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(args))
-        .await
-        .expect("tool call must not be a protocol error")
+    bounded(
+        &format!("the {tool} call"),
+        client.call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(args)),
+    )
+    .await
+    .expect("tool call must not be a protocol error")
 }
 
 /// All text blocks of a result, concatenated.
@@ -1809,8 +1814,7 @@ async fn mark_as_duplicate_sends_only_dupe_of_and_comment() {
 /// `tools/list` request over the wire, so the handler's own listing path
 /// is what answers.
 async fn listed_tools(client: &RunningService<RoleClient, ()>) -> Vec<String> {
-    client
-        .list_all_tools()
+    bounded("tools/list", client.list_all_tools())
         .await
         .expect("list_tools must succeed")
         .into_iter()
@@ -2545,10 +2549,9 @@ async fn whoami_transport_error_does_not_leak_the_api_key_i12() {
             let _ = running.waiting().await;
         }
     });
-    let client: RunningService<RoleClient, ()> =
-        ().serve(client_io)
-            .await
-            .expect("MCP handshake must succeed");
+    let client: RunningService<RoleClient, ()> = bounded("the MCP handshake", ().serve(client_io))
+        .await
+        .expect("MCP handshake must succeed");
 
     let result = tokio::time::timeout(
         common::REFUSED_CONNECT_BUDGET,
@@ -2859,8 +2862,7 @@ async fn bug_fields_over_cap_makes_no_upstream_request() {
 async fn discovery_tools_absent_from_the_listing_by_default() {
     let mock = MockServer::start().await;
     let client = client_for("", &mock).await;
-    let tools = client
-        .list_all_tools()
+    let tools = bounded("tools/list", client.list_all_tools())
         .await
         .expect("list_tools must succeed");
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
@@ -2868,8 +2870,7 @@ async fn discovery_tools_absent_from_the_listing_by_default() {
     assert!(!names.contains(&"bug_fields"));
 
     let client = client_for(DISCOVERY_POLICY, &mock).await;
-    let tools = client
-        .list_all_tools()
+    let tools = bounded("tools/list", client.list_all_tools())
         .await
         .expect("list_tools must succeed");
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();

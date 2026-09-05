@@ -52,6 +52,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 #[path = "common/raw_post.rs"]
 mod raw_post;
 
+#[path = "common/deadline.rs"]
+mod deadline;
+
+#[path = "common/raw_client.rs"]
+mod raw_client;
+
 #[path = "common/pinned_cli.rs"]
 mod pinned_cli;
 
@@ -61,7 +67,9 @@ mod scrub_env;
 #[path = "common/startup_line.rs"]
 mod startup_line;
 
+use deadline::bounded;
 use pinned_cli::pinned;
+use raw_client::raw_client;
 
 /// The pin's own self-check, run in each binary that relies on it so a
 /// single-binary `cargo test --test ...` still proves what its harness
@@ -176,15 +184,14 @@ async fn connect(addr: SocketAddr, token: Option<&str>) -> RunningService<RoleCl
         client,
         StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")),
     );
-    ().serve(transport)
+    bounded("the MCP handshake", ().serve(transport))
         .await
         .expect("MCP handshake must succeed")
 }
 
 /// The tool names this credential is offered.
 async fn listed_tools(client: &RunningService<RoleClient, ()>) -> Vec<String> {
-    client
-        .list_all_tools()
+    bounded("tools/list", client.list_all_tools())
         .await
         .expect("tools/list must succeed")
         .into_iter()
@@ -268,7 +275,7 @@ async fn every_unauthenticated_request_gets_one_byte_identical_refusal() {
         .mount(&mock)
         .await;
     let addr = serve_guarded(&mock, &both_tokens(), false).await;
-    let http = reqwest::Client::new();
+    let http = raw_client();
     let mcp = format!("http://{addr}/mcp");
 
     let baseline = probe(&http, &mcp, &[]).await;
@@ -387,17 +394,19 @@ async fn the_write_token_reaches_the_whole_tool_surface() {
     }
     assert!(listed.iter().any(|t| t == "bug_info"), "{listed:?}");
 
-    let result = client
-        .call_tool(
+    let result = bounded(
+        "the add_comment call",
+        client.call_tool(
             CallToolRequestParams::new("add_comment".to_owned()).with_arguments(
                 json!({ "bug_id": 7, "comment": "hello" })
                     .as_object()
                     .expect("object")
                     .clone(),
             ),
-        )
-        .await
-        .expect("the write scope must reach a write tool");
+        ),
+    )
+    .await
+    .expect("the write scope must reach a write tool");
     assert_ne!(result.is_error, Some(true), "{result:?}");
 }
 
@@ -446,38 +455,44 @@ async fn a_read_scope_write_call_is_refused_as_unrouted_and_reaches_no_bugzilla(
 
     // A read tool still works, so the refusal below is about the scope and
     // not about the session being broken.
-    let served = client
-        .call_tool(
+    let served = bounded(
+        "the bug_info call",
+        client.call_tool(
             CallToolRequestParams::new("bug_info".to_owned()).with_arguments(
                 json!({ "bug_ids": [7] })
                     .as_object()
                     .expect("object")
                     .clone(),
             ),
-        )
-        .await
-        .expect("the read scope must reach a read tool");
+        ),
+    )
+    .await
+    .expect("the read scope must reach a read tool");
     assert_ne!(served.is_error, Some(true), "{served:?}");
 
-    let refused = client
-        .call_tool(
+    let refused = bounded(
+        "the scope-refused add_comment call",
+        client.call_tool(
             CallToolRequestParams::new("add_comment".to_owned()).with_arguments(
                 json!({ "bug_id": 7, "comment": "hello" })
                     .as_object()
                     .expect("object")
                     .clone(),
             ),
-        )
-        .await
-        .expect_err("the read scope must not reach a write tool");
+        ),
+    )
+    .await
+    .expect_err("the read scope must not reach a write tool");
 
     // Compared against the router's OWN answer for a name it does not route,
     // not against a literal: a scope-hidden tool must be indistinguishable
     // from one that does not exist, and this stays true across rmcp bumps.
-    let unknown = client
-        .call_tool(CallToolRequestParams::new("no_such_tool_at_all".to_owned()))
-        .await
-        .expect_err("an unknown tool is an error");
+    let unknown = bounded(
+        "the no_such_tool_at_all call",
+        client.call_tool(CallToolRequestParams::new("no_such_tool_at_all".to_owned())),
+    )
+    .await
+    .expect_err("an unknown tool is an error");
     assert_eq!(
         refused.to_string(),
         unknown.to_string(),
@@ -509,7 +524,7 @@ async fn per_request_post(
         "io.modelcontextprotocol/protocolVersion": PER_REQUEST_REVISION,
         "io.modelcontextprotocol/clientCapabilities": {},
     });
-    let mut builder = reqwest::Client::new()
+    let mut builder = raw_client()
         .post(format!("http://{addr}/mcp"))
         .header("Accept", "application/json, text/event-stream")
         .header("Content-Type", "application/json")

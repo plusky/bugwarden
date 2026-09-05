@@ -29,11 +29,14 @@ use serde_json::{json, Value};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "common/deadline.rs"]
+mod deadline;
 #[path = "common/pinned_cli.rs"]
 mod pinned_cli;
 #[path = "common/refused.rs"]
 mod refused;
 
+use deadline::bounded;
 use pinned_cli::pinned;
 
 /// The pin's own self-check, run in each binary that relies on it so a
@@ -275,7 +278,9 @@ async fn server_with_sinks(
             let _ = running.waiting().await;
         }
     });
-    let client = ().serve(client_io).await.expect("MCP handshake must succeed");
+    let client = bounded("the MCP handshake", ().serve(client_io))
+        .await
+        .expect("MCP handshake must succeed");
     Exported {
         client,
         audit,
@@ -362,8 +367,7 @@ async fn call(
         meta.set_traceparent(traceparent);
         params.meta = Some(meta);
     }
-    client
-        .call_tool(params)
+    bounded(&format!("the {tool} call"), client.call_tool(params))
         .await
         .expect("tool call must not be a protocol error")
 }

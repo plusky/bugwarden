@@ -129,6 +129,22 @@ are never a justification for undoing them.
   `crates/bugwarden-core/tests/` and, for server- and transport-level
   behavior, `crates/bugwarden/tests/`. The guard test list in DESIGN.md
   ("Testing") is the minimum bar, not a ceiling.
+- Nothing a test awaits for an answer from the server may be awaited
+  without a deadline: rmcp sets none, and `reqwest::Client::new()` sets
+  none, so an unanswered request parks the binary and everything cargo
+  queues behind it instead of failing one test. Three site classes, each
+  with its own form. A request through an rmcp client — the `initialize`
+  handshake and any later one included — goes through `bounded`. So does
+  a direct `ServerHandler::call_tool` or `list_tools` await in
+  `server.rs`'s tests, with no client or transport in between:
+  `call_tool` reaches the same `dispatch`, and that is where the mutants
+  which used to hang the suite lived. A hand-built POST to `/mcp` takes
+  its client from `raw_client()` instead, because `send()` resolves at the
+  response headers and only reqwest's own total timeout also covers the
+  body. `bounded` and `CALL_DEADLINE` live in
+  `crates/bugwarden/tests/common/deadline.rs`, `raw_client()` beside them
+  in `common/raw_client.rs`, and `server.rs`'s test module keeps its own
+  equal copy of the constant.
 - A dependency change must update `Cargo.lock`, preserve the MSRV, and pass
   `cargo deny check`. Prefer the smallest compatible version change; do not
   run a broad `cargo update` as part of an unrelated change.

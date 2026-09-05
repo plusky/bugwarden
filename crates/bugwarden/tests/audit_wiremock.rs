@@ -28,9 +28,12 @@ use serde_json::{json, Value};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "common/deadline.rs"]
+mod deadline;
 #[path = "common/pinned_cli.rs"]
 mod pinned_cli;
 
+use deadline::bounded;
 use pinned_cli::pinned;
 
 /// The pin's own self-check, run in each binary that relies on it so a
@@ -107,7 +110,9 @@ async fn audited_client_with(
             let _ = running.waiting().await;
         }
     });
-    let client = ().serve(client_io).await.expect("MCP handshake must succeed");
+    let client = bounded("the MCP handshake", ().serve(client_io))
+        .await
+        .expect("MCP handshake must succeed");
     Audited {
         client,
         audit_path,
@@ -138,7 +143,7 @@ async fn plain_client_for(policy: &str, mock: &MockServer) -> RunningService<Rol
             let _ = running.waiting().await;
         }
     });
-    ().serve(client_io)
+    bounded("the MCP handshake", ().serve(client_io))
         .await
         .expect("MCP handshake must succeed")
 }
@@ -147,10 +152,12 @@ async fn call(client: &RunningService<RoleClient, ()>, tool: &str, args: Value) 
     let Value::Object(args) = args else {
         panic!("tool arguments must be a JSON object");
     };
-    client
-        .call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(args))
-        .await
-        .expect("tool call must not be a protocol error")
+    bounded(
+        &format!("the {tool} call"),
+        client.call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(args)),
+    )
+    .await
+    .expect("tool call must not be a protocol error")
 }
 
 /// Parse every line of the audit file (empty lines skipped, as the sink's
@@ -360,9 +367,7 @@ async fn every_routed_tool_writes_exactly_one_record_per_call() {
     // (I16) — is exercised by this one-record-per-call guarantee (I15).
     let audited = audited_client_for("[global]\nallow_discovery = true\n", &mock, "test-key").await;
 
-    let tools = audited
-        .client
-        .list_all_tools()
+    let tools = bounded("tools/list", audited.client.list_all_tools())
         .await
         .expect("list_tools must succeed");
     assert!(!tools.is_empty(), "the router lists the tool surface");
@@ -618,15 +623,20 @@ async fn unknown_and_stripped_tools_error_identically_and_still_record() {
 
     // Unknown tool: the same protocol error with auditing on or off,
     // plus exactly one record with outcome error.
-    let with_audit = audited
-        .client
-        .call_tool(CallToolRequestParams::new("no_such_tool".to_string()))
-        .await
-        .expect_err("unknown tool is a protocol error");
-    let without = plain
-        .call_tool(CallToolRequestParams::new("no_such_tool".to_string()))
-        .await
-        .expect_err("unknown tool is a protocol error");
+    let with_audit = bounded(
+        "the audited no_such_tool call",
+        audited
+            .client
+            .call_tool(CallToolRequestParams::new("no_such_tool".to_string())),
+    )
+    .await
+    .expect_err("unknown tool is a protocol error");
+    let without = bounded(
+        "the unaudited no_such_tool call",
+        plain.call_tool(CallToolRequestParams::new("no_such_tool".to_string())),
+    )
+    .await
+    .expect_err("unknown tool is a protocol error");
     assert_eq!(
         format!("{with_audit:?}"),
         format!("{without:?}"),
@@ -643,29 +653,32 @@ async fn unknown_and_stripped_tools_error_identically_and_still_record() {
     assert!(tc.guard.is_none(), "no guard ran for an unknown tool");
 
     // A write tool stripped by read-only mode (I13) is an unknown tool.
-    let with_audit = audited
-        .client
-        .call_tool(
+    let with_audit = bounded(
+        "the audited add_comment call",
+        audited.client.call_tool(
             CallToolRequestParams::new("add_comment".to_string()).with_arguments(
                 serde_json::Map::from_iter([
                     ("bug_id".to_string(), json!(7)),
                     ("comment".to_string(), json!("hi")),
                 ]),
             ),
-        )
-        .await
-        .expect_err("a stripped tool is a protocol error");
-    let without = plain
-        .call_tool(
+        ),
+    )
+    .await
+    .expect_err("a stripped tool is a protocol error");
+    let without = bounded(
+        "the unaudited add_comment call",
+        plain.call_tool(
             CallToolRequestParams::new("add_comment".to_string()).with_arguments(
                 serde_json::Map::from_iter([
                     ("bug_id".to_string(), json!(7)),
                     ("comment".to_string(), json!("hi")),
                 ]),
             ),
-        )
-        .await
-        .expect_err("a stripped tool is a protocol error");
+        ),
+    )
+    .await
+    .expect_err("a stripped tool is a protocol error");
     assert_eq!(format!("{with_audit:?}"), format!("{without:?}"));
     let events = read_events(&audited.audit_path);
     assert_eq!(events.len(), 3, "one more record for the stripped call");
@@ -679,15 +692,20 @@ async fn unknown_and_stripped_tools_error_identically_and_still_record() {
     // file and the OTLP export, and it is recorded whatever it is. Four
     // times the cap, through the real transport.
     let huge = "z".repeat(RECORDED_MAX_CHARS * 4);
-    let with_audit = audited
-        .client
-        .call_tool(CallToolRequestParams::new(huge.clone()))
-        .await
-        .expect_err("an unknown tool is a protocol error whatever its length");
-    let without = plain
-        .call_tool(CallToolRequestParams::new(huge.clone()))
-        .await
-        .expect_err("an unknown tool is a protocol error whatever its length");
+    let with_audit = bounded(
+        "the audited oversized-name call",
+        audited
+            .client
+            .call_tool(CallToolRequestParams::new(huge.clone())),
+    )
+    .await
+    .expect_err("an unknown tool is a protocol error whatever its length");
+    let without = bounded(
+        "the unaudited oversized-name call",
+        plain.call_tool(CallToolRequestParams::new(huge.clone())),
+    )
+    .await
+    .expect_err("an unknown tool is a protocol error whatever its length");
     assert_eq!(
         format!("{with_audit:?}"),
         format!("{without:?}"),
@@ -2552,11 +2570,14 @@ async fn a_protocol_error_records_no_response_size() {
     mount_fixture(&mock).await;
     let audited = audited_client_for("", &mock, "test-key").await;
 
-    let err = audited
-        .client
-        .call_tool(CallToolRequestParams::new("no_such_tool".to_string()))
-        .await
-        .expect_err("an unknown tool is a protocol error");
+    let err = bounded(
+        "the no_such_tool call",
+        audited
+            .client
+            .call_tool(CallToolRequestParams::new("no_such_tool".to_string())),
+    )
+    .await
+    .expect_err("an unknown tool is a protocol error");
     drop(err);
 
     let events = read_events(&audited.audit_path);
