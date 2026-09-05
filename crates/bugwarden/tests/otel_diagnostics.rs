@@ -20,8 +20,9 @@
 //!   exporter's `reqwest`/`hyper` events be exported and turns one flush
 //!   into an endless self-feeding one;
 //! - exporting a field's value without the sink's per-field budget or
-//!   without its escaping (#260, #266) — the collector is reached by the
-//!   same rmcp lines stderr is, and a bound only stderr has is not one;
+//!   without its escaping (#260, #266, #275) — the collector is reached
+//!   by the same rmcp lines stderr is, and a bound only stderr has is
+//!   not one;
 //! - swapping which of `message` and the other fields leads the body,
 //!   on either the `Debug` path or the `&str` one;
 //! - dropping the separator a second body field opens with, which a
@@ -43,8 +44,11 @@ type Posted = Arc<Mutex<Vec<Vec<u8>>>>;
 /// it is testing agrees with any value.
 const CAP: usize = 1024;
 
-/// The byte a terminal reads as the start of a control sequence.
+/// The byte a terminal reads as the start of a control sequence, and the
+/// two that end a line for whatever reads the exported body next (#275).
 const ESC: char = '\u{1b}';
+const LF: char = '\u{a}';
+const CR: char = '\u{d}';
 
 /// A collector that answers OTLP posts and LOGS NOTHING ITSELF.
 ///
@@ -234,9 +238,10 @@ async fn the_servers_diagnostics_reach_the_collector_but_the_exporters_own_do_no
 
     tracing::info!(answer = 42, "otel-diagnostics-probe");
     // The body answers to the same per-field bound and the same escaping
-    // the stderr layer applies (#260, #266). Multi-byte after the ESC, so
-    // a byte budget cannot pass for a character one.
-    let over_cap = format!("{ESC}{}", "é".repeat(CAP * 4));
+    // the stderr layer applies (#260, #266, #275). Multi-byte after the
+    // three control bytes, so a byte budget cannot pass for a character
+    // one.
+    let over_cap = format!("{ESC}{LF}{CR}{}", "é".repeat(CAP * 4));
     // Two fields, so the assertion below also pins that a cut field
     // leaves the separator and the field after it intact.
     tracing::info!(probe = %over_cap, next = "after", "otel-diagnostics-cap-probe");
@@ -324,13 +329,21 @@ async fn the_servers_diagnostics_reach_the_collector_but_the_exporters_own_do_no
     assert_eq!(
         capped.0,
         format!(
-            "otel-diagnostics-cap-probe probe=\\x1b{} next=after",
-            "é".repeat(CAP - 1)
+            "otel-diagnostics-cap-probe probe=\\x1b\\n\\r{} next=after",
+            "é".repeat(CAP - 3)
         ),
         "the body's field is cut at {CAP} characters as handed in, the \
-         ESC among them and escaped on the way out, and the field after \
-         it still opens with its own separator"
+         three control bytes among them and escaped on the way out, and \
+         the field after it still opens with its own separator"
     );
+    for (byte, name) in [(LF, "LF"), (CR, "CR")] {
+        assert!(
+            !capped.0.contains(byte),
+            "a raw {name} must not reach the collector: the exported \
+             body is read line by line as often as stderr is: {:?}",
+            capped.0
+        );
+    }
 
     assert!(
         !records

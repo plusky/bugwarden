@@ -1,5 +1,5 @@
 //! What the SHIPPED BINARY's tracing lines carry of a client's own strings
-//! and id arrays (issues #240, #258, #260, #266).
+//! and id arrays (issues #240, #258, #260, #266, #275).
 //!
 //! The audit record caps every client string at 1024 chars before it
 //! reaches the JSONL file or the OTLP audit stream; the `info!` line the
@@ -14,8 +14,8 @@
 //! the handshake, the notifications and the request ids of a client this
 //! process never gave a `Capped` to. Those are bounded at the SINK, by
 //! the field formatter `main` installs (#260), and sanitized there too
-//! (#266) — and only a process can show it, because the formatter is
-//! part of the subscriber `main` builds and of nothing else.
+//! (#266, #275) — and only a process can show it, because the formatter
+//! is part of the subscriber `main` builds and of nothing else.
 //!
 //! Coverage contract (each of these mutations must fail a test here):
 //! - the stderr layer built without `fmt_fields`, or with a formatter
@@ -28,10 +28,29 @@
 //!   probe is multi-byte;
 //! - `bug_info` or `update_bug_dependencies` logging an id array whole, or
 //!   a head without the count that says how long the array really was;
-//! - ESC or BEL reaching stderr unescaped. BS, FF, DEL and the C1 range
-//!   are in the same match arm but are not probed here; the module's own
-//!   `the_escaping_matches_what_default_fields_does_to_a_message` walks
-//!   the whole byte set, and a process is the wrong instrument for that.
+//! - ESC or BEL reaching stderr unescaped (#266), probed on a `query`
+//!   of ours and on the two fields rmcp writes that no code here fronts,
+//!   its `%id` and its `?peer_info`;
+//! - CR or TAB reaching stderr unescaped (#275), probed on a `query` of
+//!   ours and on rmcp's `message` — the one field for which a child
+//!   process is the only instrument;
+//! - LF or U+2028 ending a line the client did not open. No absence
+//!   assertion can see those: LF is what separates the lines being read,
+//!   and U+2028 is not. So
+//!   `a_client_field_can_neither_end_a_stderr_line_nor_open_one` counts
+//!   tracing lines against a SECOND child given the same session with
+//!   those characters replaced by spaces, and pins the forged text to
+//!   the tool's own line.
+//!   `an_unparsable_line_reaches_the_message_field_escaped` is the
+//!   `message` half and spawns ONE child, counting the forged text's
+//!   occurrences: rmcp's reader is line-delimited, so an LF ends
+//!   the frame before rmcp sees it and that row smuggles CR and TAB
+//!   inside one instead;
+//! - the rest of C0, DEL, the C1 range and U+2029 are in the same match
+//!   arms but are not probed here. `tracing_fields`' own
+//!   `every_escaped_character_leaves_the_sink_as_its_escape` walks every
+//!   character in the set against a spelled-out table, and a child
+//!   process is the wrong instrument for 67 rows;
 //!
 //! What this file NO LONGER proves, since #260, is anything about the
 //! call SITES. `%Capped(&p.query)` and `%p.query` render identically once
@@ -85,6 +104,29 @@ const PROBE: char = 'é';
 /// one it rings the bell for (#266).
 const ESC: char = '\u{1b}';
 const BEL: char = '\u{7}';
+
+/// The characters that end a line, or a column, for whatever reads
+/// stderr next (#275). LF is the line separator itself; CR is one to a
+/// terminal and to a good many log shippers; TAB ends a column in the
+/// field-separated formats they parse into; and U+2028 ends a line for
+/// every consumer that splits the way Python, Java and JavaScript do,
+/// which is why the sink escapes it even though stderr itself does not
+/// break on it.
+const LF: char = '\u{a}';
+const CR: char = '\u{d}';
+const TAB: char = '\u{9}';
+const LS: char = '\u{2028}';
+
+/// A tracing line as `main`'s formatter writes one, made of nothing but
+/// characters a client may put in a `query`.
+///
+/// The forgery this exists to stop: a value carrying LF ends the line
+/// the server was writing and this text begins another, with a
+/// timestamp, a level and a bugwarden target of the client's choosing.
+/// Nothing reads the date; `FORGED LINE` is what tells this text from a
+/// real line, and the midnight timestamp is a shape no line this server
+/// writes will ever have.
+const FORGED_LINE: &str = "2026-09-05T00:00:00.000000Z  INFO bugwarden::server: FORGED LINE";
 
 /// Each binary runs the walker itself, so a single-binary
 /// `cargo test --test binary_tracing_caps` still proves what its scrub claims.
@@ -308,13 +350,20 @@ fn longest_run(text: &str, probe: char) -> usize {
     longest
 }
 
-/// No raw ESC and no raw BEL anywhere on stderr, and both present in
-/// their escaped spellings so the absence is evidence rather than an
-/// empty haystack.
-fn assert_control_bytes_escaped(log: &str) {
-    for (byte, name, escaped) in [(ESC, "ESC", "\\x1b"), (BEL, "BEL", "\\x07")] {
+/// None of `bytes` raw in any line's TEXT, and each present in its
+/// escaped spelling so the absence is evidence rather than an empty
+/// haystack.
+///
+/// "In any line's text" is the honest scope. `log` was assembled from
+/// tokio's `Lines`, which pops a trailing `\n` and then a trailing `\r`
+/// (tokio 1.53 `io/util/lines.rs:126-129`), so a CR sitting immediately
+/// before a line end is gone before this function ever sees it. Both
+/// #275 rows put their CR in the middle of a value, where that blind
+/// spot does not reach.
+fn assert_escaped_never_raw(log: &str, bytes: &[(char, &str, &str)]) {
+    for (byte, name, escaped) in bytes {
         assert!(
-            !log.contains(byte),
+            !log.contains(*byte),
             "a raw {name} reached stderr: {}",
             excerpt(log)
         );
@@ -324,6 +373,21 @@ fn assert_control_bytes_escaped(log: &str) {
             excerpt(log)
         );
     }
+}
+
+/// No raw ESC and no raw BEL anywhere on stderr (#266).
+fn assert_control_bytes_escaped(log: &str) {
+    assert_escaped_never_raw(log, &[(ESC, "ESC", "\\x1b"), (BEL, "BEL", "\\x07")]);
+}
+
+/// No raw CR and no raw TAB in stderr's line texts (#275).
+///
+/// LF is not in this list and cannot be: it is the separator between the
+/// lines being read. That the client's LF opened no line of its own is
+/// what the line COUNT in the rows below proves instead, and U+2028 is
+/// held to the same count for the same reason.
+fn assert_cr_and_tab_escaped(log: &str) {
+    assert_escaped_never_raw(log, &[(CR, "CR", "\\r"), (TAB, "TAB", "\\t")]);
 }
 
 /// The value the tracing line gives `field`; `ends_with` is `None` when the
@@ -690,7 +754,7 @@ async fn an_over_long_request_id_is_cut_at_the_sink() {
 /// would have been the wrong fix and the sink is the right one.
 ///
 /// `service.rs:1535` logs the whole request at debug, `params` and every
-/// argument included. `transport/async_rw.rs:336` logs the whole
+/// argument included. `transport/async_rw.rs:335` logs the whole
 /// UNPARSABLE line at debug, once per malformed line — and it is the
 /// `message` field, so only a sink that budgets `message` bounds it.
 /// Measured on this branch's parent at `RUST_LOG=debug`: 100 330
@@ -806,6 +870,130 @@ async fn rmcps_own_fields_never_reach_stderr_as_raw_control_bytes() {
         "rmcp's `%id` is the field with no `Debug` to fall back on: {}",
         excerpt(line)
     );
+}
+
+/// A LINE is the unit an operator greps and a log shipper ships, so a
+/// client field carrying LF used to end the server's line and open one
+/// of its own (#275): the escape set copied from `EscapeGuard` in #266
+/// left LF, CR and TAB raw. Measured on this branch's parent, a `query`
+/// of `a`CR`b`TAB`c`LF plus a hand-written timestamp put a second,
+/// well-formed `INFO bugwarden::server:` line on stderr.
+///
+/// U+2028 rides along in the same value. It ends no line HERE — stderr
+/// and this test both split on LF alone — so the count below is blind
+/// to it and only the field assertion binds; that is enough to keep the
+/// arm honest end to end, and the unit table is where the character is
+/// really pinned.
+///
+/// Two assertions on the forgery, because either alone can be met by
+/// accident: the forged text must sit ON the tool line and on no other,
+/// and the count of tracing lines must equal the count the SAME session
+/// produces with those characters replaced by spaces. The second is the
+/// one the issue asks for by name, and the pair costs one extra child.
+#[tokio::test]
+async fn a_client_field_can_neither_end_a_stderr_line_nor_open_one() {
+    let forging = format!("a{CR}b{TAB}c{LS}d{LF}{FORGED_LINE}");
+    // Same session, same query length, same needle: only the characters
+    // under test differ, so a difference in the line count is theirs.
+    let plain = forging.replace([CR, TAB, LF, LS], " ");
+
+    let mut runs = Vec::new();
+    for query in [plain, forging] {
+        runs.push(
+            stderr_through(
+                &[
+                    initialize("binary-tracing-caps-test"),
+                    initialized(),
+                    tools_call(json!(2), "bugs_quicksearch", json!({ "query": query })),
+                ],
+                None,
+                "tool: bugs_quicksearch",
+            )
+            .await,
+        );
+    }
+    let (plain_log, forged_log) = (&runs[0], &runs[1]);
+
+    // The forgery first, because it is what the issue is: the text after
+    // the client's LF must not stand as a line of its own.
+    let forged_lines: Vec<&str> = forged_log
+        .lines()
+        .filter(|line| line.contains("FORGED LINE"))
+        .collect();
+    assert_eq!(
+        forged_lines.len(),
+        1,
+        "the forged text may appear on exactly one line: {}",
+        excerpt(forged_log)
+    );
+    assert!(
+        forged_lines[0].contains("query="),
+        "and that line must be the tool's own, not a line of the \
+         client's making: {}",
+        excerpt(forged_log)
+    );
+    assert_eq!(
+        tracing_lines(forged_log).count(),
+        tracing_lines(plain_log).count(),
+        "a client's LF may not add a line to stderr:\nforged: {}\nplain: {}",
+        excerpt(forged_log),
+        excerpt(plain_log)
+    );
+
+    assert_eq!(
+        logged_field(
+            find_line(forged_log, "tool: bugs_quicksearch"),
+            "query=",
+            Some(" status=")
+        ),
+        format!("a\\rb\\tc\\u{{2028}}d\\n{FORGED_LINE}"),
+        "and the whole of it stays inside one field, escaped: {}",
+        excerpt(forged_log)
+    );
+    assert_cr_and_tab_escaped(forged_log);
+}
+
+/// The same forgery through rmcp's `message`, which no field name of this
+/// workspace fronts: `transport/async_rw.rs:335` echoes an unparsable
+/// line whole at debug, and only a sink that escapes `message` bounds it.
+///
+/// CR and not LF, because rmcp's reader is line-delimited: an LF ends the
+/// frame before rmcp sees it, so CR is the byte a client can smuggle
+/// INSIDE one. It reached stderr raw on this branch's parent, where a
+/// terminal reads it as a return to column zero and a good many log
+/// shippers read it as a line of its own.
+#[tokio::test]
+async fn an_unparsable_line_reaches_the_message_field_escaped() {
+    let garbage = format!("garbage{CR}{TAB}{FORGED_LINE}");
+    let log = stderr_through(
+        &[
+            initialize("binary-tracing-caps-test"),
+            initialized(),
+            // Not JSON, and not a prefix of any: rmcp echoes it whole.
+            garbage,
+            tools_call(json!(2), "bugs_quicksearch", json!({ "query": "kernel" })),
+        ],
+        Some("debug"),
+        "tool: bugs_quicksearch",
+    )
+    .await;
+
+    let parse_failure = find_line(&log, "Failed to parse message");
+    assert!(
+        parse_failure.contains(&format!("garbage\\r\\t{FORGED_LINE}")),
+        "rmcp's whole unparsable line rides `message`, and its control \
+         bytes must be escaped there too: {}",
+        excerpt(parse_failure)
+    );
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("FORGED LINE"))
+            .count(),
+        1,
+        "and the forgery stays on that one line: {}",
+        excerpt(&log)
+    );
+    assert_cr_and_tab_escaped(&log);
 }
 
 #[tokio::test]

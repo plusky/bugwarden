@@ -47,9 +47,11 @@ async fn main() -> anyhow::Result<()> {
     // the same filter, so both carry the same events.
     //
     // `fmt_fields` is the bound on what a client can put there (#260,
-    // #266): every field of every line, ours and rmcp's alike, is cut at
-    // 1024 chars and has ESC, BEL, BS, FF, DEL and the C1 range escaped,
-    // whatever this filter says.
+    // #266, #275): every field of every line, ours and rmcp's alike, is
+    // cut at 1024 chars and has every control character and every
+    // mandatory line break escaped — C0, DEL, C1 and U+2028/U+2029
+    // — whatever this filter says. LF is in that set, so a field can
+    // no longer end this line and open one of its own.
     let registry = tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(
