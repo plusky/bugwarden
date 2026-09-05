@@ -3258,10 +3258,18 @@ wired, `server.rs` and `main.rs` are the reference.
   payload absent from the reply and from every captured tracing line
   (#253; the probe is a panicking route added through rmcp's own
   `ToolRoute::new_dyn`, so no production path carries a test-only branch,
-  and every call is bounded by a deadline so the old defect fails a test
-  instead of hanging the run), and that recovery line is pinned at WARN
-  rather than ERROR (#270), which is a level decision and not a weakened
-  assertion — the same test also refuses a line that still says ERROR;
+  and a 30s deadline now bounds three classes of await across these tests
+  — every request sent through an rmcp client, the `initialize` handshake
+  and a re-`initialize` on a live session included; every direct
+  in-process `ServerHandler` await, `call_tool` reaching the same
+  `dispatch` with no client or transport in between and `list_tools`
+  alongside it; and every raw reqwest POST a harness aims at `/mcp`, which
+  reqwest bounds because there is no single future to wrap — so a request
+  the server never answers fails ONE test rather than parking the binary
+  and everything cargo queues behind it, #254), and that recovery line is
+  pinned at WARN rather than ERROR (#270), which is a level decision and
+  not a weakened assertion — the same test also refuses a line that still
+  says ERROR;
   the refusal map is total over the full router; responses are
   byte-identical with auditing off, on, and failing-open; suppressed ids
   are in the record and never in the envelope; content and API-key

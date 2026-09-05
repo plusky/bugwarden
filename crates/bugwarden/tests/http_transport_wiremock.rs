@@ -80,10 +80,18 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 #[path = "common/raw_post.rs"]
 mod raw_post;
 
+#[path = "common/deadline.rs"]
+mod deadline;
+
+#[path = "common/raw_client.rs"]
+mod raw_client;
+
 #[path = "common/pinned_cli.rs"]
 mod pinned_cli;
 
+use deadline::bounded;
 use pinned_cli::pinned;
+use raw_client::raw_client;
 
 /// Build the http-transport `Cli` against `mock`, with `key_file` when the
 /// test runs in server-held mode.
@@ -191,7 +199,7 @@ async fn connect(addr: SocketAddr, header_value: Option<&str>) -> RunningService
         builder.build().expect("reqwest client"),
         StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp")),
     );
-    ().serve(transport)
+    bounded("the MCP handshake", ().serve(transport))
         .await
         .expect("MCP handshake must succeed")
 }
@@ -205,9 +213,11 @@ async fn try_call(
     let Value::Object(args) = args else {
         panic!("tool arguments must be a JSON object");
     };
-    client
-        .call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(args))
-        .await
+    bounded(
+        &format!("the {tool} call"),
+        client.call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(args)),
+    )
+    .await
 }
 
 /// All text blocks of a result, concatenated.
@@ -455,7 +465,7 @@ async fn a_client_addressing_the_server_by_name_is_served() {
     let cli = http_cli(&mock, Some(file.path()));
     let addr = serve_http(cli, "", &mock, None).await;
 
-    let response = reqwest::Client::new()
+    let response = raw_client()
         .post(format!("http://{addr}/mcp"))
         .header("Host", "bugwarden.example:8080")
         .header("Accept", "application/json, text/event-stream")
@@ -498,7 +508,7 @@ async fn allowed_hosts_serve_the_named_authority_and_refuse_the_others() {
     let addr = serve_http(Arc::new(cli), "", &mock, None).await;
 
     for (host, served) in [("bugwarden.example:8080", true), ("evil.example", false)] {
-        let response = reqwest::Client::new()
+        let response = raw_client()
             .post(format!("http://{addr}/mcp"))
             .header("Host", host)
             .header("Accept", "application/json, text/event-stream")
@@ -538,7 +548,7 @@ async fn an_allowed_hosts_entry_naming_no_host_leaves_validation_off() {
     cli.allowed_hosts = vec![String::new()];
     let addr = serve_http(Arc::new(cli), "", &mock, None).await;
 
-    let response = reqwest::Client::new()
+    let response = raw_client()
         .post(format!("http://{addr}/mcp"))
         .header("Host", "bugwarden.example:8080")
         .header("Accept", "application/json, text/event-stream")
@@ -622,7 +632,7 @@ async fn a_handshake_free_call_is_refused_and_never_names_a_client() {
     let addr = serve_http(cli, "", &mock, Some(audit)).await;
 
     // Raw HTTP: no rmcp client will build this request, which is the point.
-    let response = reqwest::Client::new()
+    let response = raw_client()
         .post(format!("http://{addr}/mcp"))
         .header("Accept", "application/json, text/event-stream")
         .header("Content-Type", "application/json")
@@ -702,7 +712,7 @@ async fn discover_names_this_build_and_reaches_nothing_else() {
     let cli = http_cli(&mock, Some(file.path()));
     let addr = serve_http(cli, "", &mock, None).await;
 
-    let response = reqwest::Client::new()
+    let response = raw_client()
         .post(format!("http://{addr}/mcp"))
         .header("Accept", "application/json, text/event-stream")
         .header("Content-Type", "application/json")
@@ -914,8 +924,7 @@ async fn traceparent_over_http_lands_in_the_audit_record() {
     let mut meta = rmcp::model::RequestMetaObject::new();
     meta.set_traceparent(traceparent);
     params.meta = Some(meta);
-    let traced = client
-        .call_tool(params)
+    let traced = bounded("the traced bug_info call", client.call_tool(params))
         .await
         .expect("a traced bug_info must not be a protocol error");
 

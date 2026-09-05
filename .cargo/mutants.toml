@@ -19,9 +19,29 @@ test_workspace = true
 # `cargo test --workspace` (~20s unmutated) at max(20s, 5x baseline) = 20s.
 # That alone reported a dozen guard.rs mutants as timeouts; most resolve at
 # 20-23s. The floor must also clear this suite's failure paths, which hold
-# deliberate multi-second barriers (an 8s bounded wait in otel_wiremock, 20s
+# deliberate multi-second barriers (a 30s deadline on every request a test
+# awaits from the server, an 8s bounded wait in otel_wiremock, 20s
 # child-process budgets in binary_user_agent and http_auth_wiremock) so a
 # broken build fails instead of hanging -- an additive cost no multiple of a
-# 20s happy path expresses. A floor and not --timeout, so the 5x multiplier
-# still scales past it on a slow runner or once upstream fixes the baseline.
+# 20s happy path expresses.
+#
+# The 30s deadline is the largest, and it is paid PER TEST, not once: a
+# mutant that leaves requests unanswered costs a binary
+# ceil(failing tests / test threads) x 30s, since libtest defaults its
+# thread count to the core count. Measured under a hand-applied
+# CatchUnwind mutant that answers nothing, on a 32-core box and then at
+# --test-threads=4 to stand in for a small runner: the lib binary's 22
+# failures take 31s and 158s, audit_wiremock's 36 take 60s and 271s,
+# tools_wiremock's 82 take 91s and 632s. Four threads is thus already the
+# edge -- the floor holds for a mutant the lib binary catches, and cargo
+# reaches that binary first, but one that hangs ONLY a wiremock harness
+# outruns the floor and reports TIMEOUT with its verdict unknown. That
+# residual is #254's and is left standing on purpose: a shorter deadline
+# converts hangs sooner but flakes sooner too, on the smaller runners
+# ci.yml's rust-macos job and this workflow use, and the lever for the
+# residual is this floor or a --test-threads pinned in mutants.yml rather
+# than the constant the tests share.
+#
+# A floor and not --timeout, so the 5x multiplier still scales past it on a
+# slow runner or once upstream fixes the baseline.
 minimum_test_timeout = 300

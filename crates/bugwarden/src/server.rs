@@ -6717,11 +6717,50 @@ mod tests {
                 let _ = running.waiting().await;
             }
         });
-        ().serve(client_io)
+        bounded("the MCP handshake", ().serve(client_io))
             .await
             .expect("MCP handshake must succeed")
     }
 
+    /// Bound on every request these tests await — over the duplex
+    /// transport and in process alike.
+    ///
+    /// rmcp 3.1.4 sends with `PeerRequestOptions::default()`, whose
+    /// `timeout` is `None` (`service.rs`), and its `initialize` handshake
+    /// reads the response off the transport with no deadline either. A
+    /// request the server never answers therefore waits forever: it hangs
+    /// its test, this whole binary, and every binary cargo queues behind
+    /// it. That failure is the one this module hunts (#253, #254), so it
+    /// must fail ONE test rather than decide how long the run takes. A
+    /// direct `ServerHandler::call_tool` await is bounded for the same
+    /// reason: it reaches the same dispatch, and the mutants that hung the
+    /// suite were inside it. So is a hand-sent second `initialize` — over
+    /// a live session that is an ordinary request, answered or not.
+    ///
+    /// 30s is far above anything legitimate here — no test delays a mock
+    /// and every upstream is loopback or absent — and it is the number
+    /// `tests/common/deadline.rs` gives the integration harnesses. Two
+    /// definitions of it exist, not one: a `#[cfg(test)]` module in the
+    /// library cannot reach `tests/`, so nothing but this sentence keeps
+    /// them equal. Move one and move the other; the reasoning for the
+    /// value itself lives in that file.
+    const CALL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Await `fut` under [`CALL_DEADLINE`], panicking if it does not
+    /// resolve. `what` names the request, because the panic is all a
+    /// reader of a CI log gets.
+    async fn bounded<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(CALL_DEADLINE, fut)
+            .await
+            .unwrap_or_else(|_| panic!("{what} was not answered within {CALL_DEADLINE:?}"))
+    }
+
+    /// Call `tool` over the session, under [`CALL_DEADLINE`].
+    ///
+    /// The bound carries weight wherever this follows a call that panicked:
+    /// "the session survives" is a claim that a reply ARRIVES, so an
+    /// unbounded await would turn a missing one into a hang rather than
+    /// the failure it is.
     async fn call(
         client: &RunningService<RoleClient, ()>,
         tool: &str,
@@ -6730,10 +6769,12 @@ mod tests {
         let Value::Object(args) = args else {
             panic!("tool arguments must be a JSON object");
         };
-        client
-            .call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(args))
-            .await
-            .expect("tool call must not be a protocol error")
+        bounded(
+            &format!("the {tool} call"),
+            client.call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(args)),
+        )
+        .await
+        .expect("tool call must not be a protocol error")
     }
 
     fn text_of(result: &CallToolResult) -> String {
@@ -6989,8 +7030,7 @@ mod tests {
         let mut meta = rmcp::model::RequestMetaObject::new();
         meta.set_traceparent(traceparent);
         params.meta = Some(meta);
-        client
-            .call_tool(params)
+        bounded(&format!("the traced {tool} call"), client.call_tool(params))
             .await
             .expect("tool call must not be a protocol error")
     }
@@ -7032,35 +7072,38 @@ mod tests {
             }
         });
         let client: RunningService<RoleClient, ()> =
-            ().serve(client_io)
+            bounded("the MCP handshake", ().serve(client_io))
                 .await
                 .expect("MCP handshake must succeed");
 
         assert!(
-            client
-                .list_all_tools()
+            bounded("tools/list", client.list_all_tools())
                 .await
                 .expect("tools/list must succeed")
                 .is_empty(),
             "a request with no scope must be offered nothing"
         );
-        let refused = client
-            .call_tool(
+        let refused = bounded(
+            "the scope-refused bug_info call",
+            client.call_tool(
                 CallToolRequestParams::new("bug_info".to_string()).with_arguments(
                     json!({ "bug_ids": [7] })
                         .as_object()
                         .expect("object")
                         .clone(),
                 ),
-            )
-            .await
-            .expect_err("a request with no scope must reach no tool");
-        let unknown = client
-            .call_tool(CallToolRequestParams::new(
+            ),
+        )
+        .await
+        .expect_err("a request with no scope must reach no tool");
+        let unknown = bounded(
+            "the no_such_tool_at_all call",
+            client.call_tool(CallToolRequestParams::new(
                 "no_such_tool_at_all".to_string(),
-            ))
-            .await
-            .expect_err("an unknown tool is an error");
+            )),
+        )
+        .await
+        .expect_err("an unknown tool is an error");
         assert_eq!(refused.to_string(), unknown.to_string());
     }
 
@@ -7084,14 +7127,16 @@ mod tests {
             }
         });
         let client: RunningService<RoleClient, ()> =
-            ().serve(client_io)
+            bounded("the MCP handshake", ().serve(client_io))
                 .await
                 .expect("MCP handshake must succeed");
 
-        client
-            .call_tool(CallToolRequestParams::new("add_comment".to_string()))
-            .await
-            .expect_err("the call must be refused");
+        bounded(
+            "the scope-refused add_comment call",
+            client.call_tool(CallToolRequestParams::new("add_comment".to_string())),
+        )
+        .await
+        .expect_err("the call must be refused");
         drop(client);
 
         let events = read_audit_events(&audit_path);
@@ -7389,37 +7434,20 @@ mod tests {
         )
     }
 
-    /// Every call in this cluster is bounded by this. A request the server
-    /// never answers must fail one test, not hang the whole binary (#254),
-    /// and that is the exact defect under test.
-    const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-
     /// Call the probe and return the protocol error the request must be
-    /// answered with.
+    /// answered with. Bounded like every request here, and here the bound
+    /// is the point: a panicking handler that answers nothing is the exact
+    /// defect under test.
     async fn panic_probe_error(client: &RunningService<RoleClient, ()>) -> McpError {
-        let answered = tokio::time::timeout(
-            PROBE_DEADLINE,
+        let answered = bounded(
+            "the panic probe",
             client.call_tool(CallToolRequestParams::new(PANIC_PROBE.to_string())),
         )
-        .await
-        .expect("a panicking handler must still answer its request");
+        .await;
         match answered {
             Err(rmcp::service::ServiceError::McpError(err)) => err,
             other => panic!("a recovered panic is a protocol error, got {other:?}"),
         }
-    }
-
-    /// [`call`] under [`PROBE_DEADLINE`]. The follow-up matters as much as
-    /// the panicking call: "the session survives" is a claim about a reply
-    /// arriving, so an unbounded await would turn its absence into a hang.
-    async fn call_bounded(
-        client: &RunningService<RoleClient, ()>,
-        tool: &str,
-        args: Value,
-    ) -> CallToolResult {
-        tokio::time::timeout(PROBE_DEADLINE, call(client, tool, args))
-            .await
-            .expect("the next call on the same session must still be answered")
     }
 
     /// The reply is fixed, carries no `data`, and nothing derived from the
@@ -7461,7 +7489,7 @@ mod tests {
         assert_panic_reply(&err);
 
         // The session survives the unwind: the next call is served.
-        let served = call_bounded(&client, "mcp_server_info", json!({})).await;
+        let served = call(&client, "mcp_server_info", json!({})).await;
         assert!(!is_error(&served), "the session must keep serving");
 
         let events = read_audit_events(&audit_path);
@@ -7484,7 +7512,7 @@ mod tests {
         let client = mcp_client_routed("", NO_BUGZILLA, None, true).await;
         let err = panic_probe_error(&client).await;
         assert_panic_reply(&err);
-        let served = call_bounded(&client, "mcp_server_info", json!({})).await;
+        let served = call(&client, "mcp_server_info", json!({})).await;
         assert!(!is_error(&served), "the session must keep serving");
     }
 
@@ -7560,7 +7588,9 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(1 << 16);
         let serving = server.clone();
         let task = tokio::spawn(async move { serving.serve(server_io).await });
-        let _client = ().serve(client_io).await.expect("MCP handshake must succeed");
+        let _client = bounded("the MCP handshake", ().serve(client_io))
+            .await
+            .expect("MCP handshake must succeed");
         task.await
             .expect("serve task must not panic")
             .expect("server must serve")
@@ -7639,9 +7669,12 @@ mod tests {
         for (row, client, _) in &rows {
             let mut context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer.clone());
             context.meta = per_request_meta(ProtocolVersion::V_2026_07_28, client.clone());
-            ServerHandler::call_tool(&server, local_call(), context)
-                .await
-                .unwrap_or_else(|e| panic!("{row}: a per-request call is served: {e}"));
+            bounded(
+                &format!("{row}: the in-process call"),
+                ServerHandler::call_tool(&server, local_call(), context),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{row}: a per-request call is served: {e}"));
         }
 
         let events = read_audit_events(&audit_path);
@@ -7674,11 +7707,14 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(1 << 16);
         let serving = server.clone();
         let task = tokio::spawn(async move { serving.serve(server_io).await });
-        let _client = InitializeRequestParams::new(
-            ClientCapabilities::default(),
-            Implementation::new(name.to_owned(), "1"),
+        let _client = bounded(
+            "the MCP handshake",
+            InitializeRequestParams::new(
+                ClientCapabilities::default(),
+                Implementation::new(name.to_owned(), "1"),
+            )
+            .serve(client_io),
         )
-        .serve(client_io)
         .await
         .expect("MCP handshake must succeed");
         task.await
@@ -7720,9 +7756,12 @@ mod tests {
             "no version key, so this request belongs to the handshake arm"
         );
 
-        ServerHandler::call_tool(&server, local_call(), context)
-            .await
-            .expect("an ordinary in-session call is served");
+        bounded(
+            "the in-process call",
+            ServerHandler::call_tool(&server, local_call(), context),
+        )
+        .await
+        .expect("an ordinary in-session call is served");
 
         let events = read_audit_events(&audit_path);
         let calls = tool_calls(&events);
@@ -7764,9 +7803,12 @@ mod tests {
             ProtocolVersion::V_2026_07_28,
             Some(json!({ "name": "stdio-client", "version": "1" })),
         );
-        ServerHandler::call_tool(&server, local_call(), context)
-            .await
-            .expect("a per-request call is served over stdio too");
+        bounded(
+            "the in-process call",
+            ServerHandler::call_tool(&server, local_call(), context),
+        )
+        .await
+        .expect("a per-request call is served over stdio too");
 
         let events = read_audit_events(&audit_path);
         let calls: Vec<&AuditEvent> = events
@@ -7807,11 +7849,14 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(1 << 16);
         let serving = server.clone();
         let task = tokio::spawn(async move { serving.serve(server_io).await });
-        let _client = InitializeRequestParams::new(
-            ClientCapabilities::default(),
-            Implementation::new(long_name.clone(), long_version.clone()),
+        let _client = bounded(
+            "the MCP handshake",
+            InitializeRequestParams::new(
+                ClientCapabilities::default(),
+                Implementation::new(long_name.clone(), long_version.clone()),
+            )
+            .serve(client_io),
         )
-        .serve(client_io)
         .await
         .expect("MCP handshake must succeed");
         let peer = task
@@ -7826,9 +7871,12 @@ mod tests {
             ProtocolVersion::V_2026_07_28,
             Some(json!({ "name": long_name, "version": long_version })),
         );
-        ServerHandler::call_tool(&server, local_call(), context)
-            .await
-            .expect("a per-request call is served");
+        bounded(
+            "the in-process call",
+            ServerHandler::call_tool(&server, local_call(), context),
+        )
+        .await
+        .expect("a per-request call is served");
 
         let events = read_audit_events(&audit_path);
         let recorded: Vec<&audit::ClientInfo> = events
@@ -7906,10 +7954,13 @@ mod tests {
             if *out_of_contract {
                 context.meta = per_request_meta(ProtocolVersion::V_2025_06_18, None);
             }
-            ServerHandler::call_tool(
-                &server,
-                CallToolRequestParams::new((*sent).to_string()),
-                context,
+            bounded(
+                &format!("the {sent} call"),
+                ServerHandler::call_tool(
+                    &server,
+                    CallToolRequestParams::new((*sent).to_string()),
+                    context,
+                ),
             )
             .await
             .expect_err("refused either way, and the refusal is not what moves");
@@ -7976,10 +8027,13 @@ mod tests {
             if out_of_contract {
                 context.meta = per_request_meta(ProtocolVersion::V_2025_06_18, None);
             }
-            ServerHandler::call_tool(
-                &server,
-                CallToolRequestParams::new("no_such_tool".to_string()),
-                context,
+            bounded(
+                "the no_such_tool call",
+                ServerHandler::call_tool(
+                    &server,
+                    CallToolRequestParams::new("no_such_tool".to_string()),
+                    context,
+                ),
             )
             .await
             .expect_err("refused either way, and the refusal is not what moves");
@@ -8027,10 +8081,13 @@ mod tests {
         }) else {
             panic!("tool arguments must be a JSON object");
         };
-        ServerHandler::call_tool(
-            &server,
-            CallToolRequestParams::new("bug_url".to_string()).with_arguments(args),
-            context,
+        bounded(
+            "the bug_url call",
+            ServerHandler::call_tool(
+                &server,
+                CallToolRequestParams::new("bug_url".to_string()).with_arguments(args),
+                context,
+            ),
         )
         .await
         .expect("an off-schema object key is ignored, not rejected");
@@ -8101,10 +8158,13 @@ mod tests {
             .with_audit(Arc::clone(&audit));
         let peer = peer_of(&server).await;
         let context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer);
-        ServerHandler::call_tool(
-            &server,
-            CallToolRequestParams::new("bug_url".to_string()).with_arguments(args),
-            context,
+        bounded(
+            "the bug_url call",
+            ServerHandler::call_tool(
+                &server,
+                CallToolRequestParams::new("bug_url".to_string()).with_arguments(args),
+                context,
+            ),
         )
         .await
         .expect("off-schema keys are ignored, not rejected");
@@ -8244,7 +8304,11 @@ mod tests {
                 serde_json::from_value(json!(declared)).expect("a wire revision parses");
             let mut context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer.clone());
             context.meta = per_request_meta(version, None);
-            let answer = ServerHandler::call_tool(&server, local_call(), context).await;
+            let answer = bounded(
+                &format!("{declared}: the in-process call"),
+                ServerHandler::call_tool(&server, local_call(), context),
+            )
+            .await;
             assert_eq!(
                 answer.is_ok(),
                 served,
@@ -8265,9 +8329,12 @@ mod tests {
         // And a request declaring nothing keeps the handshake arm: the
         // session's own revision never routes a request per-request.
         let context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer);
-        ServerHandler::call_tool(&server, local_call(), context)
-            .await
-            .expect("an ordinary in-session call is served");
+        bounded(
+            "the in-process call",
+            ServerHandler::call_tool(&server, local_call(), context),
+        )
+        .await
+        .expect("an ordinary in-session call is served");
     }
 
     #[tokio::test]
@@ -8297,7 +8364,12 @@ mod tests {
             async move {
                 let context = context_with_scope(peer, Some(Scope::Read));
                 let params = CallToolRequestParams::new(name.to_string());
-                match ServerHandler::call_tool(&server, params, context).await {
+                match bounded(
+                    &format!("the {name} call"),
+                    ServerHandler::call_tool(&server, params, context),
+                )
+                .await
+                {
                     Ok(ok) => format!("ok {ok:?}"),
                     Err(e) => format!("err {e}"),
                 }
@@ -8383,7 +8455,9 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(1 << 16);
         let serving = server.clone();
         let server_task = tokio::spawn(async move { serving.serve(server_io).await });
-        let _client = ().serve(client_io).await.expect("MCP handshake must succeed");
+        let _client = bounded("the MCP handshake", ().serve(client_io))
+            .await
+            .expect("MCP handshake must succeed");
         let running = server_task
             .await
             .expect("serve task must not panic")
@@ -8403,9 +8477,12 @@ mod tests {
             "the hand-built context must carry no meta — the params struct is the only source"
         );
 
-        let result = ServerHandler::call_tool(&server, params, context)
-            .await
-            .expect("the in-process call must not be a protocol error");
+        let result = bounded(
+            "the traced in-process call",
+            ServerHandler::call_tool(&server, params, context),
+        )
+        .await
+        .expect("the in-process call must not be a protocol error");
         let CallToolResponse::Complete(result) = result else {
             panic!("a served tool call completes; this build serves no other response kind")
         };
@@ -8460,9 +8537,12 @@ mod tests {
         request_row.meta = per_request_meta(ProtocolVersion::V_2026_07_28, None);
 
         for (row, context) in [("negotiated session", session_row), ("_meta", request_row)] {
-            let listed = ServerHandler::list_tools(&server, None, context)
-                .await
-                .expect("a 2026 listing is served");
+            let listed = bounded(
+                &format!("{row}: the in-process tools/list"),
+                ServerHandler::list_tools(&server, None, context),
+            )
+            .await
+            .expect("a 2026 listing is served");
             // On the JSON, not the enum: the wire spelling is what a caching
             // intermediary reads, and `CacheScope` renames lowercase.
             let json = serde_json::to_value(&listed).expect("the listing must serialize");
@@ -8522,9 +8602,12 @@ mod tests {
             ("no peer info", bare),
         ] {
             let context = RequestContext::<RoleServer>::new(RequestId::Number(1), peer);
-            let listed = ServerHandler::list_tools(&server, None, context)
-                .await
-                .expect("a legacy listing is served, not refused");
+            let listed = bounded(
+                &format!("{row}: the in-process tools/list"),
+                ServerHandler::list_tools(&server, None, context),
+            )
+            .await
+            .expect("a legacy listing is served, not refused");
             let json = serde_json::to_value(&listed).expect("the listing must serialize");
             assert!(
                 json.get("ttlMs").is_none(),
@@ -8609,8 +8692,7 @@ mod tests {
                 Implementation::new(name, "1"),
             )
             .with_protocol_version(asked);
-            let client = probe
-                .serve(client_io)
+            let client = bounded("the MCP handshake", probe.serve(client_io))
                 .await
                 .expect("the handshake must succeed");
 
@@ -8661,7 +8743,9 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(1 << 16);
         let serving = server.clone();
         let server_task = tokio::spawn(async move { serving.serve(server_io).await });
-        let client = ().serve(client_io).await.expect("the handshake must succeed");
+        let client = bounded("the MCP handshake", ().serve(client_io))
+            .await
+            .expect("the handshake must succeed");
         // Held, not dropped: this is the live session's own peer, and it is
         // the only way to read back what the handler stored.
         let running = server_task
@@ -8689,11 +8773,13 @@ mod tests {
         // 2026-07-28 is served, and moves the session in the last row.
         let asked: ProtocolVersion =
             serde_json::from_value(json!("9999-01-01")).expect("a wire revision parses");
-        let answered = client
-            .peer()
-            .send_request(ClientRequest::InitializeRequest(InitializeRequest::new(
-                ClientInfo::default().with_protocol_version(asked),
-            )))
+        let second =
+            client
+                .peer()
+                .send_request(ClientRequest::InitializeRequest(InitializeRequest::new(
+                    ClientInfo::default().with_protocol_version(asked),
+                )));
+        let answered = bounded("the second initialize", second)
             .await
             .expect("a second initialize is answered, not dropped");
         let ServerResult::InitializeResult(answered) = answered else {
@@ -8721,15 +8807,16 @@ mod tests {
         // mirror of the one fixed: stored disagreeing with answered. Both
         // ends of the served range, so a list that lost either end fails.
         for probe in [ProtocolVersion::V_2024_11_05, ProtocolVersion::V_2026_07_28] {
-            let answered = client
-                .peer()
-                .send_request(ClientRequest::InitializeRequest(InitializeRequest::new(
+            let again = client.peer().send_request(ClientRequest::InitializeRequest(
+                InitializeRequest::new(
                     InitializeRequestParams::new(
                         ClientCapabilities::default(),
                         Implementation::new("renegotiating-client", "9.9"),
                     )
                     .with_protocol_version(probe.clone()),
-                )))
+                ),
+            ));
+            let answered = bounded(&format!("{probe}: the renegotiating initialize"), again)
                 .await
                 .expect("a supported renegotiation is answered");
             let ServerResult::InitializeResult(answered) = answered else {
@@ -8826,11 +8913,8 @@ mod tests {
                 let _ = running.waiting().await;
             }
         });
-        // Bounded: a handler that never answers should fail this test, not
-        // stall the run until CI's own timeout kills it.
-        let client = tokio::time::timeout(std::time::Duration::from_secs(10), ().serve(client_io))
+        let client = bounded("the MCP handshake", ().serve(client_io))
             .await
-            .expect("the handshake must not hang")
             .expect("the handshake must succeed");
 
         let advertised = client
