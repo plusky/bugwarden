@@ -35,6 +35,7 @@ use crate::audit::{self, AuditCell, AuditState, FailMode, TransportKind, Verdict
 use crate::config::{Cli, KeyCustody, Transport};
 use crate::http_auth::{self, Scope};
 use crate::stdio::BoundedLines;
+use crate::tracing_fields::PARAM_VALUE_MAX_CHARS;
 
 /// The MCP revisions this build actually implements, newest last.
 ///
@@ -329,10 +330,11 @@ const PARAM_ALLOWLIST: &[&str] = &[
     "version",
 ];
 
-/// Cap on recorded string values AND on object key names; see
-/// [`PARAM_ALLOWLIST`]. Also on every tracing field that formats a client
-/// string ([`Capped`], #240).
-const PARAM_VALUE_MAX_CHARS: usize = 1024;
+// The cap on recorded string values AND on object key names (see
+// `PARAM_ALLOWLIST`) is `PARAM_VALUE_MAX_CHARS`, imported above. It moved
+// to `tracing_fields` in #260, where the same constant bounds every field
+// of every tracing line at the sink: one number rather than two that have
+// to agree.
 
 /// Reserved key under which one recorded object holds its over-cap and
 /// reserved-name keys; see [`recorded_object`].
@@ -389,6 +391,15 @@ fn capped(value: &str) -> String {
 /// SILENTLY, no marker, exactly as the record's own cut does. [`capped`]
 /// delegates here, so there is one cut to remember (#191); the unit
 /// tests pin both at the boundary.
+///
+/// [`crate::tracing_fields`] now cuts every field of every line at the
+/// same bound, this one included, which MASKS these wrappers on stderr:
+/// `%Capped(&p.query)` and `%p.query` render the same bytes once the sink
+/// cuts at the same constant, so `binary_tracing_caps` measures the sink
+/// and no longer this. They stay anyway. [`capped`] delegates here and IS
+/// the record's cut, which `audit_wiremock` measures; `bug_ids` needs a
+/// count-plus-head SHAPE no sink can synthesise from a rendered value;
+/// and a second bound in front of the first costs a wrapper.
 struct Capped<'a>(&'a str);
 
 impl<'a> Capped<'a> {

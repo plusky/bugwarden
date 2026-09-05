@@ -1226,8 +1226,54 @@ Decisions, all deliberate:
   the record enforces and the handler's own `info!` line undoes is not a
   bound.
 
+  Since #260 the bound no longer depends on the SITE. `tracing_fields`
+  puts it where every line passes: the stderr layer's field formatter
+  (`fmt::layer().fmt_fields(CappedFields)`) and `otel`'s diagnostics body
+  visitor write each field's value through one character budget, so every
+  field of every line is cut at `PARAM_VALUE_MAX_CHARS` — rmcp's own,
+  which print the whole handshake, every client notification and a raw
+  string request id, at whatever level and whatever `RUST_LOG` says. Each
+  value is also escaped there (#266): tracing-subscriber 0.3 sanitizes
+  `message` and `record_error` and nothing else, so a `%`-formatted
+  field reached the terminal verbatim, and most of the client strings
+  this codebase logs are `%` — a `query` of ESC `[2J` cleared the
+  operator's screen. (The `?`-formatted ones — `group_by`, `resolution`,
+  `priority`, `severity` — were already escaped by `str`'s own `Debug`,
+  as rmcp's `?peer_info` is; its `%id` is not.) The sink escapes ESC,
+  BEL, BS, FF, DEL and the C1 range, unconditionally, whatever the
+  writer's ANSI-sanitization setting says: that setting exists so that
+  TRUSTED sequences in a logged value pass through unchanged, and it is
+  not a channel a client may inherit. That set is `EscapeGuard`'s and no
+  larger, so LF, CR and TAB still pass — as they always did for
+  `message`, which `EscapeGuard` already covered — and a client field
+  carrying LF still forges a whole stderr line. That is #275, not this
+  bound's business: widening the set past what tracing-subscriber
+  escapes is a separate decision about a separate defect. The cap is
+  also per FIELD of a line and says nothing about how many LINES a
+  client can cause: rmcp logs every notification at `info`, so 300
+  `notifications/progress` still produce 301 lines, each bounded.
+
+  The call-site `Capped`s STAY, and the sink MASKS them on stderr: once
+  both cut at the same constant, `%Capped(&p.query)` and `%p.query` put
+  the same bytes on the line, so `binary_tracing_caps` now measures the
+  sink and nothing about the sites — measured, by removing a wrapper and
+  watching the suite stay green. They are kept for three reasons that
+  survive that. `capped()` shares their cut and is the AUDIT RECORD's,
+  which `audit_wiremock` measures and no sink touches. `bug_ids` needs a
+  count-plus-head shape, and a sink that sees only rendered characters
+  cannot synthesise one. And a bound in front of a bound costs a wrapper.
+  Where the two meet the sink's budget covers the rendered form,
+  decoration included, so an `?Option<Capped>` field spends six of its
+  1024 characters on `Some("` and loses the closing `")` to the cut: a
+  strict tightening, never a loosening, and the price of a cut that does
+  not depend on the site knowing it exists.
+
   The two lines a failed stdio handshake writes are bounded by a
-  different means, because a cap would not have reached them (#261).
+  different means, because the cut above is the wrong instrument for
+  them (#261): one of the two is no tracing event, so no sink reaches
+  it, and on the other a per-field cut would still leave 1024 characters
+  of the client's own frame in front of the operator, where the right
+  number is none.
   rmcp's `ServerInitializeError` carries the client's whole first frame
   in its `Debug` AND — through
   `ExpectedInitializeRequest`'s `#[error("…: {0:?}")]` — in its
@@ -1754,7 +1800,14 @@ names an endpoint.
   derives from the transport.
 - **What is exported.** One OTel log record per `AuditEvent` the sink
   persisted, plus the server's own `tracing` diagnostics; the two are told
-  apart by the `bugwarden.stream` attribute (`audit` / `diagnostics`). An
+  apart by the `bugwarden.stream` attribute (`audit` / `diagnostics`). A
+  DIAGNOSTICS record's body is the event's message followed by its
+  fields, built by `BodyVisitor`, and every value in it goes through the
+  same character budget and the same escaping the stderr formatter
+  applies (`tracing_fields`, #260/#266): the collector is the same
+  operator's stream, reached by the same uncapped rmcp lines, and a bound
+  only the terminal has is not a bound. That budget touches the
+  diagnostics body and nothing else. An
   audit record's body is the audit line VERBATIM — when a file is
   configured, the same bytes it holds, without the terminating newline and
   without the leading one a torn-line repair may have prefixed; a fileless
@@ -1822,12 +1875,17 @@ names an endpoint.
   peak (three copies of the batch's bytes); at the ceiling, ≈192 GiB and
   ≈256 GiB. Over stdio the same `max_request_body_bytes` bounds a frame
   (`BoundedLines`, #234), so the per-stream figures are identical. The
-  diagnostics queue is the same shape and not smaller. Since #240 the
-  server's OWN lines are bounded by their field count rather than by the
-  call (`error = %e` aside, #261), but rmcp's are not — its handshake and
-  notification lines print the client's frame whole (#260) — so the queue
-  stays unsized by record too. It DROPS what it cannot hold, where the audit queue refuses and
-  closes the fail-mode gate.
+  diagnostics queue is the same shape and not smaller, but since #260 it
+  is no longer unsized by record, and the figures above are the AUDIT
+  queue's alone. Every field of every diagnostic line is cut at 1024
+  characters at the sink — rmcp's handshake, notification, request and
+  parse-failure lines included — so a diagnostic record is at
+  most its callsite's field count × 1024 characters plus its field names,
+  `message` being one of those fields, and a character costs at most six
+  bytes once an escape expands it. A callsite's field count is fixed by
+  the code that logs, so count × cap is a real byte bound there. The diagnostics queue still DROPS what
+  it cannot hold, where the audit queue refuses and closes the fail-mode
+  gate.
 - **Decided-no: byte-bounding the queue (#235).** A byte budget (a
   `Semaphore` acquired per record in `accept`, released when the batch
   drops) would refuse audit records — and so close the gate for the whole
@@ -1842,9 +1900,12 @@ names an endpoint.
   records and the power-of-two drop line for the diagnostics. The
   numbers are large because a record is unbounded, and #220 decided
   against bounding one (a params-total cap) on the same terms —
-  the large records are the calls an operator most needs. This reopens
-  if a record-size cap ever lands: count × cap is then a real byte bound,
-  and the availability trade above stops being the whole argument.
+  the large records are the calls an operator most needs. This bullet is
+  about the AUDIT queue and the AUDIT record; the diagnostics record got
+  its own size cap in #260 and reopens nothing here. It reopens if a cap
+  on the audit record ever lands: count × cap is then a real byte bound
+  for this queue too, and the availability trade above stops being the
+  whole argument. Until then the decision stands as written.
 - **The drop line carries a count and a reason and nothing else.** The
   reason is a closed vocabulary (`queue_full`, `network`, `http_status`,
   `shutdown`) for the same purpose `GapReason` is one: a free-text reason

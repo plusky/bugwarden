@@ -15,6 +15,7 @@ pub mod http_session;
 pub mod otel;
 pub mod server;
 pub mod stdio;
+pub mod tracing_fields;
 
 #[cfg(test)]
 mod testlog;
