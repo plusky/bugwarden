@@ -1225,6 +1225,39 @@ Decisions, all deliberate:
   longer than `MAX_ASSESS_IDS`. Same operator, same collector — a bound
   the record enforces and the handler's own `info!` line undoes is not a
   bound.
+
+  The two lines a failed stdio handshake writes are bounded by a
+  different means, because a cap would not have reached them (#261).
+  rmcp's `ServerInitializeError` carries the client's whole first frame
+  in its `Debug` AND — through
+  `ExpectedInitializeRequest`'s `#[error("…: {0:?}")]` — in its
+  Display, so logging it and returning it from `main` put that frame on
+  stderr twice: once on the `serving error` line and once on the
+  `Error:` line Rust prints for a returned `anyhow::Error`. Neither
+  formats the error now. `serve_failure` (main.rs) maps the variant, and
+  for `ExpectedInitializeRequest` the frame's JSON-RPC kind, to one of
+  its own `&'static str`s, and that is the whole of what either line
+  says about the failure. The kind, because it comes from the enum and
+  is the diagnostic an operator needs; NOT the method name, because
+  `ClientRequest::CustomRequest` holds a free-form `method: String` and
+  rmcp's untagged deserialization routes every unrecognised method
+  there, which would put client bytes back into the line. The frame
+  kinds are matched in a nested `match` carrying no wildcard of its own,
+  so a fifth `JsonRpcMessage` kind fails the build rather than falling
+  into the outer wildcard, which is there for `ServerInitializeError`'s
+  `#[non_exhaustive]` alone.
+
+  One failure is named by the CALLER instead, because the classifier
+  cannot see it: this build's own frame-cap refusal reaches rmcp as a
+  read error, rmcp turns every read error into `receive() -> None`, and
+  `None` before the handshake is `ConnectionClosed` — indistinguishable
+  from the peer walking away. So the arm's own text stays neutral about
+  who ended the stream, and the `over_cap` flag the #267 arm already
+  reads picks the cap's sentence out of `OVER_CAP_CLOSE`, the same
+  constant the post-handshake refusal bails with: one refusal keeps one
+  description on either side of `initialize`. Nothing else moves: exit
+  status stays 1, and the `probed && !over_cap` hangup arm (#267) still
+  returns 0 ahead of both.
 - **The params caps bound content, not record size — and a total cap is a
   decided no** (#220). Array element and map entry counts are uncapped, so
   an allowlisted value's SHAPE can still make a large record; what bounds

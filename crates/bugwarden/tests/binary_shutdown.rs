@@ -15,6 +15,14 @@
 //! ordinary close, so after the handshake only the exit code tells a
 //! refused frame from a peer hangup.
 //!
+//! It also pins what the two lines a failed stdio handshake writes may say
+//! (#261). rmcp's `ServerInitializeError` carries the client's whole first
+//! frame in its Debug *and* its Display, so logging the error, or letting
+//! it reach `main`'s `anyhow::Result` where Rust prints `Error: {:?}` of
+//! it, put a client-sized string on stderr twice. `main` classifies it to
+//! one of its own literals instead, and only a process shows both lines:
+//! the exit line is written by the runtime after `main` returns.
+//!
 //! Coverage contract (each of these mutations must fail at least one test):
 //! - HTTP graceful-shutdown waiting only on `ctrl_c` (no SIGTERM);
 //! - stdio wrapping only `waiting()` and not `serve` (the handshake wait
@@ -25,7 +33,21 @@
 //! - stdio served on a bare `stdio()` instead of the bounded reader, which
 //!   buffers the whole frame and never exits;
 //! - stdio dropping the over-cap flag `main` checks after `waiting()`,
-//!   which exits 0 on a refusal it was the point of refusing.
+//!   which exits 0 on a refusal it was the point of refusing;
+//! - the over-cap frame refused BEFORE the handshake described as a peer
+//!   hangup, or in any wording but the one the post-handshake refusal uses;
+//! - either handshake-failure line formatting rmcp's error instead of the
+//!   classification, or the classification naming the wrong frame kind;
+//! - any `serve_failure` arm deleted so its failure falls to the wildcard,
+//!   or any two of its literals exchanged. Three arms have no row, and
+//!   cannot: `ExpectedInitializeRequest(None)` is constructed nowhere in
+//!   rmcp 3.1.4, `UnexpectedInitializeResponse` cannot happen while rmcp
+//!   maps this handler's own `InitializeResult` into the result it then
+//!   checks, and `Cancelled` needs a cancellation token `ServiceExt::serve`
+//!   creates and never cancels. cargo-mutants reaches only the OUTER
+//!   match's arms, so the four frame kinds share one generated mutant and
+//!   the rows that separate them are the exchanged-literal ones — which
+//!   is why the four texts differ in more than one word each.
 //!
 //! Both races this file used to lose (#173) were readiness barriers that
 //! did not prove what they had to, and both are answered in `main`:
@@ -96,6 +118,47 @@ const OVER_CAP_FRAME: usize = 5 * 1024 * 1024;
 const OVER_CAP_LINE: &str =
     "stdio frame exceeds the 4194304-byte request cap; closing the transport";
 
+/// The refusal `main` itself reports for that frame, and the whole of the
+/// line the process then exits with.
+///
+/// Two constants because they are two different statements: the one above
+/// is the reader saying which bound it applied, this one is `main` saying
+/// what became of the session. This one must read the same whichever side
+/// of `initialize` the frame arrived on.
+const OVER_CAP_CLOSE: &str = "stdio transport closed: an inbound frame exceeded the request cap";
+const OVER_CAP_EXIT_LINE: &str =
+    "Error: stdio transport closed: an inbound frame exceeded the request cap";
+
+/// The `serving error` line's prefix, and the whole of the exit line's.
+///
+/// `main` writes the first; the runtime writes the second from the
+/// `anyhow::Error` `main` returned. Both must be followed by a
+/// classification `main` authored and nothing else (#261).
+const SERVING_ERROR_PREFIX: &str = "serving error: ";
+const EXIT_LINE_PREFIX: &str = "Error: stdio serving failed: ";
+
+/// Ceiling on either of those lines, in characters.
+///
+/// The longest classification any of these rows can reach is 51 chars (53
+/// counting `UnexpectedInitializeResponse`, which nothing can reach), and
+/// the `serving error` line carries tracing's timestamp, level and target
+/// ahead of it — 111 chars measured. The defect these tests exist for
+/// produced 100 403 and 100 365, so anything between the two is a bound;
+/// 200 is chosen close enough to the real lines that a *new* client string
+/// leaking in would trip it too.
+const HANDSHAKE_LINE_MAX: usize = 200;
+
+/// A client string long enough that a line embedding it is bounded by the
+/// 4 MiB frame cap and by nothing else.
+const FILLER_CHARS: usize = 100_000;
+
+/// A run of filler this long appears in no line the binary authors, so
+/// finding one on stderr means client bytes reached it. Well under
+/// `PARAM_VALUE_MAX_CHARS`, so even a line merely *capped* at the server's
+/// usual 1024-char bound would still fail — these two lines carry no
+/// client text at all, not a shortened copy of it.
+const FILLER_RUN: usize = 64;
+
 /// A spawned binary, its pipes, and every stderr line it has written.
 struct Server {
     child: Child,
@@ -116,10 +179,16 @@ impl Server {
     /// Spawn the shipped binary with every environment fallback scrubbed.
     /// `kill_on_drop` reaps the child if an assertion panics.
     fn spawn(args: &[&str]) -> Self {
+        Self::spawn_with_stdout(args, Stdio::piped())
+    }
+
+    /// [`Self::spawn`] with the child's stdout chosen by the caller, for
+    /// the one row that needs a stdout nothing will ever read.
+    fn spawn_with_stdout(args: &[&str], stdout: Stdio) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_bugwarden"));
         cmd.args(args)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdout(stdout)
             .stderr(Stdio::piped());
         for var in scrub_env::AMBIENT_VARS {
             cmd.env_remove(var);
@@ -193,7 +262,17 @@ impl Server {
     /// Same bound as [`Self::assert_graceful_exit`]: without the cap the
     /// child buffers the whole frame and waits for a delimiter that never
     /// arrives, so `wait` times out here rather than the suite hanging.
-    async fn assert_over_cap_exit(mut self, what: &str) {
+    ///
+    /// The exit line is asserted for every caller, because it is the one
+    /// sentence the refusal must not vary: the cap fires the same way on
+    /// both sides of `initialize`, and rmcp hands the two sides different
+    /// error shapes for it — `ConnectionClosed` out of `serve`, an
+    /// ordinary `Ok` close out of `waiting()` — so nothing but this
+    /// assertion keeps them from drifting into two descriptions of one
+    /// refusal (#261). `pre_handshake` says the refusal came out of
+    /// `serve`, which additionally writes the classified `serving error`
+    /// line; the post-handshake arm writes only the exit line.
+    async fn assert_over_cap_exit(mut self, what: &str, pre_handshake: bool) {
         let status = tokio::time::timeout(EXIT_TIMEOUT, self.child.wait())
             .await
             .unwrap_or_else(|_| {
@@ -217,22 +296,208 @@ impl Server {
             "{what}: bugwarden must log the cap it enforced: {log}",
             log = self.log
         );
+        assert!(
+            self.log.lines().any(|line| line == OVER_CAP_EXIT_LINE),
+            "{what}: the process must exit naming the cap, in the one wording \
+             both sides of the handshake share: {log}",
+            log = self.log
+        );
+        let serving_error = self
+            .log
+            .lines()
+            .find(|line| line.contains(SERVING_ERROR_PREFIX));
+        if pre_handshake {
+            let line = serving_error.unwrap_or_else(|| {
+                panic!(
+                    "{what}: a refusal out of `serve` must log it: {log}",
+                    log = self.log
+                )
+            });
+            assert!(
+                line.ends_with(OVER_CAP_CLOSE),
+                "{what}: the `serving error` line must name the cap, not a \
+                 hangup the peer never chose: {line}"
+            );
+            assert!(
+                line.chars().count() <= HANDSHAKE_LINE_MAX,
+                "{what}: the `serving error` line must stay under \
+                 {HANDSHAKE_LINE_MAX} chars: {len} chars",
+                len = line.chars().count()
+            );
+        } else {
+            assert!(
+                serving_error.is_none(),
+                "{what}: a refusal out of `waiting()` never entered `serve`'s \
+                 error path: {log}",
+                log = self.log
+            );
+        }
+    }
+
+    /// The process exits `1`, and both lines a failed handshake writes
+    /// carry `classification` and nothing the client chose (#261).
+    ///
+    /// `forbidden` is checked against the WHOLE log, not just those two
+    /// lines: the frame reached rmcp's own tracing too, so a leak that
+    /// moved rather than stopped must fail here.
+    ///
+    /// Bounded like the other two waits: without the fix the process still
+    /// exits 1, so what fails here is the size and content of the lines,
+    /// not the wait. Stderr is drained BEFORE the wait, unlike the two
+    /// above: the unfixed lines are larger than a pipe, so a `wait()` first
+    /// deadlocks against the child's own blocked write and the assertions
+    /// below never run.
+    async fn assert_bounded_handshake_failure(
+        mut self,
+        what: &str,
+        classification: &str,
+        forbidden: Option<&str>,
+    ) {
+        // To EOF, which the exit closes — and the exit line is the LAST
+        // thing written, so nothing shorter sees it at all.
+        let drained = tokio::time::timeout(EXIT_TIMEOUT, async {
+            while self.next_stderr_line().await.is_some() {}
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "{what}: a failed handshake must end the process within {EXIT_TIMEOUT:?}: {log}",
+            log = self.log
+        );
+        let status = tokio::time::timeout(EXIT_TIMEOUT, self.child.wait())
+            .await
+            .unwrap_or_else(|_| panic!("{what}: the process must be reaped after its stderr ends"))
+            .expect("the child must be waitable");
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "{what}: a failed handshake must stay a failure exit: status={status:?} \
+             stderr={log}",
+            log = self.log
+        );
+        for prefix in [SERVING_ERROR_PREFIX, EXIT_LINE_PREFIX] {
+            let mut matched = self.log.lines().filter(|line| line.contains(prefix));
+            let line = matched.next().unwrap_or_else(|| {
+                panic!(
+                    "{what}: stderr must carry a {prefix:?} line: {log}",
+                    log = self.log
+                )
+            });
+            assert!(
+                matched.next().is_none(),
+                "{what}: {prefix:?} must be written once, not per attempt: {log}",
+                log = self.log
+            );
+            assert!(
+                line.ends_with(classification),
+                "{what}: {prefix:?} must be followed by the classification and \
+                 nothing else: {line}"
+            );
+            assert!(
+                line.chars().count() <= HANDSHAKE_LINE_MAX,
+                "{what}: {prefix:?} must stay under {HANDSHAKE_LINE_MAX} chars, \
+                 not grow with the frame: {len} chars",
+                len = line.chars().count()
+            );
+        }
+        if let Some(needle) = forbidden {
+            assert!(
+                !self.log.contains(needle),
+                "{what}: no {run}-char run of the client's own string may reach \
+                 stderr: {log}",
+                run = needle.chars().count(),
+                log = self.log
+            );
+        }
+    }
+
+    /// Write one newline-delimited frame, ignoring the write result and
+    /// bounding the wait: the child answers some of these and dies on all
+    /// of them, so the tail of a large frame may meet a closed pipe.
+    async fn write_frame(&mut self, frame: &str) {
+        let stdin = self.stdin.as_mut().expect("stdin is piped");
+        let _ = tokio::time::timeout(EXIT_TIMEOUT, stdin.write_all(frame.as_bytes())).await;
+        let _ = tokio::time::timeout(EXIT_TIMEOUT, stdin.write_all(b"\n")).await;
+    }
+
+    /// Close the child's stdin, which is the peer hanging up.
+    ///
+    /// Exposed to the same fd inheritance `stdout_with_no_reader` exists
+    /// to defeat — a sibling row's in-flight spawn holds a copy of this
+    /// write end — but benignly: an extra writer only DELAYS the child's
+    /// EOF until that sibling execs, and the frame it then reads is the
+    /// same one. Measured under eight threads spawning in a loop, the
+    /// worst close-to-exit was 20 ms against this file's 5s budget, and
+    /// no run read a different classification. Closing after the spawn is
+    /// also what the row is about: a peer that connected and left.
+    fn close_stdin(&mut self) {
+        self.stdin = None;
     }
 }
+
+/// A stdout with no reader anywhere, proven so before the child exists.
+///
+/// Closing the read end AFTER the spawn does not do this. `EPIPE` needs
+/// the reader count to be zero, and every concurrent `Command::spawn` in
+/// this process duplicates the whole fd table until its exec — so a
+/// sibling row's in-flight spawn holds a copy of this pipe's read end, the
+/// child's reply lands in the buffer instead of failing, and rmcp goes on
+/// to `ExpectedInitializeRequest`. That is what CI hit, and hammering
+/// `/bin/true` spawns from eight threads loses the same race here about a
+/// third of the time.
+///
+/// So the reader is dropped before anything can fork, and the probing
+/// write is the proof rather than an argument: `BrokenPipe` means the
+/// kernel counted zero readers at that instant, and a fork that had copied
+/// the fd earlier would still be holding it. Past that point this process
+/// owns no read end, so no later fork can make one and the child's write
+/// cannot succeed on any schedule. The retry is for the one case the probe
+/// itself can lose — a sibling that forked just before the drop and has
+/// not reached its exec — and normally does not run at all.
+fn stdout_with_no_reader() -> Stdio {
+    let (reader, mut writer) = std::io::pipe().expect("the test host must provide a pipe");
+    drop(reader);
+    for _ in 0..PROBE_ATTEMPTS {
+        match std::io::Write::write(&mut writer, b"\0") {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return Stdio::from(writer),
+            // A byte in the buffer is harmless: EPIPE counts readers, not
+            // bytes, so the child still fails once the last one is gone.
+            _ => std::thread::sleep(PROBE_WAIT),
+        }
+    }
+    panic!("a pipe whose only reader was dropped never became BrokenPipe");
+}
+
+/// `run` copies of `filler`, as one string: the needle a leaked client
+/// string would put on stderr.
+fn run_of(filler: char, run: usize) -> String {
+    std::iter::repeat_n(filler, run).collect()
+}
+
+/// Bound on [`stdout_with_no_reader`]'s probe: an inherited copy of the
+/// read end lives only until the forking sibling execs, which is orders of
+/// magnitude inside this, and a probe that never breaks means something
+/// other than a spawn race is holding the fd — worth failing over.
+const PROBE_ATTEMPTS: usize = 1000;
+const PROBE_WAIT: Duration = Duration::from_millis(1);
 
 /// Spawn the stdio transport with a Bugzilla server nothing will reach:
 /// the default policy needs no identity, so the preflight is a no-op and
 /// the process serves without a single upstream call.
 fn spawn_stdio() -> Server {
-    Server::spawn(&[
-        "--transport",
-        "stdio",
-        "--bugzilla-server",
-        "https://bugzilla.example.invalid",
-        "--api-key",
-        "test-key",
-    ])
+    Server::spawn(&STDIO_ARGS)
 }
+
+/// The arguments [`spawn_stdio`] uses, named so the one row that spawns
+/// with its own stdout starts the same server every other row does.
+const STDIO_ARGS: [&str; 6] = [
+    "--transport",
+    "stdio",
+    "--bugzilla-server",
+    "https://bugzilla.example.invalid",
+    "--api-key",
+    "test-key",
+];
 
 /// Complete the MCP handshake over the child's pipes, then keep draining
 /// its stdout so a cancel-path write cannot fill the pipe and block the
@@ -396,7 +661,7 @@ async fn stdio_an_over_cap_frame_before_the_handshake_exits_one() {
     server.wait_for_stderr(STDIO_READY).await;
     write_an_over_cap_frame(&mut server).await;
     server
-        .assert_over_cap_exit("stdio pre-handshake over-cap")
+        .assert_over_cap_exit("stdio pre-handshake over-cap", true)
         .await;
 }
 
@@ -411,7 +676,7 @@ async fn stdio_a_probe_then_an_over_cap_frame_still_exits_one() {
     let _drain = probe_and_drain(&mut server).await;
     write_an_over_cap_frame(&mut server).await;
     server
-        .assert_over_cap_exit("stdio probed pre-handshake over-cap")
+        .assert_over_cap_exit("stdio probed pre-handshake over-cap", true)
         .await;
 }
 
@@ -437,6 +702,180 @@ async fn stdio_an_over_cap_frame_after_initialize_exits_one() {
     let _drain = initialize_and_drain(&mut server).await;
     write_an_over_cap_frame(&mut server).await;
     server
-        .assert_over_cap_exit("stdio post-handshake over-cap")
+        .assert_over_cap_exit("stdio post-handshake over-cap", false)
+        .await;
+}
+
+#[tokio::test]
+async fn stdio_a_pre_initialize_tool_call_never_logs_the_frame() {
+    // The #261 reproduction. rmcp answers this frame -32602 (its `_meta`
+    // declares no handshake-free lifecycle) and then hands `main`
+    // `ExpectedInitializeRequest(Some(..))` holding the whole request, so
+    // both the `serving error` line and the runtime's `Error:` line grew
+    // with the query: 100 403 and 100 365 chars measured.
+    let mut server = spawn_stdio();
+    server.wait_for_stderr(STDIO_READY).await;
+    let query = run_of('a', FILLER_CHARS);
+    server
+        .write_frame(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"bug_info","arguments":{{"query":"{query}"}}}}}}"#
+        ))
+        .await;
+    server
+        .assert_bounded_handshake_failure(
+            "stdio pre-handshake tools/call",
+            "the first frame was a request other than initialize",
+            Some(&run_of('a', FILLER_RUN)),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn stdio_a_pre_initialize_notification_is_named_by_kind() {
+    // The other construction site: a non-request frame never reaches
+    // rmcp's `_meta` check, so this one is refused with no reply at all.
+    // The kind is the whole diagnostic — the method is not named, because
+    // `ClientRequest::CustomRequest` makes method names client free text.
+    let mut server = spawn_stdio();
+    server.wait_for_stderr(STDIO_READY).await;
+    server
+        .write_frame(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+        .await;
+    server
+        .assert_bounded_handshake_failure(
+            "stdio pre-handshake notification",
+            "the first frame was a notification, not initialize",
+            None,
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn stdio_a_pre_initialize_response_never_logs_its_id() {
+    // A JSON-RPC string id is client-chosen text of any length, and this
+    // frame carries nothing else worth logging — so the kind is named and
+    // the id is absent, not shortened.
+    let mut server = spawn_stdio();
+    server.wait_for_stderr(STDIO_READY).await;
+    let id = run_of('x', 4096);
+    server
+        .write_frame(&format!(r#"{{"jsonrpc":"2.0","id":"{id}","result":{{}}}}"#))
+        .await;
+    server
+        .assert_bounded_handshake_failure(
+            "stdio pre-handshake response",
+            "the first frame was a response, not initialize",
+            Some(&run_of('x', FILLER_RUN)),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn stdio_a_pre_initialize_error_reply_never_logs_its_message() {
+    // The fourth frame kind, and the one whose payload is free text by
+    // protocol: `ErrorData::message` is whatever the client wrote.
+    let mut server = spawn_stdio();
+    server.wait_for_stderr(STDIO_READY).await;
+    let message = run_of('e', FILLER_CHARS);
+    server
+        .write_frame(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"error":{{"code":-32000,"message":"{message}"}}}}"#
+        ))
+        .await;
+    server
+        .assert_bounded_handshake_failure(
+            "stdio pre-handshake error reply",
+            "the first frame was an error reply, not initialize",
+            Some(&run_of('e', FILLER_RUN)),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn stdio_a_hangup_before_initialize_is_classified_not_echoed() {
+    // `ConnectionClosed`, which an EOF, a read error and this build's own
+    // frame-cap refusal all reach — so the classification is deliberately
+    // neutral about who ended the stream, and the over-cap rows above pin
+    // the one case `main` can name. Its payload is server-authored today,
+    // which is exactly why it must not be echoed either: a `String` on a
+    // `#[non_exhaustive]` enum is an upstream bump away from client text.
+    let mut server = spawn_stdio();
+    server.wait_for_stderr(STDIO_READY).await;
+    server.close_stdin();
+    server
+        .assert_bounded_handshake_failure(
+            "stdio pre-handshake hangup",
+            "the stream ended before initialize",
+            None,
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn stdio_a_broken_stdout_during_the_handshake_is_classified() {
+    // The one arm reached by an I/O condition rather than by a frame:
+    // rmcp answers this request -32602 and the write meets a closed pipe,
+    // so `serve` returns `TransportError`. Its payload holds the
+    // transport's own type name and an `io::Error` — no client bytes, but
+    // it is a `DynamicTransportError` on a `#[non_exhaustive]` enum, so it
+    // is classified like every other arm rather than trusted.
+    // The stdout is dead before the child is spawned, not closed after it
+    // — see `stdout_with_no_reader` for why the difference is the whole
+    // determinism of this row.
+    let mut server = Server::spawn_with_stdout(&STDIO_ARGS, stdout_with_no_reader());
+    server.wait_for_stderr(STDIO_READY).await;
+    server
+        .write_frame(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+        .await;
+    server
+        .assert_bounded_handshake_failure(
+            "stdio pre-handshake broken stdout",
+            "the stdio transport failed during the handshake",
+            None,
+        )
+        .await;
+}
+
+/// The audit sink's own `initialize` refusal, reachable only on Linux.
+///
+/// `initialize` has exactly one production `Err`: a record the sink would
+/// not take under `fail_mode = "closed_all"`. Making a sink that already
+/// opened refuse a record afterwards needs the write to fail, and
+/// `/dev/full` — which opens like a regular file and answers every write
+/// `ENOSPC` — is the way to arrange that without privileges or a mount of
+/// this test's own. It is Linux-only, so this row is too: macOS runs the
+/// same suite and has no such device.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn stdio_a_refused_initialize_is_classified_not_echoed() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let config = dir.path().join("audit.toml");
+    std::fs::write(
+        &config,
+        "path = \"/dev/full\"\nfail_mode = \"closed_all\"\n",
+    )
+    .expect("the audit config must be writable");
+    let mut server = Server::spawn(&[
+        "--transport",
+        "stdio",
+        "--bugzilla-server",
+        "https://bugzilla.example.invalid",
+        "--api-key",
+        "test-key",
+        "--audit-config",
+        config.to_str().expect("a utf-8 temp path"),
+    ]);
+    server.wait_for_stderr(STDIO_READY).await;
+    server
+        .write_frame(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"binary-shutdown-test","version":"0"}}}"#,
+        )
+        .await;
+    server
+        .assert_bounded_handshake_failure(
+            "stdio initialize refused by the audit sink",
+            "this server refused initialize",
+            None,
+        )
         .await;
 }

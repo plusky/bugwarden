@@ -415,7 +415,16 @@ be provided up front via `--api-key` / `BUGZILLA_API_KEY` or `--api-key-file`
 line, bounded by the same cap as an HTTP POST body (see
 `global.max_attachment_bytes` below); a line that runs past it is refused,
 the transport closes and the process exits `1`, since nothing can be sent
-back for a request that was never parsed.
+back for a request that was never parsed. The first JSON-RPC message the
+server parses has to open a session — `initialize`, or a request whose
+`_meta` declares the handshake-free lifecycle (see *MCP protocol revisions*
+below); a `ping` or a `server/discover` probe may come first and commits
+neither. A line that is no JSON-RPC message at all does not count as that
+first message: an unparsable one is dropped, a well-formed one of the wrong
+shape is answered `-32600`, and the server goes on waiting either way. Any
+other opening message ends the process with exit `1`, and there the log line
+and the `Error:` line the process exits with name only the *kind* of message
+that arrived — never its content, whose size only the cap bounds.
 
 ```bash
 BUGZILLA_API_KEY=your_api_key \
