@@ -1223,11 +1223,14 @@ pub struct DiagnosticsLayer {
 /// `Debug`-quote it. That predates #260 and is not what it changed.
 ///
 /// Every value goes through a [`CappedWriter`], for the reason the stderr
-/// layer's own formatter does (#260, #266): the collector is the same
-/// operator's stream, reached by the same rmcp lines, and a bound the
-/// terminal has that the collector lacks is not a bound. So a body field
-/// is at most [`crate::tracing_fields::PARAM_VALUE_MAX_CHARS`] characters
-/// and carries no raw ESC, BEL, BS, FF, DEL or C1 byte.
+/// layer's own formatter does (#260, #266, #275): the collector is the
+/// same operator's stream, reached by the same rmcp lines, and a bound
+/// the terminal has that the collector lacks is not a bound. So a body
+/// field is at most [`crate::tracing_fields::PARAM_VALUE_MAX_CHARS`]
+/// characters and carries no raw control character and no raw line
+/// break — C0, DEL, C1 and U+2028/U+2029 — because a collector's
+/// viewer breaks a body into lines as readily as a terminal does, and
+/// splits on more characters than a terminal would.
 ///
 /// It also picks the `log.target` field out rather than rendering it. The
 /// `log` crate's records reach a `tracing` subscriber through

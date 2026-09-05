@@ -1239,19 +1239,70 @@ Decisions, all deliberate:
   this codebase logs are `%` — a `query` of ESC `[2J` cleared the
   operator's screen. (The `?`-formatted ones — `group_by`, `resolution`,
   `priority`, `severity` — were already escaped by `str`'s own `Debug`,
-  as rmcp's `?peer_info` is; its `%id` is not.) The sink escapes ESC,
-  BEL, BS, FF, DEL and the C1 range, unconditionally, whatever the
-  writer's ANSI-sanitization setting says: that setting exists so that
-  TRUSTED sequences in a logged value pass through unchanged, and it is
-  not a channel a client may inherit. That set is `EscapeGuard`'s and no
-  larger, so LF, CR and TAB still pass — as they always did for
-  `message`, which `EscapeGuard` already covered — and a client field
-  carrying LF still forges a whole stderr line. That is #275, not this
-  bound's business: widening the set past what tracing-subscriber
-  escapes is a separate decision about a separate defect. The cap is
-  also per FIELD of a line and says nothing about how many LINES a
-  client can cause: rmcp logs every notification at `info`, so 300
-  `notifications/progress` still produce 301 lines, each bounded.
+  as rmcp's `?peer_info` is; its `%id` is not.) The sink escapes every
+  control character and every mandatory line break — the whole C0
+  range, DEL, the C1 range and U+2028/U+2029 — unconditionally,
+  whatever the writer's ANSI-sanitization setting says: that setting
+  exists so that TRUSTED sequences in a logged value pass through
+  unchanged, and it is not a channel a client may inherit.
+
+  That set is WIDER than `EscapeGuard`'s (#275), and the difference is a
+  decision rather than a transcription slip. tracing-subscriber passes
+  LF, CR, TAB, the C0 bytes outside its five, and U+2028/U+2029 through
+  raw even in `message`, which is defensible for text a program wrote
+  and not for text a client chose: a LINE is the unit an operator greps
+  and a log shipper ships, so a `query` of `a` CR `b` TAB `c` LF
+  followed by a hand-written timestamp put a second, well-formed
+  `INFO bugwarden::server:` line on stderr that no reader could tell
+  from one the server wrote. U+2028 and U+2029 forge that line for a
+  consumer that splits the way Python's `str.splitlines`,
+  `java.util.Scanner` and ECMA-262 do, which stderr itself does not:
+  measured through the built binary before this arm widened, a `query`
+  of `a` LS followed by that timestamp left stderr 11 LF-separated lines
+  and 12 `splitlines` pieces, the forged one standing alone in the
+  second count. A client field can no longer end a line, return a
+  terminal to column zero, or open a column in a field-separated log.
+
+  Where the set STOPS is a rule rather than the reach of the last defect
+  reported. UAX #14 makes exactly seven characters mandatory breaks —
+  LF, VT, FF, CR, NEL, LS and PS — and every one but LS and PS already
+  sits inside C0 or C1. So "every control character, plus LS and PS"
+  covers every mandatory break with room to spare, and — unlike a list
+  grown one reported byte at a time — it is a set the next reader can
+  restate from a standard instead of from this paragraph.
+
+  Spellings. LF, CR and TAB are written `\n`, `\r` and `\t`, which is
+  how `str`'s own `Debug` writes them, so for those three — and only
+  those three — a `?` field and a `%` field carrying the same value
+  put identical bytes on the line. `Debug` writes `\0` for NUL and
+  `\u{..}` for the rest, so the two shapes disagree over the other 30
+  characters of C0 and DEL; that parity was never on offer and is not
+  claimed anywhere. Everything else is written the way `EscapeGuard`
+  writes the part the two sets share: `\xNN` for the five single
+  characters it covers (ESC, BEL, BS, FF and DEL), `\u{..}` for the
+  whole C1 range, and that same `\u{..}` for LS and PS. One field's
+  escapes stay one family. Both halves of the divergence are pinned by
+  unit tests, tracing-subscriber's own rendering included, so a later
+  "make it match tracing-subscriber" cleanup has to argue with a test
+  rather than delete a comment.
+
+  The rendering is NOT injective, and never was: a client that sends the
+  two characters `\` and `n` renders byte for byte as an escaped LF
+  does. A consumer that UNESCAPES a bugwarden line therefore hands the
+  forgery back to itself. Nothing this repo ships unescapes one, and the
+  property predates #275 — `\x1b` and everything `str`'s `Debug`
+  writes have always had it — but a downstream tool that "renders
+  escapes for readability" is the way to reopen this.
+
+  The cap is also per FIELD of a line and says nothing about how many
+  LINES a client can cause: rmcp logs every notification at `info`, so
+  300 `notifications/progress` still produce 301 lines, each bounded.
+  Nor does it stop a field's VALUE from carrying text SHAPED like a
+  later ` key=value` pair: a `query` of `evil status=HACKED limit=999`
+  renders as `query=evil status=HACKED limit=999 status=ALL …`, and a
+  parser that splits that line into fields reads a `status` the client
+  chose. #275 closes LINE forgery; intra-line field forgery is a
+  separate bound, and this one does not claim it.
 
   The call-site `Capped`s STAY, and the sink MASKS them on stderr: once
   both cut at the same constant, `%Capped(&p.query)` and `%p.query` put
@@ -1804,7 +1855,7 @@ names an endpoint.
   DIAGNOSTICS record's body is the event's message followed by its
   fields, built by `BodyVisitor`, and every value in it goes through the
   same character budget and the same escaping the stderr formatter
-  applies (`tracing_fields`, #260/#266): the collector is the same
+  applies (`tracing_fields`, #260/#266/#275): the collector is the same
   operator's stream, reached by the same uncapped rmcp lines, and a bound
   only the terminal has is not a bound. That budget touches the
   diagnostics body and nothing else. An
@@ -1881,8 +1932,9 @@ names an endpoint.
   characters at the sink — rmcp's handshake, notification, request and
   parse-failure lines included — so a diagnostic record is at
   most its callsite's field count × 1024 characters plus its field names,
-  `message` being one of those fields, and a character costs at most six
-  bytes once an escape expands it. A callsite's field count is fixed by
+  `message` being one of those fields, and a character costs at most
+  eight bytes once an escape expands it (`\u{2028}`, the widest the sink
+  writes). A callsite's field count is fixed by
   the code that logs, so count × cap is a real byte bound there. The diagnostics queue still DROPS what
   it cannot hold, where the audit queue refuses and closes the fail-mode
   gate.

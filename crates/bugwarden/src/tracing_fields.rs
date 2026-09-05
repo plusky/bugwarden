@@ -1,9 +1,10 @@
 //! The diagnostic stream's bound, applied at the SINK: every field of
 //! every tracing line is cut at [`PARAM_VALUE_MAX_CHARS`] characters and
-//! rewritten wherever it carries one of the control bytes
-//! tracing-subscriber escapes in `message` (#260, #266). That set is ESC,
-//! BEL, BS, FF, DEL and the C1 range, and no more: LF, CR and TAB pass
-//! through, which is #275's subject rather than this module's.
+//! rewritten wherever it carries a control character or a line break
+//! (#260, #266, #275). That set is the WHOLE C0 range `\x00`–`\x1f`,
+//! DEL, the C1 range `\u{80}`–`\u{9f}`, and U+2028 and U+2029 — every
+//! control character, and every line break Unicode makes mandatory. It
+//! is wider than the set tracing-subscriber escapes in `message`.
 //!
 //! bugwarden caps the client strings it logs at the CALL SITE
 //! (`server::Capped`), which bounds its own lines and nothing else. rmcp
@@ -26,7 +27,10 @@
 //! `record_debug`, whose `Debug` hands straight to its `Display` — so it
 //! reaches the terminal verbatim, and a `query` of ESC `[2J` clears the
 //! operator's screen while ESC `]0;` … BEL retitles it. [`CappedWriter`]
-//! escapes the bytes `EscapeGuard` does, for every field.
+//! escapes those bytes for every field, and #275's as well: a LINE is
+//! the unit stderr readers and log shippers trust, so a field carrying
+//! LF ended one line and opened another that a reader could not tell
+//! from one this server wrote.
 //!
 //! Parity with `DefaultFields` is a requirement, not a courtesy: a value
 //! under the cap carrying no control bytes must render byte for byte as
@@ -75,14 +79,38 @@ pub const PARAM_VALUE_MAX_CHARS: usize = 1024;
 /// bound with a hole. A strict tightening either way, and the price of a
 /// cut that does not depend on the site knowing it exists.
 ///
-/// Control bytes are escaped on the way through, in the rendering
-/// tracing-subscriber 0.3's own `EscapeGuard` uses for `message`: ESC,
-/// BEL, BS, FF and DEL become `\x1b`-style text and the C1 range
-/// `\u{80}`–`\u{9f}` becomes `\u{..}`. `EscapeGuard` is private to
-/// tracing-subscriber, so this is a copy of its byte set rather than a
-/// reuse, and a unit test below pins the rendering byte-equal to what
-/// `DefaultFields` produces for the same bytes in `message`. The escaping
-/// is UNCONDITIONAL — it does not consult
+/// Characters are escaped on the way through. The set is every C0 byte
+/// `\x00`–`\x1f`, DEL, every C1 byte `\u{80}`–`\u{9f}`, and U+2028
+/// and U+2029: every control character, plus the only two mandatory
+/// line breaks Unicode puts outside those ranges. UAX #14 makes LF, VT,
+/// FF, CR, NEL, LS and PS mandatory breaks, and all but the last two
+/// are C0 or C1 already — so the set ends where a rule ends it,
+/// rather than where the last reported defect happened to reach.
+///
+/// LF, CR and TAB are written `\n`, `\r` and `\t`, the spellings
+/// `str`'s own `Debug` uses. For THOSE THREE, and only those three, a
+/// `?`-formatted field — escaped by `Debug` long before it reaches
+/// this adapter — and a `%`-formatted one carrying the same text put
+/// identical bytes on the line. The two part company over the rest of
+/// C0 and DEL, where `Debug` writes `\0` and `\u{..}` against this
+/// adapter's `\xNN`; that parity was never on offer and is not claimed.
+/// Everything else in the set is written the way tracing-subscriber
+/// 0.3's own `EscapeGuard` writes the part of it the two share: `\xNN`
+/// for the five single characters it covers (ESC, BEL, BS, FF and DEL)
+/// and `\u{..}` for the whole C1 range. Borrowing those two spellings
+/// keeps one field's escapes one family rather than two.
+///
+/// Wider than `EscapeGuard`'s set, deliberately (#275). It passes LF,
+/// CR, TAB, the C0 bytes outside its five, and U+2028/U+2029 through
+/// raw even in `message` — defensible for text a program wrote, and
+/// not for text a client chose: a LINE is the unit an operator greps
+/// and a log shipper ships, so a `query` carrying LF ended the server's
+/// line and opened one of its own, timestamp and level and target
+/// included. Unit tests below pin both halves of the divergence, so a
+/// later "make it match tracing-subscriber" cleanup has to argue with a
+/// test rather than delete a comment.
+///
+/// The escaping is UNCONDITIONAL — it does not consult
 /// `Writer::sanitizes_ansi_escapes`, whose `false` setting exists so that
 /// TRUSTED sequences in logged values pass through unchanged, which is
 /// exactly the channel a client must never inherit.
@@ -109,15 +137,23 @@ impl<W: fmt::Write> fmt::Write for CappedWriter<'_, W> {
             }
             self.remaining -= 1;
             match ch {
-                // The C0 bytes a terminal reads as the start of, or part
-                // of, a control sequence.
-                '\x1b' => self.inner.write_str("\\x1b")?,
-                '\x07' => self.inner.write_str("\\x07")?,
-                '\x08' => self.inner.write_str("\\x08")?,
-                '\x0c' => self.inner.write_str("\\x0c")?,
-                '\x7f' => self.inner.write_str("\\x7f")?,
-                // C1: the 8-bit forms of the same sequences.
-                '\u{80}'..='\u{9f}' => write!(self.inner, "\\u{{{:x}}}", ch as u32)?,
+                // The three that end a line or a column for a reader,
+                // in `str`'s own `Debug` spellings — the three, and no
+                // others, where a `?` field (already escaped by `Debug`
+                // before it gets here) and a `%` field carrying the
+                // same text read alike.
+                '\n' => self.inner.write_str("\\n")?,
+                '\r' => self.inner.write_str("\\r")?,
+                '\t' => self.inner.write_str("\\t")?,
+                // The rest of C0, and DEL: `EscapeGuard`'s `\xNN`,
+                // widened from the five it spells that way to the range.
+                '\x00'..='\x1f' | '\x7f' => write!(self.inner, "\\x{:02x}", ch as u32)?,
+                // C1, the 8-bit forms of the same sequences, and the
+                // two mandatory line breaks Unicode puts outside both
+                // control ranges (#275).
+                '\u{80}'..='\u{9f}' | '\u{2028}' | '\u{2029}' => {
+                    write!(self.inner, "\\u{{{:x}}}", ch as u32)?
+                }
                 _ => self.inner.write_char(ch)?,
             }
         }
@@ -278,6 +314,82 @@ mod tests {
     /// ESC, the byte a terminal reads as the start of a control sequence.
     const ESC: char = '\x1b';
 
+    /// Every character the sink rewrites, with the text it writes for
+    /// it.
+    ///
+    /// Spelled out rather than computed from the same `match` the code
+    /// uses: a table derived from the implementation agrees with any
+    /// implementation, including a broken one.
+    const ESCAPES: [(char, &str); 67] = [
+        ('\u{00}', "\\x00"),
+        ('\u{01}', "\\x01"),
+        ('\u{02}', "\\x02"),
+        ('\u{03}', "\\x03"),
+        ('\u{04}', "\\x04"),
+        ('\u{05}', "\\x05"),
+        ('\u{06}', "\\x06"),
+        ('\u{07}', "\\x07"),
+        ('\u{08}', "\\x08"),
+        ('\u{09}', "\\t"),
+        ('\u{0a}', "\\n"),
+        ('\u{0b}', "\\x0b"),
+        ('\u{0c}', "\\x0c"),
+        ('\u{0d}', "\\r"),
+        ('\u{0e}', "\\x0e"),
+        ('\u{0f}', "\\x0f"),
+        ('\u{10}', "\\x10"),
+        ('\u{11}', "\\x11"),
+        ('\u{12}', "\\x12"),
+        ('\u{13}', "\\x13"),
+        ('\u{14}', "\\x14"),
+        ('\u{15}', "\\x15"),
+        ('\u{16}', "\\x16"),
+        ('\u{17}', "\\x17"),
+        ('\u{18}', "\\x18"),
+        ('\u{19}', "\\x19"),
+        ('\u{1a}', "\\x1a"),
+        ('\u{1b}', "\\x1b"),
+        ('\u{1c}', "\\x1c"),
+        ('\u{1d}', "\\x1d"),
+        ('\u{1e}', "\\x1e"),
+        ('\u{1f}', "\\x1f"),
+        ('\u{7f}', "\\x7f"),
+        ('\u{80}', "\\u{80}"),
+        ('\u{81}', "\\u{81}"),
+        ('\u{82}', "\\u{82}"),
+        ('\u{83}', "\\u{83}"),
+        ('\u{84}', "\\u{84}"),
+        ('\u{85}', "\\u{85}"),
+        ('\u{86}', "\\u{86}"),
+        ('\u{87}', "\\u{87}"),
+        ('\u{88}', "\\u{88}"),
+        ('\u{89}', "\\u{89}"),
+        ('\u{8a}', "\\u{8a}"),
+        ('\u{8b}', "\\u{8b}"),
+        ('\u{8c}', "\\u{8c}"),
+        ('\u{8d}', "\\u{8d}"),
+        ('\u{8e}', "\\u{8e}"),
+        ('\u{8f}', "\\u{8f}"),
+        ('\u{90}', "\\u{90}"),
+        ('\u{91}', "\\u{91}"),
+        ('\u{92}', "\\u{92}"),
+        ('\u{93}', "\\u{93}"),
+        ('\u{94}', "\\u{94}"),
+        ('\u{95}', "\\u{95}"),
+        ('\u{96}', "\\u{96}"),
+        ('\u{97}', "\\u{97}"),
+        ('\u{98}', "\\u{98}"),
+        ('\u{99}', "\\u{99}"),
+        ('\u{9a}', "\\u{9a}"),
+        ('\u{9b}', "\\u{9b}"),
+        ('\u{9c}', "\\u{9c}"),
+        ('\u{9d}', "\\u{9d}"),
+        ('\u{9e}', "\\u{9e}"),
+        ('\u{9f}', "\\u{9f}"),
+        ('\u{2028}', "\\u{2028}"),
+        ('\u{2029}', "\\u{2029}"),
+    ];
+
     /// One event's fields rendered by both formatters.
     #[derive(Clone, Debug, Default)]
     struct Rendered {
@@ -384,14 +496,20 @@ mod tests {
         );
     }
 
-    /// Every control byte `EscapeGuard` rewrites, rendered exactly as
-    /// tracing-subscriber renders it in `message` — the property that
-    /// makes this a copy of that byte set rather than an approximation.
+    /// Every character `EscapeGuard` rewrites, rendered here exactly as
+    /// tracing-subscriber renders it in `message`: over that set the two
+    /// are byte-equal, which is what makes the spellings borrowed above
+    /// a reuse of its renderings rather than a guess at them.
+    ///
+    /// The probe stops at `EscapeGuard`'s set on purpose: where this
+    /// sink goes further (#275) the two differ by decision, and
+    /// [`the_characters_default_fields_leaves_raw_are_escaped_here`] is
+    /// where that half is pinned.
     #[test]
     fn the_escaping_matches_what_default_fields_does_to_a_message() {
         let probe: String = ['\x1b', '\x07', '\x08', '\x0c', '\x7f']
             .into_iter()
-            .chain(('\u{80}'..='\u{9f}').chain(['a', 'é', '\n', '\t', '"', '\\']))
+            .chain(('\u{80}'..='\u{9f}').chain(['a', 'é', '"', '\\']))
             .collect();
         // `DefaultFields` escapes `message` and `record_error` and
         // nothing else, so `message` is where the two renderings can be
@@ -415,6 +533,139 @@ mod tests {
             "the raw ESC this exists to stop must still be in what \
              `DefaultFields` writes: {:?}",
             field.default
+        );
+    }
+
+    /// Every character the sink escapes leaves it as the text
+    /// [`ESCAPES`] names, on the adapter and through the visitor alike
+    /// (#275).
+    ///
+    /// Both ranges walked whole rather than spot-checked: the characters
+    /// an attacker reaches for are not the ones a reviewer thinks of,
+    /// and a range arm is exactly the kind of code whose ends drift.
+    #[test]
+    fn every_escaped_character_leaves_the_sink_as_its_escape() {
+        assert_eq!(
+            ESCAPES.map(|(ch, _)| ch).to_vec(),
+            ('\u{00}'..='\u{1f}')
+                .chain(['\u{7f}'])
+                .chain('\u{80}'..='\u{9f}')
+                .chain(['\u{2028}', '\u{2029}'])
+                .collect::<Vec<char>>(),
+            "the table must walk C0, DEL, C1 and the two separators, \
+             in order and whole"
+        );
+        for (ch, escaped) in ESCAPES {
+            // Flanked, so an arm that swallowed the byte instead of
+            // escaping it cannot pass by leaving an empty string behind.
+            let value = format!("a{ch}b");
+            let mut out = String::new();
+            write!(CappedWriter::new(&mut out), "{value}")
+                .expect("a String never fails to be written");
+            assert_eq!(
+                out,
+                format!("a{escaped}b"),
+                "U+{:04X} must leave the adapter escaped",
+                ch as u32
+            );
+            assert_eq!(
+                render_one(|| tracing::info!(probe = %value)).capped,
+                format!("probe=a{escaped}b"),
+                "and the same through the field visitor, U+{:04X}",
+                ch as u32
+            );
+        }
+
+        // The characters immediately past each range stay raw, so an
+        // end that slipped by one is caught from the outside too: SPACE
+        // sits just above C0, NBSP just above C1.
+        for ch in [' ', '\u{a0}'] {
+            let value = format!("a{ch}b");
+            let mut out = String::new();
+            write!(CappedWriter::new(&mut out), "{value}")
+                .expect("a String never fails to be written");
+            assert_eq!(
+                out, value,
+                "U+{:04X} is outside the set and must pass through raw",
+                ch as u32
+            );
+        }
+    }
+
+    /// The divergence from `EscapeGuard`, pinned on both sides: over
+    /// the characters tracing-subscriber does NOT cover — LF, CR, TAB,
+    /// the C0 bytes outside its five, and U+2028/U+2029 — it writes the
+    /// raw character into `message` where this sink writes an escape
+    /// (#275).
+    ///
+    /// Asserting only our half would let a future "make it match
+    /// tracing-subscriber again" change delete the decision quietly; a
+    /// test that also states what tracing-subscriber does makes the
+    /// difference the subject rather than a side effect. One
+    /// representative of each uncovered group, since
+    /// [`every_escaped_character_leaves_the_sink_as_its_escape`] already
+    /// walks this side of the difference whole.
+    #[test]
+    fn the_characters_default_fields_leaves_raw_are_escaped_here() {
+        for (ch, escaped) in [
+            ('\n', "\\n"),
+            ('\r', "\\r"),
+            ('\t', "\\t"),
+            ('\u{01}', "\\x01"),
+            ('\u{2028}', "\\u{2028}"),
+        ] {
+            let probe = format!("a{ch}b");
+            let rendered = render_one(|| tracing::info!("{probe}"));
+            assert_eq!(
+                rendered.default, probe,
+                "tracing-subscriber leaves U+{:04X} raw even in \
+                 `message`, which is the thing being diverged from",
+                ch as u32
+            );
+            assert_eq!(
+                rendered.capped,
+                format!("a{escaped}b"),
+                "and this sink escapes it instead, by decision: U+{:04X}",
+                ch as u32
+            );
+        }
+    }
+
+    /// For LF, CR and TAB — and for those three only — a
+    /// `?`-formatted field and a `%`-formatted one carrying the same
+    /// text put the same bytes on the line, once the `?` one's own
+    /// quotes come off. That agreement is the entire reason the three
+    /// are spelled `\n`, `\r` and `\t` here rather than `\x0a`, `\x0d`
+    /// and `\x09`.
+    ///
+    /// It does not generalise, and is not meant to: `str`'s `Debug`
+    /// writes `\0` for NUL and `\u{1b}` for ESC where this sink writes
+    /// `\x00` and `\x1b`, so the two shapes disagree on the other 30
+    /// characters of C0 and DEL. The probe carries the three that agree,
+    /// which is the claim being made.
+    ///
+    /// The two arrive by different routes: `str`'s `Debug` has already
+    /// escaped the `?` field before the adapter sees it, and the adapter
+    /// escapes the `%` one itself. Reading alike is what makes one field
+    /// comparable with the one beside it.
+    #[test]
+    fn lf_cr_and_tab_read_alike_in_a_debug_field_and_a_display_one() {
+        let probe = "a\nb\tc\rd";
+        let rendered = render_one(|| tracing::info!(debug = ?probe, display = %probe)).capped;
+        let (debug, display) = rendered
+            .split_once(" display=")
+            .unwrap_or_else(|| panic!("both fields must reach the line: {rendered:?}"));
+        let debug = debug
+            .strip_prefix("debug=\"")
+            .and_then(|value| value.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("`str`'s `Debug` quotes its value: {debug:?}"));
+        assert_eq!(
+            debug, display,
+            "the two shapes must render one value identically: {rendered:?}"
+        );
+        assert_eq!(
+            display, "a\\nb\\tc\\rd",
+            "and in the spellings `Debug` chose: {rendered:?}"
         );
     }
 
@@ -535,8 +786,9 @@ mod tests {
     /// OUT.
     ///
     /// The two orders agree on ordinary text and differ by a factor of
-    /// four or six on escapable input, and it is the in-order one that
-    /// the rustdoc above and DESIGN.md's "at most six bytes per budgeted
+    /// up to eight on escapable input — `\u{2028}` is the widest
+    /// escape the sink writes — and it is the in-order one that the
+    /// rustdoc above and DESIGN.md's "at most eight bytes per budgeted
     /// character" rest on. Nothing on the stderr path tells them apart,
     /// because a real line's escapable characters are a handful among
     /// thousands.
@@ -553,6 +805,36 @@ mod tests {
             out,
             "\\x1b".repeat(PARAM_VALUE_MAX_CHARS),
             "1024 escapes in, four characters out apiece"
+        );
+
+        // And for #275's own arm, whose escape is two characters out for
+        // one in: a budget that charged the OUTPUT would cut this at 512.
+        let mut out = String::new();
+        write!(
+            CappedWriter::new(&mut out),
+            "{}",
+            "\n".repeat(PARAM_VALUE_MAX_CHARS + 1)
+        )
+        .expect("a String never fails to be written");
+        assert_eq!(
+            out,
+            "\\n".repeat(PARAM_VALUE_MAX_CHARS),
+            "1024 newlines in, two characters out apiece"
+        );
+
+        // And for the widest escape the sink writes, eight characters
+        // out for one in: an output-charged budget would stop at 128.
+        let mut out = String::new();
+        write!(
+            CappedWriter::new(&mut out),
+            "{}",
+            "\u{2028}".repeat(PARAM_VALUE_MAX_CHARS + 1)
+        )
+        .expect("a String never fails to be written");
+        assert_eq!(
+            out,
+            "\\u{2028}".repeat(PARAM_VALUE_MAX_CHARS),
+            "1024 line separators in, eight characters out apiece"
         );
 
         // And through the visitor, on both the `%` path and `message`:
