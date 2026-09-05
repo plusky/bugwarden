@@ -260,9 +260,27 @@ async fn main() -> anyhow::Result<()> {
                             tracing::info!("peer hung up after a server/discover probe");
                             return Ok(());
                         }
+                        // The cap fired, so THIS is the refusal and rmcp's
+                        // error is its echo: bugwarden's bounded reader
+                        // returned an error, rmcp turned that into
+                        // `receive() -> None`, and `None` before the
+                        // handshake is `ConnectionClosed` — a shape that
+                        // says the peer left when the server refused. Same
+                        // sentence as the post-handshake arm below, from
+                        // the same constant, so one refusal keeps one
+                        // description on either side of `initialize`.
+                        Err(rmcp::service::ServerInitializeError::ConnectionClosed(_))
+                            if over_cap.load(Ordering::Acquire) =>
+                        {
+                            tracing::error!("serving error: {OVER_CAP_CLOSE}");
+                            anyhow::bail!("{OVER_CAP_CLOSE}");
+                        }
+                        // Never `e` itself, in either line: rmcp's error
+                        // carries the client's whole first frame (#261).
                         Err(e) => {
-                            tracing::error!("serving error: {:?}", e);
-                            return Err(e.into());
+                            let what = serve_failure(&e);
+                            tracing::error!("serving error: {what}");
+                            return Err(anyhow::anyhow!("stdio serving failed: {what}"));
                         }
                     },
                     () = &mut shutdown => {
@@ -285,9 +303,7 @@ async fn main() -> anyhow::Result<()> {
                         // 0 while the pre-handshake half exits 1 — the same
                         // refusal, two different exit codes.
                         if over_cap.load(Ordering::Acquire) {
-                            anyhow::bail!(
-                                "stdio transport closed: an inbound frame exceeded the request cap"
-                            );
+                            anyhow::bail!("{OVER_CAP_CLOSE}");
                         }
                     }
                     () = shutdown => {
@@ -370,6 +386,90 @@ async fn main() -> anyhow::Result<()> {
     }
 
     served
+}
+
+/// What an over-cap inbound frame did, in one sentence both refusal
+/// sites use.
+///
+/// The bounded reader closes the transport the moment a frame passes the
+/// cap, and rmcp reports that to the service the way it reports a peer
+/// hangup: `receive() -> None`, which before the handshake becomes
+/// `ServerInitializeError::ConnectionClosed` and after it an ordinary
+/// `Ok` close. Both arms therefore have to say so themselves, and saying
+/// it from one constant is what stops the same refusal acquiring two
+/// descriptions on either side of `initialize`.
+const OVER_CAP_CLOSE: &str = "stdio transport closed: an inbound frame exceeded the request cap";
+
+/// A fixed, server-authored classification of a failed stdio handshake —
+/// the only thing either exit path may say about one (#261).
+///
+/// rmcp 3.1.4's `ServerInitializeError`
+/// (`service/server.rs:82-104`, `#[non_exhaustive]`) puts the client's
+/// whole first frame into `ExpectedInitializeRequest`, and its
+/// `#[error("expect initialized request, but received: {0:?}")]` puts it
+/// into DISPLAY as well as `Debug` — so neither the error nor its Display
+/// may be logged, and it may not be propagated into `main`'s
+/// `anyhow::Result` either, since Rust prints `Error: {:?}` of that and
+/// anyhow's `Debug` opens with the same Display. A 100 000-char `query` in
+/// a pre-`initialize` `tools/call` measured 100 403 and 100 365 chars on
+/// those two lines, bounded only by the transport's frame cap.
+///
+/// Every arm returns a literal, so both lines are bounded by this file. The
+/// frame's KIND is named because it is the diagnostic an operator needs and
+/// it comes from the enum, not from the frame; the method name is NOT,
+/// because `ClientRequest::CustomRequest` (`model.rs:948`) holds a
+/// free-form `method: String` and rmcp's untagged deserialization routes
+/// every unrecognised method there — naming it would put client bytes back
+/// into the line this exists to bound. `ConnectionClosed`'s payload is the
+/// `&'static str` its one server-side construction site passes
+/// (`service/server.rs:442, 511`), but it is typed `String` on a
+/// `#[non_exhaustive]` enum, so it is classified rather than echoed.
+///
+/// What that costs, deliberately: `TransportError` used to show the
+/// underlying `io::Error` (`Broken pipe (os error 32)`), which is
+/// server-side I/O and carries no client bytes. It is dropped anyway,
+/// because a per-variant exception is the thing that erodes — the payload
+/// is a `DynamicTransportError` whose contents are the transport's to
+/// choose, on an enum upstream may extend.
+///
+/// The frame kinds are matched in their own nested `match` with no arm of
+/// its own for the unexpected, so a `JsonRpcMessage` that grew a fifth
+/// kind would fail to compile here rather than fall quietly into the
+/// wildcard below — which exists only for `ServerInitializeError`'s
+/// `#[non_exhaustive]` and would otherwise swallow both.
+fn serve_failure(error: &rmcp::service::ServerInitializeError) -> &'static str {
+    use rmcp::model::ClientJsonRpcMessage as Frame;
+    use rmcp::service::ServerInitializeError as Failure;
+
+    match error {
+        Failure::ExpectedInitializeRequest(Some(frame)) => match frame {
+            // A request here is never `initialize` (it would have been
+            // served) and never `ping` (rmcp answers those in its
+            // pre-init loop).
+            Frame::Request(_) => "the first frame was a request other than initialize",
+            Frame::Notification(_) => "the first frame was a notification, not initialize",
+            Frame::Response(_) => "the first frame was a response, not initialize",
+            Frame::Error(_) => "the first frame was an error reply, not initialize",
+        },
+        // Unreachable on rmcp 3.1.4: both construction sites pass `Some`.
+        Failure::ExpectedInitializeRequest(None) => "no first frame was received",
+        // Actor-neutral on purpose: an EOF, a read error and this build's
+        // own frame-cap refusal all arrive here as the same `None`, and
+        // the arm cannot tell them apart. The caller names the cap when it
+        // knows; rmcp logs a read error itself.
+        Failure::ConnectionClosed(_) => "the stream ended before initialize",
+        // Unreachable too: rmcp builds the value it checks here by mapping
+        // this handler's own `InitializeResult` into `ServerResult`.
+        Failure::UnexpectedInitializeResponse(_) => {
+            "this server answered initialize with the wrong result"
+        }
+        Failure::InitializeFailed(_) => "this server refused initialize",
+        Failure::TransportError { .. } => "the stdio transport failed during the handshake",
+        // Unreachable as long as `ServiceExt::serve` makes the cancellation
+        // token itself and never cancels it.
+        Failure::Cancelled => "the handshake was cancelled",
+        _ => "the handshake failed",
+    }
 }
 
 /// Bounded OTLP flush, then `_exit`. Used on the stdio signal arms: those
