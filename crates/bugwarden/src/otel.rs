@@ -66,6 +66,7 @@ use tracing_subscriber::layer::Context as LayerContext;
 use tracing_subscriber::Layer;
 
 use crate::audit::{AuditEvent, AuditEventKind, AuditExport, ExportRefused};
+use crate::tracing_fields::CappedWriter;
 
 /// Collector base URL; `LOGS_PATH` is appended to it. Unset or empty —
 /// with [`LOGS_ENDPOINT_VAR`] unset or empty too — turns the whole feature
@@ -1216,8 +1217,17 @@ pub struct DiagnosticsLayer {
     slot: Arc<OnceLock<Arc<Pipeline>>>,
 }
 
-/// Collects an event's fields into the body text, message first, the way
-/// the stderr formatter renders them.
+/// Collects an event's fields into the body text, message first, close to
+/// the way the stderr formatter renders them — close, because a `&str`
+/// field is written here unquoted, where `DefaultVisitor` would
+/// `Debug`-quote it. That predates #260 and is not what it changed.
+///
+/// Every value goes through a [`CappedWriter`], for the reason the stderr
+/// layer's own formatter does (#260, #266): the collector is the same
+/// operator's stream, reached by the same rmcp lines, and a bound the
+/// terminal has that the collector lacks is not a bound. So a body field
+/// is at most [`crate::tracing_fields::PARAM_VALUE_MAX_CHARS`] characters
+/// and carries no raw ESC, BEL, BS, FF, DEL or C1 byte.
 ///
 /// It also picks the `log.target` field out rather than rendering it. The
 /// `log` crate's records reach a `tracing` subscriber through
@@ -1227,7 +1237,9 @@ pub struct DiagnosticsLayer {
 /// to read it, or every `reqwest` and `hyper` line sails past a check that
 /// only ever sees `"log"`. Its `log.module_path`/`log.file`/`log.line`
 /// siblings are dropped for the same reason the stderr formatter drops
-/// them: they are bridge bookkeeping, not what the event said.
+/// them: they are bridge bookkeeping, not what the event said. The target
+/// is neither capped nor escaped: it is the emitting module's own static
+/// name, and it rides an attribute rather than the body.
 struct BodyVisitor {
     message: String,
     fields: String,
@@ -1244,6 +1256,20 @@ fn is_log_bridge_field(name: &str) -> bool {
     )
 }
 
+impl BodyVisitor {
+    /// Open a field's slot: the separator and `name=` go in raw — a field
+    /// name is static text of ours or of a dependency's — and the value
+    /// that follows is written through the budget.
+    fn open_field(&mut self, name: &str) -> CappedWriter<'_, String> {
+        if !self.fields.is_empty() {
+            self.fields.push(' ');
+        }
+        self.fields.push_str(name);
+        self.fields.push('=');
+        CappedWriter::new(&mut self.fields)
+    }
+}
+
 impl tracing::field::Visit for BodyVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
         use std::fmt::Write as _;
@@ -1255,14 +1281,9 @@ impl tracing::field::Visit for BodyVisitor {
             return;
         }
         if field.name() == "message" {
-            let _ = write!(self.message, "{value:?}");
+            let _ = write!(CappedWriter::new(&mut self.message), "{value:?}");
         } else {
-            let _ = write!(
-                self.fields,
-                "{}{}={value:?}",
-                if self.fields.is_empty() { "" } else { " " },
-                field.name()
-            );
+            let _ = write!(self.open_field(field.name()), "{value:?}");
         }
     }
 
@@ -1276,14 +1297,9 @@ impl tracing::field::Visit for BodyVisitor {
             return;
         }
         if field.name() == "message" {
-            self.message.push_str(value);
+            let _ = CappedWriter::new(&mut self.message).write_str(value);
         } else {
-            let _ = write!(
-                self.fields,
-                "{}{}={value}",
-                if self.fields.is_empty() { "" } else { " " },
-                field.name()
-            );
+            let _ = self.open_field(field.name()).write_str(value);
         }
     }
 }

@@ -18,7 +18,14 @@
 //!   exporter its own source of records to export;
 //! - narrowing the skip back to this module's target, which lets the
 //!   exporter's `reqwest`/`hyper` events be exported and turns one flush
-//!   into an endless self-feeding one.
+//!   into an endless self-feeding one;
+//! - exporting a field's value without the sink's per-field budget or
+//!   without its escaping (#260, #266) — the collector is reached by the
+//!   same rmcp lines stderr is, and a bound only stderr has is not one;
+//! - swapping which of `message` and the other fields leads the body,
+//!   on either the `Debug` path or the `&str` one;
+//! - dropping the separator a second body field opens with, which a
+//!   one-field record cannot see.
 
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -31,6 +38,13 @@ use tracing_subscriber::EnvFilter;
 
 /// Bodies posted to the collector, newest last.
 type Posted = Arc<Mutex<Vec<Vec<u8>>>>;
+
+/// The sink's per-field cap, spelled out: a test that reads the constant
+/// it is testing agrees with any value.
+const CAP: usize = 1024;
+
+/// The byte a terminal reads as the start of a control sequence.
+const ESC: char = '\u{1b}';
 
 /// A collector that answers OTLP posts and LOGS NOTHING ITSELF.
 ///
@@ -219,6 +233,21 @@ async fn the_servers_diagnostics_reach_the_collector_but_the_exporters_own_do_no
     slot.set(pipeline.clone()).expect("the slot fills once");
 
     tracing::info!(answer = 42, "otel-diagnostics-probe");
+    // The body answers to the same per-field bound and the same escaping
+    // the stderr layer applies (#260, #266). Multi-byte after the ESC, so
+    // a byte budget cannot pass for a character one.
+    let over_cap = format!("{ESC}{}", "é".repeat(CAP * 4));
+    // Two fields, so the assertion below also pins that a cut field
+    // leaves the separator and the field after it intact.
+    tracing::info!(probe = %over_cap, next = "after", "otel-diagnostics-cap-probe");
+    // A `&str` value reaches the visitor through `record_str`, not
+    // `record_debug`, and only an explicit `message` field takes that
+    // path for the body's leading text — so this is the one shape that
+    // tells the two apart.
+    tracing::info!(
+        message = "otel-diagnostics-str-probe",
+        tag = "reached-as-a-str"
+    );
     // What the exporter says about itself never goes on the wire: this is
     // the shape of the drop warning, and exporting it would feed a failing
     // exporter its own failures.
@@ -276,6 +305,31 @@ async fn the_servers_diagnostics_reach_the_collector_but_the_exporters_own_do_no
         probe.1.iter().any(|(k, _)| k == "log.target"),
         "the emitting target must ride along: {:?}",
         probe.1
+    );
+
+    let by_str = records
+        .iter()
+        .find(|(body, _)| body.contains("otel-diagnostics-str-probe"))
+        .expect("the record_str diagnostic must be exported");
+    assert_eq!(
+        by_str.0, "otel-diagnostics-str-probe tag=reached-as-a-str",
+        "a `&str` message leads the body and a `&str` field follows it \
+         as `name=value`, the same way a `Debug` one does"
+    );
+
+    let capped = records
+        .iter()
+        .find(|(body, _)| body.starts_with("otel-diagnostics-cap-probe"))
+        .expect("the capped diagnostic must be exported");
+    assert_eq!(
+        capped.0,
+        format!(
+            "otel-diagnostics-cap-probe probe=\\x1b{} next=after",
+            "é".repeat(CAP - 1)
+        ),
+        "the body's field is cut at {CAP} characters as handed in, the \
+         ESC among them and escaped on the way out, and the field after \
+         it still opens with its own separator"
     );
 
     assert!(

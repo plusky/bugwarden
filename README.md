@@ -627,7 +627,7 @@ Command-line arguments take precedence over environment variables.
 | — | `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | — | Logs-specific endpoint. Overrides `OTEL_EXPORTER_OTLP_ENDPOINT` per the OTLP spec, and is used **as given** — write the whole URL including `/v1/logs`. Set alone it still turns export on |
 | — | `OTEL_EXPORTER_OTLP_LOGS_HEADERS` | — | Logs-specific headers; overrides `OTEL_EXPORTER_OTLP_HEADERS`. Same secrecy rules |
 | — | `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | — | Logs-specific protocol; overrides `OTEL_EXPORTER_OTLP_PROTOCOL`. Same single accepted value |
-| — | `RUST_LOG` | `info` | Tracing filter for the diagnostic log, which always goes to **stderr** — stdout belongs to the stdio transport. An unparsable value falls back to `info` |
+| — | `RUST_LOG` | `info` | Tracing filter for the diagnostic log, which always goes to **stderr** — stdout belongs to the stdio transport. An unparsable value falls back to `info`. Whatever the filter, every FIELD of every line — the MCP library's own included — is cut at 1024 characters and has ESC, BEL, BS, FF, DEL and U+0080–U+009F escaped, so no single client string can fill the terminal or open an escape sequence in it. Two limits worth knowing: the bound is per field per line and says nothing about how many lines a client can cause, and LF, CR and TAB are not in that set (issue #275) |
 
 An empty value counts as unset for `--api-key`, `--api-key-file`,
 `--allowed-hosts`, `BUGWARDEN_HTTP_TOKEN` and `BUGWARDEN_HTTP_READ_TOKEN`, so

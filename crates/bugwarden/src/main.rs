@@ -17,6 +17,7 @@ use bugwarden::http_auth::{self, HttpEnv};
 use bugwarden::http_session::AuditedSessionManager;
 use bugwarden::otel::{self, OtelEnv, Pipeline};
 use bugwarden::stdio::DiscoverAnswering;
+use bugwarden::tracing_fields::CappedFields;
 use bugwarden::{config, server};
 use bugwarden_core::{guard::Guard, policy::Policy};
 use clap::Parser;
@@ -44,10 +45,16 @@ async fn main() -> anyhow::Result<()> {
     // Tracing always goes to stderr: stdout belongs to the stdio transport.
     // The OTLP layer, when export is on, sits beside the stderr one under
     // the same filter, so both carry the same events.
+    //
+    // `fmt_fields` is the bound on what a client can put there (#260,
+    // #266): every field of every line, ours and rmcp's alike, is cut at
+    // 1024 chars and has ESC, BEL, BS, FF, DEL and the C1 range escaped,
+    // whatever this filter says.
     let registry = tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(
             tracing_subscriber::fmt::layer()
+                .fmt_fields(CappedFields)
                 .with_writer(std::io::stderr)
                 .with_ansi(false),
         );
