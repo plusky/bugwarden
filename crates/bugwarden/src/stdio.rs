@@ -115,11 +115,22 @@ impl<R> BoundedLines<R> {
 
     /// Trip the flag, log once from bugwarden's side, and return the error.
     ///
-    /// The log matters: rmcp's own `Error reading from stream` is the only
-    /// other trace of this, and it names neither the cap nor the transport.
+    /// The log matters: this is the only line that names the byte bound it
+    /// applied. rmcp echoes this error's `Display` (`Error reading from
+    /// stream: …`), which stops before the tail added here and names
+    /// neither the bound nor the transport; before `initialize` `main` adds
+    /// a line saying the session is over, which names the refusal but not
+    /// the number.
+    ///
+    /// WARN and not ERROR (#272): the line IS the refusal, the cap doing
+    /// what it exists for, so no operator has anything to act on and a
+    /// client repeats it as often as it can reconnect. ERROR stays with
+    /// `main`'s statement that the process ended — which only the
+    /// pre-`initialize` half writes, the other bailing out of `waiting()`
+    /// silently, so a refused frame costs bugwarden one ERROR or none.
     fn trip(&mut self) -> io::Error {
         self.over_cap.store(true, Ordering::Release);
-        tracing::error!(
+        tracing::warn!(
             "stdio frame exceeds the {}-byte request cap; closing the transport",
             self.cap
         );

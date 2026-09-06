@@ -36,6 +36,13 @@
 //!   which exits 0 on a refusal it was the point of refusing;
 //! - the over-cap frame refused BEFORE the handshake described as a peer
 //!   hangup, or in any wording but the one the post-handshake refusal uses;
+//! - the reader's refusal line raised back to ERROR, dropped to a level the
+//!   default filter hides, or deleted altogether (#272);
+//! - either `serving error` arm demoted below ERROR, which is what says the
+//!   process ended;
+//! - rmcp's echo of the reader's error removed or moved off
+//!   `rmcp::transport::async_rw`, which would leave the `RUST_LOG`
+//!   directive DESIGN.md documents addressing nothing;
 //! - either handshake-failure line formatting rmcp's error instead of the
 //!   classification, or the classification naming the wrong frame kind;
 //! - any `serve_failure` arm deleted so its failure falls to the wildcard,
@@ -118,9 +125,21 @@ const OVER_CAP_FRAME: usize = 5 * 1024 * 1024;
 /// logs anything at all — the tail after the `;` is what makes the needle
 /// bugwarden's line and not the SDK's. The cap is spelled out because the
 /// default policy derives the 4 MiB floor, so a derivation that stopped
-/// following the policy would show up here too.
+/// following the policy would show up here too. Because rmcp's echo stops
+/// short of that tail, a search for the WHOLE constant can only land on
+/// bugwarden's line — which is a WARN since #272, while rmcp's is an
+/// ERROR, so the two are told apart twice over.
 const OVER_CAP_LINE: &str =
     "stdio frame exceeds the 4194304-byte request cap; closing the transport";
+
+/// rmcp's target for that echo.
+///
+/// Named because the level rule (#272) leaves it the only ERROR a refusal
+/// writes after the handshake, and DESIGN.md documents the per-target
+/// `RUST_LOG` directive that removes it. Asserting the target keeps that
+/// documentation measured: were rmcp to move the line, the directive named
+/// there would address nothing.
+const RMCP_READ_ERROR_TARGET: &str = "rmcp::transport::async_rw";
 
 /// The refusal `main` itself reports for that frame, and the whole of the
 /// line the process then exits with.
@@ -162,6 +181,46 @@ const FILLER_CHARS: usize = 100_000;
 /// usual 1024-char bound would still fail — these two lines carry no
 /// client text at all, not a shortened copy of it.
 const FILLER_RUN: usize = 64;
+
+/// The level token of one `Full`-format stderr line, if it has one.
+///
+/// tracing writes `<timestamp> <LEVEL> [<span>: ]<target>: <message>` and
+/// the timestamp holds no space, so the second whitespace-separated token
+/// IS the level. Read positionally rather than searched for: a line whose
+/// MESSAGE contains the word `ERROR` satisfies a `contains(" ERROR ")` and
+/// does not satisfy this. `main` builds the fmt layer `.with_ansi(false)`,
+/// so no escape sequence is wrapped around the token. Lines the runtime
+/// writes rather than tracing — the `Error:` exit line — have no level and
+/// yield whatever their second word is, so callers ask about lines they
+/// have already identified.
+fn level_of(line: &str) -> Option<&str> {
+    line.split_whitespace().nth(1)
+}
+
+/// Whether one stderr line is at `level`.
+fn at_level(line: &str, level: &str) -> bool {
+    level_of(line) == Some(level)
+}
+
+/// Whether one stderr line is at `level` AND carries a target from this
+/// workspace rather than from a dependency.
+///
+/// The target follows the level and any span prefix (`serve_inner:`, on the
+/// post-handshake rows), and a target here is always a module path, so the
+/// needles are the two crates' roots with the space and colon the format
+/// brackets them with — never `rmcp::…`. `bugwarden-core` has no `error!`
+/// site today and is matched anyway, so the count below is the WORKSPACE's
+/// invariant and not one crate's. Only a message carrying one of the
+/// needles itself could forge a match, and no line these rows produce does.
+fn from_bugwarden_at(line: &str, level: &str) -> bool {
+    const TARGETS: [&str; 4] = [
+        " bugwarden: ",
+        " bugwarden::",
+        " bugwarden_core: ",
+        " bugwarden_core::",
+    ];
+    at_level(line, level) && TARGETS.iter().any(|target| line.contains(target))
+}
 
 /// A spawned binary, its pipes, and every stderr line it has written.
 struct Server {
@@ -276,6 +335,17 @@ impl Server {
     /// refusal (#261). `pre_handshake` says the refusal came out of
     /// `serve`, which additionally writes the classified `serving error`
     /// line; the post-handshake arm writes only the exit line.
+    ///
+    /// The levels are asserted here too (#272), because one refused frame
+    /// used to be three ERROR lines before the handshake and two after it.
+    /// The reader's line is a WARN — the cap doing what it exists for, and
+    /// a client repeats it by reconnecting — which leaves bugwarden one
+    /// ERROR for the whole refusal, `main` saying the process ended, and
+    /// none at all on the post-handshake row, where `main` bails out of
+    /// `waiting()` without a line. rmcp's echo is asserted to still BE an
+    /// ERROR rather than dropped from the count: it is a dependency's line
+    /// that this build documents rather than owns, and the `RUST_LOG`
+    /// directive DESIGN.md names addresses that target at that level.
     async fn assert_over_cap_exit(mut self, what: &str, pre_handshake: bool) {
         let status = tokio::time::timeout(EXIT_TIMEOUT, self.child.wait())
             .await
@@ -295,11 +365,59 @@ impl Server {
              silent close would produce: status={status:?} stderr={log}",
             log = self.log
         );
+        let refusal = self
+            .log
+            .lines()
+            .find(|line| line.contains(OVER_CAP_LINE))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{what}: bugwarden must log the cap it enforced: {log}",
+                    log = self.log
+                )
+            });
+        assert_eq!(
+            level_of(refusal),
+            Some("WARN"),
+            "{what}: the refusal is the cap doing its job and a client \
+             repeats it by reconnecting, so the reader's line is a WARN and \
+             not an ERROR: {refusal}"
+        );
+        let rmcp_echo = self
+            .log
+            .lines()
+            .find(|line| line.contains(RMCP_READ_ERROR_TARGET));
         assert!(
-            self.log.contains(OVER_CAP_LINE),
-            "{what}: bugwarden must log the cap it enforced: {log}",
+            rmcp_echo.is_some_and(|line| at_level(line, "ERROR")),
+            "{what}: rmcp still echoes the reader's error at ERROR — the \
+             line DESIGN.md documents, and the reason the directive that \
+             quiets it is documented with it: {log}",
             log = self.log
         );
+        let own_errors: Vec<&str> = self
+            .log
+            .lines()
+            .filter(|line| from_bugwarden_at(line, "ERROR"))
+            .collect();
+        if pre_handshake {
+            assert_eq!(
+                own_errors.len(),
+                1,
+                "{what}: one refusal earns bugwarden one ERROR line, the one \
+                 that ends the process: {own_errors:?}"
+            );
+            assert!(
+                own_errors[0].contains(SERVING_ERROR_PREFIX),
+                "{what}: and that line is `serving error`, not the reader's \
+                 refusal wearing its level: {line}",
+                line = own_errors[0]
+            );
+        } else {
+            assert!(
+                own_errors.is_empty(),
+                "{what}: after the handshake `main` bails with no line of its \
+                 own, so bugwarden says nothing at ERROR here: {own_errors:?}"
+            );
+        }
         assert!(
             self.log.lines().any(|line| line == OVER_CAP_EXIT_LINE),
             "{what}: the process must exit naming the cap, in the one wording \
@@ -397,6 +515,18 @@ impl Server {
                 "{what}: {prefix:?} must be followed by the classification and \
                  nothing else: {line}"
             );
+            // Only the tracing line has a level; the exit line is the
+            // runtime's. ERROR because it reports that the PROCESS ended
+            // (#272) — the half of the level rule the refusal rows read
+            // from the other side.
+            if prefix == SERVING_ERROR_PREFIX {
+                assert_eq!(
+                    level_of(line),
+                    Some("ERROR"),
+                    "{what}: a handshake failure ends the process, which is \
+                     what this workspace keeps ERROR for: {line}"
+                );
+            }
             assert!(
                 line.chars().count() <= HANDSHAKE_LINE_MAX,
                 "{what}: {prefix:?} must stay under {HANDSHAKE_LINE_MAX} chars, \

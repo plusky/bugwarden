@@ -415,16 +415,21 @@ be provided up front via `--api-key` / `BUGZILLA_API_KEY` or `--api-key-file`
 line, bounded by the same cap as an HTTP POST body (see
 `global.max_attachment_bytes` below); a line that runs past it is refused,
 the transport closes and the process exits `1`, since nothing can be sent
-back for a request that was never parsed. The first JSON-RPC message the
-server parses has to open a session — `initialize`, or a request whose
-`_meta` declares the handshake-free lifecycle (see *MCP protocol revisions*
-below); a `ping` or a `server/discover` probe may come first and commits
-neither. A line that is no JSON-RPC message at all does not count as that
-first message: an unparsable one is dropped, a well-formed one of the wrong
-shape is answered `-32600`, and the server goes on waiting either way. Any
-other opening message ends the process with exit `1`, and there the log line
-and the `Error:` line the process exits with name only the *kind* of message
-that arrived — never its content, whose size only the cap bounds.
+back for a request that was never parsed. That refusal is logged at `WARN` —
+it is the cap doing its job, not something to page an operator about. Beside
+it the MCP library echoes the same reason at `ERROR`, and before a completed
+handshake the server adds one `ERROR` of its own, the line that reports the
+session is over; after a completed handshake the library's echo is the only
+`ERROR` there is. The first JSON-RPC message the server parses has to open a
+session — `initialize`, or a request whose `_meta` declares the handshake-free
+lifecycle (see *MCP protocol revisions* below); a `ping` or a `server/discover`
+probe may come first and commits neither. A line that is no JSON-RPC message at
+all does not count as that first message: an unparsable one is dropped, a
+well-formed one of the wrong shape is answered `-32600`, and the server goes on
+waiting either way. Any other opening message ends the process with exit `1`,
+and there the log line and the `Error:` line the process exits with name only
+the *kind* of message that arrived — never its content, whose size only the
+cap bounds.
 
 ```bash
 BUGZILLA_API_KEY=your_api_key \
@@ -627,7 +632,7 @@ Command-line arguments take precedence over environment variables.
 | — | `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | — | Logs-specific endpoint. Overrides `OTEL_EXPORTER_OTLP_ENDPOINT` per the OTLP spec, and is used **as given** — write the whole URL including `/v1/logs`. Set alone it still turns export on |
 | — | `OTEL_EXPORTER_OTLP_LOGS_HEADERS` | — | Logs-specific headers; overrides `OTEL_EXPORTER_OTLP_HEADERS`. Same secrecy rules |
 | — | `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | — | Logs-specific protocol; overrides `OTEL_EXPORTER_OTLP_PROTOCOL`. Same single accepted value |
-| — | `RUST_LOG` | `info` | Tracing filter for the diagnostic log, which always goes to **stderr** — stdout belongs to the stdio transport. An unparsable value falls back to `info`. Whatever the filter, every FIELD of every line — the MCP library's own included — is cut at 1024 characters and has every control character and every mandatory line break escaped (U+0000–U+001F, U+007F, U+0080–U+009F, U+2028 and U+2029), so no single client string can fill the terminal, open an escape sequence in it, or end one line and start another. One limit worth knowing: the bound is per field per line and says nothing about how many lines a client can cause. Panics are reported through this filter too, never straight to the descriptor: the first panic of a process is ERROR and every later one WARN, and neither carries the panic payload, so `RUST_LOG=error` reports only the first — use `RUST_LOG=error,bugwarden::panic_hook=warn` to keep every panic on stderr under an otherwise quiet filter |
+| — | `RUST_LOG` | `info` | Tracing filter for the diagnostic log, which always goes to **stderr** — stdout belongs to the stdio transport. An unparsable value falls back to `info`. Whatever the filter, every FIELD of every line — the MCP library's own included — is cut at 1024 characters and has every control character and every mandatory line break escaped (U+0000–U+001F, U+007F, U+0080–U+009F, U+2028 and U+2029), so no single client string can fill the terminal, open an escape sequence in it, or end one line and start another. One limit worth knowing: the bound is per field per line and says nothing about how many lines a client can cause. Panics are reported through this filter too, never straight to the descriptor: the first panic of a process is ERROR and every later one WARN, and neither carries the panic payload, so `RUST_LOG=error` reports only the first — use `RUST_LOG=error,bugwarden::panic_hook=warn` to keep every panic on stderr under an otherwise quiet filter. A stdio frame over the request cap is a WARN for the other half of the same rule — a refusal the server chose is not an operator's problem. The ERROR lines beside it are the MCP library's echo of the same reason and, before a completed handshake only, the server's own line reporting that the session is over. Removing the library's echo takes `rmcp::transport::async_rw=off` (a level here is a ceiling on verbosity, so `=warn` still lets ERROR through), and it is worth keeping: that is also where a genuine stdin read failure is reported, and after the handshake it is the only report of one |
 
 An empty value counts as unset for `--api-key`, `--api-key-file`,
 `--allowed-hosts`, `BUGWARDEN_HTTP_TOKEN` and `BUGWARDEN_HTTP_READ_TOKEN`, so
