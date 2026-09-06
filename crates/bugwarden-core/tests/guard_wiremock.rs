@@ -41,28 +41,24 @@ fn client(server: &MockServer) -> BugzillaClient {
 /// pooled listener from another test cannot answer this request. The
 /// load-bearing assertion is `port() < 1024` — a bind-then-drop of an
 /// ephemeral port fails the helper. A 500 ms TCP probe refuses to
-/// return an address that accepted or timed out; the URL is built from
-/// the probed socket so the two cannot drift.
+/// return an address that timed out; the URL is built from the probed
+/// socket so the two cannot drift.
 ///
 /// `crates/bugwarden/tests/common/refused.rs` is this function's twin —
 /// it says where the probe belongs and why this package cannot share it
-/// — and nothing pairs them: a change here is a change there (#280).
+/// — and `the_core_copy_matches` there pins the bodies (#287).
 fn refused_base_url() -> String {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
     assert!(
         addr.port() < 1024,
-        "I12 transport tests must use a privileged port; wiremock binds 127.0.0.1:0 (#115)"
+        "these tests must use a privileged port; wiremock binds 127.0.0.1:0 (#115, #229)"
     );
     match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500)) {
-        Ok(_) => panic!(
-            "{addr} accepted a connection; I12 tests need a refused address \
-             that wiremock's 127.0.0.1:0 pool cannot occupy (#115)"
-        ),
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => panic!(
             "{addr} timed out; refusing to point the 30s client at an address \
              that would hang the test (#115)"
         ),
-        Err(_) => format!("http://{addr}"),
+        _ => format!("http://{addr}"),
     }
 }
 

@@ -3154,11 +3154,13 @@ wired, `server.rs` and `main.rs` are the reference.
   error text (I12) — the I12 transport-error sites connect to
   `127.0.0.1:1` (a privileged port a non-root wiremock `bind(127.0.0.1:0)`
   cannot occupy); `assert!(addr.port() < 1024)` is the mutation-kill for a
-  bind-then-drop of an ephemeral port, a 500 ms TCP probe refuses an
-  address that accepted or timed out (this package's own copy of the
-  probe the `bugwarden` crate shares from `tests/common/refused.rs` —
-  see the otel unit-test bullet; a `#[path]` out of this package could
-  not reach it, and the two are paired by their rustdoc alone),
+  bind-then-drop of an ephemeral port (occupy; the accepted-connect arm
+  is dropped), a 500 ms TCP probe refuses an address that timed out
+  (this package's own copy of the probe the `bugwarden` crate shares
+  from `tests/common/refused.rs` — see the otel unit-test bullet; a
+  `#[path]` out of this package could not reach it, and
+  `the_core_copy_matches` there pins the bodies modulo the timeout-panic
+  sentence),
   the client call is capped at 2 s,
   and the assertion requires reqwest's `error sending request` so an
   empty or HTTP-status error cannot pass a bare `!contains(KEY)`
