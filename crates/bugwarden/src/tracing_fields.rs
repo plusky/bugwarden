@@ -25,12 +25,27 @@
 //! `DefaultVisitor` sanitizes `message` and `record_error` only, and a
 //! `%`-formatted value is a tracing-core `DisplayValue` recorded through
 //! `record_debug`, whose `Debug` hands straight to its `Display` — so it
-//! reaches the terminal verbatim, and a `query` of ESC `[2J` clears the
-//! operator's screen while ESC `]0;` … BEL retitles it. [`CappedWriter`]
+//! reaches the terminal verbatim, and a `query` of ESC `[2J` cleared the
+//! operator's screen while ESC `]0;` … BEL retitled it. [`CappedWriter`]
 //! escapes those bytes for every field, and #275's as well: a LINE is
 //! the unit stderr readers and log shippers trust, so a field carrying
 //! LF ended one line and opened another that a reader could not tell
 //! from one this server wrote.
+//!
+//! Every client string bugwarden names a field for is `?`-formatted
+//! since #278, so `server::Capped` has already escaped it by the time it
+//! arrives here and this adapter only ever escapes what `Debug` leaves
+//! alone. That narrows nothing. bugwarden's `error`, `path`, `location`,
+//! `thread` and startup `tool` fields are still `%` and still arrive
+//! raw — `error` carries Bugzilla's own message text, which is where a
+//! client string can come back at one remove — and so do rmcp's `%id`,
+//! its `%client_requested` and every `message` on the stream.
+//!
+//! Those two families are also why the ESCAPE SPELLINGS on a line
+//! identify the sigil rather than the writer: `\u{1b}` is what `Debug`
+//! wrote, on a field of ours or on rmcp's `?peer_info` alike, and
+//! `\x1b` is what this adapter wrote, on rmcp's `%id` or on one of
+//! bugwarden's own `%` fields.
 //!
 //! Parity with `DefaultFields` is a requirement, not a courtesy: a value
 //! under the cap carrying no control bytes must render byte for byte as
@@ -61,23 +76,23 @@ pub const PARAM_VALUE_MAX_CHARS: usize = 1024;
 ///
 /// It passes characters through until [`PARAM_VALUE_MAX_CHARS`] of them
 /// have been written and then swallows the rest, silently and with no
-/// marker — the same cut `server::Capped` and the audit record make, so a
-/// field written through `%Capped(..)` and the same text written raw stop
-/// at the same character. The budget counts the characters handed TO the
-/// adapter, across however many `write_str` calls a `fmt::Arguments`
-/// arrives in, so a value assembled in pieces is cut at the total. It
-/// allocates nothing.
+/// marker, at the constant the audit record's own cut uses. The budget
+/// counts the characters handed TO the adapter, across however many
+/// `write_str` calls a `fmt::Arguments` arrives in, so a value assembled
+/// in pieces is cut at the total. It allocates nothing.
 ///
 /// The budget covers the RENDERED value, decoration included: the adapter
 /// sees a stream of characters and cannot know which of them the client
-/// wrote. So a `Debug`-shaped field spends part of its budget on its own
-/// `Some("` and loses the closing `")` to the cut, and an `?Capped` field
-/// carries that much less of the client's text than the `%Capped` one
-/// beside it. For the same reason an OPERATOR's own value — a config
-/// path, say — is cut like anyone else's; 1018 characters is legible for
-/// any real path, and a bound with an exception for trusted values is a
-/// bound with a hole. A strict tightening either way, and the price of a
-/// cut that does not depend on the site knowing it exists.
+/// wrote, so it cuts wherever the count runs out — mid-value,
+/// mid-escape, or between a value and the delimiter that was going to
+/// close it. That last case is why `server::Capped` bounds its own
+/// rendering eight characters under this one (#278) and closes its own
+/// quote: a field this adapter cuts open is a field a quote-honouring
+/// reader runs out of, into whatever follows on the line. Nothing a
+/// `Capped` renders reaches this budget; what still does is rmcp's
+/// fields, `message`, and bugwarden's own `%` ones — an OPERATOR's
+/// config path among them, cut at 1024 like anyone else's, because a
+/// bound with an exception for trusted values is a bound with a hole.
 ///
 /// Characters are escaped on the way through. The set is every C0 byte
 /// `\x00`–`\x1f`, DEL, every C1 byte `\u{80}`–`\u{9f}`, and U+2028

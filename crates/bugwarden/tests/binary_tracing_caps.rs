@@ -1,5 +1,5 @@
 //! What the SHIPPED BINARY's tracing lines carry of a client's own strings
-//! and id arrays (issues #240, #258, #260, #266, #275).
+//! and id arrays (issues #240, #258, #260, #266, #275, #278).
 //!
 //! The audit record caps every client string at 1024 chars before it
 //! reaches the JSONL file or the OTLP audit stream; the `info!` line the
@@ -20,10 +20,12 @@
 //! Coverage contract (each of these mutations must fail a test here):
 //! - the stderr layer built without `fmt_fields`, or with a formatter
 //!   that caps only the fields and not `message`, or only the values
-//!   bugwarden itself formats — the [`Site`] rows whose field is
-//!   `Debug`-shaped are the sharp ones there, because the sink's budget
-//!   covers the RENDERED value: without it a `resolution=Some("` row
-//!   measures 1024 client characters where [`decoration`] expects 1018;
+//!   bugwarden itself formats — the sharp rows are rmcp's now, since
+//!   #278 bounds our own fields at the site and a sink with no budget
+//!   leaves them unchanged. The two `client requested unsupported` rows
+//!   drive the same handshake and differ only in whose line they read,
+//!   so such a mutant shows up as the rmcp one running past [`CAP`]
+//!   while ours stays at [`QUOTED_CAP`];
 //! - a cut at cap-1, cap+1, or on a byte boundary, which is why every
 //!   probe is multi-byte;
 //! - `bug_info` or `update_bug_dependencies` logging an id array whole, or
@@ -34,6 +36,19 @@
 //! - CR or TAB reaching stderr unescaped (#275), probed on a `query` of
 //!   ours and on rmcp's `message` — the one field for which a child
 //!   process is the only instrument;
+//! - a client string reaching a line through a `%` field, where nothing
+//!   marks the end of its value and a ` status=HACKED` inside it becomes
+//!   a field of the line (#278):
+//!   `a_client_field_cannot_forge_a_later_field_on_its_own_line` reads
+//!   the value with [`quoted_field`], which finds the boundary the
+//!   WRITER marked, and then reads the real `status` past it;
+//! - a quoted value whose closing quote the SINK cuts off, which a
+//!   reader then runs out of into the next client field (#278):
+//!   `a_cut_client_field_still_closes_its_own_quote` drives the two
+//!   narrowest shapes — 1023 plain characters, 128 U+2028 — and reads
+//!   the line's keys back with [`logfmt_keys`]. A `Capped::Debug` that
+//!   spent the sink's whole 1024 instead of [`QUOTED_CAP`], or wrote a
+//!   half escape at the boundary, fails there and nowhere else;
 //! - LF or U+2028 ending a line the client did not open. No absence
 //!   assertion can see those: LF is what separates the lines being read,
 //!   and U+2028 is not. So
@@ -52,14 +67,20 @@
 //!   character in the set against a spelled-out table, and a child
 //!   process is the wrong instrument for 67 rows;
 //!
-//! What this file NO LONGER proves, since #260, is anything about the
-//! call SITES. `%Capped(&p.query)` and `%p.query` render identically once
-//! the sink cuts at the same constant, so removing a wrapper leaves every
-//! row here green — measured. The wrappers stay all the same: `capped()`
-//! shares their cut and IS the audit record's, `bug_ids` needs a
-//! count-plus-head shape no sink can synthesise (and the row below still
-//! observes that one), and a second bound costs nothing. The record is
-//! measured by `audit_wiremock`, not here.
+//! Between #260 and #278 this file proved nothing about the call SITES:
+//! the sink cut every field at the same constant, so `%Capped(&p.query)`
+//! and `%p.query` rendered alike and removing a wrapper left every row
+//! green — measured then. #278 gives the wrapper work only it can do.
+//! `Capped` writes its own quotes inside a budget of its own, eight
+//! characters under the sink's, so a long value closes at 1018 where the
+//! bare `?p.query` beside it would be cut open at 1024 — and a field cut
+//! open is one a quote-honouring reader runs straight out of. So the
+//! rows below measure the site and the sink both: [`QUOTED_CAP`] and the
+//! closing delimiter are the site's, the 1024 on rmcp's own fields is
+//! the sink's. `capped()` still shares [`CAP`] and IS the audit record's
+//! cut, measured by `audit_wiremock` rather than here, and `bug_ids`
+//! still needs a count-plus-head shape no sink can synthesise from a
+//! rendered value.
 //!
 //! Untestable at any level and so not claimed: making the escaping
 //! conditional on `Writer::sanitizes_ansi_escapes`. That flag is `true`
@@ -90,6 +111,17 @@ const LOG_TIMEOUT: Duration = Duration::from_secs(20);
 /// The cap, spelled out: `server::PARAM_VALUE_MAX_CHARS` is private, and a
 /// test that reads the constant it is testing agrees with any value.
 const CAP: usize = 1024;
+
+/// The rendered characters a client string of OURS carries between the
+/// quotes `server::Capped` writes round it (#278), spelled out for the
+/// reason [`CAP`] is.
+///
+/// Eight less than the cap, which is what the widest shape a site wraps
+/// a `Capped` in costs: `Some("` and `")` are six characters and the
+/// quotes are two, so `Some("` + 1016 + `")` is 1024 exactly and the
+/// sink has nothing left to cut. A field cut open is a field whose
+/// closing quote is gone, and that is what this number exists to stop.
+const QUOTED_CAP: usize = 1016;
 
 /// A revision the server serves, so the handshake is unremarkable
 /// everywhere except the row testing an unsupported one.
@@ -127,6 +159,23 @@ const LS: char = '\u{2028}';
 /// real line, and the midnight timestamp is a shape no line this server
 /// writes will ever have.
 const FORGED_LINE: &str = "2026-09-05T00:00:00.000000Z  INFO bugwarden::server: FORGED LINE";
+
+/// A `query` shaped like the tail of the very line it lands on: a value,
+/// then a space, then two `key=value` pairs of the client's own (#278).
+/// `status` is a field the same line really carries, so a reader fooled
+/// by this one reads `HACKED` where the server wrote `ALL`.
+const FORGING_PAIR: &str = "evil status=HACKED limit=999";
+
+/// The same forgery carrying the two characters `Debug` escapes, the
+/// backslash placed LAST so the rendered value ends `\\` immediately
+/// before its closing quote.
+///
+/// That is the shape a reader gets wrong when it decides a `"` is
+/// escaped by looking only at the character before it: here the
+/// backslash before the closing quote is itself escaped, the quote is
+/// real, and a reader fooled by it runs on into the next field — the
+/// same outcome the bare `%` field had.
+const FORGING_ESCAPES: &str = "evil\" status=HACKED \\";
 
 /// Each binary runs the walker itself, so a single-binary
 /// `cargo test --test binary_tracing_caps` still proves what its scrub claims.
@@ -375,9 +424,18 @@ fn assert_escaped_never_raw(log: &str, bytes: &[(char, &str, &str)]) {
     }
 }
 
-/// No raw ESC and no raw BEL anywhere on stderr (#266).
-fn assert_control_bytes_escaped(log: &str) {
-    assert_escaped_never_raw(log, &[(ESC, "ESC", "\\x1b"), (BEL, "BEL", "\\x07")]);
+/// No raw ESC and no raw BEL anywhere on stderr (#266), each present in
+/// the spelling the field carrying it uses.
+///
+/// The two differ, and the caller says which it expects. The spelling
+/// follows the SIGIL and not the owner: a `?` field is escaped by
+/// `Debug` long before the sink sees it and reads `\u{1b}`, a `%` field
+/// arrives raw and takes the sink's `\x1b`. Both families appear on
+/// bugwarden's own lines — every client string of ours is `?` since
+/// #278, while `error`, `path`, `location` and `thread` are still `%` —
+/// and on rmcp's, whose `?peer_info` is quoted where its `%id` is not.
+fn assert_control_bytes_escaped(log: &str, esc: &str, bel: &str) {
+    assert_escaped_never_raw(log, &[(ESC, "ESC", esc), (BEL, "BEL", bel)]);
 }
 
 /// No raw CR and no raw TAB in stderr's line texts (#275).
@@ -392,6 +450,11 @@ fn assert_cr_and_tab_escaped(log: &str) {
 
 /// The value the tracing line gives `field`; `ends_with` is `None` when the
 /// field is the last one on its line.
+///
+/// For a value written BARE — rmcp's `%id`, an id array of ours — where
+/// there is no closing delimiter to find. A client string of ours is
+/// quoted and read with [`quoted_field`] instead, because a caller-named
+/// `ends_with` is a boundary the VALUE can move (#278).
 fn logged_field<'a>(line: &'a str, field: &str, ends_with: Option<&str>) -> &'a str {
     let after = line
         .split_once(field)
@@ -406,6 +469,38 @@ fn logged_field<'a>(line: &'a str, field: &str, ends_with: Option<&str>) -> &'a 
     }
 }
 
+/// The value of a `Debug`-quoted field, and the rest of the line after
+/// its closing quote.
+///
+/// [`logged_field`] ends a value where the CALLER says the next field
+/// begins, which is exactly what a `%` field let a client move: a
+/// `query` of `evil status=HACKED limit=999` handed it `evil`, because
+/// the client's own ` status=` came first (#278). A quoted value ends at
+/// its own closing quote — the first `"` OUTSIDE an escape, which is not
+/// the same as the first `"` no backslash precedes: a value ending in a
+/// backslash renders `…\\"` and closes there — so this reads the
+/// boundary the WRITER marked, and returns the tail so the field after
+/// it is found past that boundary rather than inside it.
+fn quoted_field<'a>(line: &'a str, field: &str) -> (&'a str, &'a str) {
+    let after = line
+        .split_once(field)
+        .unwrap_or_else(|| panic!("the line must carry a {field} field: {line}"))
+        .1;
+    let inner = after
+        .strip_prefix('"')
+        .unwrap_or_else(|| panic!("the {field} field must open with a quote: {line}"));
+    let mut escaped = false;
+    for (at, ch) in inner.char_indices() {
+        match ch {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => return (&inner[..at], &inner[at + 1..]),
+            _ => {}
+        }
+    }
+    panic!("the {field} field must close its quote: {line}")
+}
+
 /// The ids an array field logged, `field` being everything up to its first
 /// id.
 fn logged_ids(line: &str, field: &str) -> Vec<u64> {
@@ -413,6 +508,58 @@ fn logged_ids(line: &str, field: &str) -> Vec<u64> {
         .split(", ")
         .map(|id| id.parse().unwrap_or_else(|e| panic!("{id:?}: {e}: {line}")))
         .collect()
+}
+
+/// The field KEYS a quote-honouring reader finds in `text`, in order.
+///
+/// This is the reader #278 is about, written out: a field is a `key=` at
+/// a token boundary; its value is either a `Debug`-quoted string, ended
+/// by the first `"` outside an escape, or a bare run up to the next
+/// space. A client value that keeps its own quotes contributes no key
+/// here. One that LOSES its closing quote runs on to the opening quote
+/// of the next client field, swallows the server's key in between and
+/// hands back a key the client wrote — which is the whole defect, and
+/// what a run-length assertion alone cannot see.
+///
+/// Fed the text after the target, so the timestamp and level are gone;
+/// a token carrying no `=` (the message's own words) is skipped.
+fn logfmt_keys(text: &str) -> Vec<&str> {
+    let mut keys = Vec::new();
+    let mut rest = text;
+    loop {
+        rest = rest.trim_start_matches(' ');
+        if rest.is_empty() {
+            return keys;
+        }
+        let token_end = rest.find(['=', ' ']).unwrap_or(rest.len());
+        if rest.as_bytes().get(token_end) != Some(&b'=') {
+            rest = &rest[token_end..];
+            continue;
+        }
+        keys.push(&rest[..token_end]);
+        let value = &rest[token_end + 1..];
+        rest = match value.strip_prefix('"') {
+            Some(inner) => {
+                let mut escaped = false;
+                let mut closed = None;
+                for (at, ch) in inner.char_indices() {
+                    match ch {
+                        _ if escaped => escaped = false,
+                        '\\' => escaped = true,
+                        '"' => {
+                            closed = Some(at);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                // An unclosed value swallows the rest of the line, which
+                // is exactly what the reader would do.
+                closed.map_or("", |at| &inner[at + 1..])
+            }
+            None => &value[value.find(' ').unwrap_or(value.len())..],
+        };
+    }
 }
 
 /// One tracing field that formats a client string, and the call that puts
@@ -426,21 +573,27 @@ struct Site {
     policy: Option<&'static str>,
     needle: &'static str,
     /// The field as it reaches the line, up to where the client's own
-    /// text begins: `query=` for a `%Capped` field, `resolution=Some("`
-    /// for an `?Option<Capped>` one. Everything it carries past the `=`
-    /// is [`decoration`].
+    /// text begins: `query="` for a `?Capped` field (#278),
+    /// `resolution=Some("` for an `?Option<Capped>` one, and a bare
+    /// `client_requested=` for the one row rmcp writes itself. Everything
+    /// it carries past the `=` is [`decoration`], and the trailing quote
+    /// is also what tells the two REGIMES apart: a needle that opens a
+    /// quote is a field `Capped` bounds and closes, one that does not is
+    /// a field only the sink bounds.
     field: &'static str,
 }
 
-/// The characters a field's own rendering spends out of the sink's
-/// per-field budget before the client's text starts: none for a bare
-/// `%Capped` field, one for a `Debug`-quoted one, six for `Some("`.
+/// The characters a field's own rendering spends before the client's
+/// text starts: one for the opening quote every client string of ours
+/// carries (#278), six for `Some("`, none for the field rmcp writes raw.
 ///
-/// Since #260 the budget covers the RENDERED value (the sink sees a
-/// stream of characters and cannot know which of them the client wrote),
-/// so a decorated field carries exactly that much less of the probe —
-/// and loses its closing delimiter to the cut, which is why no row
-/// brackets its value on one.
+/// Since #260 the sink's budget covers the RENDERED value — it sees a
+/// stream of characters and cannot know which of them the client wrote —
+/// so decoration and value are spent out of one 1024. What changed with
+/// #278 is who spends first: `Capped` bounds its own value at
+/// [`QUOTED_CAP`] and writes both quotes, so decoration plus value plus
+/// the closing delimiter comes to at most the cap and the sink cuts
+/// nothing. This count is what the row checks that arithmetic with.
 fn decoration(field: &str) -> usize {
     field
         .split_once('=')
@@ -465,21 +618,21 @@ fn sites(probe: &str) -> Vec<Site> {
             arguments: json!({ "query": probe }),
             policy: None,
             needle: "tool: bugs_quicksearch",
-            field: "query=",
+            field: "query=\"",
         },
         Site {
             tool: Some("bugs_quicksearch"),
             arguments: json!({ "query": "kernel", "status": probe }),
             policy: None,
             needle: "tool: bugs_quicksearch",
-            field: "status=",
+            field: "status=\"",
         },
         Site {
             tool: Some("bugs_quicksearch"),
             arguments: json!({ "query": "kernel", "include_fields": probe }),
             policy: None,
             needle: "tool: bugs_quicksearch",
-            field: "include_fields=",
+            field: "include_fields=\"",
         },
         Site {
             tool: Some("bugs_quicksearch"),
@@ -499,7 +652,7 @@ fn sites(probe: &str) -> Vec<Site> {
             }),
             policy: None,
             needle: "tool: create_bug",
-            field: "product=",
+            field: "product=\"",
         },
         Site {
             tool: Some("create_bug"),
@@ -509,7 +662,7 @@ fn sites(probe: &str) -> Vec<Site> {
             }),
             policy: None,
             needle: "tool: create_bug",
-            field: "component=",
+            field: "component=\"",
         },
         Site {
             tool: Some("create_bug"),
@@ -519,7 +672,7 @@ fn sites(probe: &str) -> Vec<Site> {
             }),
             policy: Some(DENY_ALL),
             needle: "guard denied bug creation",
-            field: "product=",
+            field: "product=\"",
         },
         Site {
             tool: Some("add_attachment"),
@@ -529,14 +682,14 @@ fn sites(probe: &str) -> Vec<Site> {
             }),
             policy: None,
             needle: "tool: add_attachment",
-            field: "file_name=",
+            field: "file_name=\"",
         },
         Site {
             tool: Some("update_bug_status"),
             arguments: json!({ "bug_id": 1, "status": probe }),
             policy: None,
             needle: "tool: update_bug_status",
-            field: "status=",
+            field: "status=\"",
         },
         Site {
             tool: Some("update_bug_status"),
@@ -550,7 +703,7 @@ fn sites(probe: &str) -> Vec<Site> {
             arguments: json!({ "bug_id": 1, "assignee": probe }),
             policy: None,
             needle: "tool: assign_bug",
-            field: "assignee=",
+            field: "assignee=\"",
         },
         Site {
             tool: Some("update_bug_fields"),
@@ -578,7 +731,7 @@ fn sites(probe: &str) -> Vec<Site> {
             arguments: json!({ "bug_id": 1, "cc_email": probe }),
             policy: None,
             needle: "tool: add_cc_to_bug",
-            field: "cc_email=",
+            field: "cc_email=\"",
         },
         Site {
             // rmcp logs the same message text with the version raw (#260),
@@ -587,7 +740,7 @@ fn sites(probe: &str) -> Vec<Site> {
             arguments: json!({}),
             policy: None,
             needle: "bugwarden::server: client requested unsupported",
-            field: "client_requested=",
+            field: "client_requested=\"",
         },
         Site {
             // And rmcp's own copy of it, one line later: the fourth row
@@ -626,20 +779,51 @@ async fn every_tracing_field_that_formats_a_client_string_is_cut_to_the_cap() {
             .split_once(site.field)
             .unwrap_or_else(|| panic!("the line must carry {}: {line}", site.field))
             .1;
-        // EXACTLY the cap, not "at most": an off-by-one cut is a second
+        // EXACTLY the bound, not "at most": an off-by-one cut is a second
         // rule that has to be remembered next to the audit record's, which
         // is the thing #191 and this share a definition to prevent. The
-        // run stops where the sink's budget ran out, so counting it also
-        // proves the field ended there rather than running on.
+        // run stops where the budget ran out, so counting it also proves
+        // the field ended there rather than running on.
         let run = value.chars().take_while(|c| *c == PROBE).count();
+        let tail = value
+            .char_indices()
+            .nth(run)
+            .map_or("", |(at, _)| &value[at..]);
+        let Some(opened) = site.field.strip_suffix('"') else {
+            // rmcp's own field: bare, and the sink is its only bound.
+            assert_eq!(
+                run + decoration(site.field),
+                CAP,
+                "{} on {:?} must reach stderr as exactly {CAP} rendered chars: {line}",
+                site.field,
+                site.needle
+            );
+            continue;
+        };
+        // Ours (#278). `Capped` bounds the value itself and writes both
+        // quotes, so the run is ITS budget, the closing delimiter is on
+        // the line, and the whole field still fits the sink's cap — which
+        // is what keeps a cut from opening the value.
         assert_eq!(
-            run + decoration(site.field),
-            CAP,
-            "{} on {:?} must reach stderr as exactly {CAP} rendered chars, \
-             {} of them its own decoration: {line}",
-            site.field,
-            site.needle,
-            decoration(site.field)
+            run, QUOTED_CAP,
+            "{} on {:?} must carry exactly {QUOTED_CAP} of the client's \
+             own characters: {line}",
+            site.field, site.needle
+        );
+        let closer = if opened.ends_with("Some(") {
+            "\")"
+        } else {
+            "\""
+        };
+        assert!(
+            tail.starts_with(closer),
+            "and must close with {closer:?}, or a reader runs on into the \
+             next field: {line}"
+        );
+        assert!(
+            decoration(site.field) + run + closer.chars().count() <= CAP,
+            "and the whole field must fit the sink's {CAP}, or the sink \
+             cuts the closing delimiter off again: {line}"
         );
     }
 }
@@ -820,9 +1004,15 @@ async fn a_raised_filter_opens_no_line_the_sink_does_not_cut() {
 
 /// A `%` field is written verbatim (#266): tracing-subscriber sanitizes
 /// `message` and `record_error` and nothing else, and most of the client
-/// strings this workspace logs are `%`, `query` among them. A `query` of
+/// strings this workspace logged were `%`, `query` among them. A `query` of
 /// ESC `[2J` clears the operator's terminal and BEL rings it; exactly one
 /// raw ESC and one raw BEL reached stderr on the unpatched tree.
+///
+/// The SPELLING moved with #278 and the guarantee did not: `query` is
+/// `Debug`-formatted now, so `str`'s own `Debug` writes `\u{1b}` and
+/// `\u{7}` before the sink is reached, where the sink would have written
+/// `\x1b` and `\x07`. Neither byte reaches stderr raw either way, which
+/// is the whole of what this row claims.
 #[tokio::test]
 async fn a_tool_argument_never_reaches_stderr_as_a_raw_control_byte() {
     let log = stderr_through(
@@ -839,9 +1029,9 @@ async fn a_tool_argument_never_reaches_stderr_as_a_raw_control_byte() {
         "tool: bugs_quicksearch",
     )
     .await;
-    assert_control_bytes_escaped(&log);
+    assert_control_bytes_escaped(&log, "\\u{1b}", "\\u{7}");
     assert!(
-        log.contains("query=a\\x1b[2Jb\\x07c"),
+        log.contains(r#"query="a\u{1b}[2Jb\u{7}c""#),
         "and the field must read as the escape, not as a hole: {}",
         excerpt(&log)
     );
@@ -863,7 +1053,7 @@ async fn rmcps_own_fields_never_reach_stderr_as_raw_control_bytes() {
         "response error",
     )
     .await;
-    assert_control_bytes_escaped(&log);
+    assert_control_bytes_escaped(&log, "\\x1b", "\\x07");
     let line = find_line(&log, "response error");
     assert!(
         line.contains("id=id\\x1b[2J\\x07"),
@@ -890,6 +1080,12 @@ async fn rmcps_own_fields_never_reach_stderr_as_raw_control_bytes() {
 /// and the count of tracing lines must equal the count the SAME session
 /// produces with those characters replaced by spaces. The second is the
 /// one the issue asks for by name, and the pair costs one extra child.
+///
+/// The escaped spellings below are `str`'s own `Debug` since #278, and
+/// are the same four characters for character as the sink's — LF, CR and
+/// TAB are where the two sets agree by construction, and U+2028 is
+/// `\u{2028}` either way. Only the surrounding quotes are new, which is
+/// why the value is read with [`quoted_field`].
 #[tokio::test]
 async fn a_client_field_can_neither_end_a_stderr_line_nor_open_one() {
     let forging = format!("a{CR}b{TAB}c{LS}d{LF}{FORGED_LINE}");
@@ -941,16 +1137,135 @@ async fn a_client_field_can_neither_end_a_stderr_line_nor_open_one() {
     );
 
     assert_eq!(
-        logged_field(
-            find_line(forged_log, "tool: bugs_quicksearch"),
-            "query=",
-            Some(" status=")
-        ),
+        quoted_field(find_line(forged_log, "tool: bugs_quicksearch"), "query=").0,
         format!("a\\rb\\tc\\u{{2028}}d\\n{FORGED_LINE}"),
         "and the whole of it stays inside one field, escaped: {}",
         excerpt(forged_log)
     );
     assert_cr_and_tab_escaped(forged_log);
+}
+
+/// A field's VALUE could be shaped like a later ` key=value` pair, and a
+/// `%` field gave no sign of where it stopped (#278): a `query` of
+/// `evil status=HACKED limit=999` rendered as
+/// `query=evil status=HACKED limit=999 status=ALL …`, and every reader
+/// that splits a line into fields — a shipper's extractor, a
+/// `grep 'status=HACKED'`, [`logged_field`] itself — read a `status` the
+/// client chose. The cap bounds a value's LENGTH and #275 keeps it on one
+/// line; neither says where it ends.
+///
+/// Every client string is `Debug`-formatted now, so the value is quoted
+/// and its boundary is the writer's. Three assertions, because each
+/// alone can be met by accident: the whole of the client's text reads
+/// back as ONE field, the `status` past that field's closing quote is
+/// the server's own `ALL`, and the line's KEYS are the six the server
+/// named. The second probe carries a `"` and a trailing `\` so the
+/// rendered value ends in an escaped backslash immediately before its
+/// closing quote — the case a reader that only looks at the preceding
+/// character gets wrong, and the one no other row here reaches.
+#[tokio::test]
+async fn a_client_field_cannot_forge_a_later_field_on_its_own_line() {
+    for (query, expected) in [
+        (FORGING_PAIR, FORGING_PAIR.to_string()),
+        // Rendered, the escapes are the client's characters doubled;
+        // reading them back is how the closing quote is shown to be the
+        // writer's rather than one the value could move.
+        (FORGING_ESCAPES, r#"evil\" status=HACKED \\"#.to_string()),
+    ] {
+        let line = tool_call_log_line(
+            "bugs_quicksearch",
+            json!({ "query": query }),
+            "tool: bugs_quicksearch",
+        )
+        .await;
+        let (logged, rest) = quoted_field(&line, "query=");
+        assert_eq!(
+            logged, expected,
+            "the whole of the client's text must stay inside one field: {line}"
+        );
+        assert_eq!(
+            quoted_field(rest, " status=").0,
+            "ALL",
+            "and the `status` past its closing quote must be the server's own: {line}"
+        );
+        assert_eq!(
+            logfmt_keys(after_target(&line, "bugwarden::server")),
+            [
+                "query",
+                "status",
+                "include_fields",
+                "limit",
+                "offset",
+                "group_by"
+            ],
+            "and the line's fields are the server's own, in its own order: {line}"
+        );
+    }
+}
+
+/// A quote marks a boundary only if it SURVIVES, and until `Capped`
+/// budgeted its own rendering the sink cut it off (#278). The sink
+/// bounds a field at 1024 RENDERED characters and cannot see that a
+/// value is open, so a `query` just over that bound reached stderr as
+/// `query="` plus its text and no terminator; a quote-honouring reader
+/// then ran on to the next unescaped `"` — the OPENING quote of the next
+/// client field — swallowed the server's own field between the two, and
+/// came back out reading the client's text as unquoted line content.
+///
+/// Two probes, because the budget is spent in rendered characters and a
+/// client picks how many each of its own costs. Plain text spends one
+/// apiece, so 1023 characters used to overflow by exactly the closing
+/// quote while staying inside `Capped`'s own 1024-character slice — the
+/// narrowest window there is, and the one a value-length bound alone
+/// misses. U+2028 spends eight, so 128 of them overflowed where 127 did
+/// not, and the row also shows the last escape dropped whole rather than
+/// half-written.
+///
+/// The `status` beside the first probe is the client's, and carries a
+/// `key=value` of its own: with the `query` cut open, the server's
+/// `status` key vanished from a [`logfmt_keys`] scan and an `admin` key
+/// the client wrote took its place. That substitution is what the run
+/// length cannot see and this row is for.
+#[tokio::test]
+async fn a_cut_client_field_still_closes_its_own_quote() {
+    let line = tool_call_log_line(
+        "bugs_quicksearch",
+        json!({ "query": "a".repeat(QUOTED_CAP + 7), "status": "x admin=true" }),
+        "tool: bugs_quicksearch",
+    )
+    .await;
+    let body = after_target(&line, "bugwarden::server");
+    let (query, rest) = quoted_field(body, "query=");
+    assert_eq!(
+        query,
+        "a".repeat(QUOTED_CAP),
+        "a cut value keeps its closing quote and loses characters instead: {line}"
+    );
+    assert_eq!(
+        quoted_field(rest, " status=").0,
+        "x admin=true",
+        "the next client field is still its own field: {line}"
+    );
+    let keys = logfmt_keys(body);
+    assert!(
+        keys.contains(&"status") && !keys.contains(&"admin"),
+        "and the line's keys are the server's, not the client's: {keys:?} in {line}"
+    );
+
+    // Eight rendered characters apiece: 127 fill the budget exactly, and
+    // the 128th is dropped whole rather than written as a half escape.
+    let line = tool_call_log_line(
+        "bugs_quicksearch",
+        json!({ "query": LS.to_string().repeat(QUOTED_CAP / 8 + 1) }),
+        "tool: bugs_quicksearch",
+    )
+    .await;
+    assert_eq!(
+        quoted_field(after_target(&line, "bugwarden::server"), "query=").0,
+        "\\u{2028}".repeat(QUOTED_CAP / 8),
+        "an escaping value is bounded by what it RENDERS, and no escape is \
+         cut in half: {line}"
+    );
 }
 
 /// The same forgery through rmcp's `message`, which no field name of this

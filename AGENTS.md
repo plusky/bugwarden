@@ -119,8 +119,11 @@ are never a justification for undoing them.
   timeout.
 - Tracing goes to stderr always — stdout belongs to the stdio transport.
   A client string in a tracing field goes through `Capped`, on the audit
-  record's 1024-char boundary; a client-sized id array is logged as a count
-  plus a `MAX_ASSESS_IDS` head.
+  record's 1024-char boundary, and as a `?` field, never `%`: `Capped`
+  renders a quoted, escaped value that closes inside its own budget, so a
+  value cannot forge a later `key=value` pair on the line, and
+  `%Capped(..)` does not compile. A client-sized id array is logged as a
+  count plus a `MAX_ASSESS_IDS` head.
 
 ## Tests and Dependencies
 
