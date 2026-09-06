@@ -5093,6 +5093,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::deadline::bounded;
     use crate::pinned_cli::pinned;
     use bugwarden_core::policy::Policy;
 
@@ -6872,43 +6873,7 @@ mod tests {
             .expect("MCP handshake must succeed")
     }
 
-    /// Bound on every request these tests await — over the duplex
-    /// transport and in process alike.
-    ///
-    /// rmcp 3.1.4 sends with `PeerRequestOptions::default()`, whose
-    /// `timeout` is `None` (`service.rs`), and its `initialize` handshake
-    /// reads the response off the transport with no deadline either. A
-    /// request the server never answers therefore waits forever: it hangs
-    /// its test, this whole binary, and every binary cargo queues behind
-    /// it. That failure is the one this module hunts (#253, #254), so it
-    /// must fail ONE test rather than decide how long the run takes. A
-    /// direct `ServerHandler::call_tool` await is bounded for the same
-    /// reason: it reaches the same dispatch, and the mutants that hung the
-    /// suite were inside it. So is a hand-sent second `initialize` — over
-    /// a live session that is an ordinary request, answered or not.
-    ///
-    /// 30s is far above anything legitimate here — no test delays a mock
-    /// and every upstream is loopback or absent — and it is the number
-    /// `tests/common/deadline.rs` gives the integration harnesses. Two
-    /// definitions of it exist, not one: a known duplication, not a
-    /// necessity — a `#[cfg(test)]` module in the library cannot `use`
-    /// an integration-test file, but it can include one by `#[path]`,
-    /// as `lib.rs` does for `pinned_cli` and `refused` (#280). Until
-    /// that is done nothing but this sentence keeps the two equal: move
-    /// one and move the other; the reasoning for the value itself lives
-    /// in that file.
-    const CALL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-
-    /// Await `fut` under [`CALL_DEADLINE`], panicking if it does not
-    /// resolve. `what` names the request, because the panic is all a
-    /// reader of a CI log gets.
-    async fn bounded<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
-        tokio::time::timeout(CALL_DEADLINE, fut)
-            .await
-            .unwrap_or_else(|_| panic!("{what} was not answered within {CALL_DEADLINE:?}"))
-    }
-
-    /// Call `tool` over the session, under [`CALL_DEADLINE`].
+    /// Call `tool` over the session, under [`crate::deadline::CALL_DEADLINE`].
     ///
     /// The bound carries weight wherever this follows a call that panicked:
     /// "the session survives" is a claim that a reply ARRIVES, so an

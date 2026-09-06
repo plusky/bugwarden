@@ -146,8 +146,8 @@ are never a justification for undoing them.
   response headers and only reqwest's own total timeout also covers the
   body. `bounded` and `CALL_DEADLINE` live in
   `crates/bugwarden/tests/common/deadline.rs`, `raw_client()` beside them
-  in `common/raw_client.rs`, and `server.rs`'s test module keeps its own
-  equal copy of the constant.
+  in `common/raw_client.rs`, and the library's test module includes the
+  same file by `#[path]`.
 - A dependency change must update `Cargo.lock`, preserve the MSRV, and pass
   `cargo deny check`. Prefer the smallest compatible version change; do not
   run a broad `cargo update` as part of an unrelated change.
