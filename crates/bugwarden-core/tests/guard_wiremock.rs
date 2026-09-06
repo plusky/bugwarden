@@ -43,6 +43,10 @@ fn client(server: &MockServer) -> BugzillaClient {
 /// ephemeral port fails the helper. A 500 ms TCP probe refuses to
 /// return an address that accepted or timed out; the URL is built from
 /// the probed socket so the two cannot drift.
+///
+/// `crates/bugwarden/tests/common/refused.rs` is this function's twin —
+/// it says where the probe belongs and why this package cannot share it
+/// — and nothing pairs them: a change here is a change there (#280).
 fn refused_base_url() -> String {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
     assert!(

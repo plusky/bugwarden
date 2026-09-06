@@ -3067,7 +3067,11 @@ wired, `server.rs` and `main.rs` are the reference.
   `127.0.0.1:1` (a privileged port a non-root wiremock `bind(127.0.0.1:0)`
   cannot occupy); `assert!(addr.port() < 1024)` is the mutation-kill for a
   bind-then-drop of an ephemeral port, a 500 ms TCP probe refuses an
-  address that accepted or timed out, the client call is capped at 2 s,
+  address that accepted or timed out (this package's own copy of the
+  probe the `bugwarden` crate shares from `tests/common/refused.rs` —
+  see the otel unit-test bullet; a `#[path]` out of this package could
+  not reach it, and the two are paired by their rustdoc alone),
+  the client call is capped at 2 s,
   and the assertion requires reqwest's `error sending request` so an
   empty or HTTP-status error cannot pass a bare `!contains(KEY)`
   (issue #115; known history, issue #127: PR #124 landed as `a0f535f`
@@ -3765,7 +3769,24 @@ wired, `server.rs` and `main.rs` are the reference.
   hand-written `Debug`
   carries neither, since `AuditSink`'s derived one would print it;
   the startup probe refuses a dead collector without naming the endpoint
-  (I12) and leaves delivery marked failing.
+  (I12) and leaves delivery marked failing. Four of these rows — the two
+  delivery-accounting ones and the two startup-probe ones — post to the
+  collector, and take the probed address the integration harnesses use
+  (`refused_base_url`, `tests/common/refused.rs`, included into the
+  library's test tree by `#[path]` the way `pinned_cli` is; that file
+  states the rule and `bugwarden-core` keeps a copy it cannot share, see
+  the `guard_wiremock.rs` bullet above). The three that shut the pipeline
+  down before a record is queued never connect, so they keep a bare
+  literal (issue #280). Where port 1 is filtered rather than closed the
+  four now fail together inside `refused_base_url`, which names the
+  address and the cause; before, the two delivery-accounting rows failed
+  on pipeline state alone — a delivery not marked failing, a drop not
+  counted — saying nothing about the box, while the two startup-probe
+  rows still PASSED, each only once `PROBE_ATTEMPTS` had run out, at ten
+  seconds an attempt. The host and the port their I12 assertions forbid
+  are parsed back out of that same URL as a socket address, so neither
+  the address nor a bracketed-v6 spelling of it can leave the assertions
+  passing vacuously.
 - Sink-selection tests (#[cfg(test)] in crates/bugwarden/src/audit.rs):
   the four deployments resolve, the two ambiguous spellings refuse naming
   both ways out, and `none` is exact bytes (`None` and `./none` are

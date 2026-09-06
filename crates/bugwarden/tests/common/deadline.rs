@@ -45,9 +45,12 @@ use std::time::Duration;
 /// here, not a nudge; none exists, and writing one means revisiting this
 /// constant rather than assuming it already covers the case.
 ///
-/// `server.rs`'s test module declares this number a second time, because a
-/// `#[cfg(test)]` module in the library cannot reach `tests/`. The two are
-/// equal by hand and nothing checks it, so a change here is a change
+/// `server.rs`'s test module declares this number a second time. That is
+/// a known duplication rather than a necessity: a `#[cfg(test)]` module in
+/// the library cannot `use` an integration-test file, but it can include
+/// one by `#[path]`, which is how `lib.rs` reaches `pinned_cli` and
+/// `refused.rs` (#280). Until this file is shared that way the two values
+/// are equal by hand and nothing checks it, so a change here is a change
 /// there.
 pub const CALL_DEADLINE: Duration = Duration::from_secs(30);
 

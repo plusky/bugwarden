@@ -1363,6 +1363,7 @@ mod tests {
         AuditEvent, AuditEventKind, ClientInfo, GuardInfo, InitializeEvent, OutcomeClass,
         OutcomeInfo, RequestInfo, SessionInfo, ToolCallEvent, TraceContext, TransportKind, Verdict,
     };
+    use crate::refused::refused_base_url;
     use crate::testlog::{assert_logged, capture_logs};
 
     fn env(endpoint: &str) -> OtelEnv {
@@ -1370,6 +1371,35 @@ mod tests {
             endpoint: Some(endpoint.to_owned()),
             ..OtelEnv::default()
         }
+    }
+
+    /// A collector address bare by the probe's rule
+    /// (`tests/common/refused.rs`): the rows below that use it shut the
+    /// pipeline down before a record is queued, so nothing here ever
+    /// opens a connection and there is no wait to buy out (#280). A row
+    /// that posts to the collector takes [`refused_base_url`] instead.
+    const NO_COLLECTOR: &str = "http://127.0.0.1:1";
+
+    /// The dead collector's base URL, and the two needles a refusal must
+    /// never carry (I12): its host, and its port with the colon a
+    /// message would print in front of it.
+    ///
+    /// Both are parsed back out of the URL the exporter is pointed at,
+    /// as a [`std::net::SocketAddr`] rather than by hand: splitting on
+    /// the first colon would read `[::1]:1` as host `[`, which no
+    /// refusal can contain, and that assertion would then pass on any
+    /// message at all. Whatever the helper hands out — v4, or a
+    /// bracketed v6 — is what these rows forbid.
+    ///
+    /// For the URL alone, call [`refused_base_url`] directly.
+    fn dead_collector() -> (String, String, String) {
+        let base = refused_base_url();
+        let addr: std::net::SocketAddr = base
+            .trim_start_matches("http://")
+            .parse()
+            .expect("the probed base is `http://` and a socket address");
+        let (host, port) = (addr.ip().to_string(), format!(":{}", addr.port()));
+        (base, host, port)
     }
 
     // -- configuration ------------------------------------------------------
@@ -2406,7 +2436,7 @@ mod tests {
         // must be able to account for (take_lost -> audit_gap), never a
         // silent drop; the diagnostics counter stays at zero for it, and
         // delivery is marked failing so the fail-mode gate closes.
-        let cfg = resolve(&env("http://127.0.0.1:1/"))
+        let cfg = resolve(&env(&refused_base_url()))
             .expect("resolves")
             .expect("export is on");
         let pipeline = Arc::new(Pipeline::start(cfg).expect("the pipeline must start"));
@@ -2439,7 +2469,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreachable_collector_counts_diagnostics_as_drops() {
-        let cfg = resolve(&env("http://127.0.0.1:1/"))
+        let cfg = resolve(&env(&refused_base_url()))
             .expect("resolves")
             .expect("export is on");
         let pipeline = Arc::new(Pipeline::start(cfg).expect("the pipeline must start"));
@@ -2468,7 +2498,7 @@ mod tests {
         // The audit queue REFUSES what it cannot take: the sink turns the
         // refusal into a failed record and the fail mode decides what the
         // caller sees. Only diagnostics are dropped-and-counted.
-        let cfg = resolve(&env("http://127.0.0.1:1/"))
+        let cfg = resolve(&env(NO_COLLECTOR))
             .expect("resolves")
             .expect("export is on");
         let pipeline = Arc::new(Pipeline::start(cfg).expect("the pipeline must start"));
@@ -2495,7 +2525,7 @@ mod tests {
         // send an operator looking for a volume problem that is not
         // there. The line is lost either way — this is about the
         // vocabulary being true.
-        let cfg = resolve(&env("http://127.0.0.1:1/"))
+        let cfg = resolve(&env(NO_COLLECTOR))
             .expect("resolves")
             .expect("export is on");
         let pipeline = Arc::new(Pipeline::start(cfg).expect("the pipeline must start"));
@@ -2552,7 +2582,8 @@ mod tests {
     async fn the_startup_probe_refuses_a_dead_collector_without_naming_it() {
         // The refusal names the variables the operator has to check and
         // never the endpoint they hold (I12) — port 1 would be the tell.
-        let cfg = resolve(&env("http://127.0.0.1:1/"))
+        let (base, host, port) = dead_collector();
+        let cfg = resolve(&env(&base))
             .expect("resolves")
             .expect("export is on");
         let pipeline = Arc::new(Pipeline::start(cfg).expect("the pipeline must start"));
@@ -2570,7 +2601,7 @@ mod tests {
             "a general-variable config must not blame the logs-specific pair: {message}"
         );
         assert!(
-            !message.contains("127.0.0.1") && !message.contains(":1"),
+            !message.contains(&host) && !message.contains(&port),
             "the refusal must not carry the endpoint: {message}"
         );
         assert!(
@@ -2582,8 +2613,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_startup_probe_names_the_logs_specific_variables_when_those_won() {
+        let (base, host, port) = dead_collector();
         let cfg = resolve(&OtelEnv {
-            logs_endpoint: Some("http://127.0.0.1:1/v1/logs".to_owned()),
+            logs_endpoint: Some(format!("{base}/v1/logs")),
             logs_headers: Some("authorization=Bearer x".to_owned()),
             ..OtelEnv::default()
         })
@@ -2602,7 +2634,7 @@ mod tests {
             "the refusal must name the variables that actually won: {message}"
         );
         assert!(
-            !message.contains("127.0.0.1") && !message.contains("Bearer"),
+            !message.contains(&host) && !message.contains(&port) && !message.contains("Bearer"),
             "the refusal must not carry the endpoint or the credential: {message}"
         );
         pipeline.shutdown().await;
@@ -2610,7 +2642,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_is_idempotent_and_bounded() {
-        let cfg = resolve(&env("http://127.0.0.1:1/"))
+        let cfg = resolve(&env(NO_COLLECTOR))
             .expect("resolves")
             .expect("export is on");
         let pipeline = Arc::new(Pipeline::start(cfg).expect("the pipeline must start"));

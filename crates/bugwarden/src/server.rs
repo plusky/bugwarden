@@ -6740,10 +6740,13 @@ mod tests {
     /// 30s is far above anything legitimate here — no test delays a mock
     /// and every upstream is loopback or absent — and it is the number
     /// `tests/common/deadline.rs` gives the integration harnesses. Two
-    /// definitions of it exist, not one: a `#[cfg(test)]` module in the
-    /// library cannot reach `tests/`, so nothing but this sentence keeps
-    /// them equal. Move one and move the other; the reasoning for the
-    /// value itself lives in that file.
+    /// definitions of it exist, not one: a known duplication, not a
+    /// necessity — a `#[cfg(test)]` module in the library cannot `use`
+    /// an integration-test file, but it can include one by `#[path]`,
+    /// as `lib.rs` does for `pinned_cli` and `refused` (#280). Until
+    /// that is done nothing but this sentence keeps the two equal: move
+    /// one and move the other; the reasoning for the value itself lives
+    /// in that file.
     const CALL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// Await `fut` under [`CALL_DEADLINE`], panicking if it does not
@@ -7407,6 +7410,12 @@ mod tests {
     /// A base URL nothing dials: the probe panics before it could, and the
     /// follow-up call (`mcp_server_info`) contacts nothing either. Keeping
     /// wiremock out makes these tests about the dispatch boundary alone.
+    ///
+    /// Bare by the rule in `tests/common/refused.rs` (#280): pointed at
+    /// an address that black-holes connections these rows still pass in
+    /// milliseconds, so no client here ever connects and there is no
+    /// wait for the probe to buy out. A row that does route a call
+    /// upstream takes `crate::refused::refused_base_url` instead.
     const NO_BUGZILLA: &str = "http://127.0.0.1:1";
 
     /// A handler that panics on every call. A free `fn` rather than a
