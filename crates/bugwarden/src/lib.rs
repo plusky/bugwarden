@@ -28,3 +28,11 @@ mod testlog;
 #[cfg(test)]
 #[path = "../tests/common/pinned_cli.rs"]
 mod pinned_cli;
+
+// The probed refused address, reached by `#[path]` for the same reason:
+// `use` cannot see an integration-test file. A unit test that DIALS an
+// unreachable upstream checks the address instead of assuming it, and
+// that file says where the probe belongs (#280).
+#[cfg(test)]
+#[path = "../tests/common/refused.rs"]
+mod refused;
