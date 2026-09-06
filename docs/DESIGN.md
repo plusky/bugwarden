@@ -2516,12 +2516,25 @@ wired, `server.rs` and `main.rs` are the reference.
   dispatch line above is WARN for the other half of the rule: before #270
   it was the only per-request, client-repeatable ERROR in THIS
   WORKSPACE's code. `server.rs`'s sole other production `tracing::error!`
-  is behind a `Once`; of the rest, `stdio.rs`'s over-cap refusal closes
-  the transport, `main.rs`'s two serving-error arms end the process,
-  `audit.rs`'s sink diagnostic is rate-limited, and `main.rs`'s
+  is behind a `Once`; of the rest, `main.rs`'s two serving-error arms end
+  the process, `audit.rs`'s sink diagnostic is rate-limited, and `main.rs`'s
   signal-arming failure runs at most once per signal kind at startup — so
-  none of them is a lever a client can pull twice. Whether the first of
-  those is ERROR under this rule is #272's question and stays open here.
+  none of them is a lever a client can pull twice. `stdio.rs`'s over-cap
+  refusal LEFT that enumeration under this same rule (#272), and which half
+  of the rule moved it matters: a client that reconnects can cause every
+  line a refusal writes, so repeatability alone would demote all of them.
+  What separates them is the other half. The reader's line reports a
+  refusal this server made ON PURPOSE — the cap doing exactly what it is
+  configured to do, with nothing to inspect and nothing to change — so
+  there is no operator action behind it at all, and it is WARN now, text
+  unchanged. `main`'s line says something a client cannot make routine:
+  that this PROCESS is over. That is the statement every handshake-failure
+  arm makes (#261), it happens once in a process's life however often a
+  peer reconnects, and it is what the level is being kept for, so it stays
+  ERROR. The post-handshake half writes no such line — `main` bails out of
+  `waiting()` without one — so a refused frame costs bugwarden one ERROR
+  before `initialize` and none after it. What each side actually puts on
+  stderr is listed under "That number is the request cap" below.
   The linked crates are outside the enumeration: rmcp logs at ERROR on
   paths of its own, none shown to be client-repeatable on demand, and a
   panic inside any dependency now routes through this hook like any
@@ -2721,16 +2734,55 @@ wired, `server.rs` and `main.rs` are the reference.
     unrecordable, and on the same terms: no tool name, no caller, no guard
     verdict.
 
-  The stdio trace is a log line and an exit code: bugwarden's own `error!`
-  naming the cap, deliberately not rmcp's `Error reading from stream`, and
-  exit `1` at BOTH stages. Pre-handshake the refusal already propagates out
-  of `serve`; post-handshake rmcp maps the read error to `receive() -> None`,
-  which the service reports as `QuitReason::Closed` — the same `Ok` a clean
-  peer hangup produces — so `main` reads a shared over-cap flag after
-  `waiting()` and bails on it, or the same refusal would exit `0` at one
-  stage and `1` at the other. An operator diagnosing either refusal compares
-  the request size against the derived cap, because nothing server-side
-  recorded the attempt.
+  What identifies a stdio refusal is bugwarden's own `warn!` naming the cap —
+  deliberately not rmcp's `Error reading from stream`, which names neither the
+  bound nor the transport — and exit `1` at BOTH stages; the full set of lines
+  each stage writes is enumerated below. Pre-handshake the refusal already
+  propagates out of `serve`; post-handshake rmcp maps the read error to
+  `receive() -> None`, which the service reports as `QuitReason::Closed` — the
+  same `Ok` a clean peer hangup produces — so `main` reads a shared over-cap
+  flag after `waiting()` and bails on it, or the same refusal would exit `0`
+  at one stage and `1` at the other. An operator diagnosing either refusal
+  compares the request size against the derived cap, because nothing
+  server-side recorded the attempt.
+
+  **What one refused frame writes** (#272), measured on the shipped binary at
+  the default filter, in order. Before `initialize`: `bugwarden::stdio` at
+  WARN, naming the cap and the close; `rmcp::transport::async_rw` at ERROR,
+  echoing this reader's error `Display` (rmcp logs every read error there
+  before turning it into `receive() -> None`, so the cap's own sentence
+  reaches stderr whether or not bugwarden logs at all, minus the `; closing
+  the transport` tail this build adds); `bugwarden` at ERROR, `serving error:`
+  and then `main`'s `OVER_CAP_CLOSE`; and the `Error:` line the runtime prints
+  for the `anyhow::Error` `main` returned. Three log lines and the exit line.
+  After `initialize` there are MORE, not fewer: the same WARN and the same
+  rmcp ERROR, then two `rmcp::service` INFO lines (`input stream terminated`,
+  `serve finished quit_reason=Closed`) that the pre-handshake half never
+  reaches, then the exit line — four log lines and the exit line, none of the
+  four bugwarden's own beyond the WARN, because `main` bails after `waiting()`
+  with no tracing line of its own. So one refusal costs ONE bugwarden ERROR
+  before the handshake and NONE after it, and after it rmcp's echo is the only
+  ERROR on stderr. The directive that quiets that echo is
+  `RUST_LOG=info,rmcp::transport::async_rw=off`, and it is `off` and not the
+  `warn` #272 proposed: an `EnvFilter` level is a CEILING on verbosity, so
+  `=warn` enables WARN *and* ERROR and leaves the line exactly where it was —
+  measured both ways. Everything else that target logs is `debug!` or
+  `trace!`, so under the default filter it shows nothing but ERROR, and of its
+  two ERROR sites only the read-error one is reachable through this transport:
+  the other sits behind a `Serde` arm that already catches every error
+  `try_parse_with_compatibility` can return. `off` therefore removes the echo
+  and nothing else. What it does cost is stated here rather than paid by
+  default: that ERROR is EVERY read error rmcp sees, not only a refused frame.
+  A genuine stdin I/O failure after the handshake is the same line, and there
+  it is the only line that says anything WENT WRONG — measured with `EIO` from
+  a closed pty master, where rmcp logs the echo, reports the close with the
+  same two INFO lines a clean hangup gets, `waiting()` returns `Ok`, the
+  over-cap flag is clear, bugwarden writes nothing of its own and the process
+  exits `0`. That a real stdin failure ends the process successfully, with a
+  dependency's ERROR as the only sign of it, is pre-existing and outside
+  #272's scope; it is recorded here as a fact, not fixed. It is also why the
+  directive stays OUT of the default filter: a default that hides a genuine
+  read error is worse than a noisy refusal.
 
   Not done, deliberately: emitting a null-id `-32700` on stdout before
   closing. It is new stdout-after-close behaviour bought for a nicety, and
@@ -3613,14 +3665,24 @@ wired, `server.rs` and `main.rs` are the reference.
   that only `return Ok(())` cannot go green on an EOF the harness handed
   it: the test's `Server` takes stdin out of the `Child` at spawn and
   holds it past `Child::wait`, which closes whatever stdin the `Child`
-  still owns. The same spawned binary pins the stdio frame cap (#234): 5 MiB
-  with NO delimiter, written before the handshake and again after a
-  completed one, must exit `1` within the same bound and log bugwarden's own
-  cap line — served on a bare `stdio()` neither case exits at all, and
-  without the over-cap flag `main` checks after `waiting()` the
-  post-handshake case exits `0`, which is what rmcp's silent close makes of
+  still owns. The same spawned binary pins the stdio frame cap (#234) on
+  three rows: 5 MiB with NO delimiter, written before the handshake, after
+  an answered `server/discover` probe (#267) and after a completed
+  handshake, each of which must exit `1` within the same bound and log
+  bugwarden's own cap line — served on a bare `stdio()` no row exits at all,
+  and without the over-cap flag `main` checks after `waiting()` the
+  post-handshake row exits `0`, which is what rmcp's silent close makes of
   it. The needle is bugwarden's line, not rmcp's `Error reading from
-  stream`, so an SDK reword cannot pass for the bound.
+  stream`, so an SDK reword cannot pass for the bound. All three rows also
+  read the LEVELS off the same stderr (#272): the cap line is a WARN, the
+  ERROR lines carrying a target of this workspace's own number exactly one
+  (`serving error`) before the handshake and none after it, and rmcp's echo
+  is still an ERROR on `rmcp::transport::async_rw` — asserted rather than
+  merely tolerated, because that target and that level are exactly what the
+  `RUST_LOG` directive documented above addresses. The `serving error` line
+  of the OTHER handshake-failure arm is pinned at ERROR in the same file
+  (`assert_bounded_handshake_failure`), so neither arm can be demoted
+  unnoticed; before this, no test read either arm's level.
 - Startup-wiring tests (crates/bugwarden/tests/binary_startup_policy.rs,
   the SHIPPED BINARY): the three `main.rs` sites only a process executes,
   which is why a hand mutation run found all three bare (#269). The I9
