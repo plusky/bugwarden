@@ -222,6 +222,7 @@ dependencies = [
  "prost",
  "reqwest",
  "rmcp",
+ "rustix",
  "schemars",
  "serde",
  "serde_json",

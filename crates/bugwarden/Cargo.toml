@@ -116,6 +116,11 @@ tokio = { version = "1", features = [
 ] }
 wiremock = "0.6"
 
+# `binary_shutdown`'s pre-handshake stdin EIO row (#285) opens a pty and
+# closes the master. Already in the lock file through tempfile.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { version = "1", features = ["pty"] }
+
 # Distribution packages for the GitHub release (x86_64 Linux only, matching
 # the only Linux tarball target). Layout mirrors the openSUSE spec in
 # devel:tools so the two packagings do not disagree about where things go;

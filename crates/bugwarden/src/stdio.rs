@@ -17,10 +17,12 @@
 //! An over-cap frame is fatal, not skippable: the request id lives inside
 //! the unparsed frame, so no response can name it, and rmcp clients set no
 //! default request timeout — a peer that resumed would hang forever, which
-//! is worse than a closed transport. rmcp maps the read error to
+//! is worse than a closed transport. rmcp maps every read error to
 //! `receive() -> None`, i.e. a silent close indistinguishable from a clean
 //! peer hangup, so the trip is also published through [`BoundedLines::over_cap`]
-//! for `main` to turn into a non-zero exit.
+//! for `main` to turn into a non-zero exit. A failure that is not the cap
+//! is published through [`BoundedLines::io_failed`], so a descriptor error
+//! is not classified as a hangup (#285).
 //!
 //! [`DiscoverAnswering`] is the other half: rmcp reads the stdio lifecycle
 //! off the first frame, so a `server/discover` probe committed the session
@@ -70,6 +72,10 @@ pub struct BoundedLines<R> {
     /// Set once, never cleared: the read stays failed, and `main` reads it
     /// after `waiting()` to tell an over-cap close from a clean one.
     over_cap: Arc<AtomicBool>,
+    /// Set once a delegated read fails for a reason other than the cap.
+    /// Distinct from `over_cap`: that is this reader's refusal, this is
+    /// the inner stream failing. `main` names the two separately (#285).
+    io_failed: Arc<AtomicBool>,
 }
 
 impl<R> BoundedLines<R> {
@@ -80,6 +86,7 @@ impl<R> BoundedLines<R> {
             cap,
             since_newline: 0,
             over_cap: Arc::new(AtomicBool::new(false)),
+            io_failed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -101,6 +108,17 @@ impl<R> BoundedLines<R> {
     /// non-zero.
     pub fn over_cap(&self) -> Arc<AtomicBool> {
         self.over_cap.clone()
+    }
+
+    /// The inner-read-error flag,
+    /// shared with whoever outlives the transport.
+    ///
+    /// rmcp turns every read error into `receive() -> None`, which before
+    /// the handshake is `ConnectionClosed` — the same shape as EOF. Without
+    /// this flag a failed descriptor and a hangup are the same sentence.
+    /// `main` reads it to say the input stream failed (#285).
+    pub fn io_failed(&self) -> Arc<AtomicBool> {
+        self.io_failed.clone()
     }
 
     /// The error a tripped reader returns, on the trip and on every read
@@ -161,7 +179,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedLines<R> {
             return Poll::Ready(Err(this.refusal()));
         }
         let before = buf.filled().len();
-        ready!(Pin::new(&mut this.inner).poll_read(cx, buf))?;
+        if let Err(e) = ready!(Pin::new(&mut this.inner).poll_read(cx, buf)) {
+            this.io_failed.store(true, Ordering::Release);
+            return Poll::Ready(Err(e));
+        }
         let mut rest = &buf.filled()[before..];
         while let Some(newline) = rest.iter().position(|&byte| byte == b'\n') {
             if this.since_newline.saturating_add(newline) > this.cap {
@@ -361,12 +382,16 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for DiscoverAnswering<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::atomic::Ordering;
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
     use rmcp::transport::async_rw::AsyncRwTransport;
     use rmcp::transport::Transport as _;
     use rmcp::RoleServer;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
+    use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _, DuplexStream, ReadBuf};
 
     use super::BoundedLines;
 
@@ -558,6 +583,46 @@ mod tests {
             received.is_none(),
             "an over-cap frame must close the transport, not yield a message"
         );
+    }
+
+    #[tokio::test]
+    async fn a_cap_trip_is_not_recorded_as_an_io_failure() {
+        let mut reader = BoundedLines::new(&b"0123456789abcdefg\n"[..], 16);
+        let mut buf = [0u8; 64];
+        reader.read(&mut buf).await.expect_err("over the cap");
+        assert!(reader.over_cap().load(Ordering::Acquire));
+        assert!(
+            !reader.io_failed().load(Ordering::Acquire),
+            "the cap is this reader's refusal, not the inner stream failing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_error_is_recorded_as_an_io_failure() {
+        struct Fail;
+        impl AsyncRead for Fail {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Err(io::Error::other("injected")))
+            }
+        }
+        let mut reader = BoundedLines::new(Fail, 16);
+        let mut buf = [0u8; 8];
+        reader.read(&mut buf).await.expect_err("inner I/O error");
+        assert!(reader.io_failed().load(Ordering::Acquire));
+        assert!(!reader.over_cap().load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn eof_is_not_recorded_as_an_io_failure() {
+        let mut reader = BoundedLines::new(&b""[..], 16);
+        let mut buf = [0u8; 8];
+        assert_eq!(reader.read(&mut buf).await.expect("EOF is Ok(0)"), 0);
+        assert!(!reader.io_failed().load(Ordering::Acquire));
+        assert!(!reader.over_cap().load(Ordering::Acquire));
     }
 }
 
