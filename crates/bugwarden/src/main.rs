@@ -19,6 +19,7 @@ use bugwarden::otel::{self, OtelEnv, Pipeline};
 use bugwarden::stdio::DiscoverAnswering;
 use bugwarden::tracing_fields::CappedFields;
 use bugwarden::{config, server};
+use bugwarden_core::quoted::QuotedError;
 use bugwarden_core::{guard::Guard, policy::Policy};
 use clap::Parser;
 use rmcp::{transport::streamable_http_server::StreamableHttpService, ServiceExt};
@@ -529,7 +530,7 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
         signal(kind)
             .inspect_err(|err| {
                 tracing::error!(
-                    error = %err,
+                    error = ?QuotedError(err),
                     "failed to install the {name} handler; {name} will not stop the process"
                 );
             })

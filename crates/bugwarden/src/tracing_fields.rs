@@ -35,11 +35,13 @@
 //! Every client string bugwarden names a field for is `?`-formatted
 //! since #278, so `server::Capped` has already escaped it by the time it
 //! arrives here and this adapter only ever escapes what `Debug` leaves
-//! alone. That narrows nothing. bugwarden's `error`, `path`, `location`,
-//! `thread` and startup `tool` fields are still `%` and still arrive
-//! raw — `error` carries Bugzilla's own message text, which is where a
-//! client string can come back at one remove — and so do rmcp's `%id`,
-//! its `%client_requested` and every `message` on the stream.
+//! alone. That narrows nothing. Upstream error text is quoted the same
+//! way since #288 (`QuotedError`), Display through Debug, so a Bugzilla
+//! message that echoes client input cannot forge a later field for a
+//! reader that honours quotes. bugwarden's `path`, `location`, `thread`
+//! and startup `tool` fields are still `%` and still arrive raw, and so
+//! do rmcp's `%id`, its `%client_requested` and every `message` on the
+//! stream.
 //!
 //! Those two families are also why the ESCAPE SPELLINGS on a line
 //! identify the sigil rather than the writer: `\u{1b}` is what `Debug`
@@ -85,14 +87,15 @@ pub const PARAM_VALUE_MAX_CHARS: usize = 1024;
 /// sees a stream of characters and cannot know which of them the client
 /// wrote, so it cuts wherever the count runs out — mid-value,
 /// mid-escape, or between a value and the delimiter that was going to
-/// close it. That last case is why `server::Capped` bounds its own
-/// rendering eight characters under this one (#278) and closes its own
-/// quote: a field this adapter cuts open is a field a quote-honouring
-/// reader runs out of, into whatever follows on the line. Nothing a
-/// `Capped` renders reaches this budget; what still does is rmcp's
-/// fields, `message`, and bugwarden's own `%` ones — an OPERATOR's
-/// config path among them, cut at 1024 like anyone else's, because a
-/// bound with an exception for trusted values is a bound with a hole.
+/// close it. That last case is why `server::Capped` (and `QuotedError`,
+/// same budget) bounds its own rendering eight characters under this
+/// one (#278, #288) and closes its own quote: a field this adapter cuts
+/// open is a field a quote-honouring reader runs out of, into whatever
+/// follows on the line. Nothing a `Capped` or `QuotedError` renders
+/// reaches this budget; what still does is rmcp's fields, `message`, and
+/// bugwarden's own `%` ones — an OPERATOR's config path among them, cut
+/// at 1024 like anyone else's, because a bound with an exception for
+/// trusted values is a bound with a hole.
 ///
 /// Characters are escaped on the way through. The set is every C0 byte
 /// `\x00`–`\x1f`, DEL, every C1 byte `\u{80}`–`\u{9f}`, and U+2028

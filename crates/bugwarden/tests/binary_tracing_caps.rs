@@ -42,6 +42,11 @@
 //!   `a_client_field_cannot_forge_a_later_field_on_its_own_line` reads
 //!   the value with [`quoted_field`], which finds the boundary the
 //!   WRITER marked, and then reads the real `status` past it;
+//! - an upstream error reaching a line through a `%` field, the #278
+//!   residual: Bugzilla echoes the client's `version` into `error=`
+//!   (#288). `an_upstream_error_cannot_forge_a_later_field_on_its_own_line`
+//!   drives `create_bug` against a mock that returns the fixture
+//!   message with `status=HACKED` inside; a `%e` site fails here;
 //! - a quoted value whose closing quote the SINK cuts off, which a
 //!   reader then runs out of into the next client field (#278):
 //!   `a_cut_client_field_still_closes_its_own_quote` drives the two
@@ -97,6 +102,8 @@ use bugwarden_core::guard::Guard;
 use serde_json::json;
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/scrub_env.rs"]
 mod scrub_env;
@@ -194,8 +201,28 @@ fn the_scrub_list_covers_every_environment_fallback() {
 /// before any upstream call, or — the create denial — after one that can
 /// only fail, so the handshake, the call and the line happen in order
 /// without a mock. stdout goes to /dev/null: the replies are not the
-/// subject.
+/// subject. The #288 row needs a real upstream body; it uses
+/// [`log_line_at`] against a mock.
 async fn log_line(
+    protocol_version: &str,
+    policy: Option<&Path>,
+    call: Option<(&str, serde_json::Value)>,
+    needle: &str,
+) -> String {
+    log_line_at(
+        "https://bugzilla.example.invalid",
+        protocol_version,
+        policy,
+        call,
+        needle,
+    )
+    .await
+}
+
+/// [`log_line`] pointed at `bugzilla_server` instead of the unreachable
+/// default.
+async fn log_line_at(
+    bugzilla_server: &str,
     protocol_version: &str,
     policy: Option<&Path>,
     call: Option<(&str, serde_json::Value)>,
@@ -203,7 +230,7 @@ async fn log_line(
 ) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_bugwarden"));
     cmd.args(["--transport", "stdio"])
-        .args(["--bugzilla-server", "https://bugzilla.example.invalid"])
+        .args(["--bugzilla-server", bugzilla_server])
         .args(["--api-key", "test-key"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -432,8 +459,9 @@ fn assert_escaped_never_raw(log: &str, bytes: &[(char, &str, &str)]) {
 /// `Debug` long before the sink sees it and reads `\u{1b}`, a `%` field
 /// arrives raw and takes the sink's `\x1b`. Both families appear on
 /// bugwarden's own lines — every client string of ours is `?` since
-/// #278, while `error`, `path`, `location` and `thread` are still `%` —
-/// and on rmcp's, whose `?peer_info` is quoted where its `%id` is not.
+/// #278, and `error=` since #288, while `path`, `location` and `thread`
+/// are still `%` — and on rmcp's, whose `?peer_info` is quoted where
+/// its `%id` is not.
 fn assert_control_bytes_escaped(log: &str, esc: &str, bel: &str) {
     assert_escaped_never_raw(log, &[(ESC, "ESC", esc), (BEL, "BEL", bel)]);
 }
@@ -1201,6 +1229,64 @@ async fn a_client_field_cannot_forge_a_later_field_on_its_own_line() {
             "and the line's fields are the server's own, in its own order: {line}"
         );
     }
+}
+
+/// Bugzilla's error `message` is client-influenced and was logged bare
+/// (`error=%e`), so a version of `1.0 status=HACKED limit=999` forged
+/// logfmt keys on the `create_bug: upstream refused` line (#288).
+///
+/// A `%e` site fails here: the sink caps and escapes the text but cannot
+/// mark where a `%` value ends, so [`quoted_field`] would not find an
+/// opening quote and [`logfmt_keys`] would see `status` and `limit`.
+#[tokio::test]
+async fn an_upstream_error_cannot_forge_a_later_field_on_its_own_line() {
+    let mock = MockServer::start().await;
+    let message = concat!(
+        "There is no version named '1.0 status=HACKED limit=999' ",
+        "in the 'openSUSE' product."
+    );
+    Mock::given(method("POST"))
+        .and(path("/rest/bug"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": true,
+            "message": message,
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let line = log_line_at(
+        &mock.uri(),
+        SUPPORTED_VERSION,
+        None,
+        Some((
+            "create_bug",
+            json!({
+                "product": "openSUSE",
+                "component": "core",
+                "summary": "crash on start",
+                "version": "1.0 status=HACKED limit=999",
+            }),
+        )),
+        "create_bug: upstream refused",
+    )
+    .await;
+
+    let display = format!("bugzilla error (HTTP 400): {message}");
+    let (logged, _rest) = quoted_field(&line, "error=");
+    assert_eq!(
+        logged, display,
+        "the whole Display including the forged pair must stay inside one field: {line}"
+    );
+    let keys = logfmt_keys(after_target(&line, "bugwarden::server"));
+    assert!(
+        !keys.contains(&"status") && !keys.contains(&"limit"),
+        "status/limit must not be keys of this line: {keys:?} in {line}"
+    );
+    assert!(
+        logged.contains("status=HACKED"),
+        "the HACKED text lives inside the quoted value: {logged:?}"
+    );
 }
 
 /// A quote marks a boundary only if it SURVIVES, and until `Capped`

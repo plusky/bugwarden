@@ -25,6 +25,7 @@ use crate::client::{BugzillaClient, CLASSIFY_FIELDS};
 use crate::policy::{
     Access, BugMeta, Capability, IdentitySource, Operation, Policy, RULE_UNAVAILABLE,
 };
+use crate::quoted::QuotedError;
 
 /// Fields kept by the redacted summary-only projection of a bug
 /// ([`Guard::summary_view`]). Everything else — assignee, CC, groups,
@@ -201,7 +202,7 @@ impl Guard {
                     // Nonexistent, forbidden upstream, or a transport failure:
                     // all indistinguishable from here, and all fail closed
                     // below (I4). Never logged with the key (I12).
-                    tracing::debug!(id, error = %err, "classification fetch failed");
+                    tracing::debug!(id, error = ?QuotedError(&err), "classification fetch failed");
                 }
             }
         }
@@ -451,7 +452,7 @@ impl Guard {
         let envelope = match bz.get_bugs(key, &wanted, Some(CLASSIFY_FIELDS)).await {
             Ok(v) => v,
             Err(err) => {
-                tracing::debug!(error = %err, "link disclosure fetch failed; scrubbing all");
+                tracing::debug!(error = ?QuotedError(&err), "link disclosure fetch failed; scrubbing all");
                 return BTreeSet::new();
             }
         };
@@ -868,7 +869,7 @@ impl Guard {
                     // silently denies everything is exactly the blackout this
                     // is meant to surface.
                     tracing::warn!(
-                        error = %err,
+                        error = ?QuotedError(&err),
                         "whoami failed; caller identity unresolved (this endpoint may not \
                          exist on this deployment — stock Bugzilla Core v1 does not define \
                          /rest/whoami)"
