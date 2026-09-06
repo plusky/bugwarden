@@ -40,7 +40,8 @@ jobs:
           # A PR-written cache is invisible to main and evicts main's own by
           # LRU once the repo is over quota; PRs restore main's entry either
           # way, since nothing ref-specific enters the key. So: main writes,
-          # PRs only read.
+          # PRs only read. Older generations of the same key prefix
+          # are pruned weekly by cache-prune.yml.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format
         run: cargo fmt --check
@@ -218,6 +219,10 @@ jobs:
         with:
           workspaces: . -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Registry only: a full target/ key for the MSRV is a second
+          # multi-hundred-MB entry next to rust's pin, and this job only
+          # `cargo check`s.
+          cache-targets: false
       - name: Assert the toolchain is the MSRV
         # If the export above ever stops working, fail here instead of
         # silently re-testing the pinned channel.
