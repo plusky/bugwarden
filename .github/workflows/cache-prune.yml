@@ -1,0 +1,39 @@
+---
+name: cache-prune
+# `save-if` is main-only across ci.yml, so every rust-cache entry is a
+# `main` generation. Older generations are pure LRU pressure once a newer
+# one for the same key prefix exists — keep the newest per prefix, delete
+# the rest.
+on:
+  schedule:
+    # Weekly, at a quiet hour so a prune is unlikely to
+    # race a running job.
+    - cron: '23 3 * * 0'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Delete superseded cache generations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # A key's trailing hash segment (Cargo.lock hash, or
+          # rust-cache's lockfile-hash component) is what changes
+          # per generation; stripping it groups a key's generations
+          # together for the keep-newest pass.
+          gh cache list --repo "$REPO" --limit 100 --json id,key,createdAt |
+            jq -r '.[] | [(.key | sub("-[0-9a-fA-F]{6,64}$"; "")), .createdAt, .id] | @tsv' |
+            sort -t $'\t' -k1,1 -k2,2r |
+            awk -F'\t' '{ if ($1 != prev) { prev = $1 } else { print $3 } }' |
+            while read -r id; do
+              echo "Deleting superseded cache id $id"
+              gh cache delete "$id" --repo "$REPO"
+            done
