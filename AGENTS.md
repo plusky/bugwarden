@@ -122,8 +122,10 @@ are never a justification for undoing them.
   record's 1024-char boundary, and as a `?` field, never `%`: `Capped`
   renders a quoted, escaped value that closes inside its own budget, so a
   value cannot forge a later `key=value` pair on the line, and
-  `%Capped(..)` does not compile. A client-sized id array is logged as a
-  count plus a `MAX_ASSESS_IDS` head.
+  `%Capped(..)` does not compile. Upstream error text is quoted the same
+  way (`QuotedError`), Display through Debug, never `%e` and never `?e`
+  on anyhow. A client-sized id array is logged as a count plus a
+  `MAX_ASSESS_IDS` head.
 
 ## Tests and Dependencies
 

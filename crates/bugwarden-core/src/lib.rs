@@ -19,7 +19,11 @@
 //!   aws-lc-rs provider, OS trust store via `rustls-platform-verifier`, with
 //!   `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` honored). Errors are sanitized so
 //!   the API key can never leak through them (I12).
+//! - [`quoted`] — Display-through-Debug quoting for tracing `error=`
+//!   fields, so a Bugzilla message that echoes client input cannot forge
+//!   a later `key=value` pair on the line.
 
 pub mod client;
 pub mod guard;
 pub mod policy;
+pub mod quoted;

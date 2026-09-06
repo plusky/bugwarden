@@ -19,6 +19,7 @@ use base64::{engine::general_purpose, Engine as _};
 use bugwarden_core::client::{with_upstream_stats, BugzillaClient, UpstreamStats, CLASSIFY_FIELDS};
 use bugwarden_core::guard::{Guard, SearchRequest, SearchWindow};
 use bugwarden_core::policy::{Access, Action, Capability, IdentitySource};
+use bugwarden_core::quoted::QuotedError;
 use chrono::{DateTime, Utc};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
@@ -383,7 +384,7 @@ fn capped(value: &str) -> String {
 }
 
 /// [`capped`] as a tracing field: `?Capped(&p.query)` formats a leading
-/// slice of the value in place, quoted, allocating nothing. Two bounds
+/// slice of the value, quoted. Two bounds
 /// meet here — [`PARAM_VALUE_MAX_CHARS`] on the value's own characters,
 /// which is the audit record's, and [`CAPPED_DEBUG_MAX_CHARS`] on what
 /// the `Debug` below WRITES, which is the diagnostic line's.
@@ -436,6 +437,10 @@ struct Capped<'a>(&'a str);
 /// `Some(..)` and nowhere else; a site that wraps it in anything wider
 /// than six characters has to lower this number, and the boundary unit
 /// tests are where that is noticed.
+#[allow(
+    dead_code,
+    reason = "named in rustdoc and tests; Debug goes through QuotedError"
+)]
 const CAPPED_DEBUG_MAX_CHARS: usize = PARAM_VALUE_MAX_CHARS - 8;
 
 impl<'a> Capped<'a> {
@@ -458,46 +463,11 @@ impl<'a> Capped<'a> {
 /// own `Debug` rendering, stopped at [`CAPPED_DEBUG_MAX_CHARS`] rendered
 /// characters so the closing quote always fits. Under an `Option` it
 /// still reads `Some("…")` / `None`, the shape a bare `?p.resolution`
-/// printed before the cap.
-///
-/// Transcribed from `impl Debug for str` rather than delegated to it
-/// because that impl offers no seam to stop at, and the transcription is
-/// exact: for every Unicode scalar value, `char::escape_debug` is what
-/// `str` writes, save the apostrophe — `str` escapes the double quote
-/// and not the single one, where a bare `char` escapes both. A unit test
-/// pins the byte-equality for any value under the budget.
-///
-/// A character is written whole or not at all. Stopping mid-escape would
-/// put `\u{20` on the line, which is neither the client's text nor a
-/// legal escape, and stopping AFTER a too-wide character while carrying
-/// on with the next one would reorder the value; both misreport what was
-/// sent, and the cut is silent, so it has to be a prefix.
+/// printed before the cap. Delegates to [`QuotedError`] so both spend
+/// the same budget on Display-through-Debug.
 impl std::fmt::Debug for Capped<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use std::fmt::Write as _;
-        f.write_char('"')?;
-        let mut remaining = CAPPED_DEBUG_MAX_CHARS;
-        for ch in self.as_str().chars() {
-            // The apostrophe is the one character `str` leaves raw where
-            // a bare `char` escapes it, so it is the one width not read
-            // off `escape_debug`.
-            let raw_quote = ch == '\'';
-            let width = if raw_quote {
-                1
-            } else {
-                ch.escape_debug().count()
-            };
-            if width > remaining {
-                break;
-            }
-            remaining -= width;
-            if raw_quote {
-                f.write_char('\'')?;
-            } else {
-                write!(f, "{}", ch.escape_debug())?;
-            }
-        }
-        f.write_char('"')
+        std::fmt::Debug::fmt(&QuotedError(self.as_str()), f)
     }
 }
 
@@ -2808,7 +2778,7 @@ impl BugWarden {
                     // absent from `full` and fall to the uniform denial
                     // below, which is also what a fetch failure should look
                     // like (I4) — one bad body no longer voids the call.
-                    tracing::warn!(error = %e, "bug_info: body fetch failed");
+                    tracing::warn!(error = ?QuotedError(&e), "bug_info: body fetch failed");
                 }
             }
         }
@@ -2986,7 +2956,7 @@ impl BugWarden {
                 })))
             }
             Err(e) => {
-                tracing::warn!(id = p.id, error = %e, "bug_history: fetch failed");
+                tracing::warn!(id = p.id, error = ?QuotedError(&e), "bug_history: fetch failed");
                 Ok(err_text("Failed to fetch bug history"))
             }
         }
@@ -3077,7 +3047,7 @@ impl BugWarden {
                 })))
             }
             Err(e) => {
-                tracing::warn!(id = p.id, error = %e, "bug_comments: fetch failed");
+                tracing::warn!(id = p.id, error = ?QuotedError(&e), "bug_comments: fetch failed");
                 Ok(err_text("Failed to fetch bug comments"))
             }
         }
@@ -3160,7 +3130,7 @@ impl BugWarden {
             Ok(window) => window,
             // Uniform: a failing search never says which bug or why (I2).
             Err(e) => {
-                tracing::warn!(error = %e, "bugs_quicksearch: upstream search failed");
+                tracing::warn!(error = ?QuotedError(&e), "bugs_quicksearch: upstream search failed");
                 return Ok(err_text("Search failed"));
             }
         };
@@ -3335,7 +3305,7 @@ impl BugWarden {
                 // Uniform with the policy refusal above (see that comment);
                 // Bugzilla's message is logged server-side only — it can say
                 // whether a product or component exists.
-                tracing::warn!(error = %e, "create_bug: upstream refused");
+                tracing::warn!(error = ?QuotedError(&e), "create_bug: upstream refused");
                 Ok(err_text(Guard::create_denial()))
             }
         }
@@ -3395,7 +3365,7 @@ impl BugWarden {
         match self.bz.add_attachment(&key, p.bug_id, payload).await {
             Ok(v) => Ok(ok_json(v)),
             Err(e) => {
-                tracing::warn!(bug_id = p.bug_id, error = %e, "add_attachment: upstream refused");
+                tracing::warn!(bug_id = p.bug_id, error = ?QuotedError(&e), "add_attachment: upstream refused");
                 Ok(err_text("Failed to add attachment"))
             }
         }
@@ -3975,7 +3945,7 @@ impl BugWarden {
             Err(e) => {
                 tracing::debug!(
                     attachment_id = p.attachment_id,
-                    error = %e,
+                    error = ?QuotedError(&e),
                     "attachment metadata fetch failed"
                 );
                 None
@@ -4049,7 +4019,7 @@ impl BugWarden {
             Err(e) => {
                 tracing::debug!(
                     attachment_id = p.attachment_id,
-                    error = %e,
+                    error = ?QuotedError(&e),
                     "attachment data fetch failed"
                 );
                 note_denied();
@@ -6537,6 +6507,11 @@ mod tests {
         assert_eq!(
             format!("{:?}", Capped(r#"evil status=HACKED "\"#)),
             r#""evil status=HACKED \"\\""#
+        );
+        assert_eq!(
+            format!("{:?}", Capped(r#"evil status=HACKED "\"#)),
+            format!("{:?}", QuotedError(r#"evil status=HACKED "\"#)),
+            "Capped and QuotedError share one quoting budget"
         );
     }
 

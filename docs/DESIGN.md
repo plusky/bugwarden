@@ -1243,7 +1243,7 @@ Decisions, all deliberate:
   NAMES for a client string is `?`, so `Capped` escapes those before the
   sink is reached. What still arrives raw is rmcp's `%id` and
   `%client_requested`, every `message`, and bugwarden's own `%` fields —
-  `error`, `path`, `location`, `thread` and the startup `tool` — so the
+  `path`, `location`, `thread` and the startup `tool` — so the
   sink's escaping is load-bearing on `bugwarden::server` lines too, and
   not only on the library's.) The sink escapes every control character and
   every mandatory line break — the whole C0 range, DEL, the C1 range and
@@ -1285,13 +1285,15 @@ Decisions, all deliberate:
   C0 and DEL; that parity was never on offer and is not claimed anywhere.
   Since #278 the disagreement is legible rather than latent, and it marks
   the SIGIL rather than the writer: `\u{1b}` is what `Debug` wrote — on a
-  client field of ours, and equally on rmcp's `?peer_info` — while `\x1b`
-  is what the sink wrote, on rmcp's `%id` and on bugwarden's own `error`
-  alike. Whoever owns the field, a reader that unescapes has to handle
-  both families. Everything else is written the way `EscapeGuard` writes
-  the part the two sets share: `\xNN` for the five single characters it
-  covers (ESC, BEL, BS, FF and DEL), `\u{..}` for the whole C1 range, and
-  that same `\u{..}` for LS and PS. One field's escapes stay one family.
+  client field of ours, on an `error=` field since #288, and equally on
+  rmcp's `?peer_info` — while `\x1b` is what the sink wrote, on rmcp's
+  `%id` and on bugwarden's own remaining `%` fields (`path`, `location`,
+  `thread`) alike. Whoever owns the field, a reader that unescapes has to
+  handle both families. Everything else is written the way
+  `EscapeGuard` writes the part the two sets share: `\xNN` for the five
+  single characters it covers (ESC, BEL, BS, FF and DEL), `\u{..}` for
+  the whole C1 range, and that same `\u{..}` for LS and PS. One field's
+  escapes stay one family.
   Both halves of the divergence are pinned by unit tests,
   tracing-subscriber's own rendering included, so a later "make it match
   tracing-subscriber" cleanup has to argue with a test rather than delete
@@ -1383,7 +1385,7 @@ Decisions, all deliberate:
   cap is untouched: `capped()` reads `Capped::as_str`, which no sigil and
   no budget of the tracing path reaches.
 
-  Two residuals stay, both outside what a site of ours can close. rmcp's
+  One residual stays, outside what a site of ours can close. rmcp's
   own `%` fields are bare — `%id`, a client-chosen string request id on
   every `response error` line, and the `%client_requested` on rmcp's copy
   of the unsupported-version warning, which puts the whole forgery on the
@@ -1392,17 +1394,18 @@ Decisions, all deliberate:
   of ours cannot quote them without quoting its own decoration too, and
   the sink's 1024 is what bounds them.
 
-  The other is next door and stays `%`: `error = %e`. The text is
-  UPSTREAM-authored, but not upstream-authored alone. `bugwarden-core`'s
-  `check_error` copies Bugzilla's `message` field into the error verbatim,
-  and Bugzilla echoes what the client sent — this repo's own fixture is
-  `There is no version named '1.0' in the 'openSUSE' product.` for a
-  `create_bug` whose `version` and `product` the client chose. So a forged
-  key/value pair can ride back into one of these fields. It is left bare
-  because an error's `Display` is the thing an operator reads and quoting
-  it would put escapes through every message this server writes; it is
-  capped and escaped by the sink like any other field, and the forgery
-  needs Bugzilla's cooperation to echo.
+  The `error=` field next door is quoted like the #278 client strings:
+  `error = ?QuotedError(&e)`. The text is UPSTREAM-authored, but not
+  upstream-authored alone. `bugwarden-core`'s `check_error` copies
+  Bugzilla's `message` field into the error verbatim, and Bugzilla echoes
+  what the client sent — this repo's own fixture is `There is no version
+  named '1.0' in the 'openSUSE' product.` for a `create_bug` whose
+  `version` and `product` the client chose. So a forged key/value pair
+  can ride back into one of these fields. `QuotedError` prints the
+  error's Display (never Debug: anyhow's Debug is the chain) through the
+  same `Capped` budget, quoted, so a reader that honours quotes finds
+  the end the writer marked. Readers that do not honour quotes are no
+  better off than before: `grep 'status=HACKED'` still matches the line.
 
   The two lines a failed stdio handshake writes are bounded by a
   different means, because the cut above is the wrong instrument for
