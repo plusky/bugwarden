@@ -24,3 +24,10 @@ all = { level = "warn", priority = -1 }
 # (do not enable pedantic as warn-as-error — it blocks scaffolding with style
 # nits).
 pedantic = { level = "allow", priority = -1 }
+
+# Shipped binary only (tarball, deb/rpm, container). CI tests stay on the
+# default profile. CGU=1 so pre-LTO optimize sees one module per crate;
+# fat LTO then merges across crates either way.
+[profile.release]
+lto = "fat"
+codegen-units = 1
