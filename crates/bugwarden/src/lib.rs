@@ -36,3 +36,10 @@ mod pinned_cli;
 #[cfg(test)]
 #[path = "../tests/common/refused.rs"]
 mod refused;
+
+// The request deadline the crate's own unit tests share with the
+// integration harnesses, reached by `#[path]` because `use` cannot
+// see an integration-test file (#286).
+#[cfg(test)]
+#[path = "../tests/common/deadline.rs"]
+mod deadline;

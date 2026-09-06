@@ -8,6 +8,10 @@
 //! `dead_code` in the rest, which `-D warnings` rejects (#167, #214). Only
 //! two binaries say it, and most of the client-driving harnesses are not
 //! among them.
+//!
+//! The library's `#[cfg(test)]` tree includes this file the same way
+//! as `pinned_cli` and `refused` (`lib.rs`), so the crate's own unit
+//! tests share one `CALL_DEADLINE` (#286).
 
 use std::future::Future;
 use std::time::Duration;
@@ -44,14 +48,6 @@ use std::time::Duration;
 /// one per named field for `bug_fields`. Such a test would need minutes
 /// here, not a nudge; none exists, and writing one means revisiting this
 /// constant rather than assuming it already covers the case.
-///
-/// `server.rs`'s test module declares this number a second time. That is
-/// a known duplication rather than a necessity: a `#[cfg(test)]` module in
-/// the library cannot `use` an integration-test file, but it can include
-/// one by `#[path]`, which is how `lib.rs` reaches `pinned_cli` and
-/// `refused.rs` (#280). Until this file is shared that way the two values
-/// are equal by hand and nothing checks it, so a change here is a change
-/// there.
 pub const CALL_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Await `fut` under [`CALL_DEADLINE`], panicking if it does not resolve.
