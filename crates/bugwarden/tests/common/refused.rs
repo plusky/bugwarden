@@ -26,8 +26,8 @@
 //! in `crates/bugwarden-core/tests/guard_wiremock.rs` — because a
 //! `#[path]` out of that package into this one's `tests/` reaches
 //! outside the package directory and would not survive packaging.
-//! Nothing but the pointer in each rustdoc pairs the two: edit one, edit
-//! the other.
+//! `the_core_copy_matches` is the pin: the two function bodies, modulo
+//! the timeout-panic sentence #280 reworded.
 
 /// Connect-time failure nothing in this process can answer (#115, #229).
 ///
@@ -36,8 +36,8 @@
 /// stranger racing an ephemeral port can answer this request. The
 /// load-bearing assertion is `port() < 1024` — a bind-then-drop of an
 /// ephemeral port fails the helper. A 500 ms TCP probe refuses to
-/// return an address that accepted or timed out; the URL is built from
-/// the probed socket so the two cannot drift.
+/// return an address that timed out; the URL is built from the probed
+/// socket so the two cannot drift.
 ///
 /// Scheme and authority only: a caller needing a path (`/v1/logs` for
 /// the OTLP export) appends its own.
@@ -48,15 +48,53 @@ pub fn refused_base_url() -> String {
         "these tests must use a privileged port; wiremock binds 127.0.0.1:0 (#115, #229)"
     );
     match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500)) {
-        Ok(_) => panic!(
-            "{addr} accepted a connection; these tests need a refused address \
-             that wiremock's 127.0.0.1:0 pool cannot occupy (#115)"
-        ),
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => panic!(
             "{addr} timed out; refusing to hand out an address whose failure \
              would arrive on the caller's client timeout instead of at \
              connect (#115, #280)"
         ),
-        Err(_) => format!("http://{addr}"),
+        _ => format!("http://{addr}"),
     }
+}
+
+/// Core cannot `#[path]` into this package's `tests/`; the bodies stay
+/// identical except the timeout-panic sentence #280 reworded.
+#[test]
+fn the_core_copy_matches() {
+    fn body(src: &str) -> &str {
+        const SIG: &str = "fn refused_base_url() -> String {";
+        let start = src.find(SIG).unwrap_or_else(|| panic!("{SIG} must exist")) + SIG.len();
+        let rest = &src[start..];
+        let end = rest
+            .find("\n}")
+            .unwrap_or_else(|| panic!("{SIG} body must close"));
+        &rest[..end]
+    }
+
+    // The one allowed difference: the string inside this panic!(...).
+    fn without_timeout_sentence(body: &str) -> String {
+        const ARM: &str = "Err(e) if e.kind() == std::io::ErrorKind::TimedOut => panic!(";
+        let start = body
+            .find(ARM)
+            .unwrap_or_else(|| panic!("the timeout-panic arm must exist"));
+        let rest = &body[start + ARM.len()..];
+        let close = rest
+            .find("),")
+            .unwrap_or_else(|| panic!("the timeout panic must close"));
+        let mut out = String::with_capacity(body.len());
+        out.push_str(&body[..start + ARM.len()]);
+        out.push_str(" SENTENCE ");
+        out.push_str(&rest[close..]);
+        out
+    }
+
+    let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let ours = std::fs::read_to_string(here.join("tests/common/refused.rs")).expect("this file");
+    let core = std::fs::read_to_string(here.join("../bugwarden-core/tests/guard_wiremock.rs"))
+        .expect("core's packaging-bound copy");
+    assert_eq!(
+        without_timeout_sentence(body(&ours)),
+        without_timeout_sentence(body(&core)),
+        "the two refused_base_url bodies must match modulo the timeout-panic sentence (#287)"
+    );
 }

@@ -7506,6 +7506,9 @@ mod tests {
     /// milliseconds, so no client here ever connects and there is no
     /// wait for the probe to buy out. A row that does route a call
     /// upstream takes `crate::refused::refused_base_url` instead.
+    ///
+    /// Unprobed on purpose (#287): that is a call-site contract with no
+    /// mechanical guard. Revisit if this cluster grows.
     const NO_BUGZILLA: &str = "http://127.0.0.1:1";
 
     /// A handler that panics on every call. A free `fn` rather than a
