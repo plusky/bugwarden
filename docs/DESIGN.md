@@ -1234,17 +1234,23 @@ Decisions, all deliberate:
   which print the whole handshake, every client notification and a raw
   string request id, at whatever level and whatever `RUST_LOG` says. Each
   value is also escaped there (#266): tracing-subscriber 0.3 sanitizes
-  `message` and `record_error` and nothing else, so a `%`-formatted
-  field reached the terminal verbatim, and most of the client strings
-  this codebase logs are `%` — a `query` of ESC `[2J` cleared the
-  operator's screen. (The `?`-formatted ones — `group_by`, `resolution`,
-  `priority`, `severity` — were already escaped by `str`'s own `Debug`,
-  as rmcp's `?peer_info` is; its `%id` is not.) The sink escapes every
-  control character and every mandatory line break — the whole C0
-  range, DEL, the C1 range and U+2028/U+2029 — unconditionally,
-  whatever the writer's ANSI-sanitization setting says: that setting
-  exists so that TRUSTED sequences in a logged value pass through
-  unchanged, and it is not a channel a client may inherit.
+  `message` and `record_error` and nothing else, so a `%`-formatted field
+  reached the terminal verbatim, and most of the client strings this
+  codebase logged were `%` — a `query` of ESC `[2J` cleared the operator's
+  screen. (The `?`-formatted ones — `group_by`, `resolution`, `priority`,
+  `severity` — were already escaped by `str`'s own `Debug`, as rmcp's
+  `?peer_info` is; its `%id` is not. Since #278 every field bugwarden
+  NAMES for a client string is `?`, so `Capped` escapes those before the
+  sink is reached. What still arrives raw is rmcp's `%id` and
+  `%client_requested`, every `message`, and bugwarden's own `%` fields —
+  `error`, `path`, `location`, `thread` and the startup `tool` — so the
+  sink's escaping is load-bearing on `bugwarden::server` lines too, and
+  not only on the library's.) The sink escapes every control character and
+  every mandatory line break — the whole C0 range, DEL, the C1 range and
+  U+2028/U+2029 — unconditionally, whatever the writer's ANSI-sanitization
+  setting says: that setting exists so that TRUSTED sequences in a logged
+  value pass through unchanged, and it is not a channel a client may
+  inherit.
 
   That set is WIDER than `EscapeGuard`'s (#275), and the difference is a
   decision rather than a transcription slip. tracing-subscriber passes
@@ -1271,20 +1277,25 @@ Decisions, all deliberate:
   grown one reported byte at a time — it is a set the next reader can
   restate from a standard instead of from this paragraph.
 
-  Spellings. LF, CR and TAB are written `\n`, `\r` and `\t`, which is
-  how `str`'s own `Debug` writes them, so for those three — and only
-  those three — a `?` field and a `%` field carrying the same value
-  put identical bytes on the line. `Debug` writes `\0` for NUL and
-  `\u{..}` for the rest, so the two shapes disagree over the other 30
-  characters of C0 and DEL; that parity was never on offer and is not
-  claimed anywhere. Everything else is written the way `EscapeGuard`
-  writes the part the two sets share: `\xNN` for the five single
-  characters it covers (ESC, BEL, BS, FF and DEL), `\u{..}` for the
-  whole C1 range, and that same `\u{..}` for LS and PS. One field's
-  escapes stay one family. Both halves of the divergence are pinned by
-  unit tests, tracing-subscriber's own rendering included, so a later
-  "make it match tracing-subscriber" cleanup has to argue with a test
-  rather than delete a comment.
+  Spellings. LF, CR and TAB are written `\n`, `\r` and `\t`, which is how
+  `str`'s own `Debug` writes them, so for those three — and only those
+  three — a `?` field and a `%` field carrying the same value put
+  identical bytes on the line. `Debug` writes `\0` for NUL and `\u{..}`
+  for the rest, so the two shapes disagree over the other 30 characters of
+  C0 and DEL; that parity was never on offer and is not claimed anywhere.
+  Since #278 the disagreement is legible rather than latent, and it marks
+  the SIGIL rather than the writer: `\u{1b}` is what `Debug` wrote — on a
+  client field of ours, and equally on rmcp's `?peer_info` — while `\x1b`
+  is what the sink wrote, on rmcp's `%id` and on bugwarden's own `error`
+  alike. Whoever owns the field, a reader that unescapes has to handle
+  both families. Everything else is written the way `EscapeGuard` writes
+  the part the two sets share: `\xNN` for the five single characters it
+  covers (ESC, BEL, BS, FF and DEL), `\u{..}` for the whole C1 range, and
+  that same `\u{..}` for LS and PS. One field's escapes stay one family.
+  Both halves of the divergence are pinned by unit tests,
+  tracing-subscriber's own rendering included, so a later "make it match
+  tracing-subscriber" cleanup has to argue with a test rather than delete
+  a comment.
 
   The rendering is NOT injective, and never was: a client that sends the
   two characters `\` and `n` renders byte for byte as an escaped LF
@@ -1297,27 +1308,101 @@ Decisions, all deliberate:
   The cap is also per FIELD of a line and says nothing about how many
   LINES a client can cause: rmcp logs every notification at `info`, so
   300 `notifications/progress` still produce 301 lines, each bounded.
-  Nor does it stop a field's VALUE from carrying text SHAPED like a
-  later ` key=value` pair: a `query` of `evil status=HACKED limit=999`
-  renders as `query=evil status=HACKED limit=999 status=ALL …`, and a
-  parser that splits that line into fields reads a `status` the client
-  chose. #275 closes LINE forgery; intra-line field forgery is a
-  separate bound, and this one does not claim it.
 
-  The call-site `Capped`s STAY, and the sink MASKS them on stderr: once
-  both cut at the same constant, `%Capped(&p.query)` and `%p.query` put
-  the same bytes on the line, so `binary_tracing_caps` now measures the
-  sink and nothing about the sites — measured, by removing a wrapper and
-  watching the suite stay green. They are kept for three reasons that
-  survive that. `capped()` shares their cut and is the AUDIT RECORD's,
-  which `audit_wiremock` measures and no sink touches. `bug_ids` needs a
-  count-plus-head shape, and a sink that sees only rendered characters
-  cannot synthesise one. And a bound in front of a bound costs a wrapper.
-  Where the two meet the sink's budget covers the rendered form,
-  decoration included, so an `?Option<Capped>` field spends six of its
-  1024 characters on `Some("` and loses the closing `")` to the cut: a
-  strict tightening, never a loosening, and the price of a cut that does
-  not depend on the site knowing it exists.
+  Where a value ENDS is a different bound, and the sink cannot state it:
+  it sees rendered characters and cannot tell a space the client wrote
+  from one a field separator put there. A `%` field states it nowhere
+  either (#278). Twelve of this codebase's tracing fields were
+  `%Capped(..)`, which writes the value bare, so a `query` of `evil
+  status=HACKED limit=999` rendered as `query=evil status=HACKED limit=999
+  status=ALL …` and every reader that splits the line into fields — a
+  shipper's key/value extractor, a `grep 'status=HACKED'`,
+  `binary_tracing_caps`' own field helper — read a `status` the client
+  chose.
+
+  So the SITES state it. Every client string bugwarden names a field for
+  is `?Capped(..)`: `Debug`, quoted, with `"` and `\` escaped inside, so
+  `query="evil status=HACKED limit=999"` is one field whose end a reader
+  can find and `query="a\"b"` is still one field. `Capped` has no
+  `Display` impl for that reason — `%Capped(..)` is how the defect is
+  written, and it no longer compiles.
+
+  A quote only marks a boundary if it SURVIVES, and the sink cuts a field
+  at 1024 rendered characters without knowing one is open. Left there, the
+  fix would have moved the defect rather than closed it: a `query` of 1023
+  plain characters, or of 128 U+2028 (eight rendered characters each),
+  rendered as `query="` plus its text and no terminator, and a
+  quote-honouring reader then ran on to the next unescaped `"` — the
+  OPENING quote of the next client field — swallowed the server's own
+  field between the two and read the client's text back as unquoted line
+  content. With `status` sent as `x admin=true`, a key scan of the line
+  lost `status` altogether and gained `admin`. Field SUPPRESSION was new:
+  a bare value at least ended at the first space.
+
+  So `Capped` carries a second bound of its own, on the RENDERED
+  characters between its quotes: `CAPPED_DEBUG_MAX_CHARS`, eight under the
+  sink's. Eight is what the widest shape a site wraps a `Capped` in costs
+  — `Some("` and `")` are six, the quotes two — so `Some("` + 1016 + `")`
+  is 1024 exactly and a bare `?Capped` field is 1018. The site can do this
+  because the site knows the shape; the sink never can. `Capped` writes
+  its own opening quote, spends the budget on WHOLE escapes (a
+  half-written `\u{20` is neither the client's text nor a legal escape,
+  and carrying on past a character that did not fit would reorder the
+  value), and writes the closing quote. Nothing a `Capped` renders reaches
+  the sink's budget, so no field of ours is ever cut open — on stderr or
+  in the OTLP diagnostics body, which the same `Debug` feeds through the
+  same writer.
+
+  That makes the call-site wrapper LOAD-BEARING, which it had not been
+  since #260. Between #260 and #278 the sink cut every field at one
+  constant, so `%Capped(&p.query)` and `%p.query` rendered alike and
+  removing a wrapper left `binary_tracing_caps` green — measured then. Now
+  `?Capped(&p.query)` and `?p.query` part on a long value: the bare one is
+  cut open at 1024, the wrapped one closes at 1018. So that suite measures
+  the site again as well as the sink, and the wrapper has three reasons
+  rather than two. `capped()` shares `Capped::as_str` and is the AUDIT
+  RECORD's cut, which `audit_wiremock` measures and no sink touches.
+  `bug_ids` needs a count-plus-head shape a sink that sees only rendered
+  characters cannot synthesise. And the balanced quote is the site's
+  alone.
+
+  The prices, each measured through the built binary. The rendering moved,
+  so an operator's `grep 'query=kernel'` is now `grep 'query="kernel"'`,
+  and a reader that does NOT honour quotes is no better off than before:
+  `grep 'status=HACKED'` still matches the line and a space-split still
+  yields `status=HACKED` as a token. The guarantee is for readers that
+  honour quotes. Our control characters are spelled by `str`'s own `Debug`
+  before the sink sees them, `\u{1b}` where the sink would have written
+  `\x1b`, which is why the #266 rows changed spelling rather than
+  assertion. And a client field carries 1016 rendered characters of its
+  own where a bare one carried 1024 — fewer of its own CHARACTERS whenever
+  they escape, since the budget counts what is WRITTEN: 508 when every one
+  is a quote or an LF, 169 when every one is ESC (which leaves two
+  characters of the budget unspendable, no escape being that narrow), 127
+  when every one is U+2028. Every one of those fields closes. The RECORD's
+  cap is untouched: `capped()` reads `Capped::as_str`, which no sigil and
+  no budget of the tracing path reaches.
+
+  Two residuals stay, both outside what a site of ours can close. rmcp's
+  own `%` fields are bare — `%id`, a client-chosen string request id on
+  every `response error` line, and the `%client_requested` on rmcp's copy
+  of the unsupported-version warning, which puts the whole forgery on the
+  very next line of the same session — so either can still carry text
+  shaped like a later key/value pair. Those are rmcp's call sites; a sink
+  of ours cannot quote them without quoting its own decoration too, and
+  the sink's 1024 is what bounds them.
+
+  The other is next door and stays `%`: `error = %e`. The text is
+  UPSTREAM-authored, but not upstream-authored alone. `bugwarden-core`'s
+  `check_error` copies Bugzilla's `message` field into the error verbatim,
+  and Bugzilla echoes what the client sent — this repo's own fixture is
+  `There is no version named '1.0' in the 'openSUSE' product.` for a
+  `create_bug` whose `version` and `product` the client chose. So a forged
+  key/value pair can ride back into one of these fields. It is left bare
+  because an error's `Display` is the thing an operator reads and quoting
+  it would put escapes through every message this server writes; it is
+  capped and escaped by the sink like any other field, and the forgery
+  needs Bugzilla's cooperation to echo.
 
   The two lines a failed stdio handshake writes are bounded by a
   different means, because the cut above is the wrong instrument for

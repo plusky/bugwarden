@@ -382,8 +382,11 @@ fn capped(value: &str) -> String {
     Capped(value).as_str().to_string()
 }
 
-/// [`capped`] as a tracing field: `%Capped(&p.query)` formats the first
-/// [`PARAM_VALUE_MAX_CHARS`] characters in place, allocating nothing.
+/// [`capped`] as a tracing field: `?Capped(&p.query)` formats a leading
+/// slice of the value in place, quoted, allocating nothing. Two bounds
+/// meet here — [`PARAM_VALUE_MAX_CHARS`] on the value's own characters,
+/// which is the audit record's, and [`CAPPED_DEBUG_MAX_CHARS`] on what
+/// the `Debug` below WRITES, which is the diagnostic line's.
 ///
 /// The tracing path reaches the same operator and the same collector as
 /// the audit record, so a client string left raw there undoes the bar
@@ -392,15 +395,48 @@ fn capped(value: &str) -> String {
 /// delegates here, so there is one cut to remember (#191); the unit
 /// tests pin both at the boundary.
 ///
-/// [`crate::tracing_fields`] now cuts every field of every line at the
-/// same bound, this one included, which MASKS these wrappers on stderr:
-/// `%Capped(&p.query)` and `%p.query` render the same bytes once the sink
-/// cuts at the same constant, so `binary_tracing_caps` measures the sink
-/// and no longer this. They stay anyway. [`capped`] delegates here and IS
-/// the record's cut, which `audit_wiremock` measures; `bug_ids` needs a
-/// count-plus-head SHAPE no sink can synthesise from a rendered value;
-/// and a second bound in front of the first costs a wrapper.
+/// `?`, never `%`, at every site (#278). A `%` field is written bare, so
+/// a value of `evil status=HACKED` put a second `status` on the line and
+/// nothing marked where the client's text stopped. This type's `Debug`
+/// quotes the value and escapes `"` and `\` inside it, so a reader that
+/// honours quotes finds the end the WRITER marked. Hence no `Display`
+/// impl: `%Capped(..)` is how the defect is written, and it no longer
+/// compiles.
+///
+/// A quoted value only marks its end if the closing quote SURVIVES, and
+/// the sink cuts a field at [`PARAM_VALUE_MAX_CHARS`] rendered
+/// characters without knowing one is open. A cut value therefore ran on
+/// to the next unescaped `"` on the line — the next client field's
+/// OPENING quote — swallowing the server's own field between them and
+/// handing the reader a key the client wrote. So the cut a quoted value
+/// answers to is this type's own, [`CAPPED_DEBUG_MAX_CHARS`], applied to
+/// the RENDERED characters between the quotes and taken here, where the
+/// shape is known: `Capped` writes its own `"`, spends the budget on
+/// whole escapes, and writes the closing `"`. Nothing this type renders
+/// reaches the sink's budget, so no field of ours is ever cut open — on
+/// stderr or in the OTLP diagnostics body, which builds its own text
+/// from the same `Debug` through the same writer.
+///
+/// That makes the wrapper LOAD-BEARING again, which it had not been
+/// since #260: `?Capped(&p.query)` and `?p.query` no longer agree on a
+/// long value — the bare one is cut open at 1024, this one closes at
+/// 1018 — so `binary_tracing_caps` measures this type and the sink both.
+/// [`capped`] still delegates to [`Capped::as_str`] and IS the record's
+/// cut, which `audit_wiremock` measures; `bug_ids` still needs a
+/// count-plus-head SHAPE no sink can synthesise from a rendered value.
 struct Capped<'a>(&'a str);
+
+/// The rendered characters [`Capped`]'s `Debug` puts between its quotes.
+///
+/// Eight less than [`PARAM_VALUE_MAX_CHARS`], which is what the WIDEST
+/// shape a site wraps a `Capped` in costs: `Some("` and `")` are six
+/// characters, the quotes are two, and `Some("` + 1016 + `")` is 1024
+/// exactly — the sink's budget, reached and never passed. A bare
+/// `?Capped` field renders 1018. A `Capped` is rendered bare or inside
+/// `Some(..)` and nowhere else; a site that wraps it in anything wider
+/// than six characters has to lower this number, and the boundary unit
+/// tests are where that is noticed.
+const CAPPED_DEBUG_MAX_CHARS: usize = PARAM_VALUE_MAX_CHARS - 8;
 
 impl<'a> Capped<'a> {
     /// The leading at-most-[`PARAM_VALUE_MAX_CHARS`]-char slice.
@@ -418,17 +454,50 @@ impl<'a> Capped<'a> {
     }
 }
 
-impl std::fmt::Display for Capped<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// So an `Option<Capped>` field keeps the `Some("…")` / `None` shape the
-/// bare `?p.resolution` printed before the cap.
+/// The only formatting this type has, and every site's (#278): `str`'s
+/// own `Debug` rendering, stopped at [`CAPPED_DEBUG_MAX_CHARS`] rendered
+/// characters so the closing quote always fits. Under an `Option` it
+/// still reads `Some("…")` / `None`, the shape a bare `?p.resolution`
+/// printed before the cap.
+///
+/// Transcribed from `impl Debug for str` rather than delegated to it
+/// because that impl offers no seam to stop at, and the transcription is
+/// exact: for every Unicode scalar value, `char::escape_debug` is what
+/// `str` writes, save the apostrophe — `str` escapes the double quote
+/// and not the single one, where a bare `char` escapes both. A unit test
+/// pins the byte-equality for any value under the budget.
+///
+/// A character is written whole or not at all. Stopping mid-escape would
+/// put `\u{20` on the line, which is neither the client's text nor a
+/// legal escape, and stopping AFTER a too-wide character while carrying
+/// on with the next one would reorder the value; both misreport what was
+/// sent, and the cut is silent, so it has to be a prefix.
 impl std::fmt::Debug for Capped<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(self.as_str(), f)
+        use std::fmt::Write as _;
+        f.write_char('"')?;
+        let mut remaining = CAPPED_DEBUG_MAX_CHARS;
+        for ch in self.as_str().chars() {
+            // The apostrophe is the one character `str` leaves raw where
+            // a bare `char` escapes it, so it is the one width not read
+            // off `escape_debug`.
+            let raw_quote = ch == '\'';
+            let width = if raw_quote {
+                1
+            } else {
+                ch.escape_debug().count()
+            };
+            if width > remaining {
+                break;
+            }
+            remaining -= width;
+            if raw_quote {
+                f.write_char('\'')?;
+            } else {
+                write!(f, "{}", ch.escape_debug())?;
+            }
+        }
+        f.write_char('"')
     }
 }
 
@@ -2527,7 +2596,7 @@ impl BugWarden {
             // the process's FIRST panic (#270).
             Err(_payload) => {
                 tracing::warn!(
-                    tool = %Capped(&tool),
+                    tool = ?Capped(&tool),
                     "tool handler panicked; the request was answered with an internal error"
                 );
                 Err(handler_panicked())
@@ -3024,9 +3093,9 @@ impl BugWarden {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(
-            query = %Capped(&p.query),
-            status = %Capped(&p.status),
-            include_fields = %Capped(&p.include_fields),
+            query = ?Capped(&p.query),
+            status = ?Capped(&p.status),
+            include_fields = ?Capped(&p.include_fields),
             limit = p.limit,
             offset = p.offset,
             group_by = ?Capped(p.group_by.as_deref().unwrap_or("")),
@@ -3175,8 +3244,8 @@ impl BugWarden {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(
-            product = %Capped(&p.product),
-            component = %Capped(&p.component),
+            product = ?Capped(&p.product),
+            component = ?Capped(&p.component),
             custom_field_count = p.custom_fields.as_ref().map_or(0, |cf| cf.len()),
             "tool: create_bug"
         );
@@ -3251,7 +3320,7 @@ impl BugWarden {
             // 0 decides nothing — caller identity is deliberately None so
             // the refused path keeps costing exactly one upstream request.
             let _ = self.assess(&key, &[0], None).await;
-            tracing::info!(product = %Capped(&p.product), "guard denied bug creation");
+            tracing::info!(product = ?Capped(&p.product), "guard denied bug creation");
             note_refused(&ctx);
             return Ok(err_text(Guard::create_denial()));
         }
@@ -3288,7 +3357,7 @@ impl BugWarden {
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(
             bug_id = p.bug_id,
-            file_name = %Capped(&p.file_name),
+            file_name = ?Capped(&p.file_name),
             is_private = p.is_private,
             "tool: add_attachment"
         );
@@ -3386,7 +3455,7 @@ impl BugWarden {
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(
             bug_id = p.bug_id,
-            status = %Capped(&p.status),
+            status = ?Capped(&p.status),
             resolution = ?p.resolution.as_deref().map(Capped),
             "tool: update_bug_status"
         );
@@ -3432,7 +3501,7 @@ impl BugWarden {
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(
             bug_id = p.bug_id,
-            assignee = %Capped(&p.assignee),
+            assignee = ?Capped(&p.assignee),
             "tool: assign_bug"
         );
         let key = self.api_key(&ctx)?;
@@ -3732,7 +3801,7 @@ impl BugWarden {
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(
             bug_id = p.bug_id,
-            cc_email = %Capped(&p.cc_email),
+            cc_email = ?Capped(&p.cc_email),
             "tool: add_cc_to_bug"
         );
         let key = self.api_key(&ctx)?;
@@ -4358,7 +4427,7 @@ impl ServerHandler for BugWarden {
             info.protocol_version = request.protocol_version.clone();
         } else {
             tracing::warn!(
-                client_requested = %Capped(request.protocol_version.as_str()),
+                client_requested = ?Capped(request.protocol_version.as_str()),
                 server_fallback = %info.protocol_version,
                 "client requested unsupported protocol version; falling back to server default"
             );
@@ -6442,16 +6511,97 @@ mod tests {
         ] {
             let value = "é".repeat(chars);
             assert_eq!(
-                Capped(&value).to_string().chars().count(),
+                Capped(&value).as_str().chars().count(),
                 chars.min(PARAM_VALUE_MAX_CHARS),
                 "{chars} chars must be cut at the cap in chars, never at a byte boundary"
             );
         }
         // Silently, with no marker of its own, as an audited string is cut.
         let over = "z".repeat(PARAM_VALUE_MAX_CHARS + 1);
-        assert_eq!(Capped(&over).to_string(), "z".repeat(PARAM_VALUE_MAX_CHARS));
+        assert_eq!(Capped(&over).as_str(), "z".repeat(PARAM_VALUE_MAX_CHARS));
+        // The FORMATTING is pinned here too, not just the slice: a
+        // `Debug` that handed `self.0` to the formatter raw would leave
+        // `as_str` with no reader on this path, and the sink would hide
+        // the difference on stderr.
+        assert_eq!(
+            format!("{:?}", Capped(&over)),
+            format!("\"{}\"", "z".repeat(CAPPED_DEBUG_MAX_CHARS)),
+            "an over-cap value renders as the budget's worth of it, quoted"
+        );
         // Debug keeps the shape a `?p.resolution` field printed uncapped.
         assert_eq!(format!("{:?}", Some(Capped("FIXED"))), "Some(\"FIXED\")");
+        // And it is the ONLY rendering a site can reach (#278): quoted,
+        // with the two characters that could hide the closing quote
+        // escaped, so a value cannot forge a later field on its line.
+        assert_eq!(
+            format!("{:?}", Capped(r#"evil status=HACKED "\"#)),
+            r#""evil status=HACKED \"\\""#
+        );
+    }
+
+    #[test]
+    fn a_quoted_tracing_field_is_never_cut_open_by_the_sink() {
+        // #278: the quote only marks a boundary if it SURVIVES. The sink
+        // cuts a field at PARAM_VALUE_MAX_CHARS rendered characters and
+        // cannot see that one is open, so `Capped` closes its own value
+        // inside a tighter budget of its own.
+        let at = "a".repeat(CAPPED_DEBUG_MAX_CHARS);
+        assert_eq!(
+            format!("{:?}", Capped(&at)),
+            format!("\"{at}\""),
+            "at the budget the value is whole and both quotes are there"
+        );
+        // One character over: the CHARACTER goes, never the quote.
+        let over = "a".repeat(CAPPED_DEBUG_MAX_CHARS + 1);
+        assert_eq!(format!("{:?}", Capped(&over)), format!("\"{at}\""));
+
+        // The widest shape a site wraps this in must still clear the
+        // sink's budget, which is where the eight comes from.
+        let wrapped = format!("{:?}", Some(Capped(&over)));
+        assert_eq!(
+            wrapped.chars().count(),
+            PARAM_VALUE_MAX_CHARS,
+            "`Some(\"` + the budget + `\")` is the sink's cap exactly: {wrapped}"
+        );
+        assert!(wrapped.ends_with("\")"), "and it closes: {wrapped}");
+        assert!(
+            format!("{:?}", Capped(&over)).chars().count() < PARAM_VALUE_MAX_CHARS,
+            "a bare one is well inside it"
+        );
+
+        // A multi-character escape is written whole or dropped whole: an
+        // ESC is six characters, so it does not fit the last five and the
+        // rendering stops before it rather than mid-escape.
+        let tight = format!("{}\u{1b}b", "a".repeat(CAPPED_DEBUG_MAX_CHARS - 5));
+        assert_eq!(
+            format!("{:?}", Capped(&tight)),
+            format!("\"{}\"", "a".repeat(CAPPED_DEBUG_MAX_CHARS - 5)),
+            "no half escape, and no character reordered past the one that did not fit"
+        );
+        // Six left is exactly enough for it.
+        let fits = format!("{}\u{1b}", "a".repeat(CAPPED_DEBUG_MAX_CHARS - 6));
+        assert_eq!(
+            format!("{:?}", Capped(&fits)),
+            format!("\"{}\\u{{1b}}\"", "a".repeat(CAPPED_DEBUG_MAX_CHARS - 6))
+        );
+
+        // Under the budget the rendering is `str`'s own, byte for byte —
+        // apostrophe raw, double quote and backslash escaped, control
+        // characters and the line separators in `Debug`'s spellings.
+        for probe in [
+            "it's a \"quoted\" \\ path",
+            "a\u{1b}b\u{7}c",
+            "\r\n\t\0",
+            "a\u{2028}b\u{2029}c",
+            "é🦀e\u{301}",
+            "",
+        ] {
+            assert_eq!(
+                format!("{:?}", Capped(probe)),
+                format!("{probe:?}"),
+                "under the budget `Capped` is `str`'s own `Debug`: {probe:?}"
+            );
+        }
     }
 
     #[test]
@@ -7559,8 +7709,8 @@ mod tests {
             .find(|line| line.contains("tool handler panicked"))
             .unwrap_or_else(|| panic!("the recovery line must be logged: {captured}"));
         assert!(
-            line.contains(&format!("tool={PANIC_PROBE}")),
-            "the recovery line must name the tool in its own field: {line}"
+            line.contains(&format!("tool={PANIC_PROBE:?}")),
+            "the recovery line must name the tool in its own quoted field: {line}"
         );
         assert!(
             line.contains("WARN"),
