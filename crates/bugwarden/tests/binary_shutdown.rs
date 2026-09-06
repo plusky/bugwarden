@@ -45,6 +45,8 @@
 //!   directive DESIGN.md documents addressing nothing;
 //! - either handshake-failure line formatting rmcp's error instead of the
 //!   classification, or the classification naming the wrong frame kind;
+//! - a pre-handshake stdin I/O error described as a hangup ("the stream
+//!   ended") rather than a failed input stream (#285);
 //! - any `serve_failure` arm deleted so its failure falls to the wildcard,
 //!   or any two of its literals exchanged. Three arms have no row, and
 //!   cannot: `ExpectedInitializeRequest(None)` is constructed nowhere in
@@ -248,9 +250,14 @@ impl Server {
     /// [`Self::spawn`] with the child's stdout chosen by the caller, for
     /// the one row that needs a stdout nothing will ever read.
     fn spawn_with_stdout(args: &[&str], stdout: Stdio) -> Self {
+        Self::spawn_with_io(args, Stdio::piped(), stdout)
+    }
+
+    /// [`Self::spawn`] with both pipes chosen by the caller.
+    fn spawn_with_io(args: &[&str], stdin: Stdio, stdout: Stdio) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_bugwarden"));
         cmd.args(args)
-            .stdin(Stdio::piped())
+            .stdin(stdin)
             .stdout(stdout)
             .stderr(Stdio::piped());
         for var in scrub_env::AMBIENT_VARS {
@@ -602,6 +609,69 @@ fn stdout_with_no_reader() -> Stdio {
     panic!("a pipe whose only reader was dropped never became BrokenPipe");
 }
 
+/// A pty slave as stdin, and the master to close once the child is
+/// blocked in a read. Closing the last master makes a slave read fail
+/// `EIO` rather than EOF — the hangup row's pipe cannot.
+///
+/// `CLOEXEC` on the master is load-bearing: if the child inherited it,
+/// dropping the parent's copy would leave a master open and the read
+/// would hang until this file's budget, not fail.
+#[cfg(target_os = "linux")]
+fn stdin_from_pty() -> (Stdio, std::fs::File) {
+    use rustix::pty::{ioctl_tiocgptpeer, openpt, unlockpt, OpenptFlags};
+
+    let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
+    let master = openpt(flags).expect("the test host must provide a pty");
+    unlockpt(&master).expect("the pty must unlock");
+    let slave = ioctl_tiocgptpeer(&master, flags).expect("the pty slave must open");
+    (
+        Stdio::from(std::fs::File::from(slave)),
+        std::fs::File::from(master),
+    )
+}
+
+/// Close-the-master *before* a slave read is outstanding is EOF; during
+/// one is `EIO`. The startup line is logged before `serve` polls stdin,
+/// so it is not this barrier.
+#[cfg(target_os = "linux")]
+async fn wait_until_stdin_read_is_outstanding(pid: u32) {
+    let ready = tokio::time::timeout(EXIT_TIMEOUT, async {
+        loop {
+            if a_thread_is_reading_stdin(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        ready.is_ok(),
+        "the child must block in a stdin read before the master is closed: pid={pid}"
+    );
+}
+
+/// `/proc/<pid>/task/*/syscall`: a blocked `read`/`readv` of fd 0.
+/// x86_64 `read`/`readv` are 0/19; aarch64 and riscv64 are 63/65.
+#[cfg(target_os = "linux")]
+fn a_thread_is_reading_stdin(pid: u32) -> bool {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    tasks.flatten().any(|task| {
+        let Ok(syscall) = std::fs::read_to_string(task.path().join("syscall")) else {
+            return false;
+        };
+        let mut words = syscall.split_whitespace();
+        let Some(nr) = words.next() else {
+            return false;
+        };
+        let Some(fd) = words.next() else {
+            return false;
+        };
+        matches!(nr, "0" | "19" | "63" | "65") && matches!(fd, "0" | "0x0")
+    })
+}
+
 /// `run` copies of `filler`, as one string: the needle a leaked client
 /// string would put on stderr.
 fn run_of(filler: char, run: usize) -> String {
@@ -927,12 +997,12 @@ async fn stdio_a_pre_initialize_error_reply_never_logs_its_message() {
 
 #[tokio::test]
 async fn stdio_a_hangup_before_initialize_is_classified_not_echoed() {
-    // `ConnectionClosed`, which an EOF, a read error and this build's own
-    // frame-cap refusal all reach — so the classification is deliberately
-    // neutral about who ended the stream, and the over-cap rows above pin
-    // the one case `main` can name. Its payload is server-authored today,
-    // which is exactly why it must not be echoed either: a `String` on a
-    // `#[non_exhaustive]` enum is an upstream bump away from client text.
+    // `ConnectionClosed` from a pipe EOF. A read error and this build's
+    // own frame-cap refusal reach the same variant;
+    // those have their own rows and the reader's flags name them. Its
+    // payload is server-authored today, which is exactly why it must not
+    // be echoed either: a `String` on a `#[non_exhaustive]` enum is an
+    // upstream bump away from client text.
     let mut server = spawn_stdio();
     server.wait_for_stderr(STDIO_READY).await;
     server.close_stdin();
@@ -940,6 +1010,28 @@ async fn stdio_a_hangup_before_initialize_is_classified_not_echoed() {
         .assert_bounded_handshake_failure(
             "stdio pre-handshake hangup",
             "the stream ended before initialize",
+            None,
+        )
+        .await;
+}
+
+/// A genuine stdin I/O error before initialize, not a hangup (#285).
+///
+/// Closing a pipe is EOF. Closing the last pty master makes a slave
+/// read fail `EIO`, which rmcp still maps to `ConnectionClosed`. Linux
+/// only, the way the `/dev/full` row is.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn stdio_a_pre_initialize_stdin_error_is_classified_as_failed() {
+    let (stdin, master) = stdin_from_pty();
+    let mut server = Server::spawn_with_io(&STDIO_ARGS, stdin, Stdio::piped());
+    server.wait_for_stderr(STDIO_READY).await;
+    wait_until_stdin_read_is_outstanding(server.pid()).await;
+    drop(master);
+    server
+        .assert_bounded_handshake_failure(
+            "stdio pre-handshake stdin I/O error",
+            "the input stream failed before initialize",
             None,
         )
         .await;

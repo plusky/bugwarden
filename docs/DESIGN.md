@@ -1432,17 +1432,20 @@ Decisions, all deliberate:
   into the outer wildcard, which is there for `ServerInitializeError`'s
   `#[non_exhaustive]` alone.
 
-  One failure is named by the CALLER instead, because the classifier
-  cannot see it: this build's own frame-cap refusal reaches rmcp as a
-  read error, rmcp turns every read error into `receive() -> None`, and
-  `None` before the handshake is `ConnectionClosed` — indistinguishable
-  from the peer walking away. So the arm's own text stays neutral about
-  who ended the stream, and the `over_cap` flag the #267 arm already
-  reads picks the cap's sentence out of `OVER_CAP_CLOSE`, the same
-  constant the post-handshake refusal bails with: one refusal keeps one
-  description on either side of `initialize`. Nothing else moves: exit
-  status stays 1, and the `probed && !over_cap` hangup arm (#267) still
-  returns 0 ahead of both.
+  Two failures are named by the CALLER instead, because the classifier
+  cannot see them: this build's own frame-cap refusal and a genuine stdin
+  I/O error both reach rmcp as a read error, rmcp turns every read error
+  into `receive() -> None`, and `None` before the handshake is
+  `ConnectionClosed` — the same variant as the peer walking away. The
+  arm's own text stays the hangup sentence, and the reader's flags pick
+  the others out: `over_cap` selects `OVER_CAP_CLOSE` (the same constant
+  the post-handshake refusal bails with, so one refusal keeps one
+  description on either side of `initialize`); a non-cap read error
+  selects "the input stream failed before initialize" (#285). Nothing
+  client-authored enters either line — an `io::ErrorKind` name would be
+  server text, and is not used. Exit status stays 1, and the
+  `probed && !over_cap && !io_failed` hangup arm (#267) still returns 0
+  ahead of both.
 - **The params caps bound content, not record size — and a total cap is a
   decided no** (#220). Array element and map entry counts are uncapped, so
   an allowlisted value's SHAPE can still make a large record; what bounds
@@ -2400,9 +2403,11 @@ wired, `server.rs` and `main.rs` are the reference.
   where it used to return a live session. `main` reads that as the peer hangup
   it is and exits 0, as before #267, but only where
   `DiscoverAnswering::answered` says a probe was answered AND the frame cap is
-  untripped: an over-cap frame closes the transport the same way and stays a
-  failure exit (`stdio_a_probe_then_an_over_cap_frame_still_exits_one`). Every
-  other `ConnectionClosed` still exits 1, and
+  untripped AND the input stream did not fail (#285): an over-cap frame
+  closes the transport the same way and stays a failure exit
+  (`stdio_a_probe_then_an_over_cap_frame_still_exits_one`); a failed read
+  does too (`stdio_a_pre_initialize_stdin_error_is_classified_as_failed`).
+  Every other `ConnectionClosed` still exits 1, and
   `a_probe_only_client_hangs_up_cleanly` pins the code and the log line. HTTP
   needs none of this and gets none: `serve_negotiated_request_directly` answers
   a discover per POST and sets no flag, which
@@ -2604,7 +2609,7 @@ wired, `server.rs` and `main.rs` are the reference.
   dispatch line above is WARN for the other half of the rule: before #270
   it was the only per-request, client-repeatable ERROR in THIS
   WORKSPACE's code. `server.rs`'s sole other production `tracing::error!`
-  is behind a `Once`; of the rest, `main.rs`'s two serving-error arms end
+  is behind a `Once`; of the rest, `main.rs`'s three serving-error arms end
   the process, `audit.rs`'s sink diagnostic is rate-limited, and `main.rs`'s
   signal-arming failure runs at most once per signal kind at startup — so
   none of them is a lever a client can pull twice. `stdio.rs`'s over-cap
@@ -2870,7 +2875,9 @@ wired, `server.rs` and `main.rs` are the reference.
   dependency's ERROR as the only sign of it, is pre-existing and outside
   #272's scope; it is recorded here as a fact, not fixed. It is also why the
   directive stays OUT of the default filter: a default that hides a genuine
-  read error is worse than a noisy refusal.
+  read error is worse than a noisy refusal. Pre-handshake, the same `EIO`
+  is classified: `serve` returns `ConnectionClosed` and `main` names it a
+  failed input stream rather than a hangup (#285).
 
   Not done, deliberately: emitting a null-id `-32700` on stdout before
   closing. It is new stdout-after-close behaviour bought for a nicety, and
@@ -3773,10 +3780,15 @@ wired, `server.rs` and `main.rs` are the reference.
   (`serving error`) before the handshake and none after it, and rmcp's echo
   is still an ERROR on `rmcp::transport::async_rw` — asserted rather than
   merely tolerated, because that target and that level are exactly what the
-  `RUST_LOG` directive documented above addresses. The `serving error` line
-  of the OTHER handshake-failure arm is pinned at ERROR in the same file
-  (`assert_bounded_handshake_failure`), so neither arm can be demoted
-  unnoticed; before this, no test read either arm's level.
+  `RUST_LOG` directive documented above addresses. A pre-handshake stdin
+  I/O error is a separate row
+  (`stdio_a_pre_initialize_stdin_error_is_classified_as_failed`, Linux):
+  closing the pty master under an outstanding slave read must classify as
+  "the input stream failed before initialize", not "the stream ended"
+  (#285). The `serving error` line of every handshake-failure arm is
+  pinned at ERROR in the same file (`assert_over_cap_exit`,
+  `assert_bounded_handshake_failure`), so none of those arms can be
+  demoted unnoticed; before this, no test read either arm's level.
 - Startup-wiring tests (crates/bugwarden/tests/binary_startup_policy.rs,
   the SHIPPED BINARY): the three `main.rs` sites only a process executes,
   which is why a hand mutation run found all three bare (#269). The I9

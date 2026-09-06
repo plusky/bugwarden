@@ -248,10 +248,12 @@ async fn main() -> anyhow::Result<()> {
                 // arm — the cap comes from `server`'s own policy, and
                 // `serve` takes it by value.
                 let (stdin, stdout) = server.stdio_transport();
-                // rmcp maps the over-cap read error to `receive() -> None`,
-                // which the service reports as an ordinary close, so this
-                // flag is the only thing that tells the two apart below.
+                // rmcp maps every read error to `receive() -> None`, which
+                // the service reports as an ordinary close. Two flags tell
+                // the cases apart: the cap, and a failure that was not the
+                // cap (#285).
                 let over_cap = stdin.over_cap();
+                let io_failed = stdin.io_failed();
                 // `server/discover` is answered by the transport, never by
                 // rmcp's lifecycle picker: rmcp commits the session to the
                 // handshake-free lifecycle on the first non-`initialize`
@@ -269,11 +271,12 @@ async fn main() -> anyhow::Result<()> {
                         Ok(service) => service,
                         // A probe-only client is a peer hangup, not a
                         // serving failure: exit 0, as before #267. Not a
-                        // refused frame though — that closes the same way
-                        // and must stay a failure exit.
+                        // refused frame or a failed read though — those
+                        // close the same way and must stay a failure exit.
                         Err(rmcp::service::ServerInitializeError::ConnectionClosed(_))
                             if probed.load(Ordering::Acquire)
-                                && !over_cap.load(Ordering::Acquire) =>
+                                && !over_cap.load(Ordering::Acquire)
+                                && !io_failed.load(Ordering::Acquire) =>
                         {
                             tracing::info!("peer hung up after a server/discover probe");
                             return Ok(());
@@ -292,6 +295,18 @@ async fn main() -> anyhow::Result<()> {
                         {
                             tracing::error!("serving error: {OVER_CAP_CLOSE}");
                             anyhow::bail!("{OVER_CAP_CLOSE}");
+                        }
+                        // A real stdin failure, not a hangup: rmcp still
+                        // reports `ConnectionClosed` because it maps every
+                        // read error to `None`. The reader recorded that
+                        // this was not EOF and not the cap (#285).
+                        Err(rmcp::service::ServerInitializeError::ConnectionClosed(_))
+                            if io_failed.load(Ordering::Acquire) =>
+                        {
+                            tracing::error!("serving error: {INPUT_STREAM_FAILED}");
+                            return Err(anyhow::anyhow!(
+                                "stdio serving failed: {INPUT_STREAM_FAILED}"
+                            ));
                         }
                         // Never `e` itself, in either line: rmcp's error
                         // carries the client's whole first frame (#261).
@@ -418,6 +433,13 @@ async fn main() -> anyhow::Result<()> {
 /// descriptions on either side of `initialize`.
 const OVER_CAP_CLOSE: &str = "stdio transport closed: an inbound frame exceeded the request cap";
 
+/// Pre-handshake stdin I/O error, as opposed to a hangup.
+///
+/// Same `ConnectionClosed` as EOF; the reader recorded that the last
+/// read failed, so the caller names a failed stream rather than an
+/// ended one (#285). Post-handshake the same error still exits 0 (#272).
+const INPUT_STREAM_FAILED: &str = "the input stream failed before initialize";
+
 /// A fixed, server-authored classification of a failed stdio handshake —
 /// the only thing either exit path may say about one (#261).
 ///
@@ -471,10 +493,9 @@ fn serve_failure(error: &rmcp::service::ServerInitializeError) -> &'static str {
         },
         // Unreachable on rmcp 3.1.4: both construction sites pass `Some`.
         Failure::ExpectedInitializeRequest(None) => "no first frame was received",
-        // Actor-neutral on purpose: an EOF, a read error and this build's
-        // own frame-cap refusal all arrive here as the same `None`, and
-        // the arm cannot tell them apart. The caller names the cap when it
-        // knows; rmcp logs a read error itself.
+        // EOF before initialize. A read error and this build's own
+        // frame-cap refusal reach the same variant; the caller names
+        // those from the reader's flags. This arm is the remainder.
         Failure::ConnectionClosed(_) => "the stream ended before initialize",
         // Unreachable too: rmcp builds the value it checks here by mapping
         // this handler's own `InitializeResult` into `ServerResult`.
