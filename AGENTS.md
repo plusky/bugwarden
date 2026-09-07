@@ -208,7 +208,11 @@ A release is one push of an annotated tag; nothing is released by hand.
   are `dist/*` less the `.sha256` files, so a new artifact is covered
   without editing the step. Verify with `gh attestation verify <file>
   --repo plusky/bugwarden`. crates.io gets its own provenance from Trusted
-  Publishing; the container image has none yet.
+  Publishing. Each architecture's container digest is attested in the
+  `container` job after push-by-digest and before smoke, so a provenance
+  failure cannot publish `:$VERSION` / `:latest`; verify with
+  `gh attestation verify oci://ghcr.io/plusky/bugwarden@<digest>
+  --repo plusky/bugwarden`.
 - The same tag also ships the multi-arch container image
   `ghcr.io/plusky/bugwarden` (jobs `container`, `container-manifest`).
   `container` runs `scripts/container-smoke.sh` — ci.yml's own assertions —
