@@ -156,6 +156,10 @@ are never a justification for undoing them.
 - `typos` runs as its own workflow and is not part of the verification
   commands above; `typos.toml` is an allowlist of deliberate spellings,
   never a mask for a real typo.
+- Instruction-count benches (`cargo bench -p bugwarden-core --bench guard
+  --features iai`) live in `perf.yml`, weekly and never a required check.
+  They pin Callgrind Ir for classify and I14 scrub, not wall-clock. The
+  `iai` feature keeps them off `cargo test --all-targets`.
 
 ## Commits and Pull Requests
 
