@@ -47,3 +47,16 @@ test_workspace = true
 # A floor and not --timeout, so the 5x multiplier still scales past it on a
 # slow runner or once upstream fixes the baseline.
 minimum_test_timeout = 720
+
+# Three serve_failure match arms #261 already called unreachable: rmcp always
+# constructs ExpectedInitializeRequest(Some(_)), maps this handler's
+# InitializeResult, and ServiceExt::serve never cancels its token. Deleting
+# them is a no-op (the wildcard still compiles) so they survive every week
+# and the scheduled job emails a false gap. Reachable arms stay in scope
+# (Some(frame), ConnectionClosed, InitializeFailed, TransportError). Drop
+# these if rmcp starts constructing the variants.
+exclude_re = [
+    "ExpectedInitializeRequest\\(None\\)",
+    "UnexpectedInitializeResponse",
+    "Failure::Cancelled",
+]
