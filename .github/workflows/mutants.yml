@@ -45,13 +45,13 @@ jobs:
     # the timeout floor holds.
     runs-on: ubuntu-latest
     # Measured at 30-46s of incremental build plus 6-23s of tests per mutant on
-    # a 32-core box -- main.rs's nine averaged 43s there, inside that band, so
-    # the startup scope costs no more per mutant than the guard one. Call it
-    # ~3 min on a 4-core runner, so a 34-mutant shard is ~102 min plus setup.
-    # Doubled for margin -- a shard that outruns this has itself become the
-    # finding. Unsharded the scope below does not fit at all: 134 x 3 min is
-    # 402, past GitHub's 360-minute ceiling, so the shards are load-bearing
-    # rather than a convenience.
+    # a 32-core box -- main.rs averaged 43s there, inside that band, so the
+    # startup scope costs no more per mutant than the guard one. Call it ~3 min
+    # on a 4-core runner. Doubled for margin -- a shard that outruns this has
+    # itself become the finding. Unsharded the scope below does not fit
+    # GitHub's 360-minute ceiling, so the shards are load-bearing rather than
+    # a convenience. Live per-file counts are the Mutate step's summary, not
+    # this comment.
     timeout-minutes: 240
     strategy:
       # A survivor in one shard must not cancel the rest: the run's value is
@@ -65,14 +65,13 @@ jobs:
       # Scope lives here, not in .cargo/mutants.toml, because it is a CI budget
       # decision and not a property of the tree: a hand-run must stay free to
       # point anywhere. The workspace holds ~1180 mutants and server.rs alone
-      # 400; guard.rs is 125 and is where the DESIGN.md invariants live, and
-      # main.rs is 9 -- the startup wiring (the I9 --read-only tightening, the
-      # audit sink selection) that only a spawned process executes, so no
-      # in-process suite reaches it. Its five survivors came out of a hand run
-      # (#269); this job saw none of them, because until now its scope was
-      # guard.rs alone. 134 together, so ~34 a shard. Space-separated, one
-      # --file each below. Grow this by adding shards, not by dropping the
-      # filter.
+      # 400; guard.rs is where the DESIGN.md invariants live, and main.rs is
+      # the startup wiring (the I9 --read-only tightening, the audit sink
+      # selection) that only a spawned process executes, so no in-process
+      # suite reaches it. Its five survivors came out of a hand run (#269);
+      # this job saw none of them, because until now its scope was guard.rs
+      # alone. Space-separated, one --file each below. Grow this by adding
+      # shards, not by dropping the filter. Live counts: the Mutate summary.
       MUTANTS_SCOPE: crates/bugwarden-core/src/guard.rs crates/bugwarden/src/main.rs
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -110,7 +109,8 @@ jobs:
         # suite. The summary reads the counts instead of that code, because
         # the code reports a timeout ahead of a survivor and would otherwise
         # bury one behind the other: a timeout is not a survivor, and neither
-        # is allowed to hide the other.
+        # is allowed to hide the other. It opens with per-file `--list`
+        # counts so the comments above do not carry a number that drifts.
         shell: bash
         env:
           MUTANTS_SHARD: ${{ matrix.shard }}
@@ -125,6 +125,20 @@ jobs:
           for path in "${scope[@]}"; do
             files+=(--file "${path}")
           done
+          # --list does not build. GNU wc pads the count; $((n)) strips it.
+          {
+            echo '| file | mutants |'
+            echo '| --- | --- |'
+            total=0
+            for path in "${scope[@]}"; do
+              n=$(cargo mutants --list --file "${path}" | wc -l)
+              n=$((n))
+              echo "| ${path} | ${n} |"
+              total=$((total + n))
+            done
+            echo "| total | ${total} |"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
           rc=0
           cargo mutants --no-shuffle \
             --shard "${MUTANTS_SHARD}/${MUTANTS_SHARDS}" \
