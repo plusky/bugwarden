@@ -15,8 +15,8 @@
 # Format: one JSON object per line (JSONL), schema version 2. Three record
 # kinds: `tool_call` (one MCP tool invocation, request through outcome,
 # with the guard's decision), `initialize` (a client sent an `initialize` —
-# usually opening a session, though a 2026-07-28 `initialize` over http
-# opens none and its record then carries no session id), and `audit_gap`
+# always opening a session, even a 2026-07-28 one; handshake-free
+# tool/discover records over http still carry no session id), and `audit_gap`
 # (records were lost — see fail_mode below; the gap is reported in the
 # stream itself, so silent loss is impossible to miss).
 #

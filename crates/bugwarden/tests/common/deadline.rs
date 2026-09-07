@@ -18,7 +18,7 @@ use std::time::Duration;
 
 /// Bound on every request one of these harnesses awaits an answer to.
 ///
-/// rmcp 3.1.4 sends with `PeerRequestOptions::default()`, whose `timeout`
+/// rmcp 3.2.0 sends with `PeerRequestOptions::default()`, whose `timeout`
 /// is `None` (`service.rs`), and the `initialize` handshake reads its
 /// response off the transport with no deadline either. So a request the
 /// server never answers waits forever: it hangs its test, its whole test

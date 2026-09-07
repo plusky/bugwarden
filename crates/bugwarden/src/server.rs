@@ -548,7 +548,7 @@ fn allowlisted(params: Option<&JsonObject>) -> BTreeMap<String, Value> {
 /// * [`Lifecycle::PerRequest`] — the request's own `_meta`. **Never
 ///   `ctx.client_info()`**: that convenience accessor falls back to
 ///   `peer_info().client_info` unless `request_metadata_required()`, which
-///   rmcp 3.1.4 sets only on the stdio handshake-free path
+///   rmcp 3.2.0 sets only on the stdio handshake-free path
 ///   (`service/server.rs`), so over streamable http it IS the
 ///   `{"name":"rmcp",…}` placeholder rmcp synthesises for a peer that
 ///   never handshook (`peer_info_for_stateless_request`, #34 §3c) — and
@@ -680,19 +680,20 @@ enum Lifecycle {
 /// what gets served and who gets recorded cannot diverge by call-site
 /// ordering.
 ///
-/// rmcp 3.1.4 routes on `_meta` shape, not on the negotiated revision and
+/// rmcp 3.2.0 routes on `_meta` shape, not on the negotiated revision and
 /// not on [`SUPPORTED_PROTOCOL_VERSIONS`]: `is_legacy_request`
-/// (`transport/streamable_http_server/tower.rs`) sends a POST down the
-/// stateless path when the request's revision is `2026-07-28` or newer, or
-/// when a non-`initialize` request carries BOTH
+/// (`transport/streamable_http_server/tower.rs`) returns true — the session
+/// path — for every `initialize` (rmcp #1228), and otherwise sends a POST
+/// down the stateless path when the request's revision is `2026-07-28` or
+/// newer, or when a non-`initialize` request carries BOTH
 /// `io.modelcontextprotocol/protocolVersion` and `…/clientCapabilities`.
 /// That second shape is why the refusal arm still exists after adoption: a
-/// pre-2026 revision sent with both keys reaches the handler with no
-/// `initialize` behind it, and rmcp synthesises its peer with the SDK's own
-/// build identity as `client_info` — a client the server never spoke to.
-/// The arm is broader than the routing on purpose: a sub-2026 declaration
-/// lacking `clientCapabilities` takes the session path, so it fires on
-/// requests that DID complete a handshake too.
+/// pre-2026 revision sent with both keys still reaches the handler with no
+/// `initialize` behind it (#204), and rmcp synthesises its peer with the
+/// SDK's own build identity as `client_info` — a client the server never
+/// spoke to. The arm is broader than the routing on purpose: a sub-2026
+/// declaration lacking `clientCapabilities` takes the session path, so it
+/// fires on requests that DID complete a handshake too.
 ///
 /// The `contains` clause is defence in depth: rmcp refuses a `_meta`
 /// revision outside `supported_protocol_versions()` first
@@ -754,7 +755,7 @@ fn read_scope_serves(tool: &str) -> bool {
 /// The refusal for a tool this request's credential does not reach.
 ///
 /// Byte-identical to what `ToolRouter` answers for a name it does not route
-/// (rmcp 3.1 `handler/server/router/tool.rs`), so a scope-hidden tool is
+/// (rmcp 3.2 `handler/server/router/tool.rs`), so a scope-hidden tool is
 /// indistinguishable from one that does not exist — the same
 /// indistinguishability read-only mode already gives every caller (I13), and
 /// no oracle about which tools the deployment serves (I2).
@@ -2254,7 +2255,7 @@ impl BugWarden {
     /// there is one place where the policy field is read. Call it before
     /// the server moves into the service closure.
     ///
-    /// These rmcp 3.1 defaults are set by name rather than inherited,
+    /// These rmcp 3.2 defaults are set by name rather than inherited,
     /// because inheriting them changes how a deployment behaves without
     /// anyone choosing it:
     ///
@@ -2298,7 +2299,7 @@ impl BugWarden {
     /// have recorded the attempt — though rmcp's own refusal body prints
     /// the number outright. That the boundary is observable to an
     /// unauthenticated client, and what it discloses, is recorded in
-    /// DESIGN.md under "rmcp 3.1 usage notes".
+    /// DESIGN.md under "rmcp 3.2 usage notes".
     ///
     /// `allowed_origins` is the browser-facing sibling of `allowed_hosts`
     /// and the same reasoning covers it, but it is left inherited: its
@@ -2306,7 +2307,7 @@ impl BugWarden {
     /// nothing. Anything that changes the `allowed_hosts` call below should
     /// decide this one too rather than leave it behind. The remaining
     /// fields, and why each stays inherited, are inventoried in DESIGN.md
-    /// under "rmcp 3.1 usage notes"; the caller in `main` adds
+    /// under "rmcp 3.2 usage notes"; the caller in `main` adds
     /// `cancellation_token` so a SIGINT or SIGTERM reaches the live
     /// transport (issue #114).
     ///
@@ -4387,13 +4388,17 @@ impl ServerHandler for BugWarden {
     ) -> Result<InitializeResult, McpError> {
         // Negotiate before anything stores or records it: both the record
         // and `peer_info` must name the revision the session SPEAKS, not
-        // the one the client asked for. Echo a requested revision this
-        // build serves, keep the server default otherwise — the same shape
-        // the SDK's own negotiation has, tested against
-        // `SUPPORTED_PROTOCOL_VERSIONS` rather than the wider set of
-        // revisions the SDK merely knows about.
+        // the one the client asked for. Echo a requested handshake-era
+        // revision this build serves; `2026-07-28` replaced the handshake
+        // with per-request metadata (rmcp #1228), so naming it here is
+        // answered with the server default — matching the SDK's
+        // `negotiate_protocol_version`. A second `initialize` mid-session
+        // reaches this handler with no SDK correction after it, so this
+        // is the only place that store is decided.
         let mut info = self.get_info();
-        if SUPPORTED_PROTOCOL_VERSIONS.contains(&request.protocol_version) {
+        if request.protocol_version.as_str() < ProtocolVersion::V_2026_07_28.as_str()
+            && SUPPORTED_PROTOCOL_VERSIONS.contains(&request.protocol_version)
+        {
             info.protocol_version = request.protocol_version.clone();
         } else {
             tracing::warn!(
@@ -4406,12 +4411,13 @@ impl ServerHandler for BugWarden {
         // NEGOTIATED revision substituted. rmcp corrects `peer_info` to the
         // negotiated value only on its own handshake path
         // (`service/server.rs`, and `NegotiatingStatelessHttpService` for
-        // stateless http); a SECOND `initialize` mid-session reaches this
-        // handler through `serve_inner` with no correction behind it and no
-        // re-init gate in front of it. Storing the request verbatim let a
-        // stdio client raise its own session's `protocol_version()` to any
-        // string it liked — `ProtocolVersion` deserializes unknown values
-        // through — while the answer it was handed said otherwise.
+        // the stateless path, which `initialize` no longer takes); a
+        // SECOND `initialize` mid-session reaches this handler through
+        // `serve_inner` with no correction behind it and no re-init gate
+        // in front of it. Storing the request verbatim let a client raise
+        // its own session's `protocol_version()` to any string it liked —
+        // `ProtocolVersion` deserializes unknown values through — or to
+        // `2026-07-28`, which this build serves but not over a session.
         let mut negotiated = request.clone();
         negotiated.protocol_version = info.protocol_version.clone();
         context.peer.set_peer_info(negotiated);
@@ -4419,11 +4425,9 @@ impl ServerHandler for BugWarden {
             // Every `initialize` is recorded, unconditionally — no
             // configuration knob: a stream that could omit session
             // starts could not anchor its tool records to a client. Over
-            // http a 2026-07-28 `initialize` takes the stateless route
-            // and opens no session, so the anchor is written with no id;
-            // unconditional is still the invariant, and joins are on id
-            // equality, so a record with no id matches nothing rather than
-            // the wrong thing.
+            // http `initialize` always mints a session (rmcp #1228), even
+            // one that named 2026-07-28, so the anchor carries the minted
+            // id; joins are on id equality.
             let event = audit::AuditEventKind::Initialize(audit::InitializeEvent {
                 client: audit::ClientInfo {
                     name: Some(capped(&request.client_info.name)),
@@ -4730,7 +4734,7 @@ impl ServerHandler for BugWarden {
             Reach::ReadOnly => tools.retain(|tool| read_scope_serves(&tool.name)),
             Reach::Nothing => tools.clear(),
         }
-        // The SEP-2549 hints are ours to gate: rmcp 3.1.4 strips
+        // The SEP-2549 hints are ours to gate: rmcp 3.2.0 strips
         // `resultType` for a legacy peer and leaves these two alone. The
         // predicate is HAND-COPIED from its `sep_2322_supported` — no shared
         // constant, no test pinning the agreement — so re-read both on an
@@ -5857,7 +5861,7 @@ mod tests {
         }
     }
 
-    /// SEP-2243's schema annotation, byte-exact as rmcp 3.1.4 reads it —
+    /// SEP-2243's schema annotation, byte-exact as rmcp 3.2.0 reads it —
     /// `schema.get("x-mcp-header")` in `transport/common/mcp_headers.rs`
     /// (`param_header_annotations`, `validate_param_header_annotations`,
     /// `reject_nested_annotations`). Upstream exports no constant for the
@@ -5875,7 +5879,7 @@ mod tests {
     /// with no recursion arms to keep in lockstep, which is the maintenance
     /// surface `schema_portability_error` above has to carry.
     ///
-    /// Deliberately broader than rmcp's functional read, which in 3.1.4 is
+    /// Deliberately broader than rmcp's functional read, which in 3.2.0 is
     /// top-level `properties` and string-valued only: the key is banned
     /// everywhere, at any value type, because upstream's depth rules are
     /// version-specific. It will also trip on the substring appearing in a
@@ -8728,13 +8732,13 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_echoes_exactly_the_revisions_this_build_serves() {
-        // Both halves of the negotiation, in both directions. This
-        // handler tests the request against `SUPPORTED_PROTOCOL_VERSIONS`;
-        // the SDK negotiates again after the handler returns, taking the
-        // handler's value as its fallback — so a handler that echoed an
-        // unsupported request would make the SDK echo it too, and a
-        // handler that refused a supported one would silently downgrade
-        // every modern client.
+        // Both halves of the negotiation. `initialize` always selects the
+        // legacy handshake (rmcp #1228): a requested handshake-era
+        // revision this build serves is echoed; anything else — including
+        // `2026-07-28`, which this build serves only via discover /
+        // per-request `_meta` — falls back to `DEFAULT_PROTOCOL_VERSION`.
+        // The SDK negotiates again after the handler returns, taking the
+        // handler's value as its fallback.
         //
         // `"9999-01-01"` carries the refusing row because widening the
         // list left no KNOWN-but-unserved revision: rmcp's
@@ -8774,7 +8778,7 @@ mod tests {
             (
                 "modern-client",
                 ProtocolVersion::V_2026_07_28.as_str(),
-                ProtocolVersion::V_2026_07_28.as_str(),
+                DEFAULT_PROTOCOL_VERSION.as_str(),
             ),
         ];
         for (name, requested, expected) in rows {
@@ -8836,10 +8840,10 @@ mod tests {
         // response shaping and, from #34 stage 2, per-request identity all
         // read — to a revision this build refuses, or to a string no
         // revision has ever had. The invariant is not that a second
-        // `initialize` cannot move the session (a supported one does, in
-        // the last row below): it is that it can only move it to what the
-        // server ANSWERED. Driven over a real duplex session because the
-        // defect is the SECOND request, not the handler in isolation.
+        // `initialize` cannot move the session (a handshake-era one does):
+        // it is that it can only move it to what the server ANSWERED.
+        // Driven over a real duplex session because the defect is the
+        // SECOND request, not the handler in isolation.
         let (cfg, guard, bz) = parts("");
         let server = BugWarden::new(cfg, guard, bz).expect("server must build");
         let (client_io, server_io) = tokio::io::duplex(1 << 16);
@@ -8871,8 +8875,7 @@ mod tests {
         // "9999-01-01" is not a typo: `ProtocolVersion` deserializes an
         // unknown string through, and every version comparison in rmcp is
         // lexical, so a fabricated future date outranks every real
-        // revision. Since #34 stage 2 it is the ONLY refusable probe left —
-        // 2026-07-28 is served, and moves the session in the last row.
+        // revision. 2026-07-28 is served, but not over initialize (#1228).
         let asked: ProtocolVersion =
             serde_json::from_value(json!("9999-01-01")).expect("a wire revision parses");
         let second =
@@ -8903,12 +8906,17 @@ mod tests {
         // The other direction, and the only place the store is observable
         // at all: rmcp overwrites whatever this handler put there on the
         // FIRST handshake, so every assertion above would also hold with no
-        // store at all. A second `initialize` naming a DIFFERENT supported
+        // store at all. A second `initialize` naming a DIFFERENT handshake
         // revision legitimately moves the session — that is what
         // `set_peer_info` is for — and the failure to catch here is the
-        // mirror of the one fixed: stored disagreeing with answered. Both
-        // ends of the served range, so a list that lost either end fails.
-        for probe in [ProtocolVersion::V_2024_11_05, ProtocolVersion::V_2026_07_28] {
+        // mirror of the one fixed: stored disagreeing with answered.
+        // 2026-07-28 is served, but not over initialize (#1228): answered
+        // and stored as the handshake default.
+        let rows = [
+            (ProtocolVersion::V_2024_11_05, ProtocolVersion::V_2024_11_05),
+            (ProtocolVersion::V_2026_07_28, DEFAULT_PROTOCOL_VERSION),
+        ];
+        for (probe, expected) in rows {
             let again = client.peer().send_request(ClientRequest::InitializeRequest(
                 InitializeRequest::new(
                     InitializeRequestParams::new(
@@ -8925,8 +8933,8 @@ mod tests {
                 panic!("initialize answers with an InitializeResult")
             };
             assert_eq!(
-                answered.protocol_version, probe,
-                "{probe}: a supported revision is echoed, so the session really does move"
+                answered.protocol_version, expected,
+                "{probe}: initialize answers with a handshake-era revision this build serves"
             );
             assert_eq!(
                 stored(),

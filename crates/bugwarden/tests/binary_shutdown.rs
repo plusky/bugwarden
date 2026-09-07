@@ -50,7 +50,7 @@
 //! - any `serve_failure` arm deleted so its failure falls to the wildcard,
 //!   or any two of its literals exchanged. Three arms have no row, and
 //!   cannot: `ExpectedInitializeRequest(None)` is constructed nowhere in
-//!   rmcp 3.1.4, `UnexpectedInitializeResponse` cannot happen while rmcp
+//!   rmcp 3.2.0, `UnexpectedInitializeResponse` cannot happen while rmcp
 //!   maps this handler's own `InitializeResult` into the result it then
 //!   checks, and `Cancelled` needs a cancellation token `ServiceExt::serve`
 //!   creates and never cancels. cargo-mutants reaches only the OUTER

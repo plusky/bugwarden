@@ -22,10 +22,10 @@
 //!   that caps only the fields and not `message`, or only the values
 //!   bugwarden itself formats — the sharp rows are rmcp's now, since
 //!   #278 bounds our own fields at the site and a sink with no budget
-//!   leaves them unchanged. The two `client requested unsupported` rows
-//!   drive the same handshake and differ only in whose line they read,
-//!   so such a mutant shows up as the rmcp one running past [`CAP`]
-//!   while ours stays at [`QUOTED_CAP`];
+//!   leaves them unchanged. The two handshake-fallback rows drive the
+//!   same initialize and differ only in whose line they read, so such a
+//!   mutant shows up as the rmcp one running past [`CAP`] while ours
+//!   stays at [`QUOTED_CAP`];
 //! - a cut at cap-1, cap+1, or on a byte boundary, which is why every
 //!   probe is multi-byte;
 //! - `bug_info` or `update_bug_dependencies` logging an id array whole, or
@@ -778,7 +778,7 @@ fn sites(probe: &str) -> Vec<Site> {
             tool: None,
             arguments: json!({}),
             policy: None,
-            needle: "rmcp::service::server: client requested unsupported",
+            needle: "rmcp::service::server: client requested a protocol version unavailable over initialize",
             field: "client_requested=",
         },
     ]
