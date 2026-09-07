@@ -34,3 +34,14 @@ reqwest = { version = "0.13", default-features = false, features = [
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 wiremock = "0.6"
+iai-callgrind = "0.16.1"
+
+# Off unless `--features iai`: `cargo test --all-targets` would otherwise
+# run this harness (no valgrind) and fail the required rust job.
+[features]
+iai = []
+
+[[bench]]
+name = "guard"
+harness = false
+required-features = ["iai"]

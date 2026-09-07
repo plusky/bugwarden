@@ -1,0 +1,54 @@
+---
+name: perf
+on:
+  schedule:
+    # Weekly, own slot: advisories Mon 06:47, codeql Wed 05:31, mutants Sat
+    # 04:19. Thursday so a hang here does not sit on a PR-day runner.
+    - cron: '41 5 * * 4'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  iai:
+    # Instruction counts for Policy::classify and Guard::scrub_bug_links.
+    # NEVER a required status check; do not add it to branch protection.
+    # Wall-clock on ubuntu-latest is noisier than the CPU work here; Callgrind
+    # Ir with a 20% band is the comparison. Same limits as mutants.yml:
+    # GitHub's failed-run email, crons die after 60 days of inactivity, and
+    # a scheduled workflow is inert until it reaches the default branch.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
+        with:
+          toolchain: "1.98.0"
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          workspaces: . -> target
+          # Restore main's registry so the bench crate compiles; do not write
+          # — a weekly job must not LRU-evict the rust job's target/.
+          save-if: false
+      - name: Cache iai results
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: target/iai
+          # Same lockfile + pin: compare this week to last. A lockfile bump
+          # starts a new baseline instead of failing on compiler noise.
+          key: iai-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+      - name: Install iai-callgrind-runner
+        run: cargo install iai-callgrind-runner --locked --version 0.16.1
+      - name: Instruction-count benches
+        run: cargo bench -p bugwarden-core --bench guard --features iai --locked
