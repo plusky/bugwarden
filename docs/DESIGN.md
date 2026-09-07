@@ -3674,9 +3674,10 @@ wired, `server.rs` and `main.rs` are the reference.
   `config.rs`, `http_auth.rs`, `otel.rs`, `stdio.rs` or `audit.rs` holds a
   production `expect`, `unwrap`, `panic!` or `unreachable!`; the index and
   slice sites that do exist there — `audit.rs`'s traceparent parser,
-  `otel.rs`'s `hex_bytes`, `stdio.rs`'s newline scan — each check the
-  length or the position before they index, so no operator or client value
-  reaches one out of bounds. The one numeric CLI value is `--port`, a
+  `audit.rs`'s export record slice (#279), `otel.rs`'s `hex_bytes`,
+  `stdio.rs`'s newline scan — each check the length or the position
+  before they index, so no operator or client value reaches one out of
+  bounds. The one numeric CLI value is `--port`, a
   `u16` clap parses and no arithmetic touches; the rotation check adds the
   live file's own length, which no operator value can drive to a `u64`
   overflow even under the overflow checks a debug build has; and the

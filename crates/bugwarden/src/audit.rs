@@ -1472,15 +1472,17 @@ impl AuditSink {
             // it, so what the exporter gets is byte-for-byte the record
             // line the file holds. Still under the state lock, so export
             // order equals `seq` order — accepting only queues.
-            let start = usize::from(healed);
             // Load-bearing since 2026-08-18 (#31): a record the exporter
             // cannot even accept is a record that will not be delivered,
             // and saying so here is what puts the call in front of the
             // same fail-mode gate a failed file write does. The file, if
             // any, keeps the record — the loss accounting over-reports
             // rather than under-reports, as it does under `fsync`.
+            let Some(payload) = export_record_bytes(&line, healed) else {
+                return Err(AuditError::Export);
+            };
             export
-                .accept(&event, &line[start..line.len() - 1])
+                .accept(&event, payload)
                 .map_err(|ExportRefused| AuditError::Export)?;
         }
         Ok(seq)
@@ -1629,6 +1631,14 @@ impl AuditSink {
         self.fail_rotation
             .store(fail, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// Bytes the exporter sees: no repair prefix, no terminating `\n`.
+/// `get` rather than index — a panic here is outside the #253 catcher.
+fn export_record_bytes(line: &[u8], healed: bool) -> Option<&[u8]> {
+    let start = usize::from(healed);
+    let end = line.len().saturating_sub(1);
+    line.get(start..end)
 }
 
 /// Open the live audit file append-only, creating it mode 0600 if absent.
@@ -3317,6 +3327,26 @@ mod tests {
     }
 
     // ---------- the exporter as a load-bearing sink ----------
+
+    #[test]
+    fn export_record_bytes_strips_repair_prefix_and_terminator() {
+        let record = br#"{"v":2,"seq":1}"#;
+        let mut line = record.to_vec();
+        line.push(b'\n');
+        assert_eq!(export_record_bytes(&line, false), Some(&record[..]));
+
+        let mut healed = vec![b'\n'];
+        healed.extend_from_slice(&line);
+        assert_eq!(export_record_bytes(&healed, true), Some(&record[..]));
+
+        // start > end: a repair prefix on a line shorter than two bytes.
+        assert_eq!(export_record_bytes(b"\n", true), None);
+        assert_eq!(export_record_bytes(b"x", true), None);
+
+        // saturating_sub: empty unhealed is an empty slice, not a panic.
+        assert_eq!(export_record_bytes(b"", false), Some(&b""[..]));
+        assert_eq!(export_record_bytes(b"", true), None);
+    }
 
     /// A scriptable exporter for sink-side tests.
     #[derive(Debug, Default)]
