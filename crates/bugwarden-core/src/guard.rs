@@ -347,6 +347,9 @@ impl Guard {
             && scanned < Self::SEARCH_SCAN_MAX
             && requests < Self::SEARCH_SCAN_REQUESTS
         {
+            // Reachable only when upstream overruns `limit`. Pin:
+            // quicksearch_window_never_asks_for_more_rows_than_its_budget
+            // in guard_wiremock.rs.
             let chunk = Self::SEARCH_SCAN_CHUNK.min(Self::SEARCH_SCAN_MAX - scanned);
             let envelope = bz
                 .quicksearch(key, query, status, include_fields, chunk, scanned)
