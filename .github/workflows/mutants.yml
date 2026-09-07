@@ -41,17 +41,19 @@ jobs:
     # reason is gone -- quicksearch_window's panicking mutants no longer hang
     # the in-process client to the timeout floor, because a tool handler that
     # panics is now answered with an internal error (#253) and those tests
-    # fail in seconds. Worth revisiting once some scheduled runs have shown
-    # the timeout floor holds.
+    # fail in seconds. A hang confined to a wiremock harness pays
+    # ceil(failing tests / cores) x 30s; that floor is sized in
+    # .cargo/mutants.toml, not here.
     runs-on: ubuntu-latest
     # Measured at 30-46s of incremental build plus 6-23s of tests per mutant on
     # a 32-core box -- main.rs averaged 43s there, inside that band, so the
     # startup scope costs no more per mutant than the guard one. Call it ~3 min
     # on a 4-core runner. Doubled for margin -- a shard that outruns this has
-    # itself become the finding. Unsharded the scope below does not fit
-    # GitHub's 360-minute ceiling, so the shards are load-bearing rather than
-    # a convenience. Live per-file counts are the Mutate step's summary, not
-    # this comment.
+    # itself become the finding, including a run of hangs each paying the
+    # floor in .cargo/mutants.toml (ceil(largest harness / 4) x 30s). Unsharded
+    # the scope below does not fit GitHub's 360-minute ceiling, so the shards
+    # are load-bearing rather than a convenience. Live per-file counts are the
+    # Mutate step's summary, not this comment.
     timeout-minutes: 240
     strategy:
       # A survivor in one shard must not cancel the rest: the run's value is
