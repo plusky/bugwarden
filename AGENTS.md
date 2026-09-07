@@ -222,6 +222,9 @@ A release is one push of an annotated tag; nothing is released by hand.
   push-by-digest makes unavoidable. `container` is a sibling of `publish`,
   not upstream of it — a broken image build must not hold back the crates.io
   release of a tag whose binaries already shipped.
+- GitHub tarball, `.deb`, `.rpm` and container binaries are built with
+  `cargo auditable` 0.7.5 so `cargo audit bin` / `rust-audit-info` work;
+  the packaged ELF is stripped with `--keep-section=.dep-v0`.
 - The `.deb`/`.rpm` come from `cargo-deb` and `cargo-generate-rpm`, both
   pinned to an exact version and installed `--locked`, reading
   `[package.metadata.deb]` / `[package.metadata.generate-rpm]` in

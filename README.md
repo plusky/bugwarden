@@ -186,6 +186,9 @@ cargo build --release
 # binary at target/release/bugwarden
 ```
 
+Release artifacts embed the crate list for `cargo audit bin`; a local
+`cargo build --release` does not.
+
 The repository pins its Rust toolchain via `rust-toolchain.toml`; `cargo`
 picks it up automatically (rustup-managed installs). Any recent stable Rust
 works if you build without the pin. The build compiles `aws-lc-sys` from

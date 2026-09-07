@@ -8,12 +8,14 @@ FROM rust:1.98.0-alpine@sha256:a10e64dd139b7387337c7fbe8aca31b959b57b2fd4c8ae20a
 # gcc and musl-dev are already in the base; aws-lc-sys (the rustls crypto
 # provider) compiles C from source and needs cmake plus a make generator.
 RUN apk add --no-cache cmake make
+# Image is a shipped artifact; tarball/deb already embed .dep-v0.
+RUN cargo install cargo-auditable --locked --version 0.7.5
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release --locked -p bugwarden && \
+    cargo auditable build --release --locked -p bugwarden && \
     cp target/release/bugwarden /out
 
 # Both FROMs carry a digest for the same reason the workflows SHA-pin actions:
