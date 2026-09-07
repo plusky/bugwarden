@@ -49,8 +49,27 @@ jobs:
             exit 1
           fi
 
+      - name: Install cargo-auditable
+        # Pinned exactly and --locked: same hermetic rule as cargo-deb.
+        # rust-audit-info extracts .dep-v0; cargo-audit is not installed
+        # here so a new advisory cannot fail the tag (advisories.yml).
+        run: |
+          cargo install cargo-auditable --locked --version 0.7.5
+          cargo install rust-audit-info --locked --version 0.5.4
+
       - name: Build release binary
-        run: cargo build --release --locked -p bugwarden
+        run: cargo auditable build --release --locked -p bugwarden
+
+      - name: Verify auditable section
+        # ELF and Mach-O both carry .dep-v0; missing data fails the tag.
+        shell: bash
+        run: |
+          set -euo pipefail
+          info="$(rust-audit-info target/release/bugwarden)"
+          grep -qF '"name":"bugwarden"' <<<"$info" \
+            || { echo "::error::binary is missing cargo-auditable data"; exit 1; }
+          grep -qF '"name":"rmcp"' <<<"$info" \
+            || { echo "::error::binary is missing crate rmcp in cargo-auditable data"; exit 1; }
 
       - name: Package release artifact
         shell: bash
@@ -116,14 +135,36 @@ jobs:
           cargo install cargo-deb --locked --version 3.7.0
           cargo install cargo-generate-rpm --locked --version 0.16.1
 
+      - name: Install cargo-auditable
+        # Pinned exactly and --locked: same hermetic rule as cargo-deb.
+        # rust-audit-info extracts .dep-v0; cargo-audit is not installed
+        # here so a new advisory cannot fail the tag (advisories.yml).
+        run: |
+          cargo install cargo-auditable --locked --version 0.7.5
+          cargo install rust-audit-info --locked --version 0.5.4
+
       - name: Build release binary
-        run: cargo build --release --locked -p bugwarden
+        run: cargo auditable build --release --locked -p bugwarden
 
       - name: Strip the packaged binary
         # cargo-deb strips by default and cargo-generate-rpm cannot at all, so
         # strip once here and tell cargo-deb not to: both packages then ship a
         # byte-identical binary. The tarballs keep their symbols (unchanged).
-        run: strip target/release/bugwarden
+        # .dep-v0 is ELF sh_flags=0 (not SHF_ALLOC); GNU strip drops it
+        # unless --keep-section=.dep-v0.
+        run: strip --keep-section=.dep-v0 target/release/bugwarden
+
+      - name: Verify auditable section
+        # After strip: a strip that ate .dep-v0 would ship unauditable
+        # .deb/.rpm.
+        shell: bash
+        run: |
+          set -euo pipefail
+          info="$(rust-audit-info target/release/bugwarden)"
+          grep -qF '"name":"bugwarden"' <<<"$info" \
+            || { echo "::error::binary is missing cargo-auditable data"; exit 1; }
+          grep -qF '"name":"rmcp"' <<<"$info" \
+            || { echo "::error::binary is missing crate rmcp in cargo-auditable data"; exit 1; }
 
       - name: Build packages
         shell: bash
@@ -384,6 +425,19 @@ jobs:
           image="ghcr.io/plusky/bugwarden@${{ steps.build.outputs.digest }}"
           docker pull "$image"
           echo "IMAGE=$image" >>"$GITHUB_ENV"
+
+      - name: Verify auditable section
+        # Tarball/deb already run rust-audit-info; this is the image
+        # copy. Both matrix legs are Linux; this job has no rustc.
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker create --name bugwarden-audit "$IMAGE"
+          docker cp bugwarden-audit:/usr/local/bin/bugwarden /tmp/bugwarden
+          docker rm bugwarden-audit
+          readelf -S /tmp/bugwarden | grep -q '\.dep-v0' \
+            || { echo "::error::image binary is missing .dep-v0"; exit 1; }
+
       # ci.yml's assertions, same script, now on both architectures and against
       # what ghcr.io will actually serve (#223) — the arm64 image was never
       # executed anywhere before this. The digest is in ghcr.io before any of
