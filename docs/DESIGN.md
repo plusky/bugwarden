@@ -949,6 +949,23 @@ Decisions, all deliberate:
   header, path or peer, so it is no oracle. A read-scope caller's refused write
   call IS audited, as one ordinary `tool_call` record with no guard verdict and
   no upstream leg — the same shape an unknown tool name produces.
+- **Pre-dispatch rmcp refusals are logged, not audited.** Independent of
+  the bearer gate: a request whose `_meta` protocol revision is outside
+  the served five (`"9999-01-01"` → `-32022`) or that names a served
+  revision without `clientCapabilities` (`-32602`) dies in rmcp's blanket
+  `Service` impl, before `call_tool` — the only place records are written.
+  Both transports funnel the handler `Err` through
+  `tracing::warn!(%id, ?error, "response error")`, so the distinction
+  lives in the log, not the stream. There is no hook that works on both:
+  a hand-written `Service` wrapper covers stdio, but
+  `StreamableHttpService::new` requires `S: ServerHandler` and re-acquires
+  the blanket impl — wrapping stdio alone would make coverage differ by
+  transport. If a future rmcp stops refusing first, the two arms split:
+  `"9999-01-01"` (`-32022`) fails `lifecycle_of`'s `contains` into
+  `OutOfContract` and becomes a recorded refusal — that arm cannot
+  silently become served. Missing `clientCapabilities` at served
+  `2026-07-28` (`-32602`) is `PerRequest` and would run the tool; the
+  pin still fails, because a `tool_call` appears.
 - **Scope enforcement is a transport property, not a policy one.**
   `BugWarden::with_scope_enforcement` is switched on by `main` for an
   authenticated http listener only: stdio issues no per-request credential and
@@ -1162,8 +1179,9 @@ Decisions, all deliberate:
 - **One record per call (I15).** The hand-written `call_tool` owns the
   record; tools only enrich it through a per-request cell in the request
   extensions (verdict worst-wins merged, suppressed ids unioned). An
-  unknown tool, a protocol error, or a missed enrichment still yields
-  exactly one record — a poorer record is possible, an audit gap is not.
+  unknown tool, a protocol error, or a missed enrichment that reaches
+  the handler still yields exactly one record — a poorer record is
+  possible, an audit gap is not.
   A handler that PANICS is no exception since #253, and used to be one: the
   unwind is caught at the dispatch boundary, the request is answered with a
   JSON-RPC internal error carrying a fixed, content-free text, and the
@@ -1179,7 +1197,10 @@ Decisions, all deliberate:
   `initialize` is always recorded, with no configuration knob to turn it
   off; `list_tools` is not recorded in schema v2 — no event kind exists
   for a listing, deliberately, and the growth rule would permit adding one
-  without a version bump.
+  without a version bump. rmcp's pre-`call_tool` refusals (`-32022` /
+  `-32602`) are another unrecorded class: they die in the blanket
+  `Service` impl and never reach the handler (see "Pre-dispatch rmcp
+  refusals are logged, not audited" under HTTP bearer authentication).
 - **Boundary.** Records go to the sinks the operator named
   (`select_sinks`): the JSONL file (0600, parent 0700), an OTLP
   collector, both, or neither. Never stderr, never any MCP surface. When
@@ -3354,7 +3375,11 @@ wired, `server.rs` and `main.rs` are the reference.
   `initialize` is answered with that revision, mints no `mcp-session-id`,
   and is recorded from the REQUEST's `clientInfo` with no id; a header-only
   `2026-07-28` with no `_meta` is refused by the transport (-32602) with
-  nothing recorded, which is the barrier the handshake arm leans on; and
+  nothing recorded, which is the barrier the handshake arm leans on; a
+  session `tools/call` whose `_meta` names an unserved revision (-32022)
+  or a served one without `clientCapabilities` (-32602) dies in rmcp
+  before `call_tool` and writes no `tool_call` record
+  (`a_pre_dispatch_rmcp_refusal_writes_no_tool_call_record`); and
   I13 and I2 are re-run on the path — a `--read-only`-pruned tool and a
   nonexistent name answer byte-identically, a policy-denied bug and a
   nonexistent one answer with the same uniform text. `list_tools` has its own

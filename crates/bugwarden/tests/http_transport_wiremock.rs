@@ -1946,6 +1946,89 @@ async fn a_header_only_2026_declaration_is_refused_by_the_transport() {
 }
 
 #[tokio::test]
+async fn a_pre_dispatch_rmcp_refusal_writes_no_tool_call_record() {
+    // Issue #182: rmcp refuses these in the blanket `Service` impl before
+    // `call_tool`, so the stream has no record. Logged (`tracing::warn`
+    // `response error`), not audited; no hook that works on both
+    // transports. If a future rmcp stops refusing first, the arms split:
+    // `"9999-01-01"` is `OutOfContract` (recorded refusal); missing
+    // `clientCapabilities` at served `2026-07-28` is `PerRequest` and
+    // would run the tool. Either way a `tool_call` appears and this
+    // fails. The `-32022` itself is
+    // `an_http_probe_never_commits_the_session_lifecycle`; this pins the
+    // stream boundary.
+    //
+    // `Mcp-Method` / `Mcp-Name` are load-bearing: `"9999-01-01"` outranks
+    // 2026-07-28, so without them the transport answers -32020 first.
+    // `clientCapabilities` on the unserved row keeps the missing-keys
+    // check from stealing it as -32602.
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("audit temp dir");
+    let file = key_file("srv-key\n");
+    let (addr, audit_path) = served_with_audit(&mock, &dir, &file).await;
+
+    let session = raw_initialize(addr, "pre-dispatch-client").await;
+
+    for (revision, caps, code, why) in [
+        ("9999-01-01", true, -32022, "unserved revision"),
+        (
+            PER_REQUEST_REVISION,
+            false,
+            -32602,
+            "missing clientCapabilities",
+        ),
+    ] {
+        let meta = if caps {
+            json!({
+                "io.modelcontextprotocol/protocolVersion": revision,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            })
+        } else {
+            json!({ "io.modelcontextprotocol/protocolVersion": revision })
+        };
+        let response = mcp_post(addr, Some(&session))
+            .header("MCP-Protocol-Version", revision)
+            .header("Mcp-Method", "tools/call")
+            .header("Mcp-Name", "bug_info")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "bug_info",
+                    "arguments": { "bug_ids": [7] },
+                    "_meta": meta
+                }
+            }))
+            .send()
+            .await
+            .expect("the refused call must reach the server");
+        let body = response.text().await.expect("a body");
+        let payload: Value = body
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .and_then(|data| serde_json::from_str(data).ok())
+            .unwrap_or_else(|| {
+                serde_json::from_str(&body).unwrap_or_else(|e| panic!("{why}: {body}: {e}"))
+            });
+        assert_eq!(
+            payload["error"]["code"],
+            json!(code),
+            "{why}: expected {code}: {body}"
+        );
+    }
+
+    let events = audit_events(&audit_path);
+    let _ = initialize_of(&events, "pre-dispatch-client");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, AuditEventKind::ToolCall(_))),
+        "a pre-dispatch refusal must write no tool_call record"
+    );
+}
+
+#[tokio::test]
 async fn a_per_request_call_cannot_reach_a_tool_the_deployment_pruned_i13() {
     // I13 under the handshake-free lifecycle: the pruned INSTANCE router is
     // what dispatch goes through on this path too, so a write tool
