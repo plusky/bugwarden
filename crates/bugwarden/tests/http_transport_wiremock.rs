@@ -454,7 +454,7 @@ async fn guard_denies_uniformly_over_http() {
 
 #[tokio::test]
 async fn a_client_addressing_the_server_by_name_is_served() {
-    // rmcp 3.1's `allowed_hosts` default is loopback only, so inheriting it
+    // rmcp 3.2's `allowed_hosts` default is loopback only, so inheriting it
     // would answer every request whose `Host` is the name the operator
     // actually deployed under — every containerised one — with a rejection.
     // main.rs disables that validation by name; this pins the decision,
@@ -576,7 +576,7 @@ async fn an_allowed_hosts_entry_naming_no_host_leaves_validation_off() {
 
 #[tokio::test]
 async fn an_unparsable_allowed_hosts_entry_is_a_startup_error() {
-    // The same path `serve_http` and `main` take: rmcp 3.1.4 would store
+    // The same path `serve_http` and `main` take: rmcp 3.2.0 would store
     // `*` as a host that matches only `Host: *`, turning validation on as
     // a silent deny-all. Refusing here is what the operator sees instead
     // of one 403 at a time.
@@ -599,18 +599,19 @@ async fn an_unparsable_allowed_hosts_entry_is_a_startup_error() {
 
 #[tokio::test]
 async fn a_handshake_free_call_is_refused_and_never_names_a_client() {
-    // rmcp 3.1.4 routes to its handshake-free lifecycle when the request's
+    // rmcp 3.2.0 routes to its handshake-free lifecycle when the request's
     // revision is 2026-07-28 or newer, or `_meta` carries BOTH
-    // `protocolVersion` and `clientCapabilities`, synthesising the peer with
-    // the SDK's own build identity. The body below sends both keys at
-    // 2025-11-25 deliberately: serving 2026-07-28 did not close that second
-    // shape — a PRE-2026 revision with both keys still reaches a handler with
-    // no `initialize` behind it and a peer named `rmcp`/<sdk version>, a
-    // client the server never spoke to, and it declares a lifecycle its own
-    // revision does not define. Drop `clientCapabilities` and it takes the
-    // session path instead, proving nothing. Narrowing
-    // SUPPORTED_PROTOCOL_VERSIONS cannot close it either, the routing never
-    // consults it, so the handler refuses the request.
+    // `protocolVersion` and `clientCapabilities` — not for `initialize`,
+    // which always takes the session path (#1228). The body below sends
+    // both keys at 2025-11-25 deliberately: serving 2026-07-28 did not
+    // close that second shape — a PRE-2026 non-initialize with both keys
+    // still reaches a handler with no `initialize` behind it and a peer
+    // named `rmcp`/<sdk version> (#204), a client the server never spoke
+    // to, and it declares a lifecycle its own revision does not define.
+    // Drop `clientCapabilities` and it takes the session path instead,
+    // proving nothing. Narrowing SUPPORTED_PROTOCOL_VERSIONS cannot close
+    // it either, the routing never consults it, so the handler refuses the
+    // request.
     let mock = MockServer::start().await;
     mount_bug_for_key(&mock, world_readable_bug(7), "srv-key").await;
 
@@ -891,7 +892,7 @@ async fn traceparent_over_http_lands_in_the_audit_record() {
     // `CallToolRequestParams.meta` arrives `None` here — and delivers it
     // to the handler as the extensions-backed `RequestContext.meta`, so
     // this test pins the `context.meta` fallback that every serialized
-    // transport depends on (see the rmcp 3.1 usage notes in DESIGN.md).
+    // transport depends on (see the rmcp 3.2 usage notes in DESIGN.md).
     let mock = MockServer::start().await;
     mount_bug_for_key(&mock, world_readable_bug(7), "srv-key").await;
 
@@ -1524,7 +1525,7 @@ async fn a_per_request_call_naming_no_client_is_served_and_names_no_placeholder(
     // The mutation this kills is `client_of` reading `ctx.client_info()` or
     // `peer_info()` on this path: rmcp synthesises the stateless peer with
     // `Implementation::default()`, so either would put
-    // `{"name":"rmcp","version":"3.1.4"}` into the record — not a missing
+    // `{"name":"rmcp","version":"3.2.0"}` into the record — not a missing
     // field but a plausible wrong one. The whole file is checked for the
     // string, not just this record's field, because a placeholder that
     // leaked into any other record would be the same defect.
@@ -1836,16 +1837,15 @@ async fn a_per_request_listing_carries_the_cache_hints() {
 }
 
 #[tokio::test]
-async fn a_per_request_initialize_is_answered_without_minting_a_session() {
-    // The asymmetry adoption creates, pinned where it is observable: rmcp
-    // routes a 2026-07-28 `initialize` down the STATELESS path, so over
-    // http it is answered and audited but opens nothing — no
-    // `mcp-session-id` on the response, no id in the record. (Over stdio
-    // the same request is an ordinary handshake and does open a session.)
-    // The record is written anyway: recording every handshake
-    // unconditionally is the invariant, and joins are on id equality — an
-    // anchor with no id anchors nothing, and gathers nothing belonging to
-    // another session either.
+async fn a_per_request_initialize_is_answered_with_a_session() {
+    // rmcp #1228: `initialize` always selects the legacy session path,
+    // whatever `protocolVersion` it names. A 2026-07-28 initialize is
+    // answered, audited, and mints `mcp-session-id`; the session speaks
+    // the handshake revision this build serves (`2025-11-25`), not
+    // 2026-07-28. (2026-07-28 is reached by discover / per-request
+    // `_meta`, not by initialize.) The record is written anyway:
+    // recording every handshake unconditionally is the invariant, and
+    // joins are on id equality.
     let mock = MockServer::start().await;
     let dir = tempfile::tempdir().expect("audit temp dir");
     let file = key_file("srv-key\n");
@@ -1868,14 +1868,17 @@ async fn a_per_request_initialize_is_answered_without_minting_a_session() {
         "the per-request initialize must be answered, got {}",
         response.status()
     );
-    assert!(
-        response.headers().get("mcp-session-id").is_none(),
-        "the stateless path mints no session id"
-    );
+    let session_id = response
+        .headers()
+        .get("mcp-session-id")
+        .expect("initialize mints a session id")
+        .to_str()
+        .expect("the minted id is ascii")
+        .to_owned();
     let body = response.text().await.expect("a body");
     assert!(
-        body.contains(&format!("\"protocolVersion\":\"{PER_REQUEST_REVISION}\"")),
-        "the revision this build now serves must be echoed: {body}"
+        body.contains("\"protocolVersion\":\"2025-11-25\""),
+        "initialize negotiates a handshake-era revision, not 2026-07-28: {body}"
     );
 
     let events = audit_events(&audit_path);
@@ -1885,8 +1888,8 @@ async fn a_per_request_initialize_is_answered_without_minting_a_session() {
     };
     assert_eq!(
         event.protocol_version.as_deref(),
-        Some(PER_REQUEST_REVISION),
-        "the record names the revision the exchange spoke"
+        Some("2025-11-25"),
+        "the record names the revision the session speaks"
     );
     assert_eq!(
         event.client.version.as_deref(),
@@ -1894,8 +1897,9 @@ async fn a_per_request_initialize_is_answered_without_minting_a_session() {
         "the record names the REQUEST's client, never the synthesised peer"
     );
     assert_eq!(
-        anchor.session.id, None,
-        "there is no session for the anchor to name"
+        anchor.session.id.as_deref(),
+        Some(session_id.as_str()),
+        "the anchor names the minted session"
     );
 }
 

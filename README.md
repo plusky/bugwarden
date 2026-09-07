@@ -894,9 +894,10 @@ One JSON object per line, schema version 2, in three kinds:
 
 - **`initialize`** — a client sent an `initialize`; carries the client's
   self-declared name and version and the *negotiated* protocol revision.
-  Written unconditionally, with no knob to suppress it. Usually that opened
-  a session; a `2026-07-28` `initialize` over HTTP does not, so that record
-  carries no session id.
+  Written unconditionally, with no knob to suppress it. That opened a
+  session on both transports (even a `2026-07-28` `initialize`);
+  handshake-free tool/discover records over HTTP still carry no session
+  id.
 - **`tool_call`** — exactly one per tool invocation, including calls that
   were denied, refused, or aimed at a tool name that does not exist. The
   tool listing is deliberately not recorded. One per *attempt*, precisely:

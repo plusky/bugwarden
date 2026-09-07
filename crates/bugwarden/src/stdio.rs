@@ -208,9 +208,9 @@ type QueuedSend<E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send>>;
 ///
 /// `server/discover` is a probe, but over stdio rmcp lets it CHOOSE the
 /// session lifecycle before anyone answers it: `serve_server_with_ct_inner`
-/// (rmcp 3.1.4 `service/server.rs:510-577`) takes any first non-`ping`
+/// (rmcp 3.2.0 `service/server.rs:550-631`) takes any first non-`ping`
 /// frame that is not `initialize` as a commitment to the handshake-free
-/// lifecycle and calls `Peer::require_request_metadata()` (`:562`) — a
+/// lifecycle and calls `Peer::require_request_metadata()` (`:616`) — a
 /// sticky `AtomicBool` that no later `initialize` clears and no public API
 /// can reset, both methods being `pub(crate)`. Every subsequent request
 /// but `initialize` that carries no `_meta` is then refused -32602
@@ -224,7 +224,7 @@ type QueuedSend<E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send>>;
 /// per-request gate stays rmcp's and no other frame is intercepted — but a
 /// probe no longer moves rmcp past its pre-`initialize` loop, so a `ping`
 /// after one is answered `{}` there rather than refused -32601 by the
-/// per-request handler (`handler/server.rs:112-118`), which is where a
+/// per-request handler (`handler/server.rs:112-117`), which is where a
 /// probe used to leave it.
 ///
 /// http needs none of this: there `serve_negotiated_request_directly`
@@ -236,7 +236,7 @@ pub struct DiscoverAnswering<T: Transport<RoleServer>> {
     server: BugWarden,
     /// A discover reply whose write has not finished, parked across
     /// `receive` calls because `receive` is one arm of rmcp's `select!`
-    /// (`service.rs:1395`) and is dropped whenever another arm wins. A
+    /// (`service.rs:1392`) and is dropped whenever another arm wins. A
     /// reply awaited on that stack dies with the frame that asked for it —
     /// consumed, never answered, the client hung on that id — while the
     /// inner transport survives the same cancellation by keeping its
@@ -906,14 +906,14 @@ mod discover {
     async fn a_pipelined_probe_is_answered_under_write_contention() {
         // The one thing this wrapper does that the inner transport does
         // not: hold a reply. rmcp polls `receive` as one arm of a
-        // `select!` (rmcp 3.1.4 `service.rs:1395`) and drops the future
+        // `select!` (rmcp 3.2.0 `service.rs:1392`) and drops the future
         // whenever another arm wins, so a reply awaited on `receive`'s own
         // stack dies with the frame that asked for it — consumed, never
         // answered, the client hung on that id while every other reply
         // arrives. Every other row here is lock-step, where nothing else
         // is ever ready and the drop never happens. A session first:
         // before `initialize` rmcp awaits `receive` outside its `select!`
-        // (`service/server.rs:511`), so a probe-only chain never shows
+        // (`service/server.rs:565`), so a probe-only chain never shows
         // this either. The whole burst fits `PIPE`, so only the SERVER's
         // writes park.
         const FRAMES: u32 = 40;
@@ -1061,7 +1061,7 @@ mod discover {
             "the probe must name this build, and nothing else: {probe}"
         );
         // Present whatever revision the probe declares:
-        // `strip_result_type_for_legacy_peer` (rmcp 3.1.4 model.rs) has no
+        // `strip_result_type_for_legacy_peer` (rmcp 3.2.0 model.rs) has no
         // `DiscoverResult` arm, so rmcp never stripped it here either.
         assert_eq!(probe["result"]["resultType"], "complete", "{probe}");
     }

@@ -11,7 +11,7 @@ Cargo workspace, two crates:
 
 - `crates/bugwarden-core` — guard policy engine + async Bugzilla REST client.
   MUST NOT depend on rmcp, axum, clap, or any MCP/transport crate.
-- `crates/bugwarden` — the binary: clap CLI, rmcp 3.1 MCP server, stdio and
+- `crates/bugwarden` — the binary: clap CLI, rmcp 3.2 MCP server, stdio and
   streamable-HTTP transports. Depends on `bugwarden-core`. The crate also
   has a lib target (`lib.rs` re-exporting `config` and `server`) consumed by
   `main.rs` and by the integration tests under `crates/bugwarden/tests/`,
@@ -1034,7 +1034,7 @@ constraints the model must know.
 | bug_comments | id, include_private: bool = false, new_since?, head?: u32, tail?: u32, max_comment_chars?: u32 | comments | filter_comments applied (I5). Optional windowing: with ANY of head/tail/max_comment_chars set the response is an envelope `{"comments":[..], "truncation":{"omitted_comments":N,"shown_comments":M}}`, else the bare array it always was. Windowing runs LAST, on the post-filter (I5), post-duplicate-marker-scrub (I14) list — `omitted_comments` counts only comments the client may see, so private-comment existence cannot leak by arithmetic. head keeps the first N (comment 0 is the report), tail the last N; overlap keeps everything and omits nothing. A comment capped by max_comment_chars carries a sibling `text_truncated: {"shown_chars","total_chars"}` — never an in-text marker, which free-form comment text would absorb. The name is max_comment_chars, not download_attachment's max_chars, on purpose: same unit, different scope — this caps EACH comment, that caps the WHOLE response — so do not converge the two into one name. summarize_bug is deliberately NOT windowed (its prompt needs every comment). Audit: `note_redacted_client_window("comments_window")` when omission or a cap actually fired — that note PRESERVES the granting rule, unlike the I5 suppression noted beside it (see "The `guard.rule` encoding") |
 | bugs_quicksearch | query, status: String = "ALL", include_fields: String = "id,product,component,assigned_to,status,resolution,summary,last_change_time", limit: u32 = 50, offset: u32 = 0, group_by?: String | post-filter | fetch include_fields = requested ∪ CLASSIFY_FIELDS; after filter, project kept bugs to requested fields (keep `_redacted` marker); envelope `{"bugs":[..]}` — or `{"groups":[..]}` under `group_by`, see below — only (I3), except an advisory `note` when the query is nothing but bug ids (comma/whitespace-separated, optional `#` per id) steering exact id sets to bug_info — the note is a pure function of the CLIENT'S REQUEST (the query and status strings), never of results, verdicts, or anything upstream said (no new oracle), and the `bugs` array is byte-identical with or without it (the query is still searched, never rerouted); its wording tracks the request: a non-empty status is prefixed to the query so upstream content-matches the whole expression, while an empty status sends the query bare and Bugzilla routes a bare all-number query to an exact id lookup (bug_id + anyexact) — on that path the note drops the content-matching claim — and a query naming more distinct ids than MAX_ASSESS_IDS steers to batched bug_info calls (the cap is already public in the too_many_ids refusal text) instead of straight into that refusal | **limit/offset address the bugs the client may SEE, not upstream rows** (Guard::quicksearch_window): filtering an already-paginated page left a hole exactly where a hidden bug sat — a short page the next offset contradicted — and since quicksearch matches summary text that hole was a probe for the hidden title, one word at a time. The guard now scans upstream from row 0 in 200-row chunks, classifies each, and fills the window from the survivors; rows are deduped on the server-reported id (relevance order is not stable between calls) and an id-less row is dropped (I4). A short page is NOT read as end-of-results — Bugzilla is free to cap a page below the requested chunk size (an admin-configured `max_search_results`, for instance), and that cap looks identical to a short page at the genuine end of a result set; only an empty page ends the scan early. Bounds, independent of each other: MAX_SEARCH_WINDOW=1000 addressable, 2000 rows scanned, and 10 sequential requests; hitting any of the three truncates, which looks exactly like the end of results. The objects returned are the ones classified. The scan target is quantised to whole chunks so the stopping point does not track the client's `limit`; without that, `limit` could be binary-searched against the clock to recover each block's exact hidden count. Residual, accepted: filling a window of VISIBLE bugs needs more rows when bugs are hidden, so a stopwatch still learns one bit per scanned block ("not entirely visible"). Removing that would mean scanning the worst case on every search, or letting pages go short again. Search failure returns a bare "Search failed"; the upstream text is logged server-side only (it can name a bug and say whether it exists). The scan's accounting — rows examined, verdict-dropped ids — goes to the audit record only (`guard.scan` plus the suppressed-ids machinery, issue #29); the response is byte-identical with or without drops. Optional `group_by` (issue #143): a comma-separated subset of GROUP_BY_FIELDS = product, component, status, resolution, severity, priority, deduped, unknown name refused BEFORE the upstream call (a silently ungrouped typo looks like a broken feature; the text quotes only what the client sent, so it is no oracle) while a spec naming NOTHING (`""`, bare commas) means "no grouping" rather than an error — that is what a client filling in every declared param sends, and the sibling `include_fields` reads an empty segment the same way. The response becomes `{"groups":[{"bugs":[..], <field>:<value>, ..}]}` and each grouped field is reported once per group instead of once per bug. Header key order is NOT caller order and is not promised anywhere client-facing: serde_json is built without `preserve_order`, so its Map is a BTreeMap and a header serializes with keys sorted, `bugs` first — `group_by=status,product` and `product,status` return identical bytes. GROUP_BY_FIELDS is a HAND-PICKED subset of the CLASSIFY_FIELDS ∩ SUMMARY_FIELDS intersection (which is all ten SUMMARY_FIELDS), restricted to low-cardinality enum-ish values; that membership is what makes grouping free of policy consequences — no extra upstream field is pulled, and a summary-redacted row carries all six so it buckets like any other row instead of needing one of its own. Membership is NOT the I14 argument: the same intersection holds `summary`, which routinely reads "regression from bug 12345". What keeps a header clean is ORDERING — a grouped field is FORCED into `requested` the way `id` is, so grouping runs on the served, link-scrubbed projection, a value can only reach a header by the same path that would have put it on the bug, and grouping never surfaces a field the projection dropped. Group order and within-group order are first appearance in the served window, so grouping cannot reorder by verdict, and a group exists only where a served bug put it: no empty buckets, no header naming a hidden bug's product (I3). It runs LAST, after the audit block has read the flat projection, so a call's record is identical whether or not the client asked for groups; `group_by` is in PARAM_ALLOWLIST (a vocabulary field, not free text) so the record carries it verbatim. The envelope key is `groups`, deliberately the same word as Bugzilla's per-bug `groups` security-group list which a client may project into the bugs nested inside it — parallel to `bugs` at the same level, and depth disambiguates; do not rename one to "fix" the collision without also moving the other |
 | create_bug | product, component, summary, version, description = "", severity?, priority?, op_sys?, platform?, keywords?: Vec<String>, groups?: Vec<String>, custom_fields?: JsonObject | create (write), judged on the bug AS REQUESTED (Guard::may_create) | there is no bug id to assess, so the request itself is classified BEFORE any upstream call (I8): the rules that hide a product by name refuse filing into it, a field the request omits fails closed (I4), and a client-claimed `groups` list is never trusted — Bugzilla unions the product's mandatory groups in server-side, so may_create forces groups to unknown, which means a group-consulting rule refuses every create request that REACHES it — creation is possible only where an earlier rule covering the create operation grants it (a rule carrying `operations = ["create"]`, placed ahead of the group-consulting rules, is how an operator permits filing without that grant shadowing reads of existing bugs — issue #26), and a policy with no such grant refuses all creation. **Both refusals are one refusal**: a policy refusal and an upstream failure return the same fixed create_denial text after the same single upstream request — the refused path burns one classify call against bug id 0 (never a valid id, creates nothing; download_attachment's padding precedent) instead of the POST. Two texts, or 0 vs 1 requests, would be a free policy-enumeration oracle: send a guaranteed-invalid `version` plus a probe product and read the policy off which refusal (or which latency) comes back, with nothing created. Residual, accepted: a SUCCESSFUL create still confirms the product is allowed — that is the tool doing its job, and it costs a real, attributable bug; and the padding equalizes request count, not the upstream handler's exact latency (GET classify vs rejected POST). Bugzilla's failure message is logged server-side only (it can say whether a product/component exists). `custom_fields` keys must start with `cf_` (I7): the gate runs before `may_create` and errors with ZERO upstream requests on a non-`cf_` key — distinguishable from the padded create refusal on purpose, since it decides nothing about policy or Bugzilla. No Matcher criterion reads `cf_*`, so a custom field cannot move a prospective bug between rules the way `product`/`component` do. `custom_fields` is not in `PARAM_ALLOWLIST`, so the audit stream records it as `_len`, same as the updater |
-| add_attachment | bug_id, data (base64), file_name, summary, content_type, comment = "", is_private = false, is_patch = false | attach (write) on bug_id | guard assessment before the upload (I8), uniform denial (I2); then global.max_attachment_bytes caps the DECODED size of `data` (0 = no cap) — the ceiling the operator set on downloads binds uploads through the same server too, measured after base64 expansion is stripped so encoding overhead cannot shrink it. The refusal names neither the payload's size nor the cap value (max_attachment_bytes is not I1-disclosable, exactly as on the download path). Over http that non-disclosure is partial and knowingly so: the transport's POST body cap is derived from this same value (#52), so its 413 boundary is probeable once the cap exceeds ~2.25 MiB decoded — accepted, with the reasoning, under "rmcp 3.1 usage notes" below. Nothing here changes: this refusal still names neither size nor cap. `comment` travels as a PLAIN string — Bug.add_attachment documents it so; the `{"comment": {"body": ..}}` shape belongs to Bug.update only |
+| add_attachment | bug_id, data (base64), file_name, summary, content_type, comment = "", is_private = false, is_patch = false | attach (write) on bug_id | guard assessment before the upload (I8), uniform denial (I2); then global.max_attachment_bytes caps the DECODED size of `data` (0 = no cap) — the ceiling the operator set on downloads binds uploads through the same server too, measured after base64 expansion is stripped so encoding overhead cannot shrink it. The refusal names neither the payload's size nor the cap value (max_attachment_bytes is not I1-disclosable, exactly as on the download path). Over http that non-disclosure is partial and knowingly so: the transport's POST body cap is derived from this same value (#52), so its 413 boundary is probeable once the cap exceeds ~2.25 MiB decoded — accepted, with the reasoning, under "rmcp 3.2 usage notes" below. Nothing here changes: this refusal still names neither size nor cap. `comment` travels as a PLAIN string — Bug.add_attachment documents it so; the `{"comment": {"body": ..}}` shape belongs to Bug.update only |
 | add_comment | bug_id, comment, is_private: bool = false | comment (write) | |
 | update_bug_status | bug_id, status, resolution?, comment: String = "" | status (write) | payload always carries `status`; `resolution` only when the caller gives a non-empty one — no local workflow assumption, no synthesised empty resolution. Bugzilla enforces `missing_resolution` on a closing status with none, and auto-clears any resolution when the target status is open |
 | assign_bug | bug_id, assignee (email), comment = "" | assign (write) | payload `{"assigned_to": ..}` |
@@ -1508,10 +1508,11 @@ Decisions, all deliberate:
   on every record regardless — a run of records sharing an id nothing
   anchors. Truthful rather than misleading: no other session holds that id,
   so those records are never gathered under the wrong one — they simply have
-  nothing to join to. A handshake-free http
-  request opens no session and its record carries no id, served or refused —
-  including a `2026-07-28` `initialize`, which rmcp routes statelessly, so
-  that anchor names no session either; grouping there is `remote` and nothing
+  nothing to join to. A handshake-free http request opens no session and
+  its record carries no id, served or refused — discover and per-request
+  `_meta`, not `initialize`. An `initialize` always mints a session
+  (rmcp #1228), even one that named `2026-07-28`, so that anchor carries
+  the minted id; grouping a handshake-free record is `remote` and nothing
   else. Over stdio the same lifecycle keeps the process-scoped id, which is
   minted rather than read off a request. The client on a per-request record
   is the one the request itself declared in `_meta`, absent when it declared
@@ -2203,10 +2204,10 @@ names an endpoint.
   of the kind the invariant already names; the endpoint is the weaker bar
   stated under "What secrecy this actually buys".
 
-## rmcp 3.1 usage notes
+## rmcp 3.2 usage notes
 
 Reference source is the rmcp this workspace pins, unpacked in the local
-registry: `~/.cargo/registry/src/*/rmcp-3.1.4/` — today's version, and the
+registry: `~/.cargo/registry/src/*/rmcp-3.2.0/` — today's version, and the
 directory holding the `rmcp` package's `manifest_path` in `cargo metadata
 --format-version 1` on any day, so it follows `Cargo.lock` rather than a copy
 of it and is by construction the source this build compiles against. Every rmcp
@@ -2216,8 +2217,8 @@ routing traps), `handler/server/router/tool.rs` (`ToolRouter`, incl.
 `remove_route` / `has_route` — I13), `model.rs` and `model/serde_impl.rs`
 (`InitializeResult`, the `_meta` strip), `service.rs` (the serve loop); the
 `#[tool_router]` / `#[tool_handler]` expansions are in the sibling
-`rmcp-macros-3.1.4` tree. The published crate carries no `examples/` — those
-live upstream at the `rmcp-v3.1.4` tag — but for how this server is actually
+`rmcp-macros-3.2.0` tree. The published crate carries no `examples/` — those
+live upstream at the `rmcp-v3.2.0` tag — but for how this server is actually
 wired, `server.rs` and `main.rs` are the reference.
 
 - `rmcp = { version = "3.1", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }`
@@ -2235,33 +2236,38 @@ wired, `server.rs` and `main.rs` are the reference.
   ADDED it — `2024-11-05` through `2025-11-25` keep their handshakes and their
   sessions — so the two lifecycles are served side by side and
   `DEFAULT_PROTOCOL_VERSION` stays `2025-11-25`.
+  **An `initialize` request selects legacy semantics whatever version it
+  names** (rmcp #1228): the handshake exists only in the revisions before
+  `2026-07-28`, so a client naming that revision or later is answered with
+  this build's newest handshake-era version (`DEFAULT_PROTOCOL_VERSION`).
+  Modern clients reach `2026-07-28` through `server/discover` / per-request
+  `_meta`, not through `initialize`.
   One consequence worth stating because nothing enforces it: rmcp's
   `KNOWN_VERSIONS` now equals this list, so there is no known-but-unserved
   revision left to test the fallback with, and the negotiation tests use a
   fabricated `"9999-01-01"` instead.
-  The hand-written `initialize` tests the same list — the SDK negotiates
-  again afterwards using the handler's answer as its fallback, so a handler
-  that echoed an unsupported request would make the SDK echo it too — and
-  records the negotiated revision, never the requested one. It also **stores**
-  the negotiated revision in `peer_info`, which is not the same statement:
-  in rmcp 3.1.4 that second negotiation runs only on the FIRST, handshake
-  `initialize` (`service/server.rs`; `NegotiatingStatelessHttpService` in
-  `tower.rs` for stateless http), while a second `initialize` mid-session
-  reaches this handler through `serve_inner` with no correction after it and
-  no re-init gate before it — so storing the request verbatim let a client
-  set its own session's `RequestContext::protocol_version()` to a revision
-  this build refuses, or to a string no revision has ever had
+  The hand-written `initialize` echoes a requested handshake-era revision
+  this build serves and keeps the server default otherwise — matching the
+  SDK's `negotiate_protocol_version` (`service/server.rs`) — and records
+  the negotiated revision, never the requested one. The SDK then
+  negotiates again on the FIRST handshake using the handler's answer as
+  its fallback (`service/server.rs`; `NegotiatingStatelessHttpService` in
+  `tower.rs` for the stateless path, which `initialize` no longer takes).
+  It also **stores** the negotiated revision in `peer_info`, which is not
+  the same statement: that second negotiation still runs only on the
+  first handshake, while a second `initialize` mid-session reaches this
+  handler through `serve_inner` with no correction after it and no
+  re-init gate before it — so storing the request verbatim would let a
+  client set its own session's `RequestContext::protocol_version()` to a
+  revision this build refuses, to a string no revision has ever had
   (`ProtocolVersion` deserializes unknown values through, and every rmcp
-  version comparison is lexical, so `"9999-01-01"` outranks all of them).
-  Both transports carried it, with different reach: stdio unrestricted,
-  while over http only a SUB-2026 fabrication rides a live session — it is
-  classified legacy and reaches the handler on that session's own stream —
-  because `2026-07-28` and above is routed statelessly and mints no session
-  to poison. So http could move a session's revision but never past the
-  2026-07-28 threshold every version-gated reader compares against.
-  The handler is gate-agnostic about this: if a future rmcp refuses or drops
-  a second `initialize`, it is simply never reached and stores nothing. Its
-  TEST is not — that test asserts the second `initialize` is answered, so a
+  version comparison is lexical, so `"9999-01-01"` outranks all of them),
+  or to `2026-07-28` itself, which this build serves but not over a
+  session. Both transports now mint a session for every `initialize`, so
+  that store is reachable over http too. The handler is gate-agnostic
+  about a future re-init gate: if a future rmcp refuses or drops a second
+  `initialize`, it is simply never reached and stores nothing. Its TEST
+  is not — that test asserts the second `initialize` is answered, so a
   bump gating re-init fails it loudly, and it should then be re-scoped or
   retired rather than taught to accept a refusal. `get_info` pins
   `DEFAULT_PROTOCOL_VERSION` rather than inheriting `ProtocolVersion::default()`,
@@ -2298,28 +2304,42 @@ wired, `server.rs` and `main.rs` are the reference.
   must likewise be built in this crate rather than in the library that
   holds the HTTP client (issue #55, "Caller identity on the wire" above).
 - **rmcp trap — the handshake-free lifecycle is chosen by `_meta` shape, not
-  by `SUPPORTED_PROTOCOL_VERSIONS`.** In rmcp 3.1.4 `is_legacy_request`
-  (`transport/streamable_http_server/tower.rs`) sends a POST down the
-  stateless path when the request's revision is `2026-07-28` or newer — the
-  `_meta` one, or `initialize`'s own `protocolVersion`, falling back to the
-  `MCP-Protocol-Version` header and then `2025-03-26` — **or** when a
-  non-`initialize` request carries the whole discover shape — BOTH
-  `io.modelcontextprotocol/protocolVersion` and `…/clientCapabilities`
-  (`missing_required_keys(&V_2026_07_28).is_empty()`). Re-read that predicate
-  on every rmcp bump: it is version-specific, this description was already
-  wrong once, and nothing fails when the prose goes stale. Two rmcp gates
-  narrow it — the version key alone below `2026-07-28` takes the session path
-  instead, and `handler/server.rs` refuses a per-request revision outside
-  `supported_protocol_versions()` — but neither closes it, because neither
-  covers a revision this build *does* serve sent with both keys. That still
-  reaches `serve_negotiated_request_directly`, whose synthesised peer carries
-  `client_info = Implementation::default()` — the SDK's own crate name and
-  version. So the handler decides for itself, three ways (`lifecycle_of`,
-  server.rs), on the revision the request DECLARES and never on the session's
-  negotiated one: no declaration is the handshake lifecycle, `>= 2026-07-28`
-  AND on `SUPPORTED_PROTOCOL_VERSIONS` is the per-request one, anything else
-  is out of contract and refused by `call_tool` and `list_tools`
-  (`mixed_lifecycle_refused`; the refusal is recorded with `client` absent).
+  by `SUPPORTED_PROTOCOL_VERSIONS`.** In rmcp 3.2.0 `is_legacy_request`
+  (`transport/streamable_http_server/tower.rs`) returns true — the session
+  path — for **every** `initialize`, whatever `protocolVersion` it names
+  and whatever `_meta` it carries (rmcp #1228: an initialize request
+  selects legacy semantics; the version in its params never routes it
+  stateless, and the handshake answers with a legacy version the server
+  supports). For every other POST it calls `uses_legacy_lifecycle`
+  (`service.rs`): false — the stateless path — when
+  `uses_discover_lifecycle` is true **or** the request's revision is
+  `2026-07-28` or newer. `uses_discover_lifecycle` is BOTH `_meta` keys
+  present — `io.modelcontextprotocol/protocolVersion` and
+  `…/clientCapabilities`
+  (`missing_required_keys(&V_2026_07_28).is_empty()`). That helper is
+  called with `V_2026_07_28` as the *schema* to check, not the request's
+  declared revision, so **a pre-2026 non-`initialize` with both keys still
+  hits the stateless path** (#204; re-verified on 3.2.0). Version
+  otherwise comes from the `_meta` key, falling back to the
+  `MCP-Protocol-Version` header and then `2025-03-26` — no longer from
+  `initialize`'s `params.protocolVersion`, which the early return already
+  handled. Re-read that predicate on every rmcp bump: it is
+  version-specific, this description was already wrong once, and nothing
+  fails when the prose goes stale. Two rmcp gates narrow it — the version
+  key alone below `2026-07-28` takes the session path instead, and
+  `handler/server.rs` refuses a per-request revision outside
+  `supported_protocol_versions()` — but neither closes the both-keys
+  shape, because neither covers a revision this build *does* serve sent
+  with both keys. That still reaches `serve_negotiated_request_directly`,
+  whose synthesised peer carries `client_info = Implementation::default()`
+  — the SDK's own crate name and version. So the handler decides for
+  itself, three ways (`lifecycle_of`, server.rs), on the revision the
+  request DECLARES and never on the session's negotiated one: no
+  declaration is the handshake lifecycle, `>= 2026-07-28` AND on
+  `SUPPORTED_PROTOCOL_VERSIONS` is the per-request one, anything else is
+  out of contract and refused by `call_tool` and `list_tools`
+  (`mixed_lifecycle_refused`; the refusal is recorded with `client`
+  absent).
   The `contains` half of the middle arm is defence in depth behind rmcp's own
   -32022 — every rmcp comparison is lexical, and a fabricated `"9999-01-01"`
   outranks every real revision.
@@ -2330,7 +2350,7 @@ wired, `server.rs` and `main.rs` are the reference.
   that did complete a handshake too.
   **rmcp trap within the trap — `RequestContext::client_info()` is not a safe
   accessor.** It falls back to `peer_info().client_info` unless
-  `peer.request_metadata_required()`, which rmcp 3.1.4 sets on exactly one path
+  `peer.request_metadata_required()`, which rmcp 3.2.0 sets on exactly one path
   (`service/server.rs`, the stdio first-message-is-not-`initialize` case) and
   never over streamable http. Since #267 that stdio path no longer sees a
   `server/discover`: the transport answers it (`stdio::DiscoverAnswering`,
@@ -2370,10 +2390,10 @@ wired, `server.rs` and `main.rs` are the reference.
   served per-request POST, which is why `client_of` never uses the convenience
   accessor.
 - **rmcp trap — over stdio, `server/discover` CHOOSES the lifecycle before it is
-  answered.** `serve_server_with_ct_inner` (rmcp 3.1.4
-  `service/server.rs:510-577`) reads the session's lifecycle off the first
+  answered.** `serve_server_with_ct_inner` (rmcp 3.2.0
+  `service/server.rs:550-631`) reads the session's lifecycle off the first
   non-`ping` frame: anything that is not `initialize` is taken as a commitment
-  to the handshake-free one, and `Peer::require_request_metadata()` (`:562`) is
+  to the handshake-free one, and `Peer::require_request_metadata()` (`:616`) is
   called BEFORE the handler answers. That flag is a sticky `AtomicBool` — no
   later `initialize` clears it (a later `initialize` succeeds and stores peer
   info, `handler/server.rs:323`, leaving it set), and both it and its reader are
@@ -2386,9 +2406,9 @@ wired, `server.rs` and `main.rs` are the reference.
   `initialize`) broke on ANY probe, served or refused. Worse, a probe rmcp
   itself refuses — no `_meta` at all — ended the PROCESS with
   `ExpectedInitializeRequest` after answering, logging the whole frame on the
-  way out (#261). Upstream `main` still does all of this as of 2026-09-04
-  (`server.rs:616`); rmcp 3.2 is unvetted. **Decision:** a probe is a probe
-  and must not pick a lifecycle, so over stdio it is answered by the transport
+  way out (#261). rmcp 3.2.0 still does all of this (`:616`).
+  **Decision:** a probe is a probe and must not pick a lifecycle, so over
+  stdio it is answered by the transport
   ([`DiscoverAnswering`](../crates/bugwarden/src/stdio.rs), wrapped in `main`)
   and never reaches rmcp's picker. rmcp's first frame is then the first one that
   IS a commitment — `initialize` for a session, or a `_meta`-carrying request
@@ -2396,10 +2416,10 @@ wired, `server.rs` and `main.rs` are the reference.
   untouched, `ping` before `initialize` and the over-cap `None` from
   `BoundedLines` included — though a probe no longer moves rmcp past its
   pre-`initialize` loop, so a `ping` after one is answered `{}` there instead of
-  refused -32601 by the per-request handler (`handler/server.rs:112-118`), where
+  refused -32601 by the per-request handler (`handler/server.rs:112-117`), where
   a probe used to leave it. The answer is QUEUED on the wrapper and driven by
   the next `receive`, never awaited inside one: rmcp polls `receive` as one arm
-  of a `select!` (`service.rs:1395`) and drops that future whenever another arm
+  of a `select!` (`service.rs:1392`) and drops that future whenever another arm
   wins, so an inline await loses the reply — and the probe with it — to any
   pipelined client (`a_pipelined_probe_is_answered_under_write_contention` and
   its binary twin; the inner transport survives the same cancellation only
@@ -2435,7 +2455,7 @@ wired, `server.rs` and `main.rs` are the reference.
   `an_http_probe_never_commits_the_session_lifecycle` pins so an rmcp bump that
   changed it fails loudly.
 - **rmcp trap — `mcp-session-id` is a validated header on only one of the two
-  routes.** In rmcp 3.1.4 the session branch of `handle_post`
+  routes.** In rmcp 3.2.0 the session branch of `handle_post`
   (`transport/streamable_http_server/tower.rs`) checks the header against
   `has_session` before it routes on it, and 404s an id it does not know; the
   stateless branch has no such check and `serve_negotiated_request_directly`
@@ -2461,7 +2481,7 @@ wired, `server.rs` and `main.rs` are the reference.
 - `list_tools` names every `ListToolsResult` field: `result_type` is
   `COMPLETE`, and the SEP-2549 cache hints are gated on the request's
   revision. **rmcp trap — the only version-shaped edit the SDK makes to a
-  served result is stripping `resultType`.** In rmcp 3.1.4
+  served result is stripping `resultType`.** In rmcp 3.2.0
   `ServerResult::strip_result_type_for_legacy_peer` (`model.rs`) edits that
   one field and nothing else; the same `handle_request` version-gates other
   things (`InputRequiredResult`, the SEP-2164 error-code swap, ping and
@@ -2470,7 +2490,7 @@ wired, `server.rs` and `main.rs` are the reference.
   ours: `RequestContext::protocol_version()` — the request's own `_meta`
   revision, else the session's negotiated one, `None` when neither — at least
   `2026-07-28`, and `None` fails toward the legacy wire shape rather than
-  toward emission. That expression is a hand-copy of the one rmcp 3.1.4
+  toward emission. That expression is a hand-copy of the one rmcp 3.2.0
   computes `sep_2322_supported` from (`handler/server.rs`): the two agree
   today by inspection, share no constant, and no test pins the agreement.
   Re-read both on every rmcp bump — if upstream's predicate moves, this build
@@ -2483,15 +2503,16 @@ wired, `server.rs` and `main.rs` are the reference.
   nothing worth caching. The exact claim, which is about listings and not
   about peers: **no `tools/list` response this handler constructs carries the
   SEP-2549 pair unless the request's revision is at least 2026-07-28.** Not
-  about peers because in rmcp 3.1.4 `DiscoverResult` (`model.rs`) declares
+  about peers because in rmcp 3.2.0 `DiscoverResult` (`model.rs`) declares
   `ttl_ms: u64` and `cache_scope: CacheScope` as non-`Option` fields with no
   `skip_serializing_if`, hard-coded to `0`/`Private` by both constructors,
   and this build serves rmcp's default `server/discover` result on both
   transports (over stdio from the transport wrapper, #267 above) — so a legacy
   peer naming 2025-11-25 gets the pair from *that* surface today, whatever
   `tools/list` does. Since stage 2 the served branch is reachable end to end —
-  a 2026-07-28 request, or a session that negotiated it — and is tested over
-  real streamable HTTP as well as in-process. The in-process rows are still the
+  a 2026-07-28 per-request `_meta`, not a session that negotiated it
+  (`initialize` cannot, #1228) — and is tested over real streamable HTTP as
+  well as in-process. The in-process rows are still the
   sharp ones: `RequestContext::protocol_version()` reads the request's `_meta`
   first and the session's revision second, and over http the handshake-free
   path's SYNTHESISED peer carries the same revision the `_meta` names, so the
@@ -2500,10 +2521,10 @@ wired, `server.rs` and `main.rs` are the reference.
   them.
 - **rmcp trap — a panicking handler answers nothing, and rmcp catches
   nothing.** The serve loop dispatches each request through
-  `spawn_service_task` (`service.rs:1575`, a bare `tokio::spawn` at
+  `spawn_service_task` (`service.rs:1580`, a bare `tokio::spawn` at
   `:1309`) and DROPS the returned `JoinHandle`; the reply is sent from
-  inside that task, at its end (`:1589`). There is no `catch_unwind`
-  anywhere in rmcp 3.1. So a tool handler that panics unwinds its own task
+  inside that task, at its end (`:1594`). There is no `catch_unwind`
+  anywhere in rmcp 3.2. So a tool handler that panics unwinds its own task
   and nothing else: no error goes out, no transport closes, the session and
   every other request stay healthy — and the request that panicked is
   answered by nobody. An rmcp client then waits forever
@@ -2717,7 +2738,7 @@ wired, `server.rs` and `main.rs` are the reference.
   behind a new knob cannot be skipped;
   `the_x_mcp_header_tripwire_fires_at_every_planted_position` is its canary,
   because a walk over zero annotations passes even when gutted. The check is
-  deliberately broader than rmcp's functional read, which in 3.1.4 is
+  deliberately broader than rmcp's functional read, which in 3.2.0 is
   top-level `properties`, string-valued only (`param_header_annotations`;
   `validate_param_header_annotations` and `reject_nested_annotations` are the
   client-side validation, and reject the key at ANY depth — but only down
@@ -2728,7 +2749,7 @@ wired, `server.rs` and `main.rs` are the reference.
   `x-mcp-header` on every rmcp bump.
 
   **The #116 record, closed here rather than fixed.** `ServerHandler::get_tool`
-  is still `fn get_tool(&self, name: &str) -> Option<Tool>` in 3.1.4: no
+  is still `fn get_tool(&self, name: &str) -> Option<Tool>` in 3.2.0: no
   `RequestContext`, so the schema cache `tower.rs` builds for `Mcp-Param-*`
   validation answers per DEPLOYMENT — the I13-pruned instance router, pinned
   by `get_tool_serves_the_pruned_instance_router_i13` — and never per
@@ -2761,14 +2782,14 @@ wired, `server.rs` and `main.rs` are the reference.
   follow-up. Counting them in prose is what let two fields go unlisted here
   before.
 
-  | field | rmcp 3.1 default | this build |
+  | field | rmcp 3.2 default | this build |
   |---|---|---|
   | `allowed_hosts` | `localhost`, `127.0.0.1`, `::1` | **set** — `disable_allowed_hosts()`, or the operator's `--allowed-hosts` / `MCP_ALLOWED_HOSTS` list when given |
   | `max_request_body_bytes` | 4 MiB | **set** — derived from `global.max_attachment_bytes`, floored at that same 4 MiB (see below) |
   | `cancellation_token` | fresh token | **set** (main.rs) — a child of the process token |
   | `allowed_origins` | `[]`, i.e. validation off | inherited, deliberately |
   | `stateless_protocol_metadata_required` | `false` | inherited, deliberately — #34 decided it (see below) |
-  | `legacy_session_mode` | `true` | inherited — sessions for the legacy revisions; 2026-07-28 routes statelessly regardless |
+  | `legacy_session_mode` | `true` | inherited — sessions for the handshake revisions; `initialize` always takes that path (#1228); non-initialize `2026-07-28` still routes statelessly |
   | `session_store` | `None` | inherited |
   | `json_response` | `false` | inherited |
   | `sse_keep_alive` / `sse_retry` | 15 s / 3 s | inherited |
@@ -2955,7 +2976,7 @@ wired, `server.rs` and `main.rs` are the reference.
   comma-only now. An entry that is not a hostname or `host:port` — `*`, a
   scheme-carrying URL, `a;b`, a percent-encoded comma, zero-width unicode, a
   space-containing typo — is a startup error (`Cli::checked_allowed_hosts`);
-  rmcp 3.1.4's `parse_allowed_authority` would otherwise keep validation on
+  rmcp 3.2.0's `parse_allowed_authority` would otherwise keep validation on
   and store (or skip) a host no inbound `Host` matches, a silent deny-all
   discovered one 403 at a time. HTTP start logs one info line stating
   whether Host validation is on or off and, when on, the resolved list
@@ -2998,12 +3019,13 @@ wired, `server.rs` and `main.rs` are the reference.
   (above): the per-request `_meta` is validated where a refusal can be recorded
   and where the identity it carries is read, rather than at a layer that sees
   neither. `legacy_session_mode` is inherited
-  `true`, so sessions exist for the legacy revisions; per SEP-2567 rmcp serves
-  `2026-07-28` requests statelessly whatever this flag says, which #34 inherits
-  rather than configures. **That is the asymmetry to hold onto: a `2026-07-28`
-  `initialize` mints a session over stdio and nothing over http** — both are
-  rmcp's routing, not a bugwarden choice, and both are audited, so over http
-  the `initialize` record is written with no `session.id` at all. `session_store` stays `None`: the client's
+  `true`, so sessions exist for the handshake revisions; per SEP-2567 rmcp
+  serves non-`initialize` `2026-07-28` requests statelessly whatever this
+  flag says, which #34 inherits rather than configures. **`initialize`
+  always takes the session path** (rmcp #1228), even one that named
+  `2026-07-28` — both transports mint an id, both are audited, so the
+  `initialize` record carries the minted `session.id` over http too.
+  `session_store` stays `None`: the client's
   `initialize` parameters remain in-process, and there is one process here and
   no cross-instance recovery to do. `json_response`, `sse_keep_alive` and
   `sse_retry` set response framing and SSE liveness — client-visible timing,
@@ -3018,7 +3040,7 @@ wired, `server.rs` and `main.rs` are the reference.
   create_bug, add_attachment.
 - API key resolution: a match on `key_custody` (resolved once at startup, see Key custody — never re-read per request): `Server(key)` => the server's key, without touching the request at all; `PerRequest` => `ctx.extensions.get::<axum::http::request::Parts>()`, then `parts.headers.get(lowercased_header_name)`.
 - HTTP serving: `let config = server.http_server_config()?.with_cancellation_token(ct.child_token());` — built while `server` can still be borrowed, since the body cap comes from its own guard policy; errors on an unparsable `--allowed-hosts` entry and logs the effective Host-validation state — then `StreamableHttpService::new(move || Ok(server.clone()), AuditedSessionManager::default().into(), config)` — the wrapper since #180, not a bare `LocalSessionManager`, because the audit session id comes from its stamp and nowhere else — never a bare `StreamableHttpServerConfig::default()`, see the field table above — then `axum::Router::new().nest_service("/mcp", service)`, `tokio::net::TcpListener::bind`, graceful shutdown on SIGINT or SIGTERM cancelling `ct` (`shutdown_signal` in main.rs; issue #114).
-- Stdio serving: `let (stdin, stdout) = server.stdio_transport();` then `server.serve((stdin, stdout))`, never a bare `stdio()` — the same rule, and for the same reason, as never a bare `StreamableHttpServerConfig::default()`: rmcp's default reads a frame into an unbounded `Vec`, and the pair is built while `server` can still be borrowed because the frame cap comes from its own guard policy (#234, "rmcp 3.1 usage notes"). Stdio uses the same waiter across `serve` (the handshake wait an unused stdio container sits in) and `waiting`; a signal at either stage flushes the OTLP queue (when export is on) then `process::exit(0)`s, because rmcp's stdio transport reads stdin via `spawn_blocking` and that read does not unblock while the client holds the pipe — returning from `main` drops the runtime onto that thread. An over-cap frame is NOT that case and needs none of it: the refusal happens in a `poll_read` that just took a delivered chunk, so the blocking reader is idle with no `read(2)` outstanding and `main` returns normally, exit `1`, with the OTLP flush on the ordinary path.
+- Stdio serving: `let (stdin, stdout) = server.stdio_transport();` then `server.serve((stdin, stdout))`, never a bare `stdio()` — the same rule, and for the same reason, as never a bare `StreamableHttpServerConfig::default()`: rmcp's default reads a frame into an unbounded `Vec`, and the pair is built while `server` can still be borrowed because the frame cap comes from its own guard policy (#234, "rmcp 3.2 usage notes"). Stdio uses the same waiter across `serve` (the handshake wait an unused stdio container sits in) and `waiting`; a signal at either stage flushes the OTLP queue (when export is on) then `process::exit(0)`s, because rmcp's stdio transport reads stdin via `spawn_blocking` and that read does not unblock while the client holds the pipe — returning from `main` drops the runtime onto that thread. An over-cap frame is NOT that case and needs none of it: the refusal happens in a `poll_read` that just took a delivered chunk, so the blocking reader is idle with no `read(2)` outstanding and `main` returns normally, exit `1`, with the OTLP flush on the ordinary path.
 - Request `_meta` (SEP-414, e.g. `traceparent`): over every serialized
   transport the wire `params._meta` does NOT arrive in the params struct
   (`CallToolRequestParams.meta` stays `None`) — the SDK's custom
@@ -3372,8 +3394,10 @@ wired, `server.rs` and `main.rs` are the reference.
   declaring one records it verbatim (the row an unconditional `(None,
   None)` passes the first test on); a `tools/list` really does reach the
   enabled half of the SEP-2549 gate end to end; a `2026-07-28`
-  `initialize` is answered with that revision, mints no `mcp-session-id`,
-  and is recorded from the REQUEST's `clientInfo` with no id; a header-only
+  `initialize` (`a_per_request_initialize_is_answered_with_a_session`) is
+  answered with the handshake revision (`2025-11-25`), mints
+  `mcp-session-id`, and the record carries that id — handshake-free
+  `tools/call` still has none; a header-only
   `2026-07-28` with no `_meta` is refused by the transport (-32602) with
   nothing recorded, which is the barrier the handshake arm leans on; a
   session `tools/call` whose `_meta` names an unserved revision (-32022)
@@ -3759,7 +3783,7 @@ wired, `server.rs` and `main.rs` are the reference.
   was POSTed, and a read tool on the same session still serves; an oversized
   POST from a stranger is answered `401` by the gate and `413` only for a
   credentialed caller, which is what the 413-observability argument under
-  "rmcp 3.1 usage notes" rests on; a scope-refused call leaves exactly ONE
+  "rmcp 3.2 usage notes" rests on; a scope-refused call leaves exactly ONE
   audit record, with no guard verdict, no upstream leg and neither
   `principal` nor `work_context`;
   scopes

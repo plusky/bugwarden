@@ -541,14 +541,12 @@ pub struct ToolCallEvent {
 
 /// Payload of an `initialize` record: a client sent an `initialize`.
 ///
-/// Usually that opened a session, and [`SessionInfo::id`] then joins this
-/// anchor to the records it anchors. A `2026-07-28` `initialize` over http
-/// is the exception: rmcp routes it down the handshake-free path, so it is
-/// answered and recorded but opens nothing, and the record carries no id.
-/// It is written anyway: recording every handshake unconditionally is the
-/// invariant, and joins are on id equality, so an anchor with no id anchors
-/// nothing and gathers nothing that belongs elsewhere either. Over stdio the
-/// same request is an ordinary handshake and does open a session.
+/// That opened a session, and [`SessionInfo::id`] then joins this
+/// anchor to the records it anchors. `initialize` always mints one
+/// (rmcp #1228), both transports — even one that named `2026-07-28`.
+/// Handshake-free tool/discover records over http still carry no
+/// session id. Recording every handshake unconditionally is the
+/// invariant; joins are on id equality.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InitializeEvent {
