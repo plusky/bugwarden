@@ -30,18 +30,20 @@ test_workspace = true
 # ceil(failing tests / test threads) x 30s, since libtest defaults its
 # thread count to the core count. Measured under a hand-applied
 # CatchUnwind mutant that answers nothing, on a 32-core box and then at
-# --test-threads=4 to stand in for a small runner: the lib binary's 22
-# failures take 31s and 158s, audit_wiremock's 36 take 60s and 271s,
-# tools_wiremock's 82 take 91s and 632s. Four threads is thus already the
-# edge -- the floor holds for a mutant the lib binary catches, and cargo
-# reaches that binary first, but one that hangs ONLY a wiremock harness
-# outruns the floor and reports TIMEOUT with its verdict unknown. That
-# residual is #254's and is left standing on purpose: a shorter deadline
-# converts hangs sooner but flakes sooner too, on the smaller runners
-# ci.yml's rust-macos job and this workflow use, and the lever for the
-# residual is this floor or a --test-threads pinned in mutants.yml rather
-# than the constant the tests share.
+# --test-threads=4 to stand in for ubuntu-latest's 4-vCPU runner: the
+# lib binary's 22 failures take 31s and 158s, audit_wiremock's 36 take
+# 60s and 271s, tools_wiremock's 82 take 91s and 632s. Size the floor
+# from that 4-thread side of the largest harness: tools_wiremock has
+# 85 tests, ceil(85 / 4) x 30s = 660s, call it 720 (#283). A hang
+# confined to that harness used to report TIMEOUT with the verdict
+# unknown; 720s clears the measured 632s with margin.
+#
+# The floor is per mutant. Caught mutants still finish in tens of
+# seconds, so raising it costs only when a mutant actually hangs. A
+# shard of real hangs would still trip mutants.yml's timeout-minutes
+# (720s x ~36 is past 240 min) and that is the finding -- the job cap
+# is the outer bound, not this floor.
 #
 # A floor and not --timeout, so the 5x multiplier still scales past it on a
 # slow runner or once upstream fixes the baseline.
-minimum_test_timeout = 300
+minimum_test_timeout = 720
