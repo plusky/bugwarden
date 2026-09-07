@@ -315,8 +315,12 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-      # Push the per-architecture images to ghcr.io.
+      # Push the per-architecture images to ghcr.io, and the attestation
+      # bundle (`push-to-registry` on the attest step).
       packages: write
+      # Same pair as `release`: OIDC for the Sigstore cert, store the bundle.
+      id-token: write
+      attestations: write
     env:
       CTR: bugwarden-smoke
     strategy:
@@ -354,9 +358,23 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           build-args: VERSION=${{ env.VERSION }}
+          # Pin mode=max: public repos already default to it, a fork/private
+          # clone would silently drop to min. VERSION is not a secret (max
+          # exposes build-args).
+          provenance: mode=max
           # No cache-from/cache-to: releases build hermetically, same rule as
           # the cargo-cache-free `build` job above.
           outputs: type=image,name=ghcr.io/plusky/bugwarden,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Attest the image digest
+        # Attest before named tags: a provenance failure must fail this
+        # job so container-manifest never publishes :$VERSION / :latest.
+        # The digest is already in ghcr.io; that residue is accepted.
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-name: ghcr.io/plusky/bugwarden
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
       - name: Pull the pushed image by digest
         shell: bash
