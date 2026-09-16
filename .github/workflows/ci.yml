@@ -356,7 +356,7 @@ jobs:
             exit 1
           fi
           # Every three-or-more-part version token in the file, not just the
-          # ones on a line mentioning rmcp: one stamp says only "in 3.1.4". The
+          # ones on a line mentioning rmcp: one stamp says only "in 3.4.0". The
           # loopback addresses are the sole other such token today and this
           # check keeps it that way -- a new non-rmcp X.Y.Z fails here and has
           # to be decided, rather than being silently skipped by a narrower
@@ -380,8 +380,8 @@ jobs:
           # requirement, so it is compared with that manifest and not with the
           # lock: a lock-only patch bump does not move the requirement, and
           # comparing it there would teach the doc to misquote Cargo.toml.
-          # DESIGN.md's other two-part mentions ("rmcp 3.1 usage notes", "rmcp
-          # 3.1 default") stay unchecked -- the file also names rmcp 2.2 and
+          # DESIGN.md's other two-part mentions ("rmcp 3.4 usage notes", "rmcp
+          # 3.4 default") stay unchecked -- the file also names rmcp 2.2 and
           # axum 0.8 in that shape, so no line rule tells a stamp from a
           # deliberate reference. They can only go stale alongside a three-part
           # stamp, which already fails above.
