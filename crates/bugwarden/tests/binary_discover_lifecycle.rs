@@ -322,7 +322,7 @@ async fn a_probe_only_client_hangs_up_cleanly() {
     // reaches rmcp, so rmcp is still inside `expect_next_message`'s wait
     // for a first COMMITTING frame when stdin ends, and calls that
     // `ConnectionClosed` rather than a clean close
-    // (`service/server.rs:432, 511`). `main` reads it as the hangup it is
+    // (`service/server.rs:443, 568`). `main` reads it as the hangup it is
     // — exit 0, as before #267 and as for every other peer that just
     // leaves — whether the probe was served or refused.
     for probe in [
@@ -351,8 +351,8 @@ async fn a_probe_only_client_hangs_up_cleanly() {
 #[tokio::test]
 async fn a_pipelined_probe_is_answered_over_real_pipes() {
     // A probe behind other traffic, which no lock-step row here reaches:
-    // rmcp polls `receive` as one arm of a `select!` (rmcp 3.2.0
-    // `service.rs:1392`) and drops that future whenever another arm wins,
+    // rmcp polls `receive` as one arm of a `select!` (rmcp 3.4.0
+    // `service.rs:1418`) and drops that future whenever another arm wins,
     // so a reply the wrapper awaited on `receive`'s own stack would be
     // dropped with it — the frame consumed, the id never answered, the
     // client hung on it while every other reply arrives. The listings are

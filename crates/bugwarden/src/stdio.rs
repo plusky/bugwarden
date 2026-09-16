@@ -208,9 +208,9 @@ type QueuedSend<E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send>>;
 ///
 /// `server/discover` is a probe, but over stdio rmcp lets it CHOOSE the
 /// session lifecycle before anyone answers it: `serve_server_with_ct_inner`
-/// (rmcp 3.2.0 `service/server.rs:550-631`) takes any first non-`ping`
+/// (rmcp 3.4.0 `service/server.rs:553-630`) takes any first non-`ping`
 /// frame that is not `initialize` as a commitment to the handshake-free
-/// lifecycle and calls `Peer::require_request_metadata()` (`:616`) — a
+/// lifecycle and calls `Peer::require_request_metadata()` (`:619`) — a
 /// sticky `AtomicBool` that no later `initialize` clears and no public API
 /// can reset, both methods being `pub(crate)`. Every subsequent request
 /// but `initialize` that carries no `_meta` is then refused -32602
@@ -236,7 +236,7 @@ pub struct DiscoverAnswering<T: Transport<RoleServer>> {
     server: BugWarden,
     /// A discover reply whose write has not finished, parked across
     /// `receive` calls because `receive` is one arm of rmcp's `select!`
-    /// (`service.rs:1392`) and is dropped whenever another arm wins. A
+    /// (`service.rs:1418`) and is dropped whenever another arm wins. A
     /// reply awaited on that stack dies with the frame that asked for it —
     /// consumed, never answered, the client hung on that id — while the
     /// inner transport survives the same cancellation by keeping its
@@ -270,9 +270,9 @@ impl<T: Transport<RoleServer>> DiscoverAnswering<T> {
     }
 
     /// rmcp's own answer for one discover request, in rmcp's own order:
-    /// the pre-`initialize` metadata check (`service/server.rs:541-551`,
-    /// its text at `:486`), then the declared-revision check
-    /// (`handler/server.rs:64-72`), then that file's default result (`:347`).
+    /// the pre-`initialize` metadata check (`service/server.rs:598-613`,
+    /// its text at `:522`), then the declared-revision check
+    /// (`handler/server.rs:64-72`), then that file's default result (`:397`).
     ///
     /// That order is the pre-`initialize` path's, which is the one this
     /// replaces; rmcp's in-session handler runs the two the other way
@@ -282,7 +282,7 @@ impl<T: Transport<RoleServer>> DiscoverAnswering<T> {
     /// required key declares no lifecycle worth reading a version out of.
     ///
     /// Not stripped for a legacy peer: `strip_result_type_for_legacy_peer`
-    /// (`model.rs:4596`) has no `DiscoverResult` arm, so `resultType`
+    /// (`model.rs:4684`) has no `DiscoverResult` arm, so `resultType`
     /// stays on the wire whatever revision the probe declares.
     fn discover_reply(&self, request: &ClientRequest, id: RequestId) -> ServerJsonRpcMessage {
         let meta = request.get_meta();
@@ -906,14 +906,14 @@ mod discover {
     async fn a_pipelined_probe_is_answered_under_write_contention() {
         // The one thing this wrapper does that the inner transport does
         // not: hold a reply. rmcp polls `receive` as one arm of a
-        // `select!` (rmcp 3.2.0 `service.rs:1392`) and drops the future
+        // `select!` (rmcp 3.4.0 `service.rs:1418`) and drops the future
         // whenever another arm wins, so a reply awaited on `receive`'s own
         // stack dies with the frame that asked for it — consumed, never
         // answered, the client hung on that id while every other reply
         // arrives. Every other row here is lock-step, where nothing else
         // is ever ready and the drop never happens. A session first:
         // before `initialize` rmcp awaits `receive` outside its `select!`
-        // (`service/server.rs:565`), so a probe-only chain never shows
+        // (`service/server.rs:568`), so a probe-only chain never shows
         // this either. The whole burst fits `PIPE`, so only the SERVER's
         // writes park.
         const FRAMES: u32 = 40;
@@ -1061,7 +1061,7 @@ mod discover {
             "the probe must name this build, and nothing else: {probe}"
         );
         // Present whatever revision the probe declares:
-        // `strip_result_type_for_legacy_peer` (rmcp 3.2.0 model.rs) has no
+        // `strip_result_type_for_legacy_peer` (rmcp 3.4.0 model.rs) has no
         // `DiscoverResult` arm, so rmcp never stripped it here either.
         assert_eq!(probe["result"]["resultType"], "complete", "{probe}");
     }

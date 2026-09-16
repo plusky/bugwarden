@@ -23,7 +23,8 @@
 //!   bugwarden itself formats — the sharp rows are rmcp's now, since
 //!   #278 bounds our own fields at the site and a sink with no budget
 //!   leaves them unchanged. The two handshake-fallback rows drive the
-//!   same initialize and differ only in whose line they read, so such a
+//!   same initialize and differ in whose line they read — and in the
+//!   filter, rmcp's copy being `debug!` since rmcp 3.3 — so such a
 //!   mutant shows up as the rmcp one running past [`CAP`] while ours
 //!   stays at [`QUOTED_CAP`];
 //! - a cut at cap-1, cap+1, or on a byte boundary, which is why every
@@ -203,10 +204,13 @@ fn the_scrub_list_covers_every_environment_fallback() {
 /// without a mock. stdout goes to /dev/null: the replies are not the
 /// subject. The #288 row needs a real upstream body; it uses
 /// [`log_line_at`] against a mock.
+///
+/// `rust_log` is `Some` only for a line the default filter hides.
 async fn log_line(
     protocol_version: &str,
     policy: Option<&Path>,
     call: Option<(&str, serde_json::Value)>,
+    rust_log: Option<&str>,
     needle: &str,
 ) -> String {
     log_line_at(
@@ -214,6 +218,7 @@ async fn log_line(
         protocol_version,
         policy,
         call,
+        rust_log,
         needle,
     )
     .await
@@ -226,6 +231,7 @@ async fn log_line_at(
     protocol_version: &str,
     policy: Option<&Path>,
     call: Option<(&str, serde_json::Value)>,
+    rust_log: Option<&str>,
     needle: &str,
 ) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_bugwarden"));
@@ -239,11 +245,13 @@ async fn log_line_at(
     if let Some(path) = policy {
         cmd.arg("--policy").arg(path);
     }
-    // Scrubbed and NOT set back: `RUST_LOG` included, so these lines are
-    // read at the level `main` falls back to. A line that only appears
-    // under a raised level is not what this issue is about.
+    // Scrubbed, `RUST_LOG` included, so our lines are read at the level
+    // `main` falls back to; set back only for a row reading rmcp's debug.
     for var in scrub_env::AMBIENT_VARS {
         cmd.env_remove(var);
+    }
+    if let Some(filter) = rust_log {
+        cmd.env("RUST_LOG", filter);
     }
     let mut child = cmd.spawn().expect("the built binary must start");
     let mut stderr = startup_line::stderr_lines(&mut child);
@@ -281,7 +289,14 @@ async fn log_line_at(
 /// [`log_line`] for the ordinary case: a served handshake, one tool call,
 /// the default allow-all policy.
 async fn tool_call_log_line(tool: &str, arguments: serde_json::Value, needle: &str) -> String {
-    log_line(SUPPORTED_VERSION, None, Some((tool, arguments)), needle).await
+    log_line(
+        SUPPORTED_VERSION,
+        None,
+        Some((tool, arguments)),
+        None,
+        needle,
+    )
+    .await
 }
 
 /// Drive `messages` through the real executable over stdio and return
@@ -593,12 +608,14 @@ fn logfmt_keys(text: &str) -> Vec<&str> {
 /// One tracing field that formats a client string, and the call that puts
 /// it on stderr.
 struct Site {
-    /// `None` for the handshake `warn!`, whose probe is the declared
-    /// protocol version rather than a tool argument.
+    /// `None` for the two handshake-fallback lines, whose probe is the
+    /// declared protocol version rather than a tool argument.
     tool: Option<&'static str>,
     arguments: serde_json::Value,
     /// A policy the guard refuses, for the line only a refusal reaches.
     policy: Option<&'static str>,
+    /// The child's `RUST_LOG`, for a line the default filter hides.
+    rust_log: Option<&'static str>,
     needle: &'static str,
     /// The field as it reaches the line, up to where the client's own
     /// text begins: `query="` for a `?Capped` field (#278),
@@ -645,6 +662,7 @@ fn sites(probe: &str) -> Vec<Site> {
             tool: Some("bugs_quicksearch"),
             arguments: json!({ "query": probe }),
             policy: None,
+            rust_log: None,
             needle: "tool: bugs_quicksearch",
             field: "query=\"",
         },
@@ -652,6 +670,7 @@ fn sites(probe: &str) -> Vec<Site> {
             tool: Some("bugs_quicksearch"),
             arguments: json!({ "query": "kernel", "status": probe }),
             policy: None,
+            rust_log: None,
             needle: "tool: bugs_quicksearch",
             field: "status=\"",
         },
@@ -659,6 +678,7 @@ fn sites(probe: &str) -> Vec<Site> {
             tool: Some("bugs_quicksearch"),
             arguments: json!({ "query": "kernel", "include_fields": probe }),
             policy: None,
+            rust_log: None,
             needle: "tool: bugs_quicksearch",
             field: "include_fields=\"",
         },
@@ -666,6 +686,7 @@ fn sites(probe: &str) -> Vec<Site> {
             tool: Some("bugs_quicksearch"),
             arguments: json!({ "query": "kernel", "group_by": probe }),
             policy: None,
+            rust_log: None,
             needle: "tool: bugs_quicksearch",
             // Debug-formatted, so it stays quoted like the bare `&str`
             // field it replaced — and the opening quote is one character
@@ -679,6 +700,7 @@ fn sites(probe: &str) -> Vec<Site> {
                 "summary": "s", "version": "v"
             }),
             policy: None,
+            rust_log: None,
             needle: "tool: create_bug",
             field: "product=\"",
         },
@@ -689,6 +711,7 @@ fn sites(probe: &str) -> Vec<Site> {
                 "summary": "s", "version": "v"
             }),
             policy: None,
+            rust_log: None,
             needle: "tool: create_bug",
             field: "component=\"",
         },
@@ -699,6 +722,7 @@ fn sites(probe: &str) -> Vec<Site> {
                 "summary": "s", "version": "v"
             }),
             policy: Some(DENY_ALL),
+            rust_log: None,
             needle: "guard denied bug creation",
             field: "product=\"",
         },
@@ -709,6 +733,7 @@ fn sites(probe: &str) -> Vec<Site> {
                 "summary": "s", "content_type": "text/plain"
             }),
             policy: None,
+            rust_log: None,
             needle: "tool: add_attachment",
             field: "file_name=\"",
         },
@@ -716,6 +741,7 @@ fn sites(probe: &str) -> Vec<Site> {
             tool: Some("update_bug_status"),
             arguments: json!({ "bug_id": 1, "status": probe }),
             policy: None,
+            rust_log: None,
             needle: "tool: update_bug_status",
             field: "status=\"",
         },
@@ -723,6 +749,7 @@ fn sites(probe: &str) -> Vec<Site> {
             tool: Some("update_bug_status"),
             arguments: json!({ "bug_id": 1, "status": "RESOLVED", "resolution": probe }),
             policy: None,
+            rust_log: None,
             needle: "tool: update_bug_status",
             field: "resolution=Some(\"",
         },
@@ -730,6 +757,7 @@ fn sites(probe: &str) -> Vec<Site> {
             tool: Some("assign_bug"),
             arguments: json!({ "bug_id": 1, "assignee": probe }),
             policy: None,
+            rust_log: None,
             needle: "tool: assign_bug",
             field: "assignee=\"",
         },
@@ -737,6 +765,7 @@ fn sites(probe: &str) -> Vec<Site> {
             tool: Some("update_bug_fields"),
             arguments: json!({ "bug_id": 1, "priority": probe }),
             policy: None,
+            rust_log: None,
             needle: "tool: update_bug_fields",
             field: "priority=Some(\"",
         },
@@ -744,6 +773,7 @@ fn sites(probe: &str) -> Vec<Site> {
             tool: Some("update_bug_fields"),
             arguments: json!({ "bug_id": 1, "severity": probe }),
             policy: None,
+            rust_log: None,
             needle: "tool: update_bug_fields",
             field: "severity=Some(\"",
         },
@@ -751,6 +781,7 @@ fn sites(probe: &str) -> Vec<Site> {
             tool: Some("update_bug_fields"),
             arguments: json!({ "bug_id": 1, "resolution": probe }),
             policy: None,
+            rust_log: None,
             needle: "tool: update_bug_fields",
             field: "resolution=Some(\"",
         },
@@ -758,15 +789,17 @@ fn sites(probe: &str) -> Vec<Site> {
             tool: Some("add_cc_to_bug"),
             arguments: json!({ "bug_id": 1, "cc_email": probe }),
             policy: None,
+            rust_log: None,
             needle: "tool: add_cc_to_bug",
             field: "cc_email=\"",
         },
         Site {
-            // rmcp logs the same message text with the version raw (#260),
-            // so this row selects on the target.
+            // Ours; rmcp's copy is the next row, worded differently since
+            // rmcp 3.2 and carrying the same version raw (#260).
             tool: None,
             arguments: json!({}),
             policy: None,
+            rust_log: None,
             needle: "bugwarden::server: client requested unsupported",
             field: "client_requested=\"",
         },
@@ -774,10 +807,12 @@ fn sites(probe: &str) -> Vec<Site> {
             // And rmcp's own copy of it, one line later: the fourth row
             // of #260's table, and a field no `Capped` of ours can
             // reach — 100 179 characters on this branch's parent for a
-            // 100 000-character `protocolVersion`.
+            // 100 000-character `protocolVersion`. `debug!` since rmcp
+            // 3.3, still bare, so only its own target is raised.
             tool: None,
             arguments: json!({}),
             policy: None,
+            rust_log: Some("info,rmcp::service::server=debug"),
             needle: "rmcp::service::server: client requested a protocol version unavailable over initialize",
             field: "client_requested=",
         },
@@ -802,7 +837,7 @@ async fn every_tracing_field_that_formats_a_client_string_is_cut_to_the_cap() {
             probe.as_str()
         };
         let call = site.tool.map(|tool| (tool, site.arguments));
-        let line = log_line(version, policy.as_deref(), call, site.needle).await;
+        let line = log_line(version, policy.as_deref(), call, site.rust_log, site.needle).await;
         let value = line
             .split_once(site.field)
             .unwrap_or_else(|| panic!("the line must carry {}: {line}", site.field))
@@ -965,7 +1000,7 @@ async fn an_over_long_request_id_is_cut_at_the_sink() {
 /// bytes this workspace never formats — which is where a level filter
 /// would have been the wrong fix and the sink is the right one.
 ///
-/// `service.rs:1535` logs the whole request at debug, `params` and every
+/// `service.rs:1569` logs the whole request at debug, `params` and every
 /// argument included. `transport/async_rw.rs:335` logs the whole
 /// UNPARSABLE line at debug, once per malformed line — and it is the
 /// `message` field, so only a sink that budgets `message` bounds it.
@@ -1268,6 +1303,7 @@ async fn an_upstream_error_cannot_forge_a_later_field_on_its_own_line() {
                 "version": "1.0 status=HACKED limit=999",
             }),
         )),
+        None,
         "create_bug: upstream refused",
     )
     .await;
