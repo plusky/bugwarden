@@ -329,7 +329,9 @@ async fn main() -> anyhow::Result<()> {
                 let cancel = service.cancellation_token();
                 tokio::select! {
                     result = service.waiting() => {
-                        result?;
+                        if let Err(e) = result {
+                            anyhow::bail!("stdio serving failed: {}", serve_loop_failure(&e));
+                        }
                         // A refused frame closes the transport exactly like
                         // a peer hangup, and `waiting()` reports both as
                         // `Ok`. Without this the post-handshake half exits
@@ -511,6 +513,16 @@ fn serve_failure(error: &rmcp::service::ServerInitializeError) -> &'static str {
     }
 }
 
+/// Why rmcp's spawned serve loop ended abnormally, in fixed text: tokio's
+/// `JoinError` quotes a panic's payload in both its Display and its Debug.
+fn serve_loop_failure(error: &tokio::task::JoinError) -> &'static str {
+    if error.is_panic() {
+        "the serve loop panicked"
+    } else {
+        "the serve loop was cancelled"
+    }
+}
+
 /// Bounded OTLP flush, then `_exit`. Used on the stdio signal arms: those
 /// cannot return from `main` (rmcp's stdin read is uncancellable) and
 /// must not skip a load-bearing collector either.
@@ -582,5 +594,85 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
 fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     async {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serve_loop_failure;
+
+    /// Shaped like the secret a payload must never carry to fd 2.
+    const PAYLOAD: &str = "SECRET-3b7e10-serve-loop-payload";
+
+    #[tokio::test]
+    async fn a_panicked_serve_loop_is_named_without_its_payload() {
+        let error = tokio::spawn(async { panic!("{PAYLOAD}") })
+            .await
+            .expect_err("the task panics");
+        // Non-vacuity: `?` handed this Display to `main`'s `Error:` line.
+        assert!(
+            error.to_string().contains(PAYLOAD),
+            "tokio's JoinError no longer quotes the payload: {error}"
+        );
+        assert_eq!(serve_loop_failure(&error), "the serve loop panicked");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_serve_loop_is_named_as_such() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        let error = task.await.expect_err("an aborted task is cancelled");
+        assert!(error.is_cancelled());
+        assert_eq!(serve_loop_failure(&error), "the serve loop was cancelled");
+    }
+
+    /// What the arm does with the classification, pinned by source.
+    ///
+    /// The tests above pin the two texts; nothing they do reaches the call
+    /// site, and no test can induce the panic that would show it — the
+    /// trigger would have to live in production code (DESIGN.md, "No binary
+    /// trigger"). The shape that restores the leak is one appended
+    /// `{e}`, which every behavioural test and clippy accept, so it is
+    /// pinned here instead: the arm binds the error once, hands that
+    /// binding to the classifier, and ends the process with the result.
+    #[test]
+    fn the_serve_loop_arm_only_hands_its_error_to_the_classifier() {
+        let src = include_str!("main.rs");
+        let after = src
+            .split("result = service.waiting() => {")
+            .nth(1)
+            .expect("main must await the serve loop in a select arm");
+        let end = after
+            .find("\n                    }")
+            .expect("the arm must close at its own indentation");
+        let arm: String = after[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let classified: Vec<&str> = arm
+            .lines()
+            .filter(|line| line.contains("serve_loop_failure("))
+            .collect();
+        assert_eq!(
+            classified.len(),
+            1,
+            "one classification of the join error: {arm}"
+        );
+        assert!(
+            classified[0].contains("bail!"),
+            "the classification must end the process, not decorate a log line: {arm}"
+        );
+        // Two `e`s and no more: `Err(e)` and `&e`. Formatting it anywhere
+        // — `{e}`, `{e:?}`, `, e)` — is a third.
+        let mentions = arm
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|token| *token == "e")
+            .count();
+        assert_eq!(
+            mentions, 2,
+            "the join error is bound as `e` and classified, never formatted: {arm}"
+        );
     }
 }

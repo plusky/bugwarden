@@ -69,8 +69,10 @@ jobs:
       # point anywhere. The workspace holds ~1180 mutants and server.rs alone
       # 400; guard.rs is where the DESIGN.md invariants live, and main.rs is
       # the startup wiring (the I9 --read-only tightening, the audit sink
-      # selection) that only a spawned process executes, so no in-process
-      # suite reaches it. Its five survivors came out of a hand run (#269);
+      # selection) that only a spawned process executes, so nearly nothing
+      # there is reached in process -- `serve_loop_failure` is the
+      # exception and its own unit tests kill both of its mutants.
+      # main.rs's five survivors came out of a hand run (#269);
       # this job saw none of them, because until now its scope was guard.rs
       # alone. Space-separated, one --file each below. Grow this by adding
       # shards, not by dropping the filter. Live counts: the Mutate summary.
