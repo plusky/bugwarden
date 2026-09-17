@@ -2658,6 +2658,34 @@ wired, `server.rs` and `main.rs` are the reference.
   one), which aborts, though even then what std prints is the nested
   panic's own fixed message rather than the payload.
 
+  **The serve loop's exit line.** The hook stops std's own write at panic
+  time; it does not stop the payload's other way out. After the stdio
+  handshake rmcp runs the session loop — its own code, and with it
+  `DiscoverAnswering` and `BoundedLines::poll_read` — in a spawned task,
+  and a panic there comes back from `RunningService::waiting` (rmcp 3.4.0
+  `service.rs:1105`) as tokio's `JoinError`, which quotes a string payload
+  in its Display (`task N panicked with message "…"`) and in its Debug
+  (`JoinError::Panic(Id(N), "…", …)`) alike. `?` on it put that text on
+  the `Error:` line Rust writes for `main`'s returned error — fd 2, which
+  over stdio is the peer's pipe — with neither the hook nor `CappedFields`
+  in the way. `serve_loop_failure` (main.rs) classifies it instead, "the
+  serve loop panicked" or "the serve loop was cancelled", and the failure
+  exit is unchanged.
+
+  **What that does not cover**, none of it new with the classifier. A
+  panic in one of rmcp's SEND tasks is reported by rmcp's own lines, which
+  DO format the `JoinError`: three `tracing::error!`s in the serve loop
+  and its drain (`send request task encounter a tokio join error`,
+  `response send task failed`, and the same text `during drain`) plus
+  `serve finished`'s `?quit_reason`. Those are tracing events, so
+  `CappedFields` escapes every field and cuts it at
+  `PARAM_VALUE_MAX_CHARS` — a bound, not a removal: 1024 characters of
+  such a payload still reach fd 2. A panicked send task also ends the loop
+  as `Ok(QuitReason::JoinError)`, which `main` discards, so that path
+  exits 0 where this one exits 1. The lines are rmcp's; the exit code is
+  `main`'s and could be tightened by reading `QuitReason`, which this
+  change deliberately does not do.
+
   **Log levels — the rule.** ERROR is for what an operator must act on and
   a client cannot repeat at will; a per-request failure a client can cause
   on demand is WARN. A panic is a server bug an operator must learn about,
@@ -3764,6 +3792,21 @@ wired, `server.rs` and `main.rs` are the reference.
   cargo-mutants generates no mutant that deletes a bare statement call, so
   `--list --file crates/bugwarden/src/main.rs` names nothing at the
   installation line and the scheduled job is unchanged either way.
+  `serve_loop_failure` has no trigger either, for the same reason — no
+  operator or client value panics rmcp's serve loop — so its two texts are
+  pinned by main.rs's own unit tests, over a `JoinError` from a task that
+  really panicked and one that was really aborted. Those texts are ALL
+  those two tests pin — they do kill the classifier's two cargo-mutants
+  return-value mutants, which is why mutants.yml's scope comment no longer
+  says every line of main.rs needs a spawned process. The CALL SITE is a
+  third test beside them, reading main.rs's own source instead of running
+  anything: appending the error to the message restores the whole
+  leak with every behavioural test and clippy green, so the arm is
+  required to name the classifier, to `bail!` with what it returns, and to
+  mention the bound error exactly twice — once binding it, once passing
+  it. Same instrument as `http_auth.rs`'s constant-time comparison and for
+  the same reason: seeing the difference at run time would take a trigger
+  that only production code could carry.
 - Identity tests (#[cfg(test)] in crates/bugwarden/src/server.rs and
   crates/bugwarden-core/src/client.rs; crates/bugwarden/tests/
   http_transport_wiremock.rs, crates/bugwarden/tests/binary_user_agent.rs
