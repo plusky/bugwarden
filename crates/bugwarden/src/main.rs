@@ -90,6 +90,11 @@ async fn main() -> anyhow::Result<()> {
     if let Some(auth) = &http_auth {
         auth.log_startup_mode();
     }
+    // Pure, and repeated where the http config is built: an unparsable Host
+    // entry must refuse before the preflight, OTLP probe and audit sink run.
+    if cli.transport == Transport::Http {
+        cli.checked_allowed_hosts()?;
+    }
 
     // Which audit sinks this deployment runs (issue #31, revised
     // 2026-08-18): file, OTLP, both, or none. Resolved here — pure
