@@ -1165,10 +1165,14 @@ is not a hostname or `host:port` and emits one info line stating whether
 Host validation is on or off (the list, when on — hosts only, I12).
 main.rs adds: the http bearer gate, resolved FIRST of all (see HTTP
 bearer authentication) so a token misconfiguration precedes every other
-startup effect; `select_sinks` (file path, `none`, OTLP endpoint) so the
-two ambiguous spellings refuse before any file or task exists; and http
-with no sink at all (`NoAudit`) => tracing::warn (remote tool calls leave
-no audit record).
+startup effect; for http, `Cli::checked_allowed_hosts` right after the
+gate — `http_server_config` repeats it only after the identity preflight,
+the OTLP probe and the audit sink, so this early call is what keeps an
+unparsable Host entry from probing Bugzilla or creating the audit file
+and its directory before it refuses; `select_sinks` (file path, `none`,
+OTLP endpoint) so the two ambiguous spellings refuse before any file or
+task exists; and http with no sink at all (`NoAudit`) => tracing::warn
+(remote tool calls leave no audit record).
 
 ## Audit stream (crates/bugwarden/src/audit.rs + the server.rs wrapper)
 
@@ -3025,8 +3029,10 @@ wired, `server.rs` and `main.rs` are the reference.
   and store (or skip) a host no inbound `Host` matches, a silent deny-all
   discovered one 403 at a time. HTTP start logs one info line stating
   whether Host validation is on or off and, when on, the resolved list
-  (hosts only, never key material — I12). Stdio never builds the http
-  config, so it has no Host check.
+  (hosts only, never key material — I12). Stdio has no Host check: `main`
+  runs the early check under `Transport::Http` alone (a binary test pins
+  that a stdio start ignores an unparsable list), and stdio never builds
+  the http config either.
 
   `allowed_origins` is the browser-facing sibling of `allowed_hosts`, and the
   bearer-gate argument covers it identically — including the lapse: under
@@ -3421,8 +3427,11 @@ wired, `server.rs` and `main.rs` are the reference.
   derives and one above clamps; and `u64::MAX` clamps to the ceiling rather
   than panicking, wrapping, or saturating into an unbounded body. Host
   validation (#117): an unparsable `--allowed-hosts` entry (`*`) is a
-  startup error from `http_server_config` — the same call `serve_http` and
-  `main` take — so it cannot reach rmcp as a silent deny-all. The info
+  startup error from `Cli::checked_allowed_hosts`, reached through
+  `http_server_config` — the call `serve_http` and these tests take — and
+  called by `main` itself before the policy load, the client, the
+  preflight, the OTLP probe and the audit sink (see "Startup validation"),
+  so it cannot reach rmcp as a silent deny-all. The info
   line and the unparsable refusal are also pinned in server.rs / config.rs
   unit tests (deleting either fails a test). Session-id provenance (#180),
   driven over the raw wire because the value in question is a header no
@@ -3864,7 +3873,11 @@ wired, `server.rs` and `main.rs` are the reference.
   bind error instead of the token error each case asserts, and a refused start
   with an `--audit-config` leaves no audit file on disk, pinning the other half
   of the ordering — with the same spawn proving a stdio start ignores tokens
-  that would refuse an http one.
+  that would refuse an http one. An unparsable `MCP_ALLOWED_HOSTS` is held
+  to that ordering too: with a server-held key and a `created_by_me` rule,
+  so the preflight is a real `whoami`, the refused http start leaves no
+  audit file and made no request, and a stdio start with the same value
+  runs past startup.
   `WRITE_TOOLS` is additionally pinned against every tool's own
   `read_only_hint` annotation, so the read scope cannot drift from what
   clients are told.

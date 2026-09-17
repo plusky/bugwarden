@@ -23,6 +23,8 @@
 //! - moving the gate behind rmcp's POST body cap, which would let an
 //!   unauthenticated caller probe the cap for the policy value it derives;
 //! - dropping any of the five startup refusals;
+//! - checking `--allowed-hosts` only where the http config is built, after
+//!   the preflight and the audit sink, or checking it for stdio too;
 //! - refusing a stdio start over a token in the environment.
 
 use std::net::SocketAddr;
@@ -868,6 +870,100 @@ async fn a_token_refusal_precedes_the_audit_sink() {
     assert!(
         !audit_path.exists(),
         "a refused start must not have opened the audit sink"
+    );
+}
+
+#[tokio::test]
+async fn an_unparsable_allowed_host_refuses_before_bugzilla_and_the_audit_sink() {
+    // Past the gate, but held to its ordering: a start that checked the
+    // Host list only while building the http config had already probed
+    // Bugzilla and created the audit file by the time it refused.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let audit_path = dir.path().join("audit.jsonl");
+    let config_path = dir.path().join("audit.toml");
+    std::fs::write(
+        &config_path,
+        format!("path = {:?}\n", audit_path.to_str().expect("utf-8 path")),
+    )
+    .expect("write the audit config");
+    // A server-held key and an identity rule make the preflight a request.
+    let key_path = dir.path().join("api-key");
+    std::fs::write(&key_path, "test-key\n").expect("write the key file");
+    let policy_path = dir.path().join("policy.toml");
+    std::fs::write(
+        &policy_path,
+        "[[rule]]\nname = \"mine\"\naction = \"allow\"\n\
+         [rule.match]\ncreated_by_me = true\n",
+    )
+    .expect("write the policy");
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1, "name": "svc@example.com", "real_name": "Service",
+        })))
+        .mount(&mock)
+        .await;
+
+    let (code, stderr) = run_binary(
+        &[
+            "--bugzilla-server",
+            &mock.uri(),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--api-key-file",
+            key_path.to_str().expect("utf-8 path"),
+            "--policy",
+            policy_path.to_str().expect("utf-8 path"),
+            "--audit-config",
+            config_path.to_str().expect("utf-8 path"),
+        ],
+        &[
+            ("BUGWARDEN_HTTP_TOKEN", WRITE_TOKEN),
+            ("MCP_ALLOWED_HOSTS", "*"),
+        ],
+    )
+    .await;
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("MCP_ALLOWED_HOSTS contains entries"),
+        "{stderr}"
+    );
+    assert!(
+        !audit_path.exists(),
+        "a refused start must not have opened the audit sink: {stderr}"
+    );
+    assert!(
+        mock.received_requests()
+            .await
+            .expect("recording")
+            .is_empty(),
+        "a refused start must not have contacted Bugzilla: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_stdio_start_ignores_an_unparsable_allowed_host() {
+    // stdio has no Host check. Stdin is null, so the start runs to the
+    // handshake and ends there, which is the proof it got past startup.
+    let (code, stderr) = run_binary(
+        &[
+            "--bugzilla-server",
+            "https://bugzilla.example.invalid",
+            "--transport",
+            "stdio",
+            "--api-key",
+            "test-key",
+        ],
+        &[("MCP_ALLOWED_HOSTS", "*")],
+    )
+    .await;
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("stdio serving failed: the stream ended before initialize"),
+        "a stdio start must not refuse on the Host list: {stderr}"
     );
 }
 
