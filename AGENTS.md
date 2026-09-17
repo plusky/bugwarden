@@ -201,7 +201,9 @@ A release is one push of an annotated tag; nothing is released by hand.
   first, then tag the merge commit on `main`.
 - `.github/workflows/release.yml` then does everything: hermetic builds for
   x86_64-unknown-linux-gnu and aarch64-apple-darwin, an x86_64 `.deb` and
-  `.rpm`, a GitHub release with all of those and their `.sha256` files, and
+  `.rpm`, a GitHub release with all of those and their `.sha256` files (a
+  tag that is not bare `X.Y.Z` is published as a pre-release and never
+  becomes Latest, as it never becomes the image's `:latest`), and
   finally the crates.io publish — `bugwarden-core` before `bugwarden`,
   because the binary crate resolves its dependency from the index and cannot
   be packaged before core is there.

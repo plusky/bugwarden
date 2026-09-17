@@ -4,7 +4,7 @@ name: release
 on:
   push:
     tags:
-      # Version tags: 0.1.0, optionally with a pre-release suffix (0.1.0rc1).
+      # Version tags: 0.1.0, optionally with a pre-release suffix (0.1.0-rc.1).
       # The project tags without a "v" prefix.
       - '[0-9]+.[0-9]+.[0-9]+'
       - '[0-9]+.[0-9]+.[0-9]+*'
@@ -298,11 +298,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           # No checkout in this job, so tell gh which repo to act on.
           GH_REPO: ${{ github.repository }}
-        run: >-
-          gh release create "$GITHUB_REF_NAME"
-          --title "$GITHUB_REF_NAME"
-          --generate-notes
-          dist/*
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The stable form container-manifest also keys `latest` on; any
+          # other tag is a pre-release and must not become Latest here.
+          prerelease=()
+          if [[ ! "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            prerelease=(--prerelease --latest=false)
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            "${prerelease[@]}" \
+            dist/*
 
   toolchain-drift:
     # ci.yml's guard, script copied verbatim, so a tag push is prevented and
@@ -499,7 +508,7 @@ jobs:
         run: |
           set -euo pipefail
           tags=(-t "ghcr.io/plusky/bugwarden:$GITHUB_REF_NAME")
-          # The tag glob admits pre-releases (0.2.0rc1); those must not
+          # The tag glob admits pre-releases (0.2.0-rc.1); those must not
           # become `latest`.
           if [[ "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             tags+=(-t ghcr.io/plusky/bugwarden:latest)
