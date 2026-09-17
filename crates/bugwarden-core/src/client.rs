@@ -545,9 +545,23 @@ impl BugzillaClient {
     /// single URL path segment (`Url::path_segments_mut`) rather than
     /// interpolated into a format string: an unescaped `/` in `name` must
     /// not be able to address a different endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, before any request, when `name` is `.` or `..`,
+    /// or holds a tab, CR or LF: `path_segments_mut` drops or resolves a
+    /// dot segment and strips those three characters instead of encoding
+    /// them, so the GET would address the whole field list, another
+    /// endpoint, or a field by a different name. An empty `name` is
+    /// refused too, for a milder reason — it appends nothing but a
+    /// trailing slash, which stock Bugzilla routes nowhere. Otherwise it
+    /// fails as the other GETs here do.
     pub async fn bug_fields(&self, key: &str, name: Option<&str>) -> Result<Value> {
         match name {
             Some(n) => {
+                if matches!(n, "" | "." | "..") || n.contains(['\t', '\n', '\r']) {
+                    bail!("no such bug field: empty, `.` or `..`, or with a tab or line break");
+                }
                 let mut url = reqwest::Url::parse(&self.api_url)
                     .map_err(|e| anyhow!("bugzilla api_url is not a valid URL: {e}"))?;
                 url.path_segments_mut()

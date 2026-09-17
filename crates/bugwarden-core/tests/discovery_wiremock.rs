@@ -1,7 +1,9 @@
 //! HTTP-level integration tests for the discovery client endpoints
 //! (wiremock): `enterable_product_ids`, `products`, `bug_fields`. Covers the
-//! documented envelope shapes, a malformed envelope, and that no error text
-//! contains the API key (I12).
+//! documented envelope shapes, a malformed envelope, that a field name
+//! travels as one percent-encoded path segment and that the names
+//! `Url::path_segments_mut` would rewrite instead are refused before any
+//! request, and that no error text contains the API key (I12).
 
 use bugwarden_core::client::BugzillaClient;
 use serde_json::json;
@@ -173,6 +175,35 @@ async fn bug_fields_percent_encodes_the_name_segment() {
         .await
         .expect("the escaped segment must reach the mock, not /rest/field/bug/a/b");
     assert_eq!(v["fields"], json!([]));
+}
+
+#[tokio::test]
+async fn bug_fields_refuses_a_name_the_path_segment_would_rewrite() {
+    // `path_segments_mut` drops "." and "..", sends "" as a bare trailing
+    // slash and strips tabs and line breaks before resolving dot segments.
+    // Every GET answers 200 here, so a request that escapes is a success.
+    for name in ["", ".", "..", "\t..", ".\n.", "\r", "prod\tuct"] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "fields": [{ "name": "product" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let result = client(&server).bug_fields(KEY, Some(name)).await;
+        let sent: Vec<String> = server
+            .received_requests()
+            .await
+            .expect("request recording is on")
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert!(
+            result.is_err() && sent.is_empty(),
+            "{name:?} must fail before any request, not reach {sent:?}: {result:?}"
+        );
+    }
 }
 
 #[tokio::test]
