@@ -17,7 +17,10 @@
 //! - attaching the quicksearch id-list advisory only when the served `bugs`
 //!   array is non-empty;
 //! - suppressing the quicksearch id-list advisory when I14 link scrubbing
-//!   removed anything.
+//!   removed anything;
+//! - dropping the client's guard on field names a path segment cannot
+//!   carry, which lets bug_fields answer `..` with the catalog's first
+//!   field instead of failing the call.
 
 use std::sync::Arc;
 
@@ -2855,6 +2858,32 @@ async fn bug_fields_over_cap_makes_no_upstream_request() {
     assert!(
         mock.received_requests().await.unwrap().is_empty(),
         "the cap refusal must make zero upstream requests"
+    );
+}
+
+#[tokio::test]
+async fn bug_fields_a_dot_segment_name_fails_the_call_without_a_request() {
+    // Sent, `..` vanishes from the URL and the catalog's first field comes
+    // back as the detail of a field that does not exist.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "fields": [{ "name": "priority", "values": [{ "name": "P1" }] }]
+        })))
+        .mount(&mock)
+        .await;
+    let client = client_for(DISCOVERY_POLICY, &mock).await;
+    let result = call(&client, "bug_fields", json!({ "field_names": [".."] })).await;
+    assert!(is_error(&result), "{}", text_of(&result));
+    assert!(
+        text_of(&result).starts_with("Failed to fetch bug fields\n"),
+        "the generic call-level failure: {}",
+        text_of(&result)
+    );
+    assert!(
+        mock.received_requests().await.unwrap().is_empty(),
+        "the refused name must make zero upstream requests"
     );
 }
 
