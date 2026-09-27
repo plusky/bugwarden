@@ -89,13 +89,15 @@ pub enum Capability {
     Deps,
     /// Write: file a NEW bug.
     ///
-    /// Judged against the bug as REQUESTED — product, component, summary and
-    /// so on are classified exactly as an existing bug's would be, so a rule
-    /// that hides a product by name also refuses to let bugs be filed into
-    /// it. The one exception is `groups`: Bugzilla augments the group list
-    /// server-side on creation, so the request's claim about it is ignored
-    /// and a policy consulting groups refuses creation outright (see
-    /// `Guard::may_create`).
+    /// Judged against the request in the form Bugzilla will file it —
+    /// product, component, summary and so on are first rewritten the way
+    /// Bugzilla rewrites them, then classified exactly as an existing bug's
+    /// would be, and that rewrite is what gets filed — so a rule that hides a
+    /// product by name also refuses to let bugs be filed into it, within the
+    /// limits `Guard::may_create` records. The one exception is `groups`:
+    /// Bugzilla augments the group list server-side on creation, so the
+    /// request's claim about it is ignored and a policy consulting groups
+    /// refuses creation outright (see `Guard::may_create`).
     Create,
     /// Write: upload a new attachment to a bug.
     ///

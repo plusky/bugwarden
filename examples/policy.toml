@@ -115,7 +115,7 @@ read_only = false
 # 0. New bug reports: accepted into the desktop products, and only there.
 #
 # Filing must be decided before the bug exists, so the policy judges the bug
-# AS DESCRIBED by the create request. The first deny rule below
+# AS IT WILL BE FILED from the create request. The first deny rule below
 # ("group-restricted") consults the group list, the group list of a
 # not-yet-created bug is unknowable (Bugzilla unions the product's mandatory
 # groups into whatever the request claims), and unknown fails closed — so
@@ -425,10 +425,19 @@ younger_than_days = 5
 
 # Filing new bugs ("create") and uploading attachments ("attach") are
 # capabilities like any other. A create request has no bug id yet, so the
-# policy judges the bug AS DESCRIBED by the request — a deny rule above
-# therefore also refuses filing into anything it hides by name, with no
-# extra configuration, for every create request that REACHES it (a grant
-# matched earlier, like "reporters", decides first). A request that omits a
+# policy judges the bug AS IT WILL BE FILED — a deny rule above
+# therefore refuses a create request that REACHES it (a grant matched
+# earlier, like "reporters", decides first) and names a product the rule
+# hides, padded or not. Such a rule is NOT a boundary by itself: Bugzilla
+# looks the name up in its database, whose collation may treat characters
+# as equal or skip them, so a spelling no glob matches (an accented letter,
+# or an invisible character in front of a plain ASCII name) can still land
+# in the hidden product, and component, keyword, severity and priority
+# names are looked up the same way. That limit is open (issue #330, and
+# the README's `create` capability row). So grant "create" only through an
+# allowlist like "reporters", placed ahead of a rule that refuses every
+# other create request: a spelling the allowlist does not match is then
+# refused rather than filed. A request that omits a
 # field a rule asks about is refused (unknown, not empty), and the request's
 # OWN claim about `groups` is never trusted: Bugzilla unions the product's
 # mandatory groups into whatever was claimed, so what groups the created bug

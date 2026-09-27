@@ -11,6 +11,8 @@
 //! - swapping `Capability::Attach` for `Capability::Attachments` at the
 //!   add_attachment gate;
 //! - deleting the `may_create` call from create_bug;
+//! - POSTing a create payload other than the one `may_create` rewrote and
+//!   judged — judging a copy compiles, and this suite is what forbids it;
 //! - deleting the upload size-cap call from add_attachment;
 //! - dropping the local see_also targets from update_bug_fields' assessed
 //!   id set (or lowering their Capability::Summary bar to nothing);
@@ -271,6 +273,91 @@ async fn create_bug_custom_field_reaches_the_post_body() {
     args["custom_fields"] = json!({ "cf_fixed_in": "1.2.3" });
     let result = call(&client, "create_bug", args).await;
     assert!(!is_error(&result), "a cf_* key must reach the POST body");
+}
+
+#[tokio::test]
+async fn create_bug_posts_the_request_as_it_was_judged() {
+    // The gate judges the request rewritten the way Bugzilla rewrites it
+    // (trimmed names, cleaned summary, skipped keywords), so the POST must
+    // carry that rewrite rather than the raw values — and nothing else:
+    // description, version, op_sys and platform travel padded, because no
+    // criterion reads them and rewriting them decides nothing.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rest/bug"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 4244 })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let client = client_for("", &mock).await;
+    let mut args = create_args(" openSUSE\t");
+    args["component"] = json!("core\u{3000}");
+    args["summary"] = json!("crash\u{1}on\tstart\n");
+    args["severity"] = json!(" normal");
+    args["priority"] = json!("P3 ");
+    args["keywords"] = json!([" regression", "0"]);
+    args["version"] = json!(" 1.0 ");
+    args["description"] = json!("\tit crashed ");
+    args["op_sys"] = json!(" Linux");
+    args["platform"] = json!("x86_64 ");
+    let result = call(&client, "create_bug", args).await;
+    assert!(!is_error(&result), "an allowed create must go through");
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("JSON POST body");
+    assert_eq!(
+        body,
+        json!({
+            "product": "openSUSE",
+            "component": "core",
+            "summary": "crash on start",
+            "version": " 1.0 ",
+            "description": "\tit crashed ",
+            "op_sys": " Linux",
+            "platform": "x86_64 ",
+            "severity": "normal",
+            "priority": "P3",
+            "keywords": ["regression"],
+        })
+    );
+}
+
+#[tokio::test]
+async fn create_bug_padded_product_meets_the_padded_refusal() {
+    // A padded product must meet the deny rule for the product Bugzilla
+    // resolves it to, and be refused like any other filing: the same text
+    // after exactly one upstream request, with nothing POSTed.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/rest/bug"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 1 })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let client = client_for(
+        concat!(
+            "[[rule]]\nname = \"hide-security\"\naction = \"deny\"\n",
+            "[rule.match]\nproducts = [\"Security*\"]\n",
+        ),
+        &mock,
+    )
+    .await;
+    let refused = call(&client, "create_bug", create_args(" Security Response\t")).await;
+    assert!(is_error(&refused), "a padded product must not be filed");
+    assert_eq!(text_of(&refused), CREATE_DENIAL);
+    assert_eq!(
+        mock.received_requests().await.unwrap().len(),
+        1,
+        "the refusal must cost exactly one upstream request"
+    );
 }
 
 #[tokio::test]

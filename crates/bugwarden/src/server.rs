@@ -3201,7 +3201,7 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "File a new bug. The bug is checked against server policy AS DESCRIBED before it is created, so a product or component the policy withholds cannot be filed into either. Accepts custom 'cf_*' fields for products with mandatory entry fields. Returns the new bug id on success.",
+        description = "File a new bug. Before anything is created, the request is checked against server policy in the form Bugzilla will file it (the names the policy reads trimmed, control characters in the summary turned into spaces), and exactly that checked form is what gets filed, so a product or component the policy withholds by name is refused. Accepts custom 'cf_*' fields for products with mandatory entry fields. Returns the new bug id on success.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3265,11 +3265,15 @@ impl BugWarden {
                 payload.insert(k.clone(), v.clone());
             }
         }
-        let payload = Value::Object(payload);
+        let mut payload = Value::Object(payload);
 
-        // No bug exists yet, so the bug AS REQUESTED is what the policy
-        // judges: the rules that decide what may be seen decide what may be
-        // filed. The refusal names no rule (I1) and — crucially — is the
+        // No bug exists yet, so the policy judges the prospective bug from
+        // this payload — which may_create first rewrites the way Bugzilla
+        // will, so the POST below files exactly what was judged (the very
+        // object, never a copy). The rules that decide what may be seen
+        // decide what may be filed.
+        //
+        // The refusal names no rule (I1) and — crucially — is the
         // SAME text, after the SAME single upstream request, whether the
         // policy or Bugzilla refused. Two distinguishable refusals would be
         // a free policy oracle: send a request Bugzilla is guaranteed to
@@ -3285,7 +3289,7 @@ impl BugWarden {
         // that product is allowed; and the padding equalizes the request
         // COUNT, not the upstream handler's exact latency (a GET classify
         // vs a rejected POST), the same residual the download path accepts.
-        if !self.guard.may_create(&payload) {
+        if !self.guard.may_create(&mut payload) {
             // No whoami on the create path, ever: the create gate forces
             // created_by_me itself, and the padding classify against bug id
             // 0 decides nothing — caller identity is deliberately None so
