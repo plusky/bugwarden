@@ -769,19 +769,71 @@ impl Guard {
             .collect()
     }
 
-    /// Whether a bug MAY BE FILED as described.
+    /// Whether a bug MAY BE FILED, judged on the request as Bugzilla will
+    /// file it.
     ///
-    /// There is no bug to classify yet, so the bug as requested is
-    /// classified instead: the same rules that decide whether an existing bug
-    /// may be seen decide whether one may be created looking like that. A
-    /// policy that hides a product by NAME therefore also refuses to let
-    /// bugs be filed into it, without needing a second vocabulary.
+    /// There is no bug to classify yet, so the prospective bug is classified
+    /// from the request instead: the same rules that decide whether an
+    /// existing bug may be seen decide whether one may be created looking
+    /// like that. A policy that hides a product by NAME therefore also
+    /// refuses to let bugs be filed into it, without needing a second
+    /// vocabulary.
     ///
-    /// The request is only evidence for fields Bugzilla will take verbatim.
-    /// For product, component, summary, version, severity, priority,
-    /// keywords and the rest, the created bug either carries exactly the
-    /// requested value or creation fails upstream — so the claim is sound to
-    /// classify on. `groups` is different in kind: Bugzilla UNIONS the
+    /// The request is evidence only for what Bugzilla will file, and
+    /// Bugzilla rewrites a request before resolving it: it trims names
+    /// (Perl `\s`, mirrored here by Unicode White_Space plus U+180E, the
+    /// superset every Perl it runs on needs), turns each run of ASCII
+    /// control characters in the summary into one space and trims that too,
+    /// and skips a keyword that is `""` or `"0"`. Judged raw,
+    /// `" Security Response"` would pass a `Security*` deny rule and be filed
+    /// into Security Response all the same. So `requested` is rewritten IN
+    /// PLACE the same way before it is classified, and the caller must file
+    /// exactly the rewritten request — its names are ones Bugzilla's own
+    /// trim leaves alone, so the name Bugzilla looks up is the one judged
+    /// (what it finds is another matter, see the known limits below).
+    /// The signature cannot enforce that much: judging a copy and filing the
+    /// original would compile, so `create_bug` files the very object it
+    /// passed here and a wiremock test compares the POST body against the
+    /// rewrite.
+    /// The superset is harmless for a name, which resolves to its stored
+    /// spelling anyway, but the summary is stored as sent, so its trim is
+    /// White_Space alone: an edge U+180E, which Perl stopped counting as `\s`
+    /// in 5.20, is judged and filed as it came, an older Perl strips it
+    /// itself, and nothing Bugzilla keeps is dropped.
+    /// The rewrite covers every field `create_bug` sends that a Matcher
+    /// reads; `version`, `op_sys` and `platform` are trimmed by Bugzilla but
+    /// read by no criterion, so mirroring them would be rewriting a request
+    /// for no verdict. A criterion over one of those fields must extend the
+    /// rewrite with it.
+    ///
+    /// Evidence needs a shape the rewrite could put in its filed form.
+    /// [`BugMeta`] reads `component` and `keywords` leniently — a lone
+    /// string, an array, `{"name": ..}` objects — while Bugzilla splits a
+    /// keyword string on whitespace and commas, resolves such objects
+    /// itself, and tests Perl-falsiness on the RAW keyword element before
+    /// any trim. So a `component` that is not a string is unknown, a keyword
+    /// element the trim would turn into `""` or `"0"` is left exactly as it
+    /// came for Bugzilla to resolve or refuse, and any keyword list holding
+    /// one is unknown as a whole (a partly rewritten list would read as a
+    /// shorter one). A list left empty because Bugzilla would skip every
+    /// element is removed, as `create_bug` omits an empty one. Unknown fails
+    /// closed (I4), so none of these shapes can satisfy a rule.
+    ///
+    /// Known limits. The name that ends up on the bug is the one the
+    /// DATABASE matched, and a collation can call two spellings equal, or
+    /// ignore a character entirely, where a glob cannot. Measured on MariaDB
+    /// 10.6, the stored `Security Response` is matched by
+    /// `"Śecurity Response"` under `utf8mb3_general_ci`, and under the UCA
+    /// `utf8mb4_unicode_ci` by its decomposed spelling and by a leading
+    /// zero-width space, BOM, word joiner or RLO — weightless there — so
+    /// ASCII-only product names are no protection either, and Bugzilla's
+    /// code looks up component, keyword, severity and priority names the
+    /// same way. This gate does not close that; issue #330 tracks it, open
+    /// and deferred. And with `letsubmitterchoosepriority` off Bugzilla
+    /// replaces the requested priority with `defaultpriority`, so a
+    /// `priorities` criterion judges a priority the bug may not get.
+    ///
+    /// `groups` is different in kind: Bugzilla UNIONS the
     /// product's mandatory groups into whatever the request named, so the
     /// created bug can belong to groups the request never mentioned (the
     /// canonical `security-*` embargo setup works exactly this way). A
@@ -816,7 +868,8 @@ impl Guard {
     /// `Policy::needs_identity`). Consequence: a create-covering rule with
     /// `created_by_me = true` matches every create request that reaches it,
     /// and one with `created_by_me = false` can never match a create.
-    pub fn may_create(&self, requested: &Value) -> bool {
+    pub fn may_create(&self, requested: &mut Value) -> bool {
+        normalize_create_request(requested);
         let mut meta = BugMeta::from_json(requested, None);
         meta.creation_time = Some(Utc::now());
         // Bugzilla augments the group list server-side on creation; the
@@ -824,6 +877,16 @@ impl Guard {
         meta.groups = None;
         // The filer IS the creator — a fact, not a claim (see above).
         meta.created_by_me = Some(true);
+        // BugMeta reads component and keywords in shapes create_bug never
+        // sends and Bugzilla resolves differently; those are not evidence
+        // (see above), and one unreadable element makes the whole list
+        // unknown, as a partial list would read as a shorter one.
+        if !requested.get("component").is_some_and(Value::is_string) {
+            meta.components = None;
+        }
+        if !keywords_are_as_filed(requested) {
+            meta.keywords = None;
+        }
         // Every other field the request does not mention is unknown, not
         // empty, and classification fails closed on it (I4).
         self.policy
@@ -1045,6 +1108,85 @@ impl Guard {
             })
             .collect()
     }
+}
+
+/// Rewrite a create request the way Bugzilla rewrites it before resolving
+/// it, for every field `create_bug` sends that a Matcher reads (see
+/// [`Guard::may_create`]).
+fn normalize_create_request(requested: &mut Value) {
+    for key in ["product", "component", "severity", "priority"] {
+        if let Some(Value::String(s)) = requested.get_mut(key) {
+            *s = bugzilla_trim_name(s).to_string();
+        }
+    }
+    if let Some(Value::String(s)) = requested.get_mut("summary") {
+        *s = bugzilla_clean_text(s);
+    }
+    let emptied = match requested.get_mut("keywords") {
+        Some(Value::Array(keywords)) => {
+            for keyword in keywords.iter_mut() {
+                if let Value::String(s) = keyword {
+                    let trimmed = bugzilla_trim_name(s);
+                    // Bugzilla tests Perl-falsiness on the RAW element and
+                    // trims only the ones it goes on to resolve, so an
+                    // element the trim would make false stays as it came and
+                    // Bugzilla answers it.
+                    if !matches!(trimmed, "" | "0") {
+                        *s = trimmed.to_string();
+                    }
+                }
+            }
+            // These Bugzilla skips instead of filing.
+            keywords.retain(|k| !matches!(k.as_str(), Some("" | "0")));
+            keywords.is_empty()
+        }
+        _ => false,
+    };
+    if emptied {
+        if let Some(fields) = requested.as_object_mut() {
+            fields.remove("keywords");
+        }
+    }
+}
+
+/// Whether every `keywords` element of a request [`normalize_create_request`]
+/// has rewritten is a string in the form Bugzilla will file it under — the
+/// only shape that is evidence.
+fn keywords_are_as_filed(requested: &Value) -> bool {
+    requested
+        .get("keywords")
+        .and_then(Value::as_array)
+        .is_some_and(|keywords| {
+            keywords
+                .iter()
+                .all(|keyword| keyword.as_str().is_some_and(|s| bugzilla_trim_name(s) == s))
+        })
+}
+
+/// Bugzilla's `trim` of a name on any Perl: Unicode White_Space, plus U+180E,
+/// which Perls before 5.20 still count as `\s`.
+fn bugzilla_trim_name(s: &str) -> &str {
+    s.trim_matches(|c: char| c.is_whitespace() || c == '\u{180E}')
+}
+
+/// Bugzilla's `clean_text`: each run of ASCII control characters becomes a
+/// single space, then the text is trimmed of White_Space alone, keeping an
+/// edge U+180E that Perl from 5.20 on stores (see [`Guard::may_create`]).
+fn bugzilla_clean_text(s: &str) -> String {
+    let mut cleaned = String::with_capacity(s.len());
+    let mut in_run = false;
+    for c in s.chars() {
+        if c.is_ascii_control() {
+            if !in_run {
+                cleaned.push(' ');
+            }
+            in_run = true;
+        } else {
+            cleaned.push(c);
+            in_run = false;
+        }
+    }
+    cleaned.trim().to_string()
 }
 
 #[cfg(test)]
@@ -1851,8 +1993,8 @@ products = ["NoView*"]
                 "[rule.match]\nproducts = [\"Security*\"]\n",
             )),
         };
-        assert!(!g.may_create(&create_request("Security Response")));
-        assert!(g.may_create(&create_request("openSUSE")));
+        assert!(!g.may_create(&mut create_request("Security Response")));
+        assert!(g.may_create(&mut create_request("openSUSE")));
     }
 
     #[test]
@@ -1869,11 +2011,11 @@ products = ["NoView*"]
         };
         let mut allowed = create_request("openSUSE");
         allowed["cf_secret_field"] = json!("hidden");
-        assert!(g.may_create(&allowed));
+        assert!(g.may_create(&mut allowed));
 
         let mut denied = create_request("Security Response");
         denied["cf_secret_field"] = json!("hidden");
-        assert!(!g.may_create(&denied));
+        assert!(!g.may_create(&mut denied));
     }
 
     #[test]
@@ -1893,17 +2035,20 @@ products = ["NoView*"]
             )),
         };
         let mut req = create_request("openSUSE");
-        assert!(!g.may_create(&req), "absent groups must fail closed");
+        assert!(!g.may_create(&mut req), "absent groups must fail closed");
         req["groups"] = json!([]);
         assert!(
-            !g.may_create(&req),
+            !g.may_create(&mut req),
             "a claimed empty group list is not knowledge: Bugzilla adds \
              mandatory groups the request cannot disclaim"
         );
         req["groups"] = json!(["harmless"]);
-        assert!(!g.may_create(&req), "a non-matching claim decides nothing");
+        assert!(
+            !g.may_create(&mut req),
+            "a non-matching claim decides nothing"
+        );
         req["groups"] = json!(["embargo-security"]);
-        assert!(!g.may_create(&req));
+        assert!(!g.may_create(&mut req));
     }
 
     #[test]
@@ -1919,9 +2064,9 @@ products = ["NoView*"]
             )),
         };
         let mut req = create_request("openSUSE");
-        assert!(!g.may_create(&req));
+        assert!(!g.may_create(&mut req));
         req["groups"] = json!([]);
-        assert!(!g.may_create(&req));
+        assert!(!g.may_create(&mut req));
     }
 
     #[test]
@@ -1939,7 +2084,7 @@ products = ["NoView*"]
                 "[rule.match]\ncreated_by_me = true\n",
             )),
         };
-        assert!(!deny_own.may_create(&create_request("openSUSE")));
+        assert!(!deny_own.may_create(&mut create_request("openSUSE")));
 
         // ...and one on created_by_me = false can never match a create: the
         // rule is a definitive No and the allowing default decides.
@@ -1949,7 +2094,7 @@ products = ["NoView*"]
                 "[rule.match]\ncreated_by_me = false\n",
             )),
         };
-        assert!(deny_foreign.may_create(&create_request("openSUSE")));
+        assert!(deny_foreign.may_create(&mut create_request("openSUSE")));
 
         // The unscoped deny-own variant refuses creation too: forcing does
         // not depend on the rule's scoping, only on the operation.
@@ -1959,7 +2104,7 @@ products = ["NoView*"]
                 "[rule.match]\ncreated_by_me = true\n",
             )),
         };
-        assert!(!deny_own_unscoped.may_create(&create_request("openSUSE")));
+        assert!(!deny_own_unscoped.may_create(&mut create_request("openSUSE")));
     }
 
     #[test]
@@ -1983,10 +2128,10 @@ products = ["NoView*"]
 
         // Accept half: the desktop products take new bug reports.
         assert!(
-            g.may_create(&create_request("GNOME Shell")),
+            g.may_create(&mut create_request("GNOME Shell")),
             "the example's headline: desktop products accept filings"
         );
-        assert!(g.may_create(&create_request("KDE Frameworks")));
+        assert!(g.may_create(&mut create_request("KDE Frameworks")));
 
         // ...but never with the embargo marker in the title: the
         // create-scoped screen refuses what "undisclosed-marker" would
@@ -1994,18 +2139,18 @@ products = ["NoView*"]
         let mut marked = create_request("GNOME Shell");
         marked["summary"] = json!("EMBARGO: heap overflow in the shell");
         assert!(
-            !g.may_create(&marked),
+            !g.may_create(&mut marked),
             "an embargo-marked title must not be filed anywhere"
         );
 
         // Refuse half: everywhere else the group-consulting deny rule fails
         // closed on the unknowable group list, whatever the request claims.
         let mut req = create_request("openSUSE");
-        assert!(!g.may_create(&req), "omitted groups: refused");
+        assert!(!g.may_create(&mut req), "omitted groups: refused");
         req["groups"] = json!([]);
-        assert!(!g.may_create(&req), "claimed empty groups: refused");
+        assert!(!g.may_create(&mut req), "claimed empty groups: refused");
         req["groups"] = json!(["security-team"]);
-        assert!(!g.may_create(&req), "claimed groups: refused");
+        assert!(!g.may_create(&mut req), "claimed groups: refused");
 
         // Every read below runs with the caller's identity KNOWN, as
         // resolve_caller provides it in production. The shipped file's
@@ -2309,7 +2454,7 @@ products = ["NoView*"]
         // still consults the group list, which is unknowable pre-creation.
         let g = Guard { policy: narrowed };
         assert!(
-            !g.may_create(&create_request("openSUSE")),
+            !g.may_create(&mut create_request("openSUSE")),
             "narrowed policy must still refuse all creation"
         );
     }
@@ -2326,8 +2471,8 @@ products = ["NoView*"]
                 "[rule.match]\nproducts = [\"Secret*\"]\ngroups = [\"embargo*\"]\n",
             )),
         };
-        assert!(g.may_create(&create_request("openSUSE")));
-        assert!(!g.may_create(&create_request("SecretSauce")));
+        assert!(g.may_create(&mut create_request("openSUSE")));
+        assert!(!g.may_create(&mut create_request("SecretSauce")));
     }
 
     #[test]
@@ -2340,9 +2485,9 @@ products = ["NoView*"]
             policy: policy("[global]\nmin_bug_age_days = 1\n"),
         };
         let mut req = create_request("openSUSE");
-        assert!(!g.may_create(&req));
+        assert!(!g.may_create(&mut req));
         req["creation_time"] = json!("2000-01-01T00:00:00Z");
-        assert!(!g.may_create(&req));
+        assert!(!g.may_create(&mut req));
     }
 
     #[test]
@@ -2356,8 +2501,8 @@ products = ["NoView*"]
                 "[rule.match]\nproducts = [\"openSUSE*\"]\n",
             )),
         };
-        assert!(g.may_create(&create_request("openSUSE Tumbleweed")));
-        assert!(!g.may_create(&create_request("Internal Tools")));
+        assert!(g.may_create(&mut create_request("openSUSE Tumbleweed")));
+        assert!(!g.may_create(&mut create_request("Internal Tools")));
     }
 
     #[test]
@@ -2365,7 +2510,234 @@ products = ["NoView*"]
         let g = Guard {
             policy: policy("[global]\nread_only = true\n"),
         };
-        assert!(!g.may_create(&create_request("openSUSE")));
+        assert!(!g.may_create(&mut create_request("openSUSE")));
+    }
+
+    #[test]
+    fn may_create_judges_each_name_the_way_bugzilla_trims_it() {
+        // Bugzilla trims these names before resolving them, so padding must
+        // not carry a request past the rule for the name it resolves to.
+        let g = Guard {
+            policy: policy(concat!(
+                "[[rule]]\nname = \"product\"\naction = \"deny\"\n",
+                "[rule.match]\nproducts = [\"Security*\"]\n",
+                "[[rule]]\nname = \"component\"\naction = \"deny\"\n",
+                "[rule.match]\ncomponents = [\"Kernel\"]\n",
+                "[[rule]]\nname = \"severity\"\naction = \"deny\"\n",
+                "[rule.match]\nseverities = [\"critical\"]\n",
+                "[[rule]]\nname = \"priority\"\naction = \"deny\"\n",
+                "[rule.match]\npriorities = [\"P1\"]\n",
+                "[[rule]]\nname = \"keyword\"\naction = \"deny\"\n",
+                "[rule.match]\nkeywords = [\"embargo\"]\n",
+            )),
+        };
+        let base = || {
+            let mut req = create_request("openSUSE");
+            req["severity"] = json!("normal");
+            req["priority"] = json!("P3");
+            req["keywords"] = json!(["regression"]);
+            req
+        };
+        assert!(g.may_create(&mut base()), "the unpadded request is allowed");
+
+        // U+180E is `\s` to the Perls before 5.20 that Bugzilla runs on.
+        let mut leaked = Vec::new();
+        for pad in [" ", "\t", "\n", "\u{3000}", "\u{180E}"] {
+            for (field, denied) in [
+                ("product", "Security Response"),
+                ("component", "Kernel"),
+                ("severity", "critical"),
+                ("priority", "P1"),
+                ("keywords", "embargo"),
+            ] {
+                for value in [format!("{pad}{denied}"), format!("{denied}{pad}")] {
+                    let mut req = base();
+                    req[field] = if field == "keywords" {
+                        json!(["regression", value])
+                    } else {
+                        json!(value)
+                    };
+                    if g.may_create(&mut req) {
+                        leaked.push(format!("{field} {value:?}"));
+                    }
+                }
+            }
+        }
+        assert!(leaked.is_empty(), "judged untrimmed: {leaked:?}");
+    }
+
+    #[test]
+    fn may_create_judges_the_summary_the_way_bugzilla_cleans_it() {
+        // Bugzilla's clean_text turns each run of ASCII control characters
+        // into one space, so a control run must not hide a spaced marker.
+        let g = Guard {
+            policy: policy(concat!(
+                "[[rule]]\nname = \"marker\"\naction = \"deny\"\n",
+                "[rule.match]\nsummary_contains = [\"security embargo\"]\n",
+            )),
+        };
+        let mut leaked = Vec::new();
+        for summary in [
+            "security\tembargo",
+            "security\r\nembargo",
+            "security\u{0}\u{1f}embargo",
+            "security\u{7f}embargo",
+        ] {
+            let mut req = create_request("openSUSE");
+            req["summary"] = json!(summary);
+            if g.may_create(&mut req) {
+                leaked.push(summary);
+            }
+        }
+        assert!(leaked.is_empty(), "judged uncleaned: {leaked:?}");
+
+        // One space per run: a space already beside the run stays.
+        let mut req = create_request("openSUSE");
+        req["summary"] = json!("security \tembargo");
+        assert!(g.may_create(&mut req));
+        assert_eq!(req["summary"], "security  embargo");
+
+        // ASCII controls only: clean_text's character class stops at U+007F,
+        // so a C1 control is text like any other, here and upstream.
+        let mut req = create_request("openSUSE");
+        req["summary"] = json!("security\u{9f}embargo");
+        assert!(g.may_create(&mut req), "a C1 control is not a space");
+        assert_eq!(req["summary"], "security\u{9f}embargo");
+    }
+
+    #[test]
+    fn may_create_trims_u180e_from_names_but_not_from_the_summary() {
+        // A name resolves to its stored spelling, so its trim may take U+180E;
+        // the summary is stored as sent, and Perl from 5.20 keeps U+180E there.
+        let g = Guard {
+            policy: policy(concat!(
+                "[[rule]]\nname = \"marker\"\naction = \"deny\"\n",
+                "[rule.match]\nsummary_contains = [\"boot\\u180E\"]\n",
+            )),
+        };
+        let mut req = create_request("\u{180E}openSUSE\u{180E}");
+        req["summary"] = json!("\t\u{180E}crash on start\u{180E} ");
+        assert!(g.may_create(&mut req));
+        assert_eq!(req["product"], "openSUSE");
+        assert_eq!(req["summary"], "\u{180E}crash on start\u{180E}");
+
+        let mut req = create_request("openSUSE");
+        req["summary"] = json!("fails to boot\u{180E}\n");
+        assert!(!g.may_create(&mut req), "the judged summary keeps U+180E");
+    }
+
+    #[test]
+    fn may_create_leaves_the_request_it_judged() {
+        // create_bug files the request as may_create left it, so the rewrite
+        // IS what was judged. Pinned against Bugzilla's trim/clean_text —
+        // including the fields it trims that no criterion reads, which stay
+        // as they came because rewriting them would buy no verdict.
+        let g = Guard { policy: policy("") };
+        let mut req = create_request("\u{180E} openSUSE\t");
+        req["component"] = json!(" core\n");
+        req["summary"] = json!("\tcrash\u{1}\u{2}on start\u{7f}");
+        req["severity"] = json!("normal ");
+        req["priority"] = json!("\u{3000}P3");
+        req["version"] = json!(" 1.0 ");
+        req["description"] = json!("\tit crashed ");
+        req["op_sys"] = json!(" Linux");
+        req["platform"] = json!("x86_64 ");
+        // "" and "0" Bugzilla skips; " " and "0 " it resolves or refuses
+        // itself, so they stay raw and the list stops being evidence.
+        req["keywords"] = json!([" regression", "", "0", " ", "0 "]);
+        assert!(g.may_create(&mut req));
+        let mut expected = create_request("openSUSE");
+        expected["severity"] = json!("normal");
+        expected["priority"] = json!("P3");
+        expected["version"] = json!(" 1.0 ");
+        expected["description"] = json!("\tit crashed ");
+        expected["op_sys"] = json!(" Linux");
+        expected["platform"] = json!("x86_64 ");
+        expected["keywords"] = json!(["regression", " ", "0 "]);
+        assert_eq!(req, expected);
+
+        let mut req = create_request("openSUSE");
+        req["keywords"] = json!(["", "0"]);
+        assert!(g.may_create(&mut req));
+        assert_eq!(
+            req,
+            create_request("openSUSE"),
+            "a list Bugzilla would skip entirely is omitted"
+        );
+    }
+
+    #[test]
+    fn may_create_judges_only_the_keywords_bugzilla_files() {
+        // Bugzilla skips a "" or "0" keyword and refuses (or resolves) one
+        // that is false only after trimming, so none of them may satisfy a
+        // keyword grant: the first two leave nothing behind, the other three
+        // leave a list nobody can read ahead of Bugzilla.
+        let tagged = Guard {
+            policy: policy(concat!(
+                "default_action = \"deny\"\n",
+                "[[rule]]\nname = \"tagged\"\naction = \"allow\"\n",
+                "[rule.match]\nkeywords = [\"*\"]\n",
+            )),
+        };
+        let mut req = create_request("openSUSE");
+        req["keywords"] = json!(["regression"]);
+        assert!(tagged.may_create(&mut req));
+        for skipped in ["", "0", " ", " 0", "0 "] {
+            let mut req = create_request("openSUSE");
+            req["keywords"] = json!([skipped]);
+            assert!(!tagged.may_create(&mut req), "keyword {skipped:?}");
+        }
+    }
+
+    #[test]
+    fn may_create_reads_only_the_shapes_create_bug_sends() {
+        // BugMeta is tolerant about component and keyword shapes; Bugzilla
+        // resolves those shapes its own way (splitting a keyword string,
+        // reading a {"name"} object, refusing a list where it wants a name).
+        // The rewrite models none of them, so none of them is evidence.
+        // One rule per case: a policy carrying both criteria would refuse the
+        // component shapes on its unknown keyword list instead, and prove
+        // nothing about component.
+        let keyword_rule = concat!(
+            "[[rule]]\nname = \"embargo\"\naction = \"deny\"\n",
+            "[rule.match]\nkeywords = [\"embargo\"]\n",
+        );
+        let component_rule = concat!(
+            "[[rule]]\nname = \"component\"\naction = \"deny\"\n",
+            "[rule.match]\ncomponents = [\"Kernel\"]\n",
+        );
+        let mut leaked = Vec::new();
+        for (rule, field, shape) in [
+            (keyword_rule, "keywords", json!(" embargo")),
+            (keyword_rule, "keywords", json!([{ "name": " embargo" }])),
+            (component_rule, "component", json!([" Kernel"])),
+            (component_rule, "component", json!([{ "name": " Kernel" }])),
+        ] {
+            let g = Guard {
+                policy: policy(rule),
+            };
+            let mut req = create_request("openSUSE");
+            req[field] = shape.clone();
+            if g.may_create(&mut req) {
+                leaked.push(format!("{field} {shape}"));
+            }
+        }
+        assert!(leaked.is_empty(), "read as evidence: {leaked:?}");
+
+        // Neither rule refuses the shape create_bug does send.
+        let keywords = Guard {
+            policy: policy(keyword_rule),
+        };
+        let mut req = create_request("openSUSE");
+        req["keywords"] = json!(["regression"]);
+        assert!(keywords.may_create(&mut req), "an array of strings is read");
+        let components = Guard {
+            policy: policy(component_rule),
+        };
+        assert!(
+            components.may_create(&mut create_request("openSUSE")),
+            "a string component is read"
+        );
     }
 
     // ---------- operation-scoped rules (issue #26) ----------
@@ -2440,9 +2812,9 @@ group_restricted = true
         // Filing into the matched product works: for the create operation
         // the scoped rule is first match and grants `create` before the
         // group-consulting rule can fail closed on the unknowable groups.
-        assert!(g.may_create(&create_request("SUSE Linux Enterprise Server 15")));
+        assert!(g.may_create(&mut create_request("SUSE Linux Enterprise Server 15")));
         // Elsewhere creation still fails closed on the group rule.
-        assert!(!g.may_create(&create_request("openSUSE")));
+        assert!(!g.may_create(&mut create_request("openSUSE")));
     }
 
     #[test]
@@ -2459,7 +2831,7 @@ group_restricted = true
                 "[rule.match]\nproducts = [\"SUSE Linux Enterprise*\"]\n",
             )),
         };
-        assert!(!g.may_create(&create_request("SUSE Linux Enterprise Server 15")));
+        assert!(!g.may_create(&mut create_request("SUSE Linux Enterprise Server 15")));
     }
 
     #[test]
@@ -2474,7 +2846,7 @@ group_restricted = true
                 "[rule.match]\nproducts = [\"openSUSE*\"]\n",
             )),
         };
-        assert!(!g.may_create(&create_request("openSUSE")));
+        assert!(!g.may_create(&mut create_request("openSUSE")));
     }
 
     #[test]
@@ -2490,7 +2862,7 @@ group_restricted = true
                 "[rule.match]\nproducts = [\"openSUSE*\"]\n",
             )),
         };
-        assert!(!g.may_create(&create_request("openSUSE")));
+        assert!(!g.may_create(&mut create_request("openSUSE")));
     }
 
     #[test]
