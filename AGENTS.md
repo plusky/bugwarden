@@ -20,7 +20,7 @@ cargo deny check
 ```
 
 Use the toolchain pinned in `rust-toolchain.toml` (repo root, currently
-`1.98.0`). That pin, the `toolchain:` inputs in `.github/workflows/`, and
+`1.98.1`). That pin, the `toolchain:` inputs in `.github/workflows/`, and
 the `FROM rust:` tag in the `Dockerfile` all name the same version and move
 together; `rust-msrv` (the MSRV) and `rust-beta` (`beta`) are the deliberate
 exceptions. An input only installs that toolchain and sets the rustup

@@ -85,7 +85,7 @@ jobs:
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # master
         with:
           # Keep in sync with rust-toolchain.toml.
-          toolchain: "1.98.0"
+          toolchain: "1.98.1"
       - name: Install cargo-mutants
         # Exact version and --locked, as release.yml installs cargo-deb and
         # cargo-generate-rpm. A crates.io version is immutable and --locked
