@@ -356,7 +356,7 @@ jobs:
             exit 1
           fi
           # Every three-or-more-part version token in the file, not just the
-          # ones on a line mentioning rmcp: one stamp says only "in 3.4.0". The
+          # ones on a line mentioning rmcp: one stamp says only "in 3.4.1". The
           # loopback addresses are the sole other such token today and this
           # check keeps it that way -- a new non-rmcp X.Y.Z fails here and has
           # to be decided, rather than being silently skipped by a narrower
