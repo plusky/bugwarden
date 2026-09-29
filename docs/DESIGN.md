@@ -2216,7 +2216,7 @@ names an endpoint.
 ## rmcp 3.4 usage notes
 
 Reference source is the rmcp this workspace pins, unpacked in the local
-registry: `~/.cargo/registry/src/*/rmcp-3.4.0/` — today's version, and the
+registry: `~/.cargo/registry/src/*/rmcp-3.4.1/` — today's version, and the
 directory holding the `rmcp` package's `manifest_path` in `cargo metadata
 --format-version 1` on any day, so it follows `Cargo.lock` rather than a copy
 of it and is by construction the source this build compiles against. Every rmcp
@@ -2226,8 +2226,8 @@ routing traps), `handler/server/router/tool.rs` (`ToolRouter`, incl.
 `remove_route` / `has_route` — I13), `model.rs` and `model/serde_impl.rs`
 (`InitializeResult`, the `_meta` strip), `service.rs` (the serve loop); the
 `#[tool_router]` / `#[tool_handler]` expansions are in the sibling
-`rmcp-macros-3.4.0` tree. The published crate carries no `examples/` — those
-live upstream at the `rmcp-v3.4.0` tag — but for how this server is actually
+`rmcp-macros-3.4.1` tree. The published crate carries no `examples/` — those
+live upstream at the `rmcp-v3.4.1` tag — but for how this server is actually
 wired, `server.rs` and `main.rs` are the reference.
 
 - `rmcp = { version = "3.4", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }`
@@ -2316,7 +2316,7 @@ wired, `server.rs` and `main.rs` are the reference.
   must likewise be built in this crate rather than in the library that
   holds the HTTP client (issue #55, "Caller identity on the wire" above).
 - **rmcp trap — the handshake-free lifecycle is chosen by `_meta` shape, not
-  by `SUPPORTED_PROTOCOL_VERSIONS`.** In rmcp 3.4.0 `is_legacy_request`
+  by `SUPPORTED_PROTOCOL_VERSIONS`.** In rmcp 3.4.1 `is_legacy_request`
   (`transport/streamable_http_server/tower.rs`) returns true — the session
   path — for **every** `initialize`, whatever `protocolVersion` it names
   and whatever `_meta` it carries (rmcp #1228: an initialize request
@@ -2331,7 +2331,7 @@ wired, `server.rs` and `main.rs` are the reference.
   (`missing_required_keys(&V_2026_07_28).is_empty()`). That helper is
   called with `V_2026_07_28` as the *schema* to check, not the request's
   declared revision, so **a pre-2026 non-`initialize` with both keys still
-  hits the stateless path** (#204; re-verified on 3.4.0). Version
+  hits the stateless path** (#204; re-verified on 3.4.1). Version
   otherwise comes from the `_meta` key, falling back to the
   `MCP-Protocol-Version` header and then `2025-03-26` — no longer from
   `initialize`'s `params.protocolVersion`, which the early return already
@@ -2362,7 +2362,7 @@ wired, `server.rs` and `main.rs` are the reference.
   that did complete a handshake too.
   **rmcp trap within the trap — `RequestContext::client_info()` is not a safe
   accessor.** It falls back to `peer_info().client_info` unless
-  `peer.request_metadata_required()`, which rmcp 3.4.0 sets on exactly one path
+  `peer.request_metadata_required()`, which rmcp 3.4.1 sets on exactly one path
   (`service/server.rs`, the stdio first-message-is-not-`initialize` case) and
   never over streamable http. Since #267 that stdio path no longer sees a
   `server/discover`: the transport answers it (`stdio::DiscoverAnswering`,
@@ -2402,7 +2402,7 @@ wired, `server.rs` and `main.rs` are the reference.
   served per-request POST, which is why `client_of` never uses the convenience
   accessor.
 - **rmcp trap — over stdio, `server/discover` CHOOSES the lifecycle before it is
-  answered.** `serve_server_with_ct_inner` (rmcp 3.4.0
+  answered.** `serve_server_with_ct_inner` (rmcp 3.4.1
   `service/server.rs:553-630`) reads the session's lifecycle off the first
   non-`ping` frame: anything that is not `initialize` is taken as a commitment
   to the handshake-free one, and `Peer::require_request_metadata()` (`:619`) is
@@ -2418,7 +2418,7 @@ wired, `server.rs` and `main.rs` are the reference.
   `initialize`) broke on ANY probe, served or refused. Worse, a probe rmcp
   itself refuses — no `_meta` at all — ended the PROCESS with
   `ExpectedInitializeRequest` after answering, logging the whole frame on the
-  way out (#261). rmcp 3.4.0 still does all of this (`:619`). What #1263
+  way out (#261). rmcp 3.4.1 still does all of this (`:619`). What #1263
   changed is where that committing request runs: rmcp 3.2 answered it
   ahead of the serve loop, before reading another frame, and rmcp 3.4
   dispatches it inside the loop like any later request. So it now honours
@@ -2477,7 +2477,7 @@ wired, `server.rs` and `main.rs` are the reference.
   `an_http_probe_never_commits_the_session_lifecycle` pins so an rmcp bump that
   changed it fails loudly.
 - **rmcp trap — `mcp-session-id` is a validated header on only one of the two
-  routes.** In rmcp 3.4.0 the session branch of `handle_post`
+  routes.** In rmcp 3.4.1 the session branch of `handle_post`
   (`transport/streamable_http_server/tower.rs`) checks the header against
   `has_session` before it routes on it, and 404s an id it does not know; the
   stateless branch has no such check and `serve_negotiated_request_directly`
@@ -2503,7 +2503,7 @@ wired, `server.rs` and `main.rs` are the reference.
 - `list_tools` names every `ListToolsResult` field: `result_type` is
   `COMPLETE`, and the SEP-2549 cache hints are gated on the request's
   revision. **rmcp trap — the only version-shaped edit the SDK makes to a
-  served result is stripping `resultType`.** In rmcp 3.4.0
+  served result is stripping `resultType`.** In rmcp 3.4.1
   `ServerResult::strip_result_type_for_legacy_peer` (`model.rs`) edits that
   one field and nothing else; the same `handle_request` version-gates other
   things (`InputRequiredResult`, the SEP-2164 error-code swap, ping and
@@ -2512,7 +2512,7 @@ wired, `server.rs` and `main.rs` are the reference.
   ours: `RequestContext::protocol_version()` — the request's own `_meta`
   revision, else the session's negotiated one, `None` when neither — at least
   `2026-07-28`, and `None` fails toward the legacy wire shape rather than
-  toward emission. That expression is a hand-copy of the one rmcp 3.4.0
+  toward emission. That expression is a hand-copy of the one rmcp 3.4.1
   computes `sep_2322_supported` from (`handler/server.rs`): the two agree
   today by inspection, share no constant, and no test pins the agreement.
   Re-read both on every rmcp bump — if upstream's predicate moves, this build
@@ -2525,7 +2525,7 @@ wired, `server.rs` and `main.rs` are the reference.
   nothing worth caching. The exact claim, which is about listings and not
   about peers: **no `tools/list` response this handler constructs carries the
   SEP-2549 pair unless the request's revision is at least 2026-07-28.** Not
-  about peers because in rmcp 3.4.0 `DiscoverResult` (`model.rs`) declares
+  about peers because in rmcp 3.4.1 `DiscoverResult` (`model.rs`) declares
   `ttl_ms: u64` and `cache_scope: CacheScope` as non-`Option` fields with no
   `skip_serializing_if`, hard-coded to `0`/`Private` by both constructors,
   and this build serves rmcp's default `server/discover` result on both
@@ -2669,7 +2669,7 @@ wired, `server.rs` and `main.rs` are the reference.
   time; it does not stop the payload's other way out. After the stdio
   handshake rmcp runs the session loop — its own code, and with it
   `DiscoverAnswering` and `BoundedLines::poll_read` — in a spawned task,
-  and a panic there comes back from `RunningService::waiting` (rmcp 3.4.0
+  and a panic there comes back from `RunningService::waiting` (rmcp 3.4.1
   `service.rs:1105`) as tokio's `JoinError`, which quotes a string payload
   in its Display (`task N panicked with message "…"`) and in its Debug
   (`JoinError::Panic(Id(N), "…", …)`) alike. `?` on it put that text on
@@ -2790,7 +2790,7 @@ wired, `server.rs` and `main.rs` are the reference.
   behind a new knob cannot be skipped;
   `the_x_mcp_header_tripwire_fires_at_every_planted_position` is its canary,
   because a walk over zero annotations passes even when gutted. The check is
-  deliberately broader than rmcp's functional read, which in 3.4.0 is
+  deliberately broader than rmcp's functional read, which in 3.4.1 is
   top-level `properties`, string-valued only (`param_header_annotations`;
   `validate_param_header_annotations` and `reject_nested_annotations` are the
   client-side validation, and reject the key at ANY depth — but only down
@@ -2801,7 +2801,7 @@ wired, `server.rs` and `main.rs` are the reference.
   `x-mcp-header` on every rmcp bump.
 
   **The #116 record, closed here rather than fixed.** `ServerHandler::get_tool`
-  is still `fn get_tool(&self, name: &str) -> Option<Tool>` in 3.4.0: no
+  is still `fn get_tool(&self, name: &str) -> Option<Tool>` in 3.4.1: no
   `RequestContext`, so the schema cache `tower.rs` builds for `Mcp-Param-*`
   validation answers per DEPLOYMENT — the I13-pruned instance router, pinned
   by `get_tool_serves_the_pruned_instance_router_i13` — and never per
@@ -3028,7 +3028,7 @@ wired, `server.rs` and `main.rs` are the reference.
   comma-only now. An entry that is not a hostname or `host:port` — `*`, a
   scheme-carrying URL, `a;b`, a percent-encoded comma, zero-width unicode, a
   space-containing typo — is a startup error (`Cli::checked_allowed_hosts`);
-  rmcp 3.4.0's `parse_allowed_authority` would otherwise keep validation on
+  rmcp 3.4.1's `parse_allowed_authority` would otherwise keep validation on
   and store (or skip) a host no inbound `Host` matches, a silent deny-all
   discovered one 403 at a time. HTTP start logs one info line stating
   whether Host validation is on or off and, when on, the resolved list

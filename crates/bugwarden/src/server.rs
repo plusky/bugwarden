@@ -548,7 +548,7 @@ fn allowlisted(params: Option<&JsonObject>) -> BTreeMap<String, Value> {
 /// * [`Lifecycle::PerRequest`] — the request's own `_meta`. **Never
 ///   `ctx.client_info()`**: that convenience accessor falls back to
 ///   `peer_info().client_info` unless `request_metadata_required()`, which
-///   rmcp 3.4.0 sets only on the stdio handshake-free path
+///   rmcp 3.4.1 sets only on the stdio handshake-free path
 ///   (`service/server.rs`), so over streamable http it IS the
 ///   `{"name":"rmcp",…}` placeholder rmcp synthesises for a peer that
 ///   never handshook (`peer_info_for_stateless_request`, #34 §3c) — and
@@ -680,7 +680,7 @@ enum Lifecycle {
 /// what gets served and who gets recorded cannot diverge by call-site
 /// ordering.
 ///
-/// rmcp 3.4.0 routes on `_meta` shape, not on the negotiated revision and
+/// rmcp 3.4.1 routes on `_meta` shape, not on the negotiated revision and
 /// not on [`SUPPORTED_PROTOCOL_VERSIONS`]: `is_legacy_request`
 /// (`transport/streamable_http_server/tower.rs`) returns true — the session
 /// path — for every `initialize` (rmcp #1228), and otherwise sends a POST
@@ -4738,7 +4738,7 @@ impl ServerHandler for BugWarden {
             Reach::ReadOnly => tools.retain(|tool| read_scope_serves(&tool.name)),
             Reach::Nothing => tools.clear(),
         }
-        // The SEP-2549 hints are ours to gate: rmcp 3.4.0 strips
+        // The SEP-2549 hints are ours to gate: rmcp 3.4.1 strips
         // `resultType` for a legacy peer and leaves these two alone. The
         // predicate is HAND-COPIED from its `sep_2322_supported` — no shared
         // constant, no test pinning the agreement — so re-read both on an
@@ -5865,7 +5865,7 @@ mod tests {
         }
     }
 
-    /// SEP-2243's schema annotation, byte-exact as rmcp 3.4.0 reads it —
+    /// SEP-2243's schema annotation, byte-exact as rmcp 3.4.1 reads it —
     /// `schema.get("x-mcp-header")` in `transport/common/mcp_headers.rs`
     /// (`param_header_annotations`, `validate_param_header_annotations`,
     /// `reject_nested_annotations`). Upstream exports no constant for the
@@ -5883,7 +5883,7 @@ mod tests {
     /// with no recursion arms to keep in lockstep, which is the maintenance
     /// surface `schema_portability_error` above has to carry.
     ///
-    /// Deliberately broader than rmcp's functional read, which in 3.4.0 is
+    /// Deliberately broader than rmcp's functional read, which in 3.4.1 is
     /// top-level `properties` and string-valued only: the key is banned
     /// everywhere, at any value type, because upstream's depth rules are
     /// version-specific. It will also trip on the substring appearing in a

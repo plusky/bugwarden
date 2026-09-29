@@ -351,7 +351,7 @@ async fn a_probe_only_client_hangs_up_cleanly() {
 #[tokio::test]
 async fn a_pipelined_probe_is_answered_over_real_pipes() {
     // A probe behind other traffic, which no lock-step row here reaches:
-    // rmcp polls `receive` as one arm of a `select!` (rmcp 3.4.0
+    // rmcp polls `receive` as one arm of a `select!` (rmcp 3.4.1
     // `service.rs:1418`) and drops that future whenever another arm wins,
     // so a reply the wrapper awaited on `receive`'s own stack would be
     // dropped with it — the frame consumed, the id never answered, the

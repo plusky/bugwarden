@@ -208,7 +208,7 @@ type QueuedSend<E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send>>;
 ///
 /// `server/discover` is a probe, but over stdio rmcp lets it CHOOSE the
 /// session lifecycle before anyone answers it: `serve_server_with_ct_inner`
-/// (rmcp 3.4.0 `service/server.rs:553-630`) takes any first non-`ping`
+/// (rmcp 3.4.1 `service/server.rs:553-630`) takes any first non-`ping`
 /// frame that is not `initialize` as a commitment to the handshake-free
 /// lifecycle and calls `Peer::require_request_metadata()` (`:619`) — a
 /// sticky `AtomicBool` that no later `initialize` clears and no public API
@@ -906,7 +906,7 @@ mod discover {
     async fn a_pipelined_probe_is_answered_under_write_contention() {
         // The one thing this wrapper does that the inner transport does
         // not: hold a reply. rmcp polls `receive` as one arm of a
-        // `select!` (rmcp 3.4.0 `service.rs:1418`) and drops the future
+        // `select!` (rmcp 3.4.1 `service.rs:1418`) and drops the future
         // whenever another arm wins, so a reply awaited on `receive`'s own
         // stack dies with the frame that asked for it — consumed, never
         // answered, the client hung on that id while every other reply
@@ -1061,7 +1061,7 @@ mod discover {
             "the probe must name this build, and nothing else: {probe}"
         );
         // Present whatever revision the probe declares:
-        // `strip_result_type_for_legacy_peer` (rmcp 3.4.0 model.rs) has no
+        // `strip_result_type_for_legacy_peer` (rmcp 3.4.1 model.rs) has no
         // `DiscoverResult` arm, so rmcp never stripped it here either.
         assert_eq!(probe["result"]["resultType"], "complete", "{probe}");
     }
