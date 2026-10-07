@@ -22,10 +22,23 @@ use chrono::Utc;
 use serde_json::{Map, Value};
 
 use crate::client::{BugzillaClient, CLASSIFY_FIELDS};
+use crate::custom_fields::CustomFieldKind;
 use crate::policy::{
     Access, BugMeta, Capability, IdentitySource, Operation, Policy, RULE_UNAVAILABLE,
 };
 use crate::quoted::QuotedError;
+
+/// How a history field's `added`/`removed` text names other bugs.
+#[derive(Clone, Copy)]
+enum HistoryLinks {
+    /// A comma-separated list of ids or see_also URLs: the core link
+    /// fields, and a Bug List custom field.
+    List,
+    /// One bug id at most, never split on commas: a Bug ID custom field
+    /// (`strict`: a value that is no id is blanked) or a custom field of
+    /// unknown kind (lenient: an id is judged, anything else left alone).
+    CustomScalar { strict: bool },
+}
 
 /// Fields kept by the redacted summary-only projection of a bug
 /// ([`Guard::summary_view`]). Everything else — assignee, CC, groups,
@@ -618,11 +631,37 @@ impl Guard {
         }
     }
 
-    /// Bug ids named by a history response.
-    pub fn history_bug_ids(history: &Value, base_url: &str) -> BTreeSet<u64> {
+    /// The `cf_*` fields a history response records changes to, so the
+    /// caller can learn their kinds before judging the changes.
+    pub fn history_custom_fields(history: &Value) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
-        Self::walk_history(history, |field, value| {
-            out.extend(Self::history_ids_in(field, value, base_url));
+        for entry in history.as_array().into_iter().flatten() {
+            for change in entry
+                .get("changes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(field) = change.get("field_name").and_then(Value::as_str) {
+                    if field.starts_with("cf_") {
+                        out.insert(field.to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Bug ids named by a history response. `kinds` says what each custom
+    /// field holds; a `cf_` field it does not name is of unknown kind.
+    pub fn history_bug_ids(
+        history: &Value,
+        base_url: &str,
+        kinds: &BTreeMap<String, CustomFieldKind>,
+    ) -> BTreeSet<u64> {
+        let mut out = BTreeSet::new();
+        Self::walk_history(history, kinds, |kind, value| {
+            out.extend(Self::history_ids_in(kind, value, base_url));
         });
         out
     }
@@ -631,8 +670,14 @@ impl Guard {
     ///
     /// A change is edited down to the ids that may be named; one left with
     /// nothing to say is dropped entirely, rather than shown as an empty
-    /// change that still marks the moment something happened.
-    pub fn scrub_history(mut history: Value, base_url: &str, disclosable: &BTreeSet<u64>) -> Value {
+    /// change that still marks the moment something happened. `kinds` is
+    /// read as in [`Guard::history_bug_ids`].
+    pub fn scrub_history(
+        mut history: Value,
+        base_url: &str,
+        disclosable: &BTreeSet<u64>,
+        kinds: &BTreeMap<String, CustomFieldKind>,
+    ) -> Value {
         let Some(entries) = history.as_array_mut() else {
             return history;
         };
@@ -646,19 +691,23 @@ impl Guard {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                if !Self::is_id_bearing_history_field(&field) {
+                let Some(kind) = Self::history_link_kind(&field, kinds) else {
                     return true;
-                }
+                };
                 let mut anything_left = false;
                 for slot in ["added", "removed"] {
                     let Some(v) = change.get_mut(slot) else {
                         continue;
                     };
-                    let kept = Self::keep_disclosable_ids(
-                        v.as_str().unwrap_or_default(),
-                        base_url,
-                        disclosable,
-                    );
+                    let value = v.as_str().unwrap_or_default();
+                    let kept = match kind {
+                        HistoryLinks::List => {
+                            Self::keep_disclosable_ids(value, base_url, disclosable)
+                        }
+                        HistoryLinks::CustomScalar { strict } => {
+                            Self::keep_custom_scalar(value, strict, disclosable)
+                        }
+                    };
                     anything_left |= !kept.is_empty();
                     *v = Value::String(kept);
                 }
@@ -674,9 +723,32 @@ impl Guard {
         history
     }
 
-    fn is_id_bearing_history_field(field: &str) -> bool {
-        Self::LINKED_ID_FIELDS.contains(&field)
+    /// How a history field's `added`/`removed` text names other bugs, or
+    /// `None` for a field that cannot. The core link fields come first, so
+    /// no custom field can shadow one; a `cf_` field is judged by its kind,
+    /// and one of unknown kind is read leniently rather than ignored (I4).
+    fn history_link_kind(
+        field: &str,
+        kinds: &BTreeMap<String, CustomFieldKind>,
+    ) -> Option<HistoryLinks> {
+        if Self::LINKED_ID_FIELDS.contains(&field)
             || matches!(field, "dupe_of" | "dup_id" | "see_also" | "url")
+        {
+            return Some(HistoryLinks::List);
+        }
+        if !field.starts_with("cf_") {
+            return None;
+        }
+        match kinds
+            .get(field)
+            .copied()
+            .unwrap_or(CustomFieldKind::Unknown)
+        {
+            CustomFieldKind::BugId => Some(HistoryLinks::CustomScalar { strict: true }),
+            CustomFieldKind::BugList => Some(HistoryLinks::List),
+            CustomFieldKind::Unknown => Some(HistoryLinks::CustomScalar { strict: false }),
+            CustomFieldKind::Other => None,
+        }
     }
 
     /// Keep only the disclosable ids in a comma-separated history value.
@@ -696,7 +768,28 @@ impl Guard {
             .join(", ")
     }
 
-    fn walk_history(history: &Value, mut visit: impl FnMut(&str, &str)) {
+    /// Keep a custom field's history value, which holds one bug id at most
+    /// and is never split on commas. Empty and `0` (how a cleared Bug ID
+    /// field reads) are kept; an id is kept only if disclosable; anything
+    /// else is blanked under `strict` and left alone otherwise.
+    fn keep_custom_scalar(value: &str, strict: bool, disclosable: &BTreeSet<u64>) -> String {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || trimmed == "0" {
+            return value.to_string();
+        }
+        match Self::scalar_bug_id(trimmed) {
+            Some(id) if disclosable.contains(&id) => value.to_string(),
+            Some(_) => String::new(),
+            None if strict => String::new(),
+            None => value.to_string(),
+        }
+    }
+
+    fn walk_history(
+        history: &Value,
+        kinds: &BTreeMap<String, CustomFieldKind>,
+        mut visit: impl FnMut(HistoryLinks, &str),
+    ) {
         let Some(entries) = history.as_array() else {
             return;
         };
@@ -709,29 +802,42 @@ impl Guard {
                     .get("field_name")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if !Self::is_id_bearing_history_field(field) {
+                let Some(kind) = Self::history_link_kind(field, kinds) else {
                     continue;
-                }
+                };
                 for slot in ["added", "removed"] {
                     if let Some(v) = change.get(slot).and_then(Value::as_str) {
-                        visit(field, v);
+                        visit(kind, v);
                     }
                 }
             }
         }
     }
 
-    fn history_ids_in(_field: &str, value: &str, base_url: &str) -> BTreeSet<u64> {
-        value
-            .split(',')
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .filter_map(|p| {
-                p.parse::<u64>()
-                    .ok()
-                    .or_else(|| Self::see_also_local_id(p, base_url))
-            })
-            .collect()
+    fn history_ids_in(kind: HistoryLinks, value: &str, base_url: &str) -> BTreeSet<u64> {
+        match kind {
+            HistoryLinks::List => value
+                .split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .filter_map(|p| {
+                    p.parse::<u64>()
+                        .ok()
+                        .or_else(|| Self::see_also_local_id(p, base_url))
+                })
+                .collect(),
+            HistoryLinks::CustomScalar { .. } => Self::scalar_bug_id(value).into_iter().collect(),
+        }
+    }
+
+    /// The one id a custom field's history value names: ASCII digits only,
+    /// once trimmed, and not `0`, which is not a bug.
+    fn scalar_bug_id(value: &str) -> Option<u64> {
+        let digits = value.trim();
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok().filter(|id| *id != 0)
     }
 
     /// The bug id in Bugzilla's auto-generated duplicate marker, if this
@@ -1309,6 +1415,112 @@ mod tests {
     }
 
     #[test]
+    fn history_cf_changes_follow_kinds() {
+        // A Bug ID field is strict: a hidden id is scrubbed, a visible one
+        // kept, an empty or "0" value kept, and a value that is no id
+        // blanked. A field of another kind is left alone whatever it says.
+        // An unknown field is lenient: a digit value is judged as an id and
+        // free text is kept verbatim. A custom value is never comma-split.
+        let kinds: BTreeMap<String, CustomFieldKind> = [
+            ("cf_regression_of".to_string(), CustomFieldKind::BugId),
+            ("cf_build".to_string(), CustomFieldKind::Other),
+            ("cf_related".to_string(), CustomFieldKind::BugList),
+        ]
+        .into_iter()
+        .collect();
+        let history = json!([{
+            "when": "2026-01-01T00:00:00Z",
+            "who": "a@b",
+            "changes": [
+                { "field_name": "cf_regression_of", "added": "7", "removed": "8" },
+                { "field_name": "cf_regression_of", "added": "0", "removed": "8" },
+                { "field_name": "cf_regression_of", "added": "see 7", "removed": "" },
+                { "field_name": "cf_regression_of", "added": "7, 8", "removed": "" },
+                { "field_name": "cf_build", "added": "8", "removed": "" },
+                { "field_name": "cf_unknown", "added": "8", "removed": "" },
+                { "field_name": "cf_unknown", "added": "fixed in 7, 8", "removed": "" },
+                { "field_name": "cf_related", "added": "7, 8", "removed": "" },
+            ]
+        }]);
+        let ids = Guard::history_bug_ids(&history, BASE, &kinds);
+        assert_eq!(
+            ids.into_iter().collect::<Vec<_>>(),
+            vec![7, 8],
+            "the Bug ID, unknown and Bug List values name ids; Other and text do not"
+        );
+
+        let allowed: BTreeSet<u64> = [7].into_iter().collect();
+        let out = Guard::scrub_history(history, BASE, &allowed, &kinds);
+        assert_eq!(
+            out[0]["changes"],
+            json!([
+                { "field_name": "cf_regression_of", "added": "7", "removed": "" },
+                { "field_name": "cf_regression_of", "added": "0", "removed": "" },
+                { "field_name": "cf_build", "added": "8", "removed": "" },
+                { "field_name": "cf_unknown", "added": "fixed in 7, 8", "removed": "" },
+                { "field_name": "cf_related", "added": "7", "removed": "" },
+            ]),
+            "strict blanks the hidden id and the non-id, lenient keeps text and \
+             scrubs the digit value, Other is untouched, a list is split: {out}"
+        );
+    }
+
+    #[test]
+    fn a_custom_scalar_history_value_is_never_comma_split() {
+        // A Bug ID field holds one id and an unknown field is read as one
+        // scalar, so a comma list names no id at all; split like a core
+        // list, "7, 8" would name 7 and 8.
+        let kinds: BTreeMap<String, CustomFieldKind> =
+            [("cf_regression_of".to_string(), CustomFieldKind::BugId)]
+                .into_iter()
+                .collect();
+        let history = json!([{
+            "when": "2026-01-01T00:00:00Z",
+            "who": "a@b",
+            "changes": [
+                { "field_name": "cf_regression_of", "added": "7, 8", "removed": "" },
+                { "field_name": "cf_unknown", "added": "fixed in 7, 8", "removed": "7,8" },
+            ]
+        }]);
+        assert!(
+            Guard::history_bug_ids(&history, BASE, &kinds).is_empty(),
+            "no comma piece is an id"
+        );
+        let disclosable: BTreeSet<u64> = [7].into_iter().collect();
+        let out = Guard::scrub_history(history, BASE, &disclosable, &kinds);
+        assert_eq!(
+            out[0]["changes"],
+            json!([
+                { "field_name": "cf_unknown", "added": "fixed in 7, 8", "removed": "7,8" },
+            ]),
+            "the strict list is blanked whole and its change dropped, the \
+             lenient values are kept verbatim: {out}"
+        );
+    }
+
+    #[test]
+    fn history_custom_fields_are_collected_by_name() {
+        let history = json!([
+            { "changes": [
+                { "field_name": "cf_build", "added": "1", "removed": "" },
+                { "field_name": "status", "added": "NEW", "removed": "" },
+            ]},
+            { "changes": [
+                { "field_name": "cf_regression_of", "added": "7", "removed": "" },
+                { "field_name": "cf_build", "added": "2", "removed": "1" },
+            ]},
+            { "when": "no changes here" }
+        ]);
+        assert_eq!(
+            Guard::history_custom_fields(&history)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["cf_build".to_string(), "cf_regression_of".to_string()]
+        );
+        assert!(Guard::history_custom_fields(&json!({})).is_empty());
+    }
+
+    #[test]
     fn history_changes_are_edited_down_and_emptied_ones_dropped() {
         let history = json!([
             {
@@ -1328,7 +1540,8 @@ mod tests {
             }
         ]);
         let allowed: BTreeSet<u64> = [10].into_iter().collect();
-        let out = Guard::scrub_history(history, BASE, &allowed);
+        // No kinds: every custom field would be Unknown, and none occur.
+        let out = Guard::scrub_history(history, BASE, &allowed, &BTreeMap::new());
 
         let first = &out[0]["changes"];
         assert_eq!(first[0]["added"], json!("10"), "hidden id 11 removed");
@@ -1353,7 +1566,7 @@ mod tests {
             ]
         }]);
         let allowed: BTreeSet<u64> = [10, 11].into_iter().collect();
-        let out = Guard::scrub_history(history, BASE, &allowed);
+        let out = Guard::scrub_history(history, BASE, &allowed, &BTreeMap::new());
         assert_eq!(
             out[0]["changes"].as_array().map(Vec::len),
             Some(1),
@@ -1378,7 +1591,7 @@ mod tests {
                 { "field_name": "estimated_time", "added": "666", "removed": "0" }
             ]
         }]);
-        let out = Guard::scrub_history(history, BASE, &BTreeSet::new());
+        let out = Guard::scrub_history(history, BASE, &BTreeSet::new(), &BTreeMap::new());
         let changes = out[0]["changes"]
             .as_array()
             .expect("the entry keeps its changes");
@@ -1410,7 +1623,7 @@ mod tests {
                 { "field_name": "cc", "added": "someone@example.com", "removed": "" }
             ]
         }]);
-        let ids = Guard::history_bug_ids(&history, BASE);
+        let ids = Guard::history_bug_ids(&history, BASE, &BTreeMap::new());
         assert_eq!(ids.into_iter().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
     }
 

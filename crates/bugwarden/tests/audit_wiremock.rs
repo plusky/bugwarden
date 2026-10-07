@@ -2585,3 +2585,102 @@ async fn a_protocol_error_records_no_response_size() {
     assert_eq!(tc.outcome.class, OutcomeClass::Error);
     assert_eq!(tc.outcome.response_bytes, None, "absent, not zero");
 }
+
+/// Bug 7's history records a Bug ID custom field change naming the
+/// [`HIDE_SECRET_POLICY`]-hidden bug 666, which costs a field-type lookup
+/// the first time the field is seen, beside a free-text field whose value
+/// happens to be all digits.
+async fn mount_custom_field_link(mock: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [world_bug(7)] })))
+        .mount(mock)
+        .await;
+    let mut secret = world_bug(666);
+    secret["product"] = json!("SecretSauce");
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "666"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [secret] })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/7/history"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": [{ "history": [{
+                "when": "2020-01-02T00:00:00Z",
+                "who": "dev@example.org",
+                "changes": [
+                    { "field_name": "cf_regression_of", "added": "666", "removed": "" },
+                    { "field_name": "cf_build", "added": "777", "removed": "" },
+                ],
+            }] }]
+        })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "fields": [
+                { "name": "cf_regression_of", "type": 6 },
+                { "name": "cf_build", "type": 1 },
+            ]
+        })))
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn bug_history_counts_the_field_type_lookup_in_upstream_requests() {
+    // The lookup runs on the calling task through the client's send choke
+    // point, so the record's `upstream.requests` includes it — measured
+    // against wiremock's own count, as the every-tool walk does. The second
+    // call is answered from the cache and costs exactly one request less.
+    let mock = MockServer::start().await;
+    mount_custom_field_link(&mock).await;
+    let audited = audited_client_for(HIDE_SECRET_POLICY, &mock, "test-key").await;
+
+    let before = upstream_hits(&mock).await;
+    let result = call(&audited.client, "bug_history", json!({ "id": 7 })).await;
+    assert_ne!(result.is_error, Some(true), "the history is served");
+    let hits = upstream_hits(&mock).await - before;
+    assert_eq!(
+        hits, 4,
+        "classify, history, the field-type lookup and link disclosure"
+    );
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(
+        tc.upstream.map_or(0, |u| u.requests) as usize,
+        hits,
+        "the record counts the lookup: {:?}",
+        tc.upstream
+    );
+    let guard = tc.guard.as_ref().expect("guard info recorded");
+    assert_eq!(
+        guard.suppressed_ids,
+        vec![666],
+        "the scrubbed custom field target is in the record, and a free-text \
+         field's digits are not a bug id once its kind is known: {:?}",
+        guard.suppressed_ids
+    );
+    let envelope = serde_json::to_string(&result).unwrap();
+    assert!(
+        envelope.contains("777"),
+        "the free-text change is served: {envelope}"
+    );
+    assert!(
+        !envelope.contains("666"),
+        "and never in the envelope: {envelope}"
+    );
+
+    let before = upstream_hits(&mock).await;
+    let result = call(&audited.client, "bug_history", json!({ "id": 7 })).await;
+    assert_ne!(result.is_error, Some(true), "the history is served again");
+    let hits = upstream_hits(&mock).await - before;
+    assert_eq!(hits, 3, "the cached kind costs no lookup");
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.upstream.map_or(0, |u| u.requests) as usize, hits);
+}

@@ -29,7 +29,10 @@
 //!   the request's reach when looking one up;
 //! - dropping the `cf_` arm from `linked_bug_ids` (a visible Bug ID custom
 //!   field would be blanked) or from `scrub_bug_links` (a hidden one would
-//!   be served), or looking field types up for a body.
+//!   be served), or looking field types up for a body;
+//! - bug_history skipping the field-type lookup, bypassing its cache,
+//!   looking up every field name instead of the `cf_` ones, reading an
+//!   unknown or an Other field as no link, or scrubbing without the kinds.
 
 use std::sync::Arc;
 
@@ -3921,4 +3924,220 @@ async fn quicksearch_projected_bug_id_custom_field_is_scrubbed() {
         Value::Null,
         "the hidden id is blanked from the projection (I14): {served}"
     );
+}
+
+// ---------- Bug ID custom fields (I14 on history) ----------
+
+/// Mount `GET /rest/field/bug` answering like stock Bugzilla's `Bug.fields`:
+/// every requested name in `table` with its type code, or 404 / code 51 for
+/// the whole request on the first name it does not know.
+async fn mount_field_types(mock: &MockServer, table: &[(&'static str, u64)]) {
+    let table: Vec<(&'static str, u64)> = table.to_vec();
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(move |req: &wiremock::Request| {
+            let mut fields = Vec::new();
+            for (_, name) in req.url.query_pairs().filter(|(k, _)| k == "names") {
+                match table.iter().find(|(n, _)| *n == name) {
+                    Some((n, t)) => fields.push(json!({ "name": n, "type": t })),
+                    None => {
+                        return ResponseTemplate::new(404).set_body_json(json!({
+                            "error": true,
+                            "code": 51,
+                            "message": format!("There is no field named '{name}'."),
+                        }));
+                    }
+                }
+            }
+            ResponseTemplate::new(200).set_body_json(json!({ "fields": fields }))
+        })
+        .mount(mock)
+        .await;
+}
+
+/// The `names` each `/rest/field/bug` request asked for, in arrival order.
+async fn field_lookups(mock: &MockServer) -> Vec<Vec<String>> {
+    mock.received_requests()
+        .await
+        .expect("wiremock records requests by default")
+        .iter()
+        .filter(|r| r.url.path() == "/rest/field/bug")
+        .map(|r| {
+            r.url
+                .query_pairs()
+                .filter(|(k, _)| k == "names")
+                .map(|(_, v)| v.into_owned())
+                .collect()
+        })
+        .collect()
+}
+
+/// Mount bug 7's classify fetch, a world-readable bug 8, a policy-hidden
+/// bug 9 (disclosure fetches for `9` alone and for `8,9`), and a history of
+/// bug 7 holding `changes`.
+async fn mount_history_naming_hidden_9(mock: &MockServer, changes: Value) {
+    mount_bug_and_padding(mock, world_readable_bug(7)).await;
+    let mut secret = world_readable_bug(9);
+    secret["product"] = json!("SecretSauce");
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [secret.clone()] })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "8,9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": [world_readable_bug(8), secret]
+        })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/7/history"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": [{ "id": 7, "history": [{
+                "when": "2020-01-01T00:00:00Z",
+                "who": "dev@example.org",
+                "changes": changes,
+            }] }]
+        })))
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn bug_history_scrubs_a_bug_id_custom_field_change_and_keeps_other_kinds() {
+    // A change to a Bug ID custom field names another bug exactly as a
+    // depends_on change does. The field's kind is learned by name: the
+    // type-6 change naming the hidden 9 is dropped and the one naming the
+    // visible 8 kept, the same "9" under a free-text field is kept, and the
+    // lookup asks for exactly the cf_ names the history carries.
+    let mock = MockServer::start().await;
+    mount_history_naming_hidden_9(
+        &mock,
+        json!([
+            { "field_name": "cf_regression_of", "removed": "", "added": "9" },
+            { "field_name": "cf_regression_of", "removed": "9", "added": "8" },
+            { "field_name": "cf_build", "removed": "", "added": "9" },
+            { "field_name": "status", "removed": "NEW", "added": "CONFIRMED" },
+        ]),
+    )
+    .await;
+    mount_field_types(&mock, &[("cf_regression_of", 6), ("cf_build", 1)]).await;
+    let client = client_for(HIDE_SECRET_POLICY, &mock).await;
+
+    let served = call(&client, "bug_history", json!({ "id": 7 })).await;
+    assert!(
+        !is_error(&served),
+        "the history is served: {}",
+        text_of(&served)
+    );
+    assert_eq!(
+        history_json(&served)[0]["changes"],
+        json!([
+            { "field_name": "cf_regression_of", "removed": "", "added": "8" },
+            { "field_name": "cf_build", "removed": "", "added": "9" },
+            { "field_name": "status", "removed": "NEW", "added": "CONFIRMED" },
+        ]),
+        "the Bug ID change naming only the hidden bug is dropped, the one \
+         naming the visible bug is edited down to it, and the free-text \
+         digits are kept (I14)"
+    );
+    let mut asked = field_lookups(&mock).await;
+    assert_eq!(asked.len(), 1, "one lookup for the whole history");
+    asked[0].sort();
+    assert_eq!(
+        asked[0],
+        vec!["cf_build".to_string(), "cf_regression_of".to_string()],
+        "exactly the history's cf_ names are looked up"
+    );
+}
+
+#[tokio::test]
+async fn bug_history_fails_closed_when_the_type_lookup_fails() {
+    // With every kind unknown, a cf_ value that is all digits is judged as
+    // a bug id — scrubbed unless disclosable — and free text is kept
+    // verbatim: an unanswered lookup narrows what is served, never widens.
+    let mock = MockServer::start().await;
+    mount_history_naming_hidden_9(
+        &mock,
+        json!([
+            { "field_name": "cf_regression_of", "removed": "", "added": "9" },
+            { "field_name": "cf_build", "removed": "", "added": "9" },
+            { "field_name": "cf_notes", "removed": "", "added": "fixed in 9" },
+        ]),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let client = client_for(HIDE_SECRET_POLICY, &mock).await;
+
+    let served = call(&client, "bug_history", json!({ "id": 7 })).await;
+    assert!(
+        !is_error(&served),
+        "a failed lookup does not fail the call: {}",
+        text_of(&served)
+    );
+    assert_eq!(
+        history_json(&served)[0]["changes"],
+        json!([
+            { "field_name": "cf_notes", "removed": "", "added": "fixed in 9" },
+        ]),
+        "both digit values are scrubbed and the free text kept (I4)"
+    );
+}
+
+#[tokio::test]
+async fn bug_history_without_custom_field_changes_makes_no_lookup() {
+    let mock = MockServer::start().await;
+    mount_history_window_fixture(&mock, five_history_entries()).await;
+    mount_no_field_lookup(&mock).await;
+    let client = client_for("", &mock).await;
+
+    let served = call(&client, "bug_history", json!({ "id": 7 })).await;
+    assert!(!is_error(&served), "{}", text_of(&served));
+    assert_eq!(history_json(&served).as_array().map(Vec::len), Some(5));
+}
+
+#[tokio::test]
+async fn bug_history_looks_a_custom_field_up_once_per_process() {
+    // A field's kind is instance schema: the first history naming it pays
+    // the lookup, the next is answered from the cache.
+    let mock = MockServer::start().await;
+    mount_history_window_fixture(
+        &mock,
+        json!([{
+            "when": "2020-01-01T00:00:00Z",
+            "who": "dev@example.org",
+            "changes": [
+                { "field_name": "cf_build", "removed": "", "added": "20200101" },
+            ],
+        }]),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "fields": [{ "name": "cf_build", "type": 1 }]
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let client = client_for("", &mock).await;
+
+    for _ in 0..2 {
+        let served = call(&client, "bug_history", json!({ "id": 7 })).await;
+        assert!(!is_error(&served), "{}", text_of(&served));
+        assert_eq!(
+            history_json(&served)[0]["changes"][0]["added"],
+            json!("20200101"),
+            "a free-text field's digits are not a bug id once its kind is known"
+        );
+    }
+    assert_eq!(field_lookups(&mock).await.len(), 1);
 }
