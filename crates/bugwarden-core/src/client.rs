@@ -576,6 +576,34 @@ impl BugzillaClient {
         }
     }
 
+    /// GET `/rest/field/bug?names=..&include_fields=name,type`: the type
+    /// of each named field, as the `{"fields": [{"name", "type"}, ..]}`
+    /// envelope Bugzilla returns it in, with `type` the integer code.
+    ///
+    /// By name rather than the whole list: Bugzilla computes the legal
+    /// values of every select and product-specific field server-side and
+    /// `include_fields` only filters the output, so a large instance
+    /// answers the full list slower than this client's timeout. `names`
+    /// travel as repeated query parameters, each percent-encoded by
+    /// reqwest; `Bugzilla::CGI`'s tied-hash `FETCH` hands a repeated
+    /// parameter to `Bug.fields` as a list.
+    ///
+    /// # Errors
+    ///
+    /// An empty `names` is refused before any request — it would address
+    /// the whole catalog. One name Bugzilla does not know fails the whole
+    /// request (HTTP 404, Bugzilla code 51), and transport and HTTP
+    /// failures fail as the other GETs here do.
+    pub async fn bug_field_types(&self, key: &str, names: &[&str]) -> Result<Value> {
+        if names.is_empty() {
+            bail!("no bug field names to look up");
+        }
+        let mut query: Vec<(&str, String)> =
+            names.iter().map(|n| ("names", (*n).to_string())).collect();
+        query.push(("include_fields", "name,type".to_string()));
+        self.get_json(key, "/field/bug", &query).await
+    }
+
     /// GET `{base_url}/page.cgi?id=quicksearch.html` — the quicksearch
     /// syntax documentation page. This is a plain HTML page, not a REST
     /// endpoint, and needs no authentication: no API key is attached.

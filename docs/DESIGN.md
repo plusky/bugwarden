@@ -158,6 +158,7 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
 ```rust
 // src/lib.rs
 pub mod client;
+pub mod custom_fields;
 pub mod guard;
 pub mod policy;
 ```
@@ -542,6 +543,60 @@ impl Guard {
 }
 ```
 
+### src/custom_fields.rs
+
+Bugzilla custom field types, learned BY NAME and cached for the process. A
+"Bug ID" custom field (`cf_*`, field type 6) links to another bug exactly
+as `depends_on` does, so a history change to one, or a write naming one,
+needs the treatment the named link fields get (I14, I8); which `cf_`
+names are of that type is instance schema. The whole field list is not
+fetched: Bugzilla computes the legal values of every select and
+product-specific field server-side and `include_fields` filters only the
+output, so a large instance (measured on bugzilla.suse.com, Bugzilla 5.0:
+~35 s) answers the full list slower than the client's 30 s timeout, while
+`?names=a&names=b&include_fields=name,type` answers in a fraction of a
+second. Bugzilla reads repeated `names` keys as a list — `Bugzilla::CGI`
+overrides the tied-hash `FETCH` behind `$cgi->Vars` to return an arrayref
+for a repeated parameter, and `Bug.fields`' `validate` wraps a lone value —
+resolves each with `Bugzilla::Field->check`, and one unknown name fails the
+whole request (HTTP 404, code 51).
+
+```rust
+pub enum CustomFieldKind { BugId /* 6 */, BugList /* 22 (BMO), and 7 */, Other, Unknown }
+impl CustomFieldKind {
+    pub fn may_link(self) -> bool; // everything but Other: Unknown fails closed (I4)
+}
+
+/// Default = empty, no I/O. A std::sync::Mutex around a BTreeMap, never held
+/// across an .await: concurrent lookups of one name both ask, harmlessly.
+pub struct FieldTypeCache { /* known: Mutex<BTreeMap<String, CustomFieldKind>> */ }
+impl FieldTypeCache {
+    /// Cached names answered locally; the rest looked up with the caller's
+    /// key in batches of at most 50 names (LOOKUP_CHUNK) per GET. Every
+    /// name has an entry. A name the lookup could not settle — a failed
+    /// or 404/51 batch, a name a 200 omits, an unreadable `type` — is
+    /// Unknown and NOT cached, so a later call asks again; a failed batch
+    /// is warn-logged without its message (HTTP status, Bugzilla code, batch
+    /// size — a 404/51 message echoes a client-chosen name), the message at
+    /// debug through QuotedError. No request when all are cached.
+    pub async fn kinds(&self, bz: &BugzillaClient, key: &str, names: &BTreeSet<String>)
+        -> BTreeMap<String, CustomFieldKind>;
+    /// Every name looked up afresh and the cache refreshed with the answer:
+    /// a write judges the field as it is now, not as an earlier read saw it.
+    pub async fn kinds_fresh(&self, bz: &BugzillaClient, key: &str, names: &BTreeSet<String>)
+        -> BTreeMap<String, CustomFieldKind>;
+}
+```
+
+A `type` is read as an integer or a digit string; 6 is `BugId`, 22 (BMO)
+and 7 are `BugList` — neither can be a working custom field: the stock
+admin dropdown offers 1-6, 9 and 10, BMO's lists 7 and 22 too, but
+`Field::create` adds a `bugs` column only for types in `SQL_DEFINITIONS`,
+which omits both (BMO's type 22 backs core fields only), so the mapping
+costs nothing — and every other readable code is `Other`. An entry the
+caller did not ask for is ignored, and a name listed twice reads as a link
+if any of its entries does.
+
 ### src/client.rs
 
 ```rust
@@ -571,6 +626,7 @@ impl BugzillaClient {
     pub async fn enterable_product_ids(&self, key: &str) -> anyhow::Result<Vec<u64>>; // .ids, string or number, both accepted
     pub async fn products(&self, key: &str, ids: &[u64], names: &[&str], include_fields: Option<&[&str]>) -> anyhow::Result<serde_json::Value>;
     pub async fn bug_fields(&self, key: &str, name: Option<&str>) -> anyhow::Result<serde_json::Value>; // name is percent-encoded as one path segment
+    pub async fn bug_field_types(&self, key: &str, names: &[&str]) -> anyhow::Result<serde_json::Value>; // names as repeated query keys; empty = error, no request
 }
 
 /// A refusal Bugzilla returned over a completed exchange, carried inside anyhow: `err.downcast_ref::<BugzillaError>()`.
@@ -605,6 +661,7 @@ Endpoint mapping:
 | enterable_product_ids | GET /rest/product_enterable | `.ids` as `Vec<u64>`; every element must parse as a numeric string or a JSON number, else error |
 | products | GET /rest/product?ids=..&names=..[&include_fields=..] (any of the three may be empty/absent) | whole envelope (`{"products":[..]}`), raw — no local projection at this layer |
 | bug_fields | GET /rest/field/bug, or /rest/field/bug/{name} with `name` percent-encoded as one path segment (`Url::path_segments_mut`, never string-interpolated); a `name` that is `.` or `..`, or holds a tab, CR or LF, is an error and sends nothing, because `path_segments_mut` drops or resolves a dot segment and strips those three characters rather than encoding them — `.` and `..` would address the whole catalog, `\t..` `/rest/field/`, `prod\tuct` the `product` field; an empty `name` is refused with them, though it only appends a trailing slash that matches neither Bugzilla 5.0 REST route (`^/field/bug$`, `^/field/bug/([^/]+)$`) | whole envelope (`{"fields":[..]}`) |
+| bug_field_types | GET /rest/field/bug?names=\<a\>&names=\<b\>&include_fields=name,type — one `names` key per field, percent-encoded by reqwest, which Bugzilla reads as a list; an empty `names` is refused before any request, since it would address the whole catalog (and on a large instance take longer than the client's timeout, see `custom_fields`); a name Bugzilla does not know fails the WHOLE request (HTTP 404, code 51) | whole envelope (`{"fields":[{"name","type"},..]}`), `type` the integer code |
 
 Auth per request: `use_auth_header` ? header `Authorization: Bearer {key}` :
 query param `api_key={key}`. Always `Accept: application/json`.
@@ -1091,7 +1148,7 @@ constraints the model must know.
 | bug_url | bug_id | none (I8 exception) | `{base_url}/show_bug.cgi?id={id}` |
 | bugzilla_server_info | — | none | client.server_info |
 | bugzilla_products | products?: Vec<String> (max 5) | none — present only when `global.allow_discovery = true` (I16) | no `products` named: `enterable_product_ids` then `products(ids, [], [id,name])`, projected to `{id, name}` catalog entries; `products` named: `products([], names, None)`, projected to `{name, description, is_active, default_milestone, has_unconfirmed, components[{name,description,is_active}], versions[{name,is_active}], milestones[{name,is_active}]}` — `default_assigned_to`/`default_qa_contact` are never selected. Over-cap (>5 names) refuses with a fixed text and makes ZERO upstream requests, since the refusal is a pure function of the request's own shape |
-| bug_fields | field_names?: Vec<String> (max 5), on_bug_entry_only: bool = false | none — present only when `global.allow_discovery = true` (I16) | no `field_names`: `bug_fields(None)`, projected per field to `{name, display_name, type, is_custom, is_mandatory, is_on_bug_entry, visibility_field, visibility_values, has_values}` — NEVER `values` — optionally filtered to `is_on_bug_entry` fields; `field_names` named: one `bug_fields(Some(name))` call per name (sequential; Bugzilla's field lookup is single-field), same projection plus `values` as `[{name, is_open?, can_change_to?}]` — `is_open` and `can_change_to: [{name, comment_required}]` present exactly when the upstream value carries them (only `bug_status` does today), omitted rather than `null` on every other field, reported exactly as Bugzilla gave it (I16). Over-cap (>5 names) refuses with a fixed text and makes ZERO upstream requests. A named field Bugzilla does not recognise is a call-level failure (the generic `Failed to fetch bug fields` text), not a partial result; so is a name that cannot survive being resolved into a path segment (`.`, `..`, or holding a tab, CR or LF), and the empty name with them — see `bug_fields` under the client's endpoint mapping — all refused by the client before any request for that name |
+| bug_fields | field_names?: Vec<String> (max 5), on_bug_entry_only: bool = false | none — present only when `global.allow_discovery = true` (I16) | no `field_names`: `bug_fields(None)`, projected per field to `{name, display_name, type, is_custom, is_mandatory, is_on_bug_entry, visibility_field, visibility_values, has_values}` — NEVER `values` — optionally filtered to `is_on_bug_entry` fields; `field_names` named: one `bug_fields(Some(name))` call per name (sequential, one `/rest/field/bug/{name}` path request per name; the `names=` query form `bug_field_types` uses would batch them, but discovery keeps the per-field path form), same projection plus `values` as `[{name, is_open?, can_change_to?}]` — `is_open` and `can_change_to: [{name, comment_required}]` present exactly when the upstream value carries them (only `bug_status` does today), omitted rather than `null` on every other field, reported exactly as Bugzilla gave it (I16). Over-cap (>5 names) refuses with a fixed text and makes ZERO upstream requests. A named field Bugzilla does not recognise is a call-level failure (the generic `Failed to fetch bug fields` text), not a partial result; so is a name that cannot survive being resolved into a path segment (`.`, `..`, or holding a tab, CR or LF), and the empty name with them — see `bug_fields` under the client's endpoint mapping — all refused by the client before any request for that name |
 | quicksearch_syntax | — | none | HTML doc page |
 | mcp_server_info | — | none | name (CARGO_PKG_NAME) and version (CARGO_PKG_VERSION), the same two the handshake sends; bugzilla server url, transport, and policy summary per I1 |
 | summarize_bug | id | comments | fetches comments (private filtered with include_private=false), returns the summarization prompt text (fixed prompt template) |
@@ -3614,6 +3671,22 @@ wired, `server.rs` and `main.rs` are the reference.
   absent from a valid_login transport error (I12), and
   resolve_caller under `identity_source = "declared"` costing ZERO HTTP
   requests to either endpoint for one tool call.
+- Unit tests (#[cfg(test)] in crates/bugwarden-core/src/custom_fields.rs)
+  and integration tests (crates/bugwarden-core/tests/custom_fields_wiremock.rs,
+  wiremock): the `type` code mapping — 6 is BugId, 22 and 7 are BugList, 1
+  and 2 are Other, a digit string reads like a number, a missing or
+  unreadable type and a name the answer omits settle nothing, an entry
+  nobody asked for is ignored, and a name listed twice links if any entry
+  does; only Other cannot link (Unknown fails closed); and the lookup on
+  the wire — it asks for exactly the given names as repeated `names` keys
+  plus `include_fields=name,type`, a repeat is answered from the cache and
+  a widened set looks up only its new name, a 500 and a 404/code-51 batch
+  leave every name of that batch Unknown and uncached so the next call
+  asks again, a name a 200 omits is Unknown and asked again while its
+  answered sibling is cached, 60 names go out as 50 + 10 with every name
+  asked exactly once, the fresh variant requests despite the cache and
+  refreshes it, an empty name list is refused with `expect(0)` requests,
+  and no error text carries the API key (I12).
 - Integration tests (crates/bugwarden/tests/tools_wiremock.rs, wiremock +
   rmcp client over an in-memory duplex transport): the tools are CALLED
   through a real MCP session, so a tool that stops calling its guard fails
