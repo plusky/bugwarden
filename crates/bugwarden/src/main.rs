@@ -450,7 +450,7 @@ const INPUT_STREAM_FAILED: &str = "the input stream failed before initialize";
 /// A fixed, server-authored classification of a failed stdio handshake —
 /// the only thing either exit path may say about one (#261).
 ///
-/// rmcp 3.4.1's `ServerInitializeError`
+/// rmcp 3.5.0's `ServerInitializeError`
 /// (`service/server.rs:83-105`, `#[non_exhaustive]`) puts the client's
 /// whole first frame into `ExpectedInitializeRequest`, and its
 /// `#[error("expect initialized request, but received: {0:?}")]` puts it
@@ -464,7 +464,7 @@ const INPUT_STREAM_FAILED: &str = "the input stream failed before initialize";
 /// Every arm returns a literal, so both lines are bounded by this file. The
 /// frame's KIND is named because it is the diagnostic an operator needs and
 /// it comes from the enum, not from the frame; the method name is NOT,
-/// because `ClientRequest::CustomRequest` (`model.rs:986`) holds a
+/// because `ClientRequest::CustomRequest` (`model.rs:1027`) holds a
 /// free-form `method: String` and rmcp's untagged deserialization routes
 /// every unrecognised method there — naming it would put client bytes back
 /// into the line this exists to bound. `ConnectionClosed`'s payload is the
@@ -498,7 +498,7 @@ fn serve_failure(error: &rmcp::service::ServerInitializeError) -> &'static str {
             Frame::Response(_) => "the first frame was a response, not initialize",
             Frame::Error(_) => "the first frame was an error reply, not initialize",
         },
-        // Unreachable on rmcp 3.4.1: both construction sites pass `Some`.
+        // Unreachable on rmcp 3.5.0: both construction sites pass `Some`.
         Failure::ExpectedInitializeRequest(None) => "no first frame was received",
         // EOF before initialize. A read error and this build's own
         // frame-cap refusal reach the same variant; the caller names

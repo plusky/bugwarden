@@ -1000,7 +1000,7 @@ async fn an_over_long_request_id_is_cut_at_the_sink() {
 /// bytes this workspace never formats — which is where a level filter
 /// would have been the wrong fix and the sink is the right one.
 ///
-/// `service.rs:1569` logs the whole request at debug, `params` and every
+/// `service.rs:1563` logs the whole request at debug, `params` and every
 /// argument included. `transport/async_rw.rs:335` logs the whole
 /// UNPARSABLE line at debug, once per malformed line — and it is the
 /// `message` field, so only a sink that budgets `message` bounds it.
