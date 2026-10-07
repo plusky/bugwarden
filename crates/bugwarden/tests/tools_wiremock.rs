@@ -26,7 +26,10 @@
 //! - forwarding Bugzilla's message from any of the seven bug-update tools'
 //!   failure arms, or dropping the hint a listed code selects;
 //! - keying the hint lookup on the HTTP status, or ignoring the tool or
-//!   the request's reach when looking one up.
+//!   the request's reach when looking one up;
+//! - dropping the `cf_` arm from `linked_bug_ids` (a visible Bug ID custom
+//!   field would be blanked) or from `scrub_bug_links` (a hidden one would
+//!   be served), or looking field types up for a body.
 
 use std::sync::Arc;
 
@@ -3813,4 +3816,109 @@ async fn an_unassessed_request_gets_no_hint_but_the_product_one() {
     )
     .await;
     assert_eq!(text, "Failed to mark as duplicate");
+}
+
+// ---------- Bug ID custom fields (I14 on bodies) ----------
+
+/// Mount `GET /rest/field/bug` expecting it never to be hit: a served body
+/// is judged by JSON type and must not trigger a field-type lookup.
+async fn mount_no_field_lookup(mock: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "fields": [] })))
+        .expect(0)
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn bug_info_scrubs_a_bug_id_custom_field_naming_a_hidden_bug() {
+    // A "Bug ID" custom field is a link like depends_on. Stock Bugzilla
+    // renders exactly that custom type as a JSON number and every other one
+    // as a string (or a string list), so a body is judged by JSON type: the
+    // hidden 9 is blanked, the visible 8 is kept, a digit string stays text,
+    // and no field-type lookup is made for a body.
+    let mock = MockServer::start().await;
+    let mut linked = world_readable_bug(7);
+    linked["cf_regression_of"] = json!(9);
+    linked["cf_fixed_by"] = json!(8);
+    linked["cf_related"] = json!([8, 9, "n/a"]);
+    linked["cf_build"] = json!("9");
+    mount_bug_and_padding(&mock, linked).await;
+    let mut secret = world_readable_bug(9);
+    secret["product"] = json!("SecretSauce");
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "8,9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": [world_readable_bug(8), secret]
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    mount_no_field_lookup(&mock).await;
+    let client = client_for(HIDE_SECRET_POLICY, &mock).await;
+
+    let served = call(&client, "bug_info", json!({ "bug_ids": [7] })).await;
+    assert!(!is_error(&served), "bug 7 is served: {}", text_of(&served));
+    let parsed: Value = serde_json::from_str(&text_of(&served)).expect("bug_info returns JSON");
+    let bug = &parsed["bugs"][0];
+    assert_eq!(bug["id"], json!(7));
+    assert_eq!(
+        bug["cf_regression_of"],
+        Value::Null,
+        "a hidden bug id in a custom field is blanked (I14): {bug}"
+    );
+    assert_eq!(bug["cf_fixed_by"], json!(8), "a disclosable one is kept");
+    assert_eq!(
+        bug["cf_related"],
+        json!([8, "n/a"]),
+        "hidden number items go, string items stay"
+    );
+    assert_eq!(
+        bug["cf_build"],
+        json!("9"),
+        "a digit string is text, not a link"
+    );
+}
+
+#[tokio::test]
+async fn quicksearch_projected_bug_id_custom_field_is_scrubbed() {
+    // The client picks the projection, so it can ask for a Bug ID custom
+    // field and read hidden ids out of a search wholesale. The projected
+    // body takes the same JSON-type rule as bug_info, again with no
+    // field-type lookup.
+    let mock = MockServer::start().await;
+    let mut secret = world_readable_bug(9);
+    secret["product"] = json!("SecretSauce");
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [secret] })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    mount_no_field_lookup(&mock).await;
+    let mut linked = world_readable_bug(101);
+    linked["cf_regression_of"] = json!(9);
+    mount_search(&mock, vec![linked]).await;
+    let client = client_for(HIDE_SECRET_POLICY, &mock).await;
+
+    let served = quicksearch_json_args(
+        &client,
+        json!({ "query": "kernel", "include_fields": "id,cf_regression_of" }),
+    )
+    .await;
+    let bug = &served["bugs"][0];
+    assert_eq!(bug["id"], json!(101));
+    assert!(
+        bug.as_object()
+            .is_some_and(|o| o.contains_key("cf_regression_of")),
+        "the projected field is still present: {served}"
+    );
+    assert_eq!(
+        bug["cf_regression_of"],
+        Value::Null,
+        "the hidden id is blanked from the projection (I14): {served}"
+    );
 }

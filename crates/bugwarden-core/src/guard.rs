@@ -509,6 +509,17 @@ impl Guard {
                     .filter_map(|e| Self::see_also_local_id(e, base_url)),
             );
         }
+        // Stock Bugzilla renders a Bug ID custom field as a JSON number and
+        // every other custom type as a string or a string list, so a number
+        // under a `cf_` key is a link, judged without any field lookup.
+        if let Some(obj) = bug.as_object() {
+            for (_, v) in obj.iter().filter(|(k, _)| k.starts_with("cf_")) {
+                match v {
+                    Value::Array(items) => out.extend(items.iter().filter_map(Value::as_u64)),
+                    v => out.extend(v.as_u64()),
+                }
+            }
+        }
         out
     }
 
@@ -591,6 +602,19 @@ impl Guard {
                         .is_none_or(|id| disclosable.contains(&id))
                 })
             });
+        }
+        // The JSON-type rule of linked_bug_ids: a number under a `cf_` key
+        // is a link and a string is not, so strings are left alone.
+        for (_, slot) in obj.iter_mut().filter(|(k, _)| k.starts_with("cf_")) {
+            match slot {
+                Value::Array(items) => items.retain(|v| {
+                    !v.is_number() || v.as_u64().is_some_and(|id| disclosable.contains(&id))
+                }),
+                Value::Number(_) if !slot.as_u64().is_some_and(|id| disclosable.contains(&id)) => {
+                    *slot = Value::Null;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1243,6 +1267,45 @@ mod tests {
             "local hidden bug dropped, foreign tracker kept"
         );
         assert_eq!(bug["id"], json!(1), "the bug's own id is untouched");
+    }
+
+    #[test]
+    fn any_json_number_in_a_cf_field_is_a_link() {
+        // Bodies are judged by JSON type: stock Bugzilla renders only a Bug
+        // ID custom field as a number, and every other custom type as a
+        // string or a string list, so no field-type lookup is needed and a
+        // digit string is text whatever it says.
+        let mut bug = json!({
+            "id": 1,
+            "cf_regression_of": 9,
+            "cf_fixed_by": 8,
+            "cf_related": [8, 9, "n/a"],
+            "cf_build": "9",
+            "cf_notes": "see 9",
+        });
+        let ids = Guard::linked_bug_ids(&bug, BASE);
+        assert_eq!(
+            ids.into_iter().collect::<Vec<_>>(),
+            vec![8, 9],
+            "the numbers are candidate links, the strings are not"
+        );
+
+        let allowed: BTreeSet<u64> = [8].into_iter().collect();
+        Guard::scrub_bug_links(&mut bug, BASE, &allowed);
+        assert_eq!(
+            bug["cf_regression_of"],
+            Value::Null,
+            "a hidden scalar is blanked"
+        );
+        assert_eq!(bug["cf_fixed_by"], json!(8), "a disclosable scalar is kept");
+        assert_eq!(
+            bug["cf_related"],
+            json!([8, "n/a"]),
+            "hidden number items go, string items stay"
+        );
+        assert_eq!(bug["cf_build"], json!("9"), "a string is never an id");
+        assert_eq!(bug["cf_notes"], json!("see 9"));
+        assert_eq!(bug["id"], json!(1));
     }
 
     #[test]

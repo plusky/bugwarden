@@ -59,9 +59,15 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
   readable metadata would: it satisfies no granting rule, and it does not let
   a bug slip past a consulted rule that would otherwise have caught it.
 - **I14** A bug id the policy would deny must not appear inside something the
-  client IS shown: dependency/duplicate/see_also fields of a served bug,
-  history changes naming other bugs, or Bugzilla's auto-generated duplicate
-  marker comments. The bar is `Capability::Summary` — the same one the write
+  client IS shown: dependency/duplicate/see_also fields and Bug ID custom
+  fields (`cf_*` of Bugzilla field type 6) of a served bug, history changes
+  naming other bugs, or Bugzilla's auto-generated duplicate marker
+  comments. A served BODY judges a custom field by JSON type, with no field
+  lookup: stock Bugzilla 5.0, 5.2 and BMO render a Bug ID custom field as a
+  JSON number and every other custom type — Integer included — as a string
+  or a string list (`_bug_to_hash`, BMO's `_format_cf_value`), so a number
+  under a `cf_` key is a link and a string is not, whatever it says. The
+  bar is `Capability::Summary` — the same one the write
   paths apply before CREATING such a link (I8/I11: dependency targets,
   `duplicate_of`, and the local-instance targets of `update_bug_fields`'
   `see_also_add`/`see_also_remove`), since a link read out and a link
@@ -81,11 +87,13 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
   `is_id_bearing_history_field` decides what gets scrubbed; the
   duplicate-marker match covers both stock templates but not
   localised/customised ones; an instance reachable under a second
-  hostname is not recognised in see_also (scheme and case are); and a
-  write Bugzilla refuses because of a hidden bug — a dependency loop
-  running through one, say — still fails where the same write would
-  otherwise succeed, which is one bit per attempt, paid for with a real
-  write on an assessed bug, and the fixed failure text adds nothing to it.
+  hostname is not recognised in see_also (scheme and case are); a
+  fork that renders a Bug ID custom field as a string escapes the body
+  rule, which judges by JSON type; and a write Bugzilla refuses because
+  of a hidden bug — a dependency loop running through one, say — still
+  fails where the same write would otherwise succeed, which is one bit
+  per attempt, paid for with a real write on an assessed bug, and the
+  fixed failure text adds nothing to it.
 - **I5** Private content (`is_private: true`) is returned only when policy
   `global.allow_private_comments = true` AND the call sets
   `include_private = true`. This one switch governs private comments,
@@ -425,7 +433,9 @@ impl Guard {
     // I14 link scrubbing. Candidate ids come from Bugzilla, not the client,
     // so ONE batched classify (bounded, and always issued — an empty set
     // still costs a request, or "no links" and "all links hidden" differ by
-    // the clock). Summary bar, the same one the write paths use.
+    // the clock). Summary bar, the same one the write paths use. Besides
+    // the named fields, every JSON number under a `cf_` key of a body is a
+    // link (a Bug ID custom field; strings are never ids), with no lookup.
     pub const LINKED_ID_FIELDS: &[&str];
     pub async fn disclosable(&self, bz: &BugzillaClient, key: &str,
         ids: &BTreeSet<u64>, caller: Option<&str>) -> BTreeSet<u64>;
@@ -3486,7 +3496,11 @@ wired, `server.rs` and `main.rs` are the reference.
   is disclosable and blanked outright when it is no id at all, looped over
   the constant so a field added to it later is covered too (served
   counterpart in `tools_wiremock.rs`; the arm was the fail-open half of
-  #244).
+  #244), and every JSON number under a `cf_` key of a body is a link while
+  a string is not (`any_json_number_in_a_cf_field_is_a_link`: a hidden
+  scalar becomes null, a disclosable one is kept, hidden number items are
+  dropped from a list and string items stay, a digit string is untouched,
+  and `linked_bug_ids` collects the numbers only).
 - Unit tests (#[cfg(test)] in crates/bugwarden-core/src/client.rs): a 400
   with code 114 is a `BugzillaError` whose code and status downcast and whose
   Display is the unchanged text; the code is read only inside an
@@ -3660,7 +3674,12 @@ wired, `server.rs` and `main.rs` are the reference.
   classify mock's expect(1) proves it), `see_also` inside `custom_fields` still
   errors on the `cf_` gate (I7) with zero upstream requests, and an
   all-empty call errors "At least one field must be specified" without
-  contacting Bugzilla; and identity end to end —
+  contacting Bugzilla; Bug ID custom fields on served bodies (I14) —
+  bug_info blanks a hidden `cf_*` number, keeps a visible one and leaves a
+  digit string alone, and a bugs_quicksearch projection naming such a
+  field is blanked the same way, both with `expect(0)` on
+  `/rest/field/bug` (a body is judged by JSON type and never looks a field
+  type up); and identity end to end —
   issue #33's exact scenario (a my-own-reports restrict rule above a
   group_restricted deny: with whoami answering the caller, a
   group-restricted bug the caller authored is readable through bug_info
