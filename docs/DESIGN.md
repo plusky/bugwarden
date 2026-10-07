@@ -547,6 +547,14 @@ impl BugzillaClient {
     pub async fn products(&self, key: &str, ids: &[u64], names: &[&str], include_fields: Option<&[&str]>) -> anyhow::Result<serde_json::Value>;
     pub async fn bug_fields(&self, key: &str, name: Option<&str>) -> anyhow::Result<serde_json::Value>; // name is percent-encoded as one path segment
 }
+
+/// A refusal Bugzilla returned over a completed exchange, carried inside anyhow: `err.downcast_ref::<BugzillaError>()`.
+pub struct BugzillaError { /* http_status: u16, code: Option<i64>, message: String — all private, no message accessor */ }
+impl BugzillaError {
+    pub fn http_status(&self) -> u16;
+    pub fn code(&self) -> Option<i64>; // the error envelope's integer `code`; None for a non-2xx without one, a non-JSON body, a string or float code
+}
+// Display: "bugzilla error (HTTP {status}): {message}"; Debug: status and code only, never the message; impl std::error::Error.
 ```
 
 Endpoint mapping:
@@ -575,9 +583,17 @@ Endpoint mapping:
 
 Auth per request: `use_auth_header` ? header `Authorization: Bearer {key}` :
 query param `api_key={key}`. Always `Accept: application/json`.
-Errors: non-2xx status or body `{"error": true}` => anyhow error containing the
-HTTP status and Bugzilla `message` field; reqwest errors sanitized with
-`.without_url()` (I12).
+Errors: a non-2xx status, a body `{"error": true}` under any status, or a
+2xx body that is not JSON => a `BugzillaError` inside anyhow. Its Display is
+`bugzilla error (HTTP {status}): {message}` — the text the untyped error
+carried before it was typed, so every pin on it stands; its `code()` is the
+envelope's integer `code`, read only inside an `"error": true` body (a
+proxy's non-2xx JSON, a string code and a float code give `None`); its Debug
+omits the message, which echoes client input and can name hidden bugs — log
+it through `QuotedError`, never put it in a tool result. A transport or
+body-read failure is a reqwest error sanitized with `.without_url()` (I12)
+and is never a `BugzillaError`, so a downcast separates "Bugzilla refused"
+from "Bugzilla never answered".
 
 **TLS stack and outbound network behavior.** `reqwest = { version = "0.13",
 default-features = false, features = ["json", "query", "rustls",
@@ -3260,6 +3276,13 @@ wired, `server.rs` and `main.rs` are the reference.
   the constant so a field added to it later is covered too (served
   counterpart in `tools_wiremock.rs`; the arm was the fail-open half of
   #244).
+- Unit tests (#[cfg(test)] in crates/bugwarden-core/src/client.rs): a 400
+  with code 114 is a `BugzillaError` whose code and status downcast and whose
+  Display is the unchanged text; the code is read only inside an
+  `"error": true` envelope (a proxy's non-2xx JSON, a string code and a float
+  code give none); a gateway's HTML under 502 and a 200 non-JSON body are
+  typed with no code; and neither the type's Debug nor anyhow's alternate
+  Debug carries the message.
 - Unit tests (#[cfg(test)] in crates/bugwarden/src/server.rs): assemble_bug_info
   re-classification — a body embargoed after the verdict is refused, a body
   that now earns only summary is downgraded, a body granting neither read nor
@@ -3315,7 +3338,10 @@ wired, `server.rs` and `main.rs` are the reference.
   assess() deny for embargoed group; min-age deny; one request per distinct
   id whatever the answer (nonexistent vs withheld cost the same), repeated
   ids fetched once, no batch to poison; per-id
-  fallback fail closed; comment privacy; error mapping; API key absent from
+  fallback fail closed; comment privacy; error mapping — a 401 with code 306
+  downcasts to a `BugzillaError` carrying that code and status, the typed
+  error's own Debug is inside the key-absence check, and a transport error
+  is not a `BugzillaError`; API key absent from
   error text (I12) — the I12 transport-error sites connect to
   `127.0.0.1:1` (a privileged port a non-root wiremock `bind(127.0.0.1:0)`
   cannot occupy); `assert!(addr.port() < 1024)` is the mutation-kill for a

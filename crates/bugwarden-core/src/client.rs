@@ -13,6 +13,7 @@
 //! `CARGO_PKG_*` would name `bugwarden-core` in the access log of every
 //! binary that embeds it (issue #55).
 
+use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -692,6 +693,57 @@ fn sanitize(e: reqwest::Error) -> anyhow::Error {
     anyhow::Error::new(e.without_url())
 }
 
+/// A refusal Bugzilla returned over a completed exchange: a non-2xx
+/// status, an error envelope (`{"error": true, ..}`) under any status, or
+/// a 2xx body that is not JSON. Carried inside `anyhow`; recover it with
+/// `err.downcast_ref::<BugzillaError>()`. A transport or body-read failure
+/// is never one — that stays a sanitized [`reqwest::Error`] (I12).
+///
+/// `Display` is `bugzilla error (HTTP {status}): {message}`. `Debug` omits
+/// the message: Bugzilla's text echoes client input and can name bugs a
+/// policy hides, so it is logged through `QuotedError` and never put in a
+/// tool result.
+pub struct BugzillaError {
+    http_status: u16,
+    code: Option<i64>,
+    message: String,
+}
+
+impl BugzillaError {
+    /// The HTTP status of the exchange.
+    pub fn http_status(&self) -> u16 {
+        self.http_status
+    }
+
+    /// Bugzilla's numeric error code (`WS_ERROR_CODE`), read from the error
+    /// envelope only: `None` for a non-2xx status without one, a non-JSON
+    /// body, or a `code` that is not a JSON integer.
+    pub fn code(&self) -> Option<i64> {
+        self.code
+    }
+}
+
+impl fmt::Display for BugzillaError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "bugzilla error (HTTP {}): {}",
+            self.http_status, self.message
+        )
+    }
+}
+
+impl fmt::Debug for BugzillaError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BugzillaError")
+            .field("http_status", &self.http_status)
+            .field("code", &self.code)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::error::Error for BugzillaError {}
+
 /// Parse a Bugzilla-reported id that may be a JSON number or a numeric
 /// string — `product_enterable`'s documented example encodes them as
 /// strings, some deployments as numbers.
@@ -704,20 +756,22 @@ fn parse_id(v: &Value) -> Option<u64> {
 }
 
 /// Fail on HTTP-level errors: a non-2xx status, or a Bugzilla error body
-/// (`{"error": true, ...}`) even under a 200 status. The error text carries
-/// the HTTP status and the Bugzilla `message` field when present — never the
-/// request URL.
+/// (`{"error": true, ...}`) even under a 200 status. The [`BugzillaError`]
+/// carries the HTTP status, the Bugzilla `message` field when present, and
+/// the `code` of an error envelope — never the request URL.
 fn check_error(status: reqwest::StatusCode, parsed: Option<&Value>) -> Result<()> {
-    let bz_error = parsed
-        .and_then(|v| v.get("error"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if !status.is_success() || bz_error {
+    let envelope = parsed.filter(|v| v.get("error").and_then(Value::as_bool).unwrap_or(false));
+    if !status.is_success() || envelope.is_some() {
         let message = parsed
             .and_then(|v| v.get("message"))
             .and_then(Value::as_str)
             .unwrap_or("unknown error");
-        bail!("bugzilla error (HTTP {}): {}", status.as_u16(), message);
+        return Err(BugzillaError {
+            http_status: status.as_u16(),
+            code: envelope.and_then(|v| v.get("code")).and_then(Value::as_i64),
+            message: message.to_string(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -727,10 +781,12 @@ fn parse_response(status: reqwest::StatusCode, body: &str) -> Result<Value> {
     let parsed: Option<Value> = serde_json::from_str(body).ok();
     check_error(status, parsed.as_ref())?;
     parsed.ok_or_else(|| {
-        anyhow!(
-            "bugzilla error (HTTP {}): response body is not valid JSON",
-            status.as_u16()
-        )
+        BugzillaError {
+            http_status: status.as_u16(),
+            code: None,
+            message: "response body is not valid JSON".to_string(),
+        }
+        .into()
     })
 }
 
@@ -839,6 +895,97 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "bugzilla error (HTTP 200): response body is not valid JSON"
+        );
+    }
+
+    /// A refusal is typed: code and status come back through the
+    /// downcast, and Display is the text the untyped error carried.
+    #[test]
+    fn parse_response_types_a_bugzilla_refusal() {
+        let err = parse_response(
+            StatusCode::BAD_REQUEST,
+            r#"{"error": true, "code": 114, "message": "Comment too long."}"#,
+        )
+        .unwrap_err();
+        let bz = err
+            .downcast_ref::<BugzillaError>()
+            .unwrap_or_else(|| panic!("a Bugzilla refusal must be typed: {err:#}"));
+        assert_eq!(bz.code(), Some(114));
+        assert_eq!(bz.http_status(), 400);
+        assert_eq!(
+            err.to_string(),
+            "bugzilla error (HTTP 400): Comment too long."
+        );
+    }
+
+    /// The code is read from the error envelope alone: a non-2xx JSON
+    /// body without `error: true` (a proxy's), a string code and a float
+    /// code all give none.
+    #[test]
+    fn bugzilla_error_code_comes_only_from_the_error_envelope() {
+        for (status, body) in [
+            (
+                StatusCode::BAD_GATEWAY,
+                r#"{"code": 114, "message": "proxy"}"#,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"error": true, "code": "114", "message": "m"}"#,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"error": true, "code": 114.0, "message": "m"}"#,
+            ),
+        ] {
+            let err = parse_response(status, body).unwrap_err();
+            let bz = err
+                .downcast_ref::<BugzillaError>()
+                .unwrap_or_else(|| panic!("{body} must be typed: {err:#}"));
+            assert_eq!(bz.code(), None, "no code from {body}");
+            assert_eq!(bz.http_status(), status.as_u16());
+        }
+    }
+
+    /// Non-JSON bodies are typed too — a gateway's HTML under a 502 and a
+    /// 200 whose body is not JSON — with no code.
+    #[test]
+    fn non_json_bodies_are_typed_without_a_code() {
+        for (status, body) in [
+            (StatusCode::BAD_GATEWAY, "<html>gateway</html>"),
+            (StatusCode::OK, "not json"),
+        ] {
+            let err = parse_response(status, body).unwrap_err();
+            let bz = err
+                .downcast_ref::<BugzillaError>()
+                .unwrap_or_else(|| panic!("{body:?} must be typed: {err:#}"));
+            assert_eq!(bz.code(), None);
+            assert_eq!(bz.http_status(), status.as_u16());
+        }
+    }
+
+    /// Debug carries no message: neither the type's own `{:?}` nor
+    /// anyhow's `{:#?}` of the wrapping error prints it.
+    #[test]
+    fn bugzilla_error_debug_omits_the_message() {
+        let err = parse_response(
+            StatusCode::BAD_REQUEST,
+            r#"{"error": true, "code": 116, "message": "Bug 424242 does not exist."}"#,
+        )
+        .unwrap_err();
+        let bz = err
+            .downcast_ref::<BugzillaError>()
+            .unwrap_or_else(|| panic!("must be typed: {err:#}"));
+        let own = format!("{bz:?}");
+        let alternate = format!("{err:#?}");
+        for rendered in [&own, &alternate] {
+            assert!(
+                !rendered.contains("424242") && !rendered.contains("does not exist"),
+                "Debug must not carry the message: {rendered}"
+            );
+        }
+        assert!(
+            own.contains("400") && own.contains("116"),
+            "Debug keeps the status and the code: {own}"
         );
     }
 }

@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use bugwarden_core::client::{with_upstream_stats, BugzillaClient, UpstreamStats};
+use bugwarden_core::client::{with_upstream_stats, BugzillaClient, BugzillaError, UpstreamStats};
 use bugwarden_core::guard::{Guard, SearchRequest};
 use bugwarden_core::policy::{Access, Capability, Policy};
 use serde_json::{json, Value};
@@ -411,6 +411,12 @@ async fn client_error_mapping_uses_status_and_bugzilla_message() {
         err.to_string(),
         "bugzilla error (HTTP 401): invalid credentials"
     );
+    // Typed over real HTTP: the envelope's code and the status downcast.
+    let typed = err
+        .downcast_ref::<BugzillaError>()
+        .unwrap_or_else(|| panic!("a Bugzilla refusal must be typed: {err:#}"));
+    assert_eq!(typed.code(), Some(306));
+    assert_eq!(typed.http_status(), 401);
 }
 
 #[tokio::test]
@@ -446,8 +452,9 @@ async fn api_key_reaches_server_but_never_error_text_i12() {
 
     let bz = client(&server);
     let err = bz.get_bugs(KEY, &[1], None).await.unwrap_err();
-    // ... but the error chain must never contain it (I12).
-    let full = format!("{err:#} {err:?}");
+    // ... but the error chain must never contain it (I12) — the typed
+    // error's own Debug (`{:#?}`) included.
+    let full = format!("{err:#} {err:?} {err:#?}");
     assert!(
         !full.contains(KEY),
         "API key leaked into error text: {full}"
@@ -467,6 +474,11 @@ async fn api_key_absent_from_transport_error_i12() {
         .expect("connect to the refused privileged port must not hang")
         .unwrap_err();
     assert_key_absent_from_transport_error(&err);
+    // Bugzilla answered nothing, so there is no refusal to type.
+    assert!(
+        err.downcast_ref::<BugzillaError>().is_none(),
+        "a transport error must not be a BugzillaError: {err:#}"
+    );
 }
 
 #[tokio::test]

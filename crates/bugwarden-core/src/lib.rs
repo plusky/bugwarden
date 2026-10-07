@@ -18,7 +18,9 @@
 //! - [`client`] — minimal async Bugzilla REST client (reqwest + rustls,
 //!   aws-lc-rs provider, OS trust store via `rustls-platform-verifier`, with
 //!   `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` honored). Errors are sanitized so
-//!   the API key can never leak through them (I12).
+//!   the API key can never leak through them (I12). A refusal Bugzilla
+//!   itself returned is a [`client::BugzillaError`]: its status and code
+//!   are recoverable by downcast, its message only through `Display`.
 //! - [`quoted`] — Display-through-Debug quoting for tracing `error=`
 //!   fields, so a Bugzilla message that echoes client input cannot forge
 //!   a later `key=value` pair on the line.
