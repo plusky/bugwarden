@@ -21,11 +21,15 @@
 //!   the API key can never leak through them (I12). A refusal Bugzilla
 //!   itself returned is a [`client::BugzillaError`]: its status and code
 //!   are recoverable by downcast, its message only through `Display`.
+//! - [`custom_fields`] — Bugzilla custom field types learned by name and
+//!   cached for the process, so a Bug ID custom field is judged as the bug
+//!   link it is; a failed lookup is `Unknown` and fails closed (I4).
 //! - [`quoted`] — Display-through-Debug quoting for tracing `error=`
 //!   fields, so a Bugzilla message that echoes client input cannot forge
 //!   a later `key=value` pair on the line.
 
 pub mod client;
+pub mod custom_fields;
 pub mod guard;
 pub mod policy;
 pub mod quoted;
