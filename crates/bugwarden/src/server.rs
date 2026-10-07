@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use base64::{engine::general_purpose, Engine as _};
 use bugwarden_core::client::{with_upstream_stats, BugzillaClient, UpstreamStats, CLASSIFY_FIELDS};
-use bugwarden_core::custom_fields::FieldTypeCache;
+use bugwarden_core::custom_fields::{candidate_ids, custom_links, FieldTypeCache, LOOKUP_CHUNK};
 use bugwarden_core::guard::{Guard, SearchRequest, SearchWindow};
 use bugwarden_core::policy::{Access, Action, Capability, IdentitySource};
 use bugwarden_core::quoted::QuotedError;
@@ -1217,6 +1217,18 @@ fn too_many_ids(ids: &[u64]) -> Option<CallToolResult> {
     })
 }
 
+/// Refuse a `custom_fields` object naming more fields than one type lookup
+/// carries, so a write costs at most one lookup however many keys a client
+/// sends; read off the request alone, like [`too_many_ids`].
+fn too_many_custom_fields(fields: &serde_json::Map<String, Value>) -> Option<CallToolResult> {
+    (fields.len() > LOOKUP_CHUNK).then(|| {
+        err_text(format!(
+            "At most {LOOKUP_CHUNK} custom fields may be set in one call, got {}",
+            fields.len()
+        ))
+    })
+}
+
 /// The head of a client-sized id array that belongs on a tracing line: at
 /// most [`Guard::MAX_ASSESS_IDS`], the bound `too_many_ids` refuses past.
 /// Log it beside a `_len` count of the whole array (#240, #258).
@@ -2032,7 +2044,8 @@ pub struct CreateBugParams {
     #[serde(default)]
     pub groups: Vec<String>,
     /// Custom fields, e.g. {"cf_fixed_in": "1.2.3"}. Keys must start with
-    /// 'cf_'.
+    /// 'cf_'. A field that holds a bug id takes a numeric bug id, or an
+    /// empty value to leave it unset.
     #[serde(default)]
     pub custom_fields: Option<JsonObject>,
 }
@@ -2141,7 +2154,8 @@ pub struct UpdateBugFieldsParams {
     #[serde(default)]
     pub see_also_remove: Option<Vec<String>>,
     /// Custom fields, e.g. {"cf_fixed_in": "1.2.3"}. Keys must start with
-    /// 'cf_'.
+    /// 'cf_'. A field that holds a bug id takes a numeric bug id, or an
+    /// empty value to clear it.
     #[serde(default)]
     pub custom_fields: Option<JsonObject>,
     /// Optional comment explaining the changes.
@@ -3452,7 +3466,7 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "File a new bug. Before anything is created, the request is checked against server policy in the form Bugzilla will file it (the names the policy reads trimmed, control characters in the summary turned into spaces), and exactly that checked form is what gets filed, so a product or component the policy withholds by name is refused. Accepts custom 'cf_*' fields for products with mandatory entry fields. Returns the new bug id on success.",
+        description = "File a new bug. Before anything is created, the request is checked against server policy in the form Bugzilla will file it (the names the policy reads trimmed, control characters in the summary turned into spaces), and exactly that checked form is what gets filed, so a product or component the policy withholds by name is refused. Accepts custom 'cf_*' fields for products with mandatory entry fields; a custom field that holds a bug id takes a numeric bug id, which must be accessible through this server, or an empty value to leave it unset. Returns the new bug id on success.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3471,6 +3485,10 @@ impl BugWarden {
             custom_field_count = p.custom_fields.as_ref().map_or(0, |cf| cf.len()),
             "tool: create_bug"
         );
+        if let Some(refusal) = p.custom_fields.as_ref().and_then(too_many_custom_fields) {
+            note_refused(&ctx);
+            return Ok(refusal);
+        }
         let key = self.api_key(&ctx)?;
 
         let mut payload = serde_json::Map::new();
@@ -3516,35 +3534,54 @@ impl BugWarden {
                 payload.insert(k.clone(), v.clone());
             }
         }
+        // The id cap, at zero requests like the gate above it: an upper
+        // bound over every custom field value that could name a bug, taken
+        // before the fields' kinds are known so it is a function of the
+        // request alone.
+        let custom_fields = p.custom_fields.as_ref().filter(|cf| !cf.is_empty());
+        if let Some(cf) = custom_fields {
+            let upper: Vec<u64> = candidate_ids(cf).into_iter().collect();
+            if let Some(refusal) = too_many_ids(&upper) {
+                note_refused(&ctx);
+                return Ok(refusal);
+            }
+        }
         let mut payload = Value::Object(payload);
 
         // No bug exists yet, so the policy judges the prospective bug from
-        // this payload — which may_create first rewrites the way Bugzilla
-        // will, so the POST below files exactly what was judged (the very
-        // object, never a copy). The rules that decide what may be seen
-        // decide what may be filed.
-        //
-        // The refusal names no rule (I1) and — crucially — is the
-        // SAME text, after the SAME single upstream request, whether the
-        // policy or Bugzilla refused. Two distinguishable refusals would be
-        // a free policy oracle: send a request Bugzilla is guaranteed to
-        // reject (an invalid `version`, say) and read the policy off which
-        // refusal comes back, with nothing created and nothing logged
-        // upstream. So the refused path burns one classification call
-        // against bug id 0 — which never exists and creates nothing —
-        // exactly as download_attachment pads its metadata-miss path, so
-        // both failure paths cost one upstream request. Honestly residual:
-        // a SUCCESSFUL create is still distinguishable (it returns the new
-        // bug id — that is the tool working), so a client willing to file a
-        // real, attributable bug in an allowed product can still confirm
-        // that product is allowed; and the padding equalizes the request
-        // COUNT, not the upstream handler's exact latency (a GET classify
-        // vs a rejected POST), the same residual the download path accepts.
-        if !self.guard.may_create(&mut payload) {
-            // No whoami on the create path, ever: the create gate forces
-            // created_by_me itself, and the padding classify against bug id
-            // 0 decides nothing — caller identity is deliberately None so
-            // the refused path keeps costing exactly one upstream request.
+        // this payload, rewritten first the way Bugzilla will, and the POST
+        // files that very object. Every refusal below is one fixed text
+        // after one request count whatever refused — the policy, a target
+        // or Bugzilla — since the difference would be a policy oracle (the
+        // count and its residuals: DESIGN.md, the create_bug row).
+        let creatable = self.guard.may_create(&mut payload);
+        // A Bug ID custom field in the new bug links it to another bug, so
+        // every target needs `summary` before anything is filed (I8/I14),
+        // judged even when the gate already refused so the count holds. The
+        // caller is resolved for the targets only; the gate forces
+        // created_by_me itself.
+        let mut targets = BTreeSet::new();
+        let mut unassessable = false;
+        if let Some(cf) = custom_fields {
+            let names = cf.keys().cloned().collect();
+            let kinds = self.fields.kinds_fresh(&self.bz, &key, &names).await;
+            let links = custom_links(cf, &kinds);
+            unassessable = links.unassessable.is_some();
+            targets = links.targets;
+        }
+        let targets: Vec<u64> = targets.into_iter().collect();
+        let targets_ok = if targets.is_empty() {
+            true
+        } else {
+            let caller = self.guard.resolve_caller(&self.bz, &key).await;
+            let verdicts = self.assess(&key, &targets, caller.as_deref()).await;
+            targets.iter().all(|id| {
+                verdicts
+                    .get(id)
+                    .is_some_and(|(access, _)| access.allows(Capability::Summary))
+            })
+        };
+        if unassessable || !targets_ok || !creatable {
             let _ = self.assess(&key, &[0], None).await;
             tracing::info!(product = ?Capped(&p.product), "guard denied bug creation");
             note_refused(&ctx);
@@ -3759,7 +3796,7 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Update bug fields: priority, severity, resolution, summary, url, whiteboard, version, target_milestone, keywords (add/remove), see_also (add/remove; values are bug URLs), and custom 'cf_*' fields. All fields are optional, but at least one must be specified. Empty strings and empty lists are ignored; clearing a field is not supported. Custom field names must start with 'cf_' (e.g. {\"cf_fixed_in\": \"1.2.3\"}).",
+        description = "Update bug fields: priority, severity, resolution, summary, url, whiteboard, version, target_milestone, keywords (add/remove), see_also (add/remove; values are bug URLs), and custom 'cf_*' fields. All fields are optional, but at least one must be specified. Empty strings and empty lists in the named fields are ignored; clearing a named field is not supported. Custom field names must start with 'cf_' (e.g. {\"cf_fixed_in\": \"1.2.3\"}); a custom field that holds a bug id takes a numeric bug id, which must be accessible through this server, or an empty value to clear it.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -3794,6 +3831,10 @@ impl BugWarden {
             custom_field_count = p.custom_fields.as_ref().map_or(0, |cf| cf.len()),
             "tool: update_bug_fields"
         );
+        if let Some(refusal) = p.custom_fields.as_ref().and_then(too_many_custom_fields) {
+            note_refused(&ctx);
+            return Ok(refusal);
+        }
 
         let mut payload = serde_json::Map::new();
         for (field, value) in [
@@ -3855,14 +3896,36 @@ impl BugWarden {
                     .filter_map(|entry| Guard::see_also_local_id(entry, base_url)),
             );
         }
-        let mut seen = BTreeSet::new();
-        ids.retain(|id| seen.insert(*id));
-        if let Some(refusal) = too_many_ids(&ids) {
+        // The id cap is judged on an upper bound that is a function of the
+        // request alone — every custom field value that could name a bug,
+        // taken before the fields' kinds are known — so a refusal here
+        // still costs no request.
+        let custom_fields = p.custom_fields.as_ref().filter(|cf| !cf.is_empty());
+        let mut upper = ids.clone();
+        if let Some(cf) = custom_fields {
+            upper.extend(candidate_ids(cf));
+        }
+        if let Some(refusal) = too_many_ids(&upper) {
             note_refused(&ctx);
             return Ok(refusal);
         }
 
         let key = self.api_key(&ctx)?;
+        // A Bug ID custom field is a link too (I8/I14). Which cf_ fields can
+        // hold one is looked up afresh for every write; a value the guard
+        // cannot judge the way Bugzilla will — an alias, an object — is
+        // refused rather than forwarded, but only once the bug's own check
+        // has passed, so the refusal tells a field's kind to nobody else.
+        let mut unassessable = None;
+        if let Some(cf) = custom_fields {
+            let names = cf.keys().cloned().collect();
+            let kinds = self.fields.kinds_fresh(&self.bz, &key, &names).await;
+            let links = custom_links(cf, &kinds);
+            unassessable = links.unassessable;
+            ids.extend(links.targets);
+        }
+        let mut seen = BTreeSet::new();
+        ids.retain(|id| seen.insert(*id));
         let caller = self.guard.resolve_caller(&self.bz, &key).await;
         let cell = audit_cell(&ctx);
         let assessments = self.assess(&key, &ids, caller.as_deref()).await;
@@ -3882,12 +3945,19 @@ impl BugWarden {
             note(p.bug_id, Verdict::Denied);
             return Ok(err_text(Guard::denial(p.bug_id)));
         }
+        if let Some(field) = unassessable {
+            note_refused(&ctx);
+            return Ok(err_text(format!(
+                "Custom field '{field}' may hold a bug id: give a numeric bug id, \
+                 or an empty value to clear it"
+            )));
+        }
         for &id in ids.iter().filter(|&&id| id != p.bug_id) {
             let target_ok = assessments
                 .get(&id)
                 .is_some_and(|(access, _)| access.allows(Capability::Summary));
             if !target_ok {
-                tracing::info!(bug_id = id, "guard denied see_also target");
+                tracing::info!(bug_id = id, "guard denied link target");
                 note(id, Verdict::Denied);
                 return Ok(err_text(Guard::denial(id)));
             }
@@ -9816,6 +9886,70 @@ mod tests {
 
     fn http_server_with_hosts(hosts: Vec<String>) -> BugWarden {
         http_server_with(hosts, None)
+    }
+
+    #[tokio::test]
+    async fn the_custom_field_count_cap_precedes_the_key_lookup() {
+        // The cap is decided from the request alone, before the API key is
+        // even looked for: under per-request custody with no key header a
+        // 51-field write draws the cap text, where a one-field write draws
+        // the missing-header protocol error.
+        let server = http_server_with(Vec::new(), None);
+        let peer = peer_of(&server).await;
+        let fields = |n: usize| -> Value {
+            Value::Object(
+                (0..n)
+                    .map(|i| (format!("cf_f{i:02}"), json!("x")))
+                    .collect(),
+            )
+        };
+        for (tool, base) in [
+            ("update_bug_fields", json!({ "bug_id": 7 })),
+            (
+                "create_bug",
+                json!({ "product": "p", "component": "c", "summary": "s", "version": "1" }),
+            ),
+        ] {
+            let mut over = base.clone();
+            over["custom_fields"] = fields(51);
+            let Value::Object(over) = over else {
+                unreachable!()
+            };
+            let capped = bounded(
+                &format!("the capped {tool} call"),
+                server.call_tool(
+                    CallToolRequestParams::new(tool.to_string()).with_arguments(over),
+                    context_with_scope(peer.clone(), None),
+                ),
+            )
+            .await
+            .expect("the cap is a tool result, never a protocol error");
+            let CallToolResponse::Complete(capped) = capped else {
+                panic!("{tool}: the cap answers with a complete result");
+            };
+            assert_eq!(capped.is_error, Some(true), "{tool}");
+            assert_eq!(
+                text_of(&capped),
+                "At most 50 custom fields may be set in one call, got 51",
+                "{tool}"
+            );
+
+            let mut one = base;
+            one["custom_fields"] = fields(1);
+            let Value::Object(one) = one else {
+                unreachable!()
+            };
+            let err = bounded(
+                &format!("the uncapped {tool} call"),
+                server.call_tool(
+                    CallToolRequestParams::new(tool.to_string()).with_arguments(one),
+                    context_with_scope(peer.clone(), None),
+                ),
+            )
+            .await
+            .expect_err("below the cap the missing key header is a protocol error");
+            assert!(err.message.contains("header is required"), "{tool}: {err}");
+        }
     }
 
     fn http_server_with(hosts: Vec<String>, api_key: Option<String>) -> BugWarden {

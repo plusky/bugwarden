@@ -16,12 +16,12 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-/// Deliberately distinctive so a leak into any error text is unmistakable (I12).
+/// Deliberately distinctive so a leak into any error text is unmistakable.
 const KEY: &str = "SUPERSECRETKEY123";
 
-/// Any identity will do here — the client requires one (#55) but these
-/// suites assert nothing about it; `user_agent_wiremock.rs` owns that
-/// proof. Names neither crate, so a check for either finds nothing.
+/// Any identity will do here — the client requires one but these tests
+/// assert nothing about it; `user_agent_wiremock.rs` owns that proof.
+/// Names neither crate, so a check for either finds nothing.
 const TEST_USER_AGENT: &str = "probe-agent/0.0.0";
 
 fn client(server: &MockServer) -> BugzillaClient {
