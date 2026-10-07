@@ -22,7 +22,11 @@
 //!   removed anything;
 //! - dropping the client's guard on field names a path segment cannot
 //!   carry, which lets bug_fields answer `..` with the catalog's first
-//!   field instead of failing the call.
+//!   field instead of failing the call;
+//! - forwarding Bugzilla's message from any of the seven bug-update tools'
+//!   failure arms, or dropping the hint a listed code selects;
+//! - keying the hint lookup on the HTTP status, or ignoring the tool or
+//!   the request's reach when looking one up.
 
 use std::sync::Arc;
 
@@ -3506,4 +3510,307 @@ async fn bug_comments_max_comment_chars_caps_and_marks() {
         parsed["truncation"],
         json!({ "omitted_comments": 0, "shown_comments": 3 })
     );
+}
+
+// ---------- upstream failures of the write tools ----------
+
+/// The upstream message every refusal below carries: it names a bug and
+/// holds a forged logfmt pair, neither of which may reach a client.
+const UPSTREAM_MESSAGE: &str = "Bug 424242 does not exist. status=HACKED";
+
+/// The 109 hint, the one every bug-update tool may carry at any reach.
+const PRODUCT_EDIT_DENIED: &str =
+    "The Bugzilla account in use may not edit bugs in this bug's product.";
+
+/// A Bugzilla error envelope under `status`, with `code` when given.
+fn bugzilla_refusal(status: u16, code: Option<i64>) -> ResponseTemplate {
+    let mut body = json!({ "error": true, "message": UPSTREAM_MESSAGE });
+    if let Some(code) = code {
+        body["code"] = json!(code);
+    }
+    ResponseTemplate::new(status).set_body_json(body)
+}
+
+/// Serve `tool` with `args` against world-readable bugs 7 and 8, with
+/// Bugzilla answering the write with `response`; returns the failure text.
+/// The write mock expects exactly one request, so the text under test is
+/// the answer to an upstream refusal and never a local gate's.
+async fn refused_write(tool: &str, args: Value, response: ResponseTemplate) -> String {
+    let mock = MockServer::start().await;
+    for id in [7u64, 8] {
+        Mock::given(method("GET"))
+            .and(path("/rest/bug"))
+            .and(query_param("id", id.to_string()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "bugs": [world_readable_bug(id)] })),
+            )
+            .mount(&mock)
+            .await;
+    }
+    let (http_method, route) = if tool == "add_comment" {
+        ("POST", "/rest/bug/7/comment")
+    } else {
+        ("PUT", "/rest/bug/7")
+    };
+    Mock::given(method(http_method))
+        .and(path(route))
+        .respond_with(response)
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let client = client_for("", &mock).await;
+    let result = call(&client, tool, args).await;
+    assert!(is_error(&result), "{tool} must fail: {}", text_of(&result));
+    text_of(&result)
+}
+
+fn comment_args() -> Value {
+    json!({ "bug_id": 7, "comment": "hi" })
+}
+
+fn deps_args() -> Value {
+    json!({ "bug_id": 7, "depends_on_add": [8] })
+}
+
+#[tokio::test]
+async fn write_tools_answer_a_refusal_with_their_line_and_a_hint_never_bugzillas_text() {
+    let rows = [
+        (
+            "add_comment",
+            comment_args(),
+            114,
+            "Failed to create a comment",
+            "The comment is longer than Bugzilla accepts; shorten or split it.",
+        ),
+        (
+            "update_bug_status",
+            json!({ "bug_id": 7, "status": "CLOSED" }),
+            121,
+            "Failed to update bug status",
+            "Closing this bug needs a resolution.",
+        ),
+        (
+            "assign_bug",
+            json!({ "bug_id": 7, "assignee": "nobody@example.com" }),
+            504,
+            "Failed to assign bug",
+            "Bugzilla did not accept this assignee: the login is unknown or may not be assigned bugs in this product.",
+        ),
+        (
+            "update_bug_fields",
+            json!({ "bug_id": 7, "priority": "P9" }),
+            51,
+            "Failed to update bug fields",
+            "Bugzilla does not know one of the values given (priority, severity, version, target milestone or keyword); bug_fields and bugzilla_products list the legal values where discovery is enabled.",
+        ),
+        (
+            "update_bug_dependencies",
+            deps_args(),
+            109,
+            "Failed to update bug dependencies",
+            PRODUCT_EDIT_DENIED,
+        ),
+        (
+            "add_cc_to_bug",
+            json!({ "bug_id": 7, "cc_email": "nobody@example.com" }),
+            51,
+            "Failed to add CC",
+            "Bugzilla did not accept this CC address: the login is unknown or may not be added in this product.",
+        ),
+        (
+            "mark_as_duplicate",
+            json!({ "bug_id": 7, "duplicate_of": 8 }),
+            109,
+            "Failed to mark as duplicate",
+            PRODUCT_EDIT_DENIED,
+        ),
+    ];
+    for (tool, args, code, line, hint) in rows {
+        let text = refused_write(tool, args, bugzilla_refusal(400, Some(code))).await;
+        assert_eq!(text, format!("{line}\n{hint}"), "{tool} with code {code}");
+        assert!(
+            !text.contains("424242")
+                && !text.contains("HACKED")
+                && !text.contains("bugzilla error"),
+            "{tool}: upstream text reached the client: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn withheld_codes_give_exactly_the_line() {
+    // The existence oracle, the loop codes, the unlisted-error fallbacks
+    // and an authentication code: no hint, and no shared "withheld" line.
+    for code in [100, 101, 102, 116, 118, 32000, -32000, 306] {
+        let text = refused_write(
+            "add_comment",
+            comment_args(),
+            bugzilla_refusal(400, Some(code)),
+        )
+        .await;
+        assert_eq!(text, "Failed to create a comment", "code {code}");
+    }
+    // The scenario that opened this: a dependency loop whose message
+    // names a bug the client was never shown.
+    let loop_text = refused_write(
+        "update_bug_dependencies",
+        deps_args(),
+        ResponseTemplate::new(400).set_body_json(json!({
+            "error": true,
+            "code": 116,
+            "message": "The following bugs are involved in the dependency loop: 666, 7, 8",
+        })),
+    )
+    .await;
+    assert_eq!(loop_text, "Failed to update bug dependencies");
+}
+
+#[tokio::test]
+async fn the_hint_lookup_is_keyed_on_the_tool() {
+    // 114 is hinted on add_comment and 123 on update_bug_status; neither
+    // row may answer for another tool.
+    let text = refused_write(
+        "add_cc_to_bug",
+        json!({ "bug_id": 7, "cc_email": "nobody@example.com" }),
+        bugzilla_refusal(400, Some(114)),
+    )
+    .await;
+    assert_eq!(text, "Failed to add CC");
+    let text = refused_write(
+        "add_comment",
+        comment_args(),
+        bugzilla_refusal(400, Some(123)),
+    )
+    .await;
+    assert_eq!(text, "Failed to create a comment");
+}
+
+#[tokio::test]
+async fn the_http_status_never_selects_a_hint() {
+    // The same code under three statuses is the same bytes ...
+    let mut texts = Vec::new();
+    for status in [200, 400, 500] {
+        texts.push(
+            refused_write(
+                "add_comment",
+                comment_args(),
+                bugzilla_refusal(status, Some(114)),
+            )
+            .await,
+        );
+    }
+    assert_eq!(
+        texts[0],
+        "Failed to create a comment\nThe comment is longer than Bugzilla accepts; shorten or split it."
+    );
+    assert!(
+        texts.iter().all(|t| t == &texts[0]),
+        "the status must not change the text: {texts:?}"
+    );
+    // ... and the statuses Bugzilla's REST layer gives the existence
+    // oracle, with or without a code, select nothing.
+    for (status, code) in [
+        (404, Some(101)),
+        (401, Some(102)),
+        (401, None),
+        (404, None),
+        (500, None),
+    ] {
+        let text = refused_write(
+            "add_comment",
+            comment_args(),
+            bugzilla_refusal(status, code),
+        )
+        .await;
+        assert_eq!(text, "Failed to create a comment", "{status} {code:?}");
+    }
+    let html = refused_write(
+        "add_comment",
+        comment_args(),
+        ResponseTemplate::new(502).set_body_string("<html>gateway</html>"),
+    )
+    .await;
+    assert_eq!(html, "Failed to create a comment");
+}
+
+#[tokio::test]
+async fn an_unassessed_request_gets_no_hint_but_the_product_one() {
+    // Dependencies are always Unassessed: the comment-too-long and
+    // illegal-change codes the Assessed tools hint stay bare here.
+    for code in [114, 115] {
+        let text = refused_write(
+            "update_bug_dependencies",
+            deps_args(),
+            bugzilla_refusal(400, Some(code)),
+        )
+        .await;
+        assert_eq!(text, "Failed to update bug dependencies", "code {code}");
+    }
+    // A status change with a resolution is Unassessed; without one, or
+    // with an empty one (never sent), it is Assessed and 123 is hinted.
+    let transition = "Failed to update bug status\nBugzilla does not allow this status change from the bug's current status: its workflow forbids the transition, or the account in use may not make it.";
+    let text = refused_write(
+        "update_bug_status",
+        json!({ "bug_id": 7, "status": "RESOLVED", "resolution": "FIXED" }),
+        bugzilla_refusal(400, Some(123)),
+    )
+    .await;
+    assert_eq!(text, "Failed to update bug status");
+    for args in [
+        json!({ "bug_id": 7, "status": "RESOLVED" }),
+        json!({ "bug_id": 7, "status": "RESOLVED", "resolution": "" }),
+    ] {
+        let text = refused_write("update_bug_status", args, bugzilla_refusal(400, Some(123))).await;
+        assert_eq!(text, transition);
+    }
+    // Fields: a custom field or a resolution makes the request Unassessed,
+    // see_also makes it Unhintable; the summary alone keeps it Assessed.
+    let empty_summary = "Failed to update bug fields\nThe summary is empty once Bugzilla trims it.";
+    for args in [
+        json!({ "bug_id": 7, "summary": " ", "see_also_add": ["https://tracker.example/1"] }),
+        json!({ "bug_id": 7, "summary": " ", "custom_fields": { "cf_fixed_in": "x" } }),
+        json!({ "bug_id": 7, "summary": " ", "resolution": "FIXED" }),
+    ] {
+        let text = refused_write("update_bug_fields", args, bugzilla_refusal(400, Some(107))).await;
+        assert_eq!(text, "Failed to update bug fields");
+    }
+    let text = refused_write(
+        "update_bug_fields",
+        json!({ "bug_id": 7, "summary": " " }),
+        bugzilla_refusal(400, Some(107)),
+    )
+    .await;
+    assert_eq!(text, empty_summary);
+    // 109 is hinted at any reach: a custom-field request still gets it.
+    let text = refused_write(
+        "update_bug_fields",
+        json!({ "bug_id": 7, "custom_fields": { "cf_fixed_in": "x" } }),
+        bugzilla_refusal(401, Some(109)),
+    )
+    .await;
+    assert_eq!(
+        text,
+        format!("Failed to update bug fields\n{PRODUCT_EDIT_DENIED}")
+    );
+    // A see_also link is Unhintable: even 109 stays bare, because BMO
+    // checks a local target's product with that very code.
+    let text = refused_write(
+        "update_bug_fields",
+        json!({
+            "bug_id": 7,
+            "see_also_add": ["https://bugzilla.other.example/show_bug.cgi?id=5"],
+        }),
+        bugzilla_refusal(401, Some(109)),
+    )
+    .await;
+    assert_eq!(text, "Failed to update bug fields");
+    // A duplicate is always Unassessed.
+    let text = refused_write(
+        "mark_as_duplicate",
+        json!({ "bug_id": 7, "duplicate_of": 8 }),
+        bugzilla_refusal(400, Some(114)),
+    )
+    .await;
+    assert_eq!(text, "Failed to mark as duplicate");
 }

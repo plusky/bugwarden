@@ -77,6 +77,9 @@ one of them, and CI failures are never a reason to relax them.
   other bugs, and duplicate-marker comments are scrubbed at the
   `Capability::Summary` bar (I14), subject to the known limits DESIGN.md
   records. A new field that can carry a bug id extends the scrub.
+- A write tool's upstream failure never carries Bugzilla's error text: its
+  fixed first line, plus at most one hint from the code-keyed table in
+  `server.rs` (`UPSTREAM_HINTS`, #323).
 - **The audit stream is never reachable through any MCP surface** (I15) — no
   tool, resource, or prompt may read, list, or replay it.
 - The discovery tools `bugzilla_products` and `bug_fields` return Bugzilla
