@@ -103,7 +103,7 @@ use bugwarden_core::guard::Guard;
 use serde_json::json;
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/scrub_env.rs"]
@@ -234,6 +234,59 @@ async fn log_line_at(
     rust_log: Option<&str>,
     needle: &str,
 ) -> String {
+    let (_child, mut stderr, stdin) =
+        spawn_call(bugzilla_server, protocol_version, policy, call, rust_log).await;
+    // Holds `stdin` open until the line arrives: EOF ends the child's serve
+    // loop and `kill_on_drop` finishes it off on return, which together can
+    // retire the child before the reader has what it came for.
+    let mut log = String::new();
+    let line = startup_line::wait_for_line(&mut stderr, &mut log, needle, LOG_TIMEOUT).await;
+    drop(stdin);
+    line
+}
+
+/// [`log_line_at`], also returning everything the child wrote to stderr
+/// until it exited: the needle line is the barrier, then stdin closes and
+/// the stream is drained to EOF, so a line logged after the barrier is
+/// evidence too.
+async fn log_line_and_stream_at(
+    bugzilla_server: &str,
+    protocol_version: &str,
+    policy: Option<&Path>,
+    call: Option<(&str, serde_json::Value)>,
+    rust_log: Option<&str>,
+    needle: &str,
+) -> (String, String) {
+    let (_child, mut stderr, stdin) =
+        spawn_call(bugzilla_server, protocol_version, policy, call, rust_log).await;
+    let mut log = String::new();
+    let line = startup_line::wait_for_line(&mut stderr, &mut log, needle, LOG_TIMEOUT).await;
+    drop(stdin);
+    tokio::time::timeout(LOG_TIMEOUT, async {
+        while startup_line::next_logged_line(&mut stderr, &mut log)
+            .await
+            .is_some()
+        {}
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the child's stderr must reach EOF: {}", excerpt(&log)));
+    (line, log)
+}
+
+/// Spawn the shipped binary against `bugzilla_server`, send the handshake
+/// and `call`, and hand back the child (alive while held), its stderr
+/// reader and its still-open stdin.
+async fn spawn_call(
+    bugzilla_server: &str,
+    protocol_version: &str,
+    policy: Option<&Path>,
+    call: Option<(&str, serde_json::Value)>,
+    rust_log: Option<&str>,
+) -> (
+    tokio::process::Child,
+    startup_line::StderrLines,
+    tokio::process::ChildStdin,
+) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_bugwarden"));
     cmd.args(["--transport", "stdio"])
         .args(["--bugzilla-server", bugzilla_server])
@@ -254,7 +307,7 @@ async fn log_line_at(
         cmd.env("RUST_LOG", filter);
     }
     let mut child = cmd.spawn().expect("the built binary must start");
-    let mut stderr = startup_line::stderr_lines(&mut child);
+    let stderr = startup_line::stderr_lines(&mut child);
     let mut stdin = child.stdin.take().expect("stdin is piped");
     let mut messages = vec![json!({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -277,13 +330,7 @@ async fn log_line_at(
             .await
             .expect("the child must accept input");
     }
-    // Holds `stdin` open until the line arrives: EOF ends the child's serve
-    // loop and `kill_on_drop` finishes it off on return, which together can
-    // retire the child before the reader has what it came for.
-    let mut log = String::new();
-    let line = startup_line::wait_for_line(&mut stderr, &mut log, needle, LOG_TIMEOUT).await;
-    drop(stdin);
-    line
+    (child, stderr, stdin)
 }
 
 /// [`log_line`] for the ordinary case: a served handshake, one tool call,
@@ -1323,6 +1370,110 @@ async fn an_upstream_error_cannot_forge_a_later_field_on_its_own_line() {
         logged.contains("status=HACKED"),
         "the HACKED text lives inside the quoted value: {logged:?}"
     );
+}
+
+/// The message a mock Bugzilla refuses the write-tool rows with: it names
+/// a bug and carries a forged pair, neither of which may reach the `warn`
+/// line.
+const REFUSED_WRITE_MESSAGE: &str = "Bug 424242 does not exist. status=HACKED";
+
+/// A mock Bugzilla that classifies bug 7 and refuses the comment on it
+/// with a 400/114 envelope carrying [`REFUSED_WRITE_MESSAGE`].
+async fn refusing_bugzilla() -> MockServer {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [{
+            "id": 7,
+            "summary": "a plain bug",
+            "product": "openSUSE",
+            "component": "Kernel",
+            "status": "NEW",
+            "severity": "normal",
+            "priority": "P3",
+            "keywords": [],
+            "groups": [],
+            "whiteboard": "",
+            "creation_time": "2020-01-01T00:00:00Z",
+        }] })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/rest/bug/7/comment"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": true,
+            "code": 114,
+            "message": REFUSED_WRITE_MESSAGE,
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    mock
+}
+
+/// A refused bug-update write is reported by status and code, never by
+/// Bugzilla's text: the `warn` line's fields are exactly `bug_id`,
+/// `http_status` and `bugzilla_code`, and under the default filter the
+/// text reaches no line at all — the split is a filter decision, so the
+/// whole stderr is the evidence, not the one line.
+#[tokio::test]
+async fn a_refused_write_is_logged_by_code_without_its_text() {
+    let mock = refusing_bugzilla().await;
+    let (line, stderr) = log_line_and_stream_at(
+        &mock.uri(),
+        SUPPORTED_VERSION,
+        None,
+        Some(("add_comment", json!({ "bug_id": 7, "comment": "hi" }))),
+        None,
+        "add_comment: upstream refused",
+    )
+    .await;
+    for needle in ["424242", "HACKED", "upstream refusal text"] {
+        assert!(
+            !stderr.contains(needle),
+            "{needle} must not reach stderr under the default filter: {}",
+            excerpt(&stderr)
+        );
+    }
+    let fields = after_target(&line, "bugwarden::server");
+    assert_eq!(
+        logfmt_keys(fields),
+        ["bug_id", "http_status", "bugzilla_code"],
+        "the warn line's fields, in the server's order: {line}"
+    );
+    for pair in ["bug_id=7", "http_status=400", "bugzilla_code=114"] {
+        assert!(fields.contains(pair), "{pair} must be on the line: {line}");
+    }
+    assert!(
+        !line.contains("424242") && !line.contains("HACKED"),
+        "Bugzilla's text must not reach the warn line: {line}"
+    );
+}
+
+/// The text goes on a `debug` line of its own, quoted as the `error=`
+/// quoting decision requires, so the forged pair cannot become a key there
+/// either.
+#[tokio::test]
+async fn a_refused_writes_text_is_a_quoted_debug_field() {
+    let mock = refusing_bugzilla().await;
+    let line = log_line_at(
+        &mock.uri(),
+        SUPPORTED_VERSION,
+        None,
+        Some(("add_comment", json!({ "bug_id": 7, "comment": "hi" }))),
+        Some("bugwarden=debug"),
+        "add_comment: upstream refusal text",
+    )
+    .await;
+    let display = format!("bugzilla error (HTTP 400): {REFUSED_WRITE_MESSAGE}");
+    let (logged, _rest) = quoted_field(&line, "error=");
+    assert_eq!(
+        logged, display,
+        "the whole Display stays inside one quoted field: {line}"
+    );
+    let keys = logfmt_keys(after_target(&line, "bugwarden::server"));
+    assert_eq!(keys, ["bug_id", "error"], "the debug line's fields: {line}");
 }
 
 /// A quote marks a boundary only if it SURVIVES, and until `Capped`

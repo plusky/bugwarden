@@ -31,7 +31,16 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
   count, `default_action`, `min_bug_age_days`, `read_only`, disabled tool names.
 - **I2** Uniform denial: a policy-denied bug and a nonexistent bug produce the
   same response text: `Bug {id} is not accessible through this server`. No
-  wording/detail difference may reveal existence.
+  wording/detail difference may reveal existence. The seven bug-update tools
+  (add_comment, update_bug_status, assign_bug, update_bug_fields,
+  update_bug_dependencies, add_cc_to_bug, mark_as_duplicate) never return
+  Bugzilla's error text either: it tells `bug_id_does_not_exist` (101) from
+  `bug_access_denied` (102), and a dependency loop message names the bugs
+  on the loop, hidden ones included (a duplicate loop is reported at all
+  only because of a chain that may run through one) — see "Upstream
+  failures of the write tools". Six read tools still forward it —
+  list_attachments, summarize_bug, quicksearch_syntax, bugzilla_server_info,
+  bugzilla_products and bug_fields (#338).
 - **I3** Search filtering is silent: counts of dropped/filtered results are
   never returned to the client (server-side debug logging is fine).
 - **I4** Fail closed: classification-fetch failure, bug absent from the
@@ -60,7 +69,9 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
   not the client, so they are assessed in ONE batched request (Guard::
   disclosable) rather than per id; a failed fetch scrubs everything (I4).
   Applies to bug_info, bugs_quicksearch (the client picks the projection, so
-  it can ask for link fields), bug_history, bug_comments and summarize_bug.
+  it can ask for link fields), bug_history, bug_comments and summarize_bug,
+  and to the failure text of the seven bug-update tools, which carries no
+  Bugzilla message (see "Upstream failures of the write tools").
   Only ids actually SERVED in the same response are exempt — a requested id
   that was DENIED must not be whitelisted, or asking about a hidden bug
   reveals it through the links of one the client may read.
@@ -69,8 +80,12 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
   free-text field (summary, whiteboard) is not touched either, since
   `is_id_bearing_history_field` decides what gets scrubbed; the
   duplicate-marker match covers both stock templates but not
-  localised/customised ones; and an instance reachable under a second
-  hostname is not recognised in see_also (scheme and case are).
+  localised/customised ones; an instance reachable under a second
+  hostname is not recognised in see_also (scheme and case are); and a
+  write Bugzilla refuses because of a hidden bug — a dependency loop
+  running through one, say — still fails where the same write would
+  otherwise succeed, which is one bit per attempt, paid for with a real
+  write on an assessed bug, and the fixed failure text adds nothing to it.
 - **I5** Private content (`is_private: true`) is returned only when policy
   `global.allow_private_comments = true` AND the call sets
   `include_private = true`. This one switch governs private comments,
@@ -1054,13 +1069,13 @@ constraints the model must know.
 | bugs_quicksearch | query, status: String = "ALL", include_fields: String = "id,product,component,assigned_to,status,resolution,summary,last_change_time", limit: u32 = 50, offset: u32 = 0, group_by?: String | post-filter | fetch include_fields = requested ∪ CLASSIFY_FIELDS; after filter, project kept bugs to requested fields (keep `_redacted` marker); envelope `{"bugs":[..]}` — or `{"groups":[..]}` under `group_by`, see below — only (I3), except an advisory `note` when the query is nothing but bug ids (comma/whitespace-separated, optional `#` per id) steering exact id sets to bug_info — the note is a pure function of the CLIENT'S REQUEST (the query and status strings), never of results, verdicts, or anything upstream said (no new oracle), and the `bugs` array is byte-identical with or without it (the query is still searched, never rerouted); its wording tracks the request: a non-empty status is prefixed to the query so upstream content-matches the whole expression, while an empty status sends the query bare and Bugzilla routes a bare all-number query to an exact id lookup (bug_id + anyexact) — on that path the note drops the content-matching claim — and a query naming more distinct ids than MAX_ASSESS_IDS steers to batched bug_info calls (the cap is already public in the too_many_ids refusal text) instead of straight into that refusal | **limit/offset address the bugs the client may SEE, not upstream rows** (Guard::quicksearch_window): filtering an already-paginated page left a hole exactly where a hidden bug sat — a short page the next offset contradicted — and since quicksearch matches summary text that hole was a probe for the hidden title, one word at a time. The guard now scans upstream from row 0 in 200-row chunks, classifies each, and fills the window from the survivors; rows are deduped on the server-reported id (relevance order is not stable between calls) and an id-less row is dropped (I4). A short page is NOT read as end-of-results — Bugzilla is free to cap a page below the requested chunk size (an admin-configured `max_search_results`, for instance), and that cap looks identical to a short page at the genuine end of a result set; only an empty page ends the scan early. Bounds, independent of each other: MAX_SEARCH_WINDOW=1000 addressable, 2000 rows scanned, and 10 sequential requests; hitting any of the three truncates, which looks exactly like the end of results. The objects returned are the ones classified. The scan target is quantised to whole chunks so the stopping point does not track the client's `limit`; without that, `limit` could be binary-searched against the clock to recover each block's exact hidden count. Residual, accepted: filling a window of VISIBLE bugs needs more rows when bugs are hidden, so a stopwatch still learns one bit per scanned block ("not entirely visible"). Removing that would mean scanning the worst case on every search, or letting pages go short again. Search failure returns a bare "Search failed"; the upstream text is logged server-side only (it can name a bug and say whether it exists). The scan's accounting — rows examined, verdict-dropped ids — goes to the audit record only (`guard.scan` plus the suppressed-ids machinery, issue #29); the response is byte-identical with or without drops. Optional `group_by` (issue #143): a comma-separated subset of GROUP_BY_FIELDS = product, component, status, resolution, severity, priority, deduped, unknown name refused BEFORE the upstream call (a silently ungrouped typo looks like a broken feature; the text quotes only what the client sent, so it is no oracle) while a spec naming NOTHING (`""`, bare commas) means "no grouping" rather than an error — that is what a client filling in every declared param sends, and the sibling `include_fields` reads an empty segment the same way. The response becomes `{"groups":[{"bugs":[..], <field>:<value>, ..}]}` and each grouped field is reported once per group instead of once per bug. Header key order is NOT caller order and is not promised anywhere client-facing: serde_json is built without `preserve_order`, so its Map is a BTreeMap and a header serializes with keys sorted, `bugs` first — `group_by=status,product` and `product,status` return identical bytes. GROUP_BY_FIELDS is a HAND-PICKED subset of the CLASSIFY_FIELDS ∩ SUMMARY_FIELDS intersection (which is all ten SUMMARY_FIELDS), restricted to low-cardinality enum-ish values; that membership is what makes grouping free of policy consequences — no extra upstream field is pulled, and a summary-redacted row carries all six so it buckets like any other row instead of needing one of its own. Membership is NOT the I14 argument: the same intersection holds `summary`, which routinely reads "regression from bug 12345". What keeps a header clean is ORDERING — a grouped field is FORCED into `requested` the way `id` is, so grouping runs on the served, link-scrubbed projection, a value can only reach a header by the same path that would have put it on the bug, and grouping never surfaces a field the projection dropped. Group order and within-group order are first appearance in the served window, so grouping cannot reorder by verdict, and a group exists only where a served bug put it: no empty buckets, no header naming a hidden bug's product (I3). It runs LAST, after the audit block has read the flat projection, so a call's record is identical whether or not the client asked for groups; `group_by` is in PARAM_ALLOWLIST (a vocabulary field, not free text) so the record carries it verbatim. The envelope key is `groups`, deliberately the same word as Bugzilla's per-bug `groups` security-group list which a client may project into the bugs nested inside it — parallel to `bugs` at the same level, and depth disambiguates; do not rename one to "fix" the collision without also moving the other |
 | create_bug | product, component, summary, version, description = "", severity?, priority?, op_sys?, platform?, keywords?: Vec<String>, groups?: Vec<String>, custom_fields?: JsonObject | create (write), judged on the prospective bug AS IT WILL BE FILED (Guard::may_create) | there is no bug id to assess, so the request itself is classified BEFORE any upstream call (I8): the rules that hide a product by name refuse filing into it, a field the request omits fails closed (I4), and a client-claimed `groups` list is never trusted — Bugzilla unions the product's mandatory groups in server-side, so may_create forces groups to unknown, which means a group-consulting rule refuses every create request that REACHES it — creation is possible only where an earlier rule covering the create operation grants it (a rule carrying `operations = ["create"]`, placed ahead of the group-consulting rules, is how an operator permits filing without that grant shadowing reads of existing bugs — issue #26), and a policy with no such grant refuses all creation. **Judged is filed.** Bugzilla rewrites a create request before it resolves anything: it trims names (Perl `\s`), turns every run of ASCII control characters in the summary into one space and trims it (`clean_text`), and skips a keyword that is `""` or `"0"` — testing that falsiness on the RAW element, before the trim it applies to the ones it goes on to resolve. Judged raw, `product: " Security Response"` walked past a `products = ["Security*"]` deny rule into the grant behind it and was filed into Security Response all the same. So `may_create` rewrites the payload the same way IN PLACE, classifies the rewrite, and create_bug POSTs that very object — the rewritten names are ones Bugzilla's own trim leaves alone, so the name Bugzilla looks up is the name that was judged; which object that lookup returns, and whether the priority survives, are the two limits below. The NAME trim is deliberately a SUPERSET of Bugzilla's: Unicode White_Space plus U+180E, which Perl counted as `\s` until 5.20 and Rust's `is_whitespace` does not — that arm is load-bearing, not decoration. A superset is safe only because the POST carries the trimmed value and a name resolves to its stored spelling anyway; trimming less is the bug. The SUMMARY is stored as sent, so it is trimmed with White_Space alone and nothing Bugzilla keeps is dropped: an edge U+180E stays in what is judged and POSTed, a Perl before 5.20 strips it itself and a later one keeps it, so on every Perl the stored summary is the one the raw request would have produced. The judged summary therefore contains the stored one, and `summary_contains` is a positive substring test, so every needle the filed summary carries the judged one carries too. WHICH fields are rewritten is a rule rather than a list: every field create_bug sends that a Matcher reads (product, component, summary, severity, priority, keywords). Bugzilla also trims version, op_sys and platform, which no criterion reads — rewriting them would decide nothing, and a new criterion over such a field must extend the rewrite with it or reopen this bug. Evidence also needs the SHAPE create_bug sends: BugMeta reads component and keywords leniently (a lone string, an array, `{"name": ..}` objects) where Bugzilla splits a keyword string, resolves such objects itself, and refuses a list where it wants a name — so a non-string component is unknown, a keyword element the trim would turn false stays exactly as it came for Bugzilla to resolve or refuse, and a list holding one is unknown as a whole (a partly rewritten list reads as a shorter one). A list Bugzilla would skip entirely is dropped, as create_bug drops an empty one. A rewritten field that came out empty is still POSTed, so the upstream refusal answers it — `require_summary`, `require_component`, and `object_not_specified` for product, severity and (with `letsubmitterchoosepriority` on; off, the second limit below applies) priority — behind the same refusal text at the same cost. The audit record keeps the client's RAW arguments while the POST carries the rewrite: audited is what was asked, filed is what was judged. Two known limits remain, both about what the filed bug ends up carrying. First, the lookup compares under the DATABASE's collation, which can treat two spellings as equal — or a character as weightless — where a glob cannot: measured on MariaDB 10.6, the stored `Security Response` is matched by `"Śecurity Response"` under `utf8mb3_general_ci`, and under the UCA `utf8mb4_unicode_ci` by its decomposed spelling and by a leading zero-width space, BOM, word joiner or RLO; this gate judges each of those as a different product and POSTs it verbatim. ASCII-only product names are therefore no protection either, and a name glob is not a boundary on such an instance. Components, keywords, severities and priorities are looked up by name through the same comparison (`Bugzilla::Object` via `sql_istrcmp`; a component by `name = ?`, which MySQL also compares under the collation), so by reading the code, not by measurement, the limit covers their criteria too. What narrows it is an allowlist-shaped create grant ahead of a rule refusing every other create request, as the shipped example does: a spelling the allowlist does not match is refused, which leaves only products whose names the database equates with a name the allowlist does match. Issue #330 carries the measurements and the options and is open and DEFERRED: stripping or refusing such characters was rejected because it would change what the reporter filed, so nothing here closes the limit (PostgreSQL's `LOWER()` against Rust's `to_lowercase` is the same class, by reasoning, not measurement). Second, with `letsubmitterchoosepriority` off Bugzilla replaces the requested priority with `defaultpriority`, so a `priorities` criterion judges a priority the filed bug may not carry. **Both refusals are one refusal**: a policy refusal and an upstream failure return the same fixed create_denial text after the same single upstream request — the refused path burns one classify call against bug id 0 (never a valid id, creates nothing; download_attachment's padding precedent) instead of the POST. Two texts, or 0 vs 1 requests, would be a free policy-enumeration oracle: send a guaranteed-invalid `version` plus a probe product and read the policy off which refusal (or which latency) comes back, with nothing created. Residual, accepted: a SUCCESSFUL create still confirms the product is allowed — that is the tool doing its job, and it costs a real, attributable bug; and the padding equalizes request count, not the upstream handler's exact latency (GET classify vs rejected POST). Bugzilla's failure message is logged server-side only (it can say whether a product/component exists). `custom_fields` keys must start with `cf_` (I7): the gate runs before `may_create` and errors with ZERO upstream requests on a non-`cf_` key — distinguishable from the padded create refusal on purpose, since it decides nothing about policy or Bugzilla. No Matcher criterion reads `cf_*`, so a custom field cannot move a prospective bug between rules the way `product`/`component` do. `custom_fields` is not in `PARAM_ALLOWLIST`, so the audit stream records it as `_len`, same as the updater |
 | add_attachment | bug_id, data (base64), file_name, summary, content_type, comment = "", is_private = false, is_patch = false | attach (write) on bug_id | guard assessment before the upload (I8), uniform denial (I2); then global.max_attachment_bytes caps the DECODED size of `data` (0 = no cap) — the ceiling the operator set on downloads binds uploads through the same server too, measured after base64 expansion is stripped so encoding overhead cannot shrink it. The refusal names neither the payload's size nor the cap value (max_attachment_bytes is not I1-disclosable, exactly as on the download path). Over http that non-disclosure is partial and knowingly so: the transport's POST body cap is derived from this same value (#52), so its 413 boundary is probeable once the cap exceeds ~2.25 MiB decoded — accepted, with the reasoning, under "rmcp 3.5 usage notes" below. Nothing here changes: this refusal still names neither size nor cap. `comment` travels as a PLAIN string — Bug.add_attachment documents it so; the `{"comment": {"body": ..}}` shape belongs to Bug.update only |
-| add_comment | bug_id, comment, is_private: bool = false | comment (write) | |
-| update_bug_status | bug_id, status, resolution?, comment: String = "" | status (write) | payload always carries `status`; `resolution` only when the caller gives a non-empty one — no local workflow assumption, no synthesised empty resolution. Bugzilla enforces `missing_resolution` on a closing status with none, and auto-clears any resolution when the target status is open |
-| assign_bug | bug_id, assignee (email), comment = "" | assign (write) | payload `{"assigned_to": ..}` |
-| update_bug_fields | bug_id, priority?, severity?, resolution?, summary?, url?, whiteboard?, version?, target_milestone?, keywords_add?/keywords_remove?: Vec<String>, see_also_add?/see_also_remove?: Vec<String> (bug URLs), custom_fields?: JsonObject, comment = "" | fields (write) on bug_id + summary on every LOCAL see_also target (I8/I14) | at least one field required — the named params all count, so a call touching only the newer fields is valid, and a call carrying nothing but empty strings/lists still errors without contacting Bugzilla; empty strings and empty lists are ignored (clearing a field is unsupported); keywords and see_also travel as `{"add": [..], "remove": [..]}`, NEVER the replace-all `set` variant; a see_also entry that points at THIS instance is a bug-id link, so its target is assessed like a dependency target — at least `summary`, uniform denial (I2), no PUT on refusal — while entries for other trackers carry no local id and pass through unassessed; custom_fields keys must start with `cf_` (I7) — `see_also` and `keywords` are named params now, and as custom_fields keys they still error before Bugzilla is contacted; free-text values (summary/whiteboard/url) never enter the server log — only which fields a call touched (see "Update-field surface") |
-| update_bug_dependencies | bug_id, blocks_add?/blocks_remove?/depends_on_add?/depends_on_remove?: Vec<u64>, comment = "" | deps (write) | at least one change required; payload uses `{"blocks": {"add": [..], "remove": [..]}}` shape |
-| add_cc_to_bug | bug_id, cc_email | cc (write) | payload `{"cc": {"add": [email]}}` |
-| mark_as_duplicate | bug_id, duplicate_of, comment = "" | status on bug_id + summary on duplicate_of (I11) | default comment "Marking as duplicate of bug {duplicate_of}"; payload carries only `dupe_of` (+ comment) — Bugzilla's `set_dup_id` applies the instance's `duplicate_or_move_bug_status` and resolution DUPLICATE itself, so the resulting status is instance-defined, not necessarily CLOSED |
+| add_comment | bug_id, comment, is_private: bool = false | comment (write) | an upstream refusal is the fixed line plus at most one code-selected hint — see "Upstream failures of the write tools" |
+| update_bug_status | bug_id, status, resolution?, comment: String = "" | status (write) | payload always carries `status`; `resolution` only when the caller gives a non-empty one — no local workflow assumption, no synthesised empty resolution. Bugzilla enforces `missing_resolution` on a closing status with none, and auto-clears any resolution when the target status is open; an upstream refusal is the fixed line plus at most one code-selected hint, and a request carrying `resolution` gets none but 109 — see "Upstream failures of the write tools" |
+| assign_bug | bug_id, assignee (email), comment = "" | assign (write) | payload `{"assigned_to": ..}`; an upstream refusal is the fixed line plus at most one code-selected hint — see "Upstream failures of the write tools" |
+| update_bug_fields | bug_id, priority?, severity?, resolution?, summary?, url?, whiteboard?, version?, target_milestone?, keywords_add?/keywords_remove?: Vec<String>, see_also_add?/see_also_remove?: Vec<String> (bug URLs), custom_fields?: JsonObject, comment = "" | fields (write) on bug_id + summary on every LOCAL see_also target (I8/I14) | at least one field required — the named params all count, so a call touching only the newer fields is valid, and a call carrying nothing but empty strings/lists still errors without contacting Bugzilla; empty strings and empty lists are ignored (clearing a field is unsupported); keywords and see_also travel as `{"add": [..], "remove": [..]}`, NEVER the replace-all `set` variant; a see_also entry that points at THIS instance is a bug-id link, so its target is assessed like a dependency target — at least `summary`, uniform denial (I2), no PUT on refusal — while entries for other trackers carry no local id and pass through unassessed; custom_fields keys must start with `cf_` (I7) — `see_also` and `keywords` are named params now, and as custom_fields keys they still error before Bugzilla is contacted; free-text values (summary/whiteboard/url) never enter the server log — only which fields a call touched (see "Update-field surface"); an upstream refusal is the fixed line plus at most one code-selected hint — a request carrying `resolution` or a `cf_*` key gets none but 109, one carrying `see_also` none at all — see "Upstream failures of the write tools" |
+| update_bug_dependencies | bug_id, blocks_add?/blocks_remove?/depends_on_add?/depends_on_remove?: Vec<u64>, comment = "" | deps (write) | at least one change required; payload uses `{"blocks": {"add": [..], "remove": [..]}}` shape; an upstream refusal is the fixed line, plus the 109 hint alone — see "Upstream failures of the write tools" |
+| add_cc_to_bug | bug_id, cc_email | cc (write) | payload `{"cc": {"add": [email]}}`; an upstream refusal is the fixed line plus at most one code-selected hint — see "Upstream failures of the write tools" |
+| mark_as_duplicate | bug_id, duplicate_of, comment = "" | status on bug_id + summary on duplicate_of (I11) | default comment "Marking as duplicate of bug {duplicate_of}"; payload carries only `dupe_of` (+ comment) — Bugzilla's `set_dup_id` applies the instance's `duplicate_or_move_bug_status` and resolution DUPLICATE itself, so the resulting status is instance-defined, not necessarily CLOSED; an upstream refusal is the fixed line, plus the 109 hint alone — see "Upstream failures of the write tools" |
 | list_attachments | bug_id | attachments | metadata only (`exclude_fields=data`) |
 | download_attachment | attachment_id, include_private: bool = false, head_lines?/tail_lines?/max_chars?: u32 | attachments (on the owning bug) | metadata fetched FIRST (no blob) for guard assessment + attachment_gate; unknown id, metadata OR blob fetch failure, denied owning bug, missing bug_id, and private-without-opt-in all yield the uniform attachment denial. Constant upstream request count on every path (a metadata miss still runs one classify call against bug id 0) so call latency is not an existence oracle. The gate AND the bug-id check re-run on the blob response (TOCTOU), then the actual base64 size is re-checked against the cap (a lying `size` cannot bypass it). Raster image types from a strict allowlist => ContentBlock::image; everything else (incl. image/svg+xml) => BlobResourceContents whose uri carries only the attachment id (uploader-chosen file_name never enters the uri). Optional head_lines/tail_lines/max_chars window TEXT-ish payloads only (text/* plus a fixed application/* allowlist, svg deliberately excluded): applied LAST, on the lossy-UTF-8 decode of a payload that passed both gates and the size re-check — head/tail select lines of the whole text, then a char cap that is the MIN of the caller's max_chars and `MAX_WINDOW_CHARS` (200k). That ceiling is unconditional — it binds with no max_chars and with no operator byte cap — because `max_attachment_bytes` bounds DECODED BYTES while the windowed serve is JSON text: JSON escapes every C0 byte to `\u00XX` (6 chars) and lossy UTF-8 maps every invalid byte to U+FFFD, and `content_type` is uploader-chosen, so 2 MiB of `0x01` labelled text/plain is ONE `lines()` line, takes the serve-whole branch on `head_lines: 1`, and would otherwise emit ~12 MiB — six times the cap it passed, and unbounded at `max_attachment_bytes = 0`. The windowed text rides as a plain text block and the summary gains a truncation object (total_lines/shown_lines/truncated_chars); `shown_lines` counts the lines of the SERVED text, recounted AFTER the char cap (a cap-shortened line still counts), so `total_lines - shown_lines` is never 0 over a mostly-dropped payload. Params on a non-text payload are ignored (summary: `windowing_ignored`), never an error, and so is a payload whose base64 will not decode (distinct reason string) — the whole blob then ships, and the caller is told why its window vanished. A window that cut content is audited as redacted_fields [attachment_window], one that cut nothing stays silent; either way the granting rule stays in the record, since the cut is the client's choice and not a guard decision (see "The `guard.rule` encoding"). The cap still measures the FULL payload, and every denial path is byte-identical with or without the params (I2). Two deliberate decisions: (a) windowing moves attacker-controlled attachment bytes into the model's TEXT channel instead of an opaque blob resource — the text-channel analogue of the image/svg+xml decision above, accepted because it is opt-in per call, bounded by MAX_WINDOW_CHARS, and never reached on a denial path; (b) the cut branch is `str::lines()` + `join("\n")`, which normalises CRLF to LF and drops a trailing newline, so a windowed text/x-patch is line-ending-normalised while the serve-whole branch stays byte-exact — windowing is a reading aid, not a fetch of the artifact |
 | bug_url | bug_id | none (I8 exception) | `{base_url}/show_bug.cgi?id={id}` |
@@ -1070,6 +1085,185 @@ constraints the model must know.
 | quicksearch_syntax | — | none | HTML doc page |
 | mcp_server_info | — | none | name (CARGO_PKG_NAME) and version (CARGO_PKG_VERSION), the same two the handshake sends; bugzilla server url, transport, and policy summary per I1 |
 | summarize_bug | id | comments | fetches comments (private filtered with include_private=false), returns the summarization prompt text (fixed prompt template) |
+
+### Upstream failures of the write tools (issue #323)
+
+**The rule.** When Bugzilla refuses one of the seven bug-update tools
+(add_comment, update_bug_status, assign_bug, update_bug_fields,
+update_bug_dependencies, add_cc_to_bug, mark_as_duplicate), the result is
+the tool's fixed first line — the text `audit_refusal_text` maps it to —
+plus, at most, one bugwarden-authored hint selected by Bugzilla's numeric
+error code from the table below (`UPSTREAM_HINTS`, `upstream_failure_text`
+in server.rs). Bugzilla's own `message` never reaches the client: it tells
+`bug_id_does_not_exist` (101) from `bug_access_denied` (102), the oracle
+I2 forbids; `dependency_loop_multi` (116) lists the ids on the loop,
+hidden ones included; and a `see_also` or `dupe_of` refusal names the bug
+it could not resolve (I14). The raw code is not forwarded either — 101
+against 102 is the same split in a number. create_bug and add_attachment
+are untouched: create's refusal is padded to one uniform text (its row
+above) and the attachment refusal was already bare.
+
+**Reach.** Whether a code may carry a hint depends on whether every bug
+Bugzilla consults while validating the request was assessed by the guard
+(`UpstreamReach`). A code selects a hint only if its occurrence depends on
+nothing but the client's input and the assessed bug; otherwise the hint's
+presence or absence would answer, for free, a check that touched a hidden
+bug. `payload_reach` reads it off the `Bug.update` payload as an
+ALLOWLIST: `Assessed` only when EVERY key is one of status, assigned_to,
+cc, comment, priority, severity, summary, url, whiteboard, version,
+target_milestone, keywords — fields Bugzilla validates against the bug
+itself and instance vocabulary. Any other key makes the request
+`Unassessed` — `resolution` (its `still_unresolved_bugs` check walks the
+open blockers), `dupe_of`, `blocks`/`depends_on`, every `cf_*` field (a
+Bug-ID custom field resolves another bug) — and a key added later lands
+on that side until it is argued in. So add_comment (whose payload
+core builds), assign_bug and add_cc_to_bug are always Assessed;
+update_bug_dependencies and mark_as_duplicate always Unassessed;
+update_bug_status is Unassessed exactly when a resolution is sent (an
+empty `resolution` is never sent and stays Assessed); update_bug_fields is
+Unassessed with `resolution` or a `cf_*` key. A third state, `Unhintable`,
+takes precedence whenever the payload carries `see_also`: BMO validates a
+local see_also target inside `set_all` by resolving it and checking
+`can_edit_product` on ITS product, throwing `product_edit_denied`
+(`Bugzilla/BugUrl/Local.pm:93-104`, `_check_value`) — the one code hinted
+at Unassessed reach — and a local target can reach Bugzilla in a form the
+guard does not assess, so a 109 hint would say "exists, visible to the
+service account, product not editable" about it. At `Unhintable` no
+row applies, 109 included. `resolution` and `cf_*` stay `Unassessed`: a
+Bug-ID custom field throws only 100/101/102/32000 for its target, none of
+which is ever hinted, and the dependency checks in all three trees
+(`_check_dependencies`; BMO's `_check_relationship`) throw
+`illegal_change_deps` for a target's product, unhinted too.
+
+**The tier.** Conservative: a row is hinted only at `Assessed`, except 109
+(`product_edit_denied`), which 5.0 and 5.2 throw from `check_for_edit`
+and BMO inline, ahead of every field check (in `Bug.add_comment` only
+the comment's emptiness, code 50, precedes it, after the bug lookup
+itself, 100/101/102) —
+so it is hinted at `Unassessed` reach too, and withheld only at
+`Unhintable`, where a later check can throw the same code for an
+unassessed bug. The alternative, hinting at Unassessed reach wherever
+Bugzilla's validation order puts a check before every hidden-dependent
+one, was rejected: it relies on the stock order, the deployment runs a
+fork, and every such row would need a re-audit per version. Each row
+carries its tier as data (`any_reach`), so moving a row is a table edit
+plus the `upstream_hint_table_invariants` pin that `any_reach` is exactly
+109, never a code change.
+
+| tool | codes | reach | hint |
+|---|---|---|---|
+| add_comment | 50 | Assessed | The comment is empty. |
+| add_comment | 109 | any | The Bugzilla account in use may not edit bugs in this bug's product. |
+| add_comment | 113 | Assessed | Private comments need Bugzilla's insider group, which the account in use lacks; retry with is_private false. |
+| add_comment | 114 | Assessed | The comment is longer than Bugzilla accepts; shorten or split it. |
+| update_bug_status | 50 | Assessed | The status is empty. |
+| update_bug_status | 51 | Assessed | Bugzilla does not know this status; bug_fields lists the legal values where discovery is enabled. |
+| update_bug_status | 109 | any | (the 109 text) |
+| update_bug_status | 114 | Assessed | (the 114 text) |
+| update_bug_status | 115 | Assessed | The Bugzilla account in use may not make this status change on this bug. |
+| update_bug_status | 121 | Assessed | Closing this bug needs a resolution. |
+| update_bug_status | 123 | Assessed | Bugzilla does not allow this status change from the bug's current status: its workflow forbids the transition, or the account in use may not make it. |
+| assign_bug | 50 | Assessed | The assignee is empty. |
+| assign_bug | 51, 504 | Assessed | Bugzilla did not accept this assignee: the login is unknown or may not be assigned bugs in this product. |
+| assign_bug | 109 | any | (the 109 text) |
+| assign_bug | 114 | Assessed | (the 114 text) |
+| assign_bug | 115 | Assessed | The Bugzilla account in use may not reassign this bug. |
+| update_bug_fields | 51 | Assessed | Bugzilla does not know one of the values given (priority, severity, version, target milestone or keyword); bug_fields and bugzilla_products list the legal values where discovery is enabled. |
+| update_bug_fields | 104 | Assessed | The summary is longer than Bugzilla accepts. |
+| update_bug_fields | 107 | Assessed | The summary is empty once Bugzilla trims it. |
+| update_bug_fields | 109 | any | (the 109 text) |
+| update_bug_fields | 114 | Assessed | (the 114 text) |
+| update_bug_fields | 115 | Assessed | The Bugzilla account in use may not change one of these fields on this bug. |
+| update_bug_dependencies | 109 | any | (the 109 text) |
+| add_cc_to_bug | 50 | Assessed | The CC address is blank. |
+| add_cc_to_bug | 51, 504 | Assessed | Bugzilla did not accept this CC address: the login is unknown or may not be added in this product. |
+| add_cc_to_bug | 109 | any | (the 109 text) |
+| mark_as_duplicate | 109 | any | (the 109 text) |
+
+"any" means `Assessed` or `Unassessed`; at `Unhintable` reach (a payload
+carrying `see_also`) no row applies.
+
+Wordings the Bugzilla sources decided. 123: stock `statuses_available`
+drops every transition `check_can_change_field` refuses (all three
+trees), so a permission refusal on a status change arrives as 123
+(`illegal_bug_status_transition`), not 115 — the hint names both causes
+rather than blaming the workflow. The 115 row on update_bug_status stays,
+though in stock 5.0, 5.2 and BMO a status-only request cannot raise it:
+the status's own permission refusal is the 123 above, `clear_resolution`
+assigns the resolution directly rather than through `set()`,
+`everconfirmed` follows the transition's canconfirm check, and a
+closed-to-closed change re-sets an unchanged resolution — so a 115 at
+Assessed reach comes only from a `bug_check_can_change_field` hook or a
+fork, and the hint is safe whatever raises it, because
+`check_can_change_field` reads only the bug and the user. 104:
+`illegal_field` shares the number, but nothing on the REST
+update path throws it (`Field::check_field` has no caller there), and
+without a `cf_*` key — which makes the request Unassessed — only
+`_check_short_desc` throws `freetext_too_long`, so at Assessed reach 104
+is the summary. add_cc_to_bug 50: `Bug::add_cc` returns silently on an
+empty name, so `cc_email: ""` succeeds doing nothing and 50
+(`object_not_specified`) comes only from a whitespace-only address, hence
+"blank". 51 and 504 share one text on assign_bug and add_cc_to_bug
+because the split — an unknown login against one that exists but
+`strict_isolation` keeps out of the product — would enumerate accounts;
+success already shows whether a login is usable.
+
+**Dropped as unreachable under the tier:** update_bug_status 119 and
+update_bug_fields 119/122 (each needs `resolution` in the payload, which
+makes the request Unassessed), update_bug_dependencies 115,
+mark_as_duplicate 114. **Never hinted on any tool:** 100/101/102 (the
+existence oracle itself), 116 (`dependency_loop_single` shares the number
+with `_multi`, whose loop may run through a hidden bug), 118 (a
+self-duplicate shares the number with a loop through a hidden chain),
+32000 and -32000 (the fallback for every error `WS_ERROR_CODE` does not
+list; `comment_required` and `still_unresolved_bugs` land there), the
+authentication codes 300–307 and 410, and any code the table does not
+list. No shared "reason withheld" line for those: the allowlist fails
+closed, a shared line would need a list of the dangerous codes, and the
+largest group of indistinguishable failures is the one the audit refusal
+already sits in.
+
+**The HTTP status never selects a hint.** `upstream_hint(tool, code,
+reach)` has no status parameter: Bugzilla's REST layer maps 51 and 101 to
+404 and 102, 109, 113, 115 and 504 (among others) to 401, so a
+status-keyed hint would carry the 101/102 split. A code-less failure — a
+transport error, a non-JSON body, a non-2xx without an envelope — is the
+first line alone.
+
+**Limits.** An extension can remap a code through the
+`webservice_error_codes` hook, or throw a hidden-bug-dependent error under
+a listed number; the table then picks the wrong hint, which is a category
+and never text. The one stock site that throws a hinted code for a bug the
+guard may not have assessed — BMO's see_also target check,
+`Bugzilla/BugUrl/Local.pm:93-104` — is what `Unhintable` covers; a fork
+that adds another such site under a listed code needs the key that
+reaches it moved to that side. The fork the deployment runs was not read;
+each row is data, so switching one off is a one-line change. Agents lose
+the feedback 116, 118, 32000 and 122 carried (a self-dependency, a
+self-duplicate, a required comment, a resolution on an open bug); a
+pre-check before the request could restore the first two. Hinted failures
+are still recorded as `refused` (#325).
+
+**Logging.** A refusal is two lines: `warn!` with `bug_id`, `http_status`
+and `bugzilla_code` and no text, and `debug!` with
+`error = ?QuotedError(&e)` carrying the message. Bugzilla's
+`illegal_change` text prints a field's old and new values — for
+update_bug_fields a summary or a whiteboard, the content the tool-entry
+trace keeps out of the log (see "Update-field surface") — and
+`object_does_not_exist` prints the value sent, so the text is a `debug`
+line and not a `warn` one. create_bug keeps its single `warn` line: its texts
+name products and components, not bug content.
+
+**The audit fingerprint.** An unhinted upstream failure is byte-identical
+to the audit gate's refusal (`audit_refusal`): both are the tool's
+`audit_refusal_text`, so an audit outage still looks like the failure the
+client already knows ("Refusals are not a fingerprint"). A hinted failure
+is distinguishable from the gate refusal, but only arises when Bugzilla
+answered, and the post-dispatch fail-mode swap replaces it with the bare
+line under `closed_writes_denials` and `closed_all` (the swap test under
+"Testing"). Hints depend on (tool, code, reach) alone, never on audit
+state, so responses stay byte-identical with auditing off, on, or failing
+open (I15).
 
 ### Update-field surface (issue #38)
 
@@ -1145,7 +1339,10 @@ field (e.g. blanking the whiteboard) stays unsupported until someone needs
 it; one bug per call. The free-text values (`summary`, `whiteboard`,
 `url`) never appear in the server log — only which fields a call touched
 (presence/counts in the tool-entry trace; the audit stream's params
-allowlist records them, and the see_also URL lists, as `_len`).
+allowlist records them, and the see_also URL lists, as `_len`), and
+Bugzilla's refusal text, which echoes them (`illegal_change` prints a
+field's old and new values), is logged at `debug` only — see "Upstream
+failures of the write tools".
 `keywords_add`/`keywords_remove` and `target_milestone` are closed
 instance vocabulary — the same class as the already-allowlisted
 `keywords` and `version` — and are audit-recorded by value, so the
@@ -1452,6 +1649,16 @@ Decisions, all deliberate:
   same `Capped` budget, quoted, so a reader that honours quotes finds
   the end the writer marked. Readers that do not honour quotes are no
   better off than before: `grep 'status=HACKED'` still matches the line.
+  The seven bug-update tools write that field on a `debug` line of their
+  own (`<tool>: upstream refusal text`), beside a `warn` line
+  (`<tool>: upstream refused`) whose fields are exactly `bug_id`,
+  `http_status` and `bugzilla_code` and which carries no text at all, so
+  the default filter reports the refusal without the content
+  `update_bug_fields` keeps out of the log (#323; `binary_tracing_caps`
+  pins both lines — the key set of the `warn` one, with the whole
+  default-filter stderr carrying neither the text nor the `debug` line,
+  and the `debug` one's quoted `error=` equal to the Display with no
+  `status` key beside it). create_bug's single `warn` line is unchanged.
 
   The two lines a failed stdio handshake writes are bounded by a
   different means, because the cut above is the wrong instrument for
@@ -1517,7 +1724,11 @@ Decisions, all deliberate:
   tool's existing uniform failure text, chosen by tool name alone; a
   protocol error from the router stands unchanged (swapping it would
   create an outage-only distinguisher). Every routed tool must have a
-  refusal mapping (tested against the full router).
+  refusal mapping (tested against the full router). The same first line
+  is what a bug-update tool answers when Bugzilla refuses it: an unhinted
+  upstream failure and the gate refusal are byte-identical, and the
+  post-dispatch swap strips a code-selected hint along with everything
+  else (see "Upstream failures of the write tools").
 - **Record provenance.** `guard.policy_hash` is `sha256:<hex>` over the
   policy file bytes, so a record ties to the exact policy that produced
   it (`None` under the built-in default policy). stdio sessions are
@@ -3294,7 +3505,21 @@ wired, `server.rs` and `main.rs` are the reference.
   construction, never at first request; and `identity_source = "declared"`
   under `KeyCustody::PerRequest` plus a `needs_identity()` policy fails at
   `BugWarden::new` construction naming both "declared" and "per-request",
-  while the same policy under a server-held key builds successfully (A5).
+  while the same policy under a server-held key builds successfully (A5);
+  the write tools' upstream hint table — every row is found by its own
+  (tool, code) at Assessed reach, only the 109 rows at Unassessed and none
+  at Unhintable; the
+  table names only the seven bug-update tools, lists no forbidden code
+  (100/101/102/116/118/±32000/300–307/410), sets `any_reach` exactly on
+  109 with a 109 row per tool, holds nothing but 109 for
+  update_bug_dependencies and mark_as_duplicate, and repeats no key;
+  create_bug and add_attachment never get a hint; hint texts carry no
+  digit, `#` or newline; line 1 equals `audit_refusal_text` for all seven
+  and a code-less failure is exactly line 1, 109 at Unhintable included;
+  `payload_reach` per key (see_also is Unhintable whatever else is sent;
+  resolution, a `cf_*` key, dupe_of, blocks and an unknown key are
+  Unassessed; status plus comment, and priority alone, Assessed); and a
+  plain transport-like error gives line 1.
 - Unit tests (#[cfg(test)] in crates/bugwarden/src/config.rs): the key
   custody table — the mutual-exclusion error names both flags (each pinned
   with its env var, since `--api-key` is a substring of `--api-key-file`);
@@ -3378,7 +3603,21 @@ wired, `server.rs` and `main.rs` are the reference.
 - Integration tests (crates/bugwarden/tests/tools_wiremock.rs, wiremock +
   rmcp client over an in-memory duplex transport): the tools are CALLED
   through a real MCP session, so a tool that stops calling its guard fails
-  a test rather than only a helper suite. Minimum bar: create_bug policy
+  a test rather than only a helper suite. Minimum bar: the write tools'
+  upstream failures, against an upstream message naming bug 424242 and a
+  forged `status=HACKED` — one row per bug-update tool returns exactly
+  line 1 plus the literal hint and never the id, the forged pair or
+  `bugzilla error`; withheld codes (100/101/102/116/118/32000/-32000/306)
+  give exactly line 1, #323's own `dependency_loop_multi` naming 666
+  included; the lookup is keyed on the tool (add_cc_to_bug 114 and
+  add_comment 123 give line 1); the HTTP status never selects a hint (114
+  under 200, 400 and 500 is byte-identical, and 101/404, 102/401, a
+  code-less 401/404/500 and an HTML 502 give line 1); and an Unassessed
+  request gets no hint (dependencies with 114 or 115, a status with a
+  resolution and 123, fields with see_also, a `cf_*` key or a resolution
+  and 107) while the same request without that key, with
+  `resolution: ""`, or carrying a `cf_*` key with 109, is hinted, and a
+  see_also link with 109 is exactly line 1; create_bug policy
   refusal and upstream refusal are byte-identical and each cost exactly one
   upstream request (nothing POSTed on the refused path, which instead burns
   a classify call against bug id 0); a claimed `groups` list never defeats
@@ -3635,7 +3874,12 @@ wired, `server.rs` and `main.rs` are the reference.
   against plain `note_redacted` still clearing it — the two sit side by
   side so neither can drift into the other; the fail-closed scopes
   (pre-dispatch gate proven by upstream request counts) via the sink's
-  cfg(test) fault injection; the transport-derived
+  cfg(test) fault injection; the post-dispatch swap under
+  `closed_writes_denials` — with a healthy handshake, add_comment against
+  a 400/114 upstream is served hinted, and once the sink fails the same
+  call is swapped for the bare `Failed to create a comment` with the POST
+  still received, the one test that reaches the swap arm with a write
+  result (#323); the transport-derived
   fail-mode defaults bound to their documented wording; the params
   allowlist (free text to `_len`, 1024-char truncation of values, and
   over-cap key names RELOCATED at both levels — an end-to-end served

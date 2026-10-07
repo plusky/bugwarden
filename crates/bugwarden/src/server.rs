@@ -244,8 +244,9 @@ fn audit_refusal_text(tool: &str) -> Option<String> {
         "quicksearch_syntax" => "Failed to fetch quicksearch documentation".to_string(),
         "bug_url" => "Failed to compute the bug url".to_string(),
         "mcp_server_info" => "Failed to compute server info".to_string(),
-        // Write tools: the first line of their existing failure text,
-        // without the upstream detail — truthfully so: nothing upstream
+        // Write tools: the first line of their failure text, which is the
+        // whole of it unless Bugzilla's code selects a hint
+        // (`upstream_failure_text`) — truthfully so: nothing upstream
         // happened when the gate refused before dispatch.
         "add_comment" => "Failed to create a comment".to_string(),
         "update_bug_status" => "Failed to update bug status".to_string(),
@@ -265,7 +266,239 @@ fn audit_refusal_text(tool: &str) -> Option<String> {
 /// a generic text; unreachable for routed tools (see
 /// [`audit_refusal_text`]) — the fallback exists so the map is total.
 fn audit_refusal(tool: &str) -> CallToolResult {
-    err_text(audit_refusal_text(tool).unwrap_or_else(|| "Request failed".to_string()))
+    err_text(refusal_line(tool))
+}
+
+/// [`audit_refusal_text`] made total: the generic fallback for a name
+/// outside the tool surface.
+fn refusal_line(tool: &str) -> String {
+    audit_refusal_text(tool).unwrap_or_else(|| "Request failed".to_string())
+}
+
+/// How far the guard's assessment reaches into a write Bugzilla refused:
+/// whether every bug Bugzilla consulted while validating it was assessed,
+/// which decides whether its error code may select a hint (DESIGN.md,
+/// "Upstream failures of the write tools").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UpstreamReach {
+    /// Every field is validated against the assessed bug and the request
+    /// alone.
+    Assessed,
+    /// Some field makes Bugzilla look at a bug the guard never assessed —
+    /// a dependency, a duplicate target, a resolution's open blockers, a
+    /// custom field — so only a code thrown before any field is read may
+    /// hint.
+    Unassessed,
+    /// A field's own validation resolves a bug the guard may not have
+    /// assessed inside a check that throws a hinted code (BMO checks a
+    /// see_also target's product with product_edit_denied), so no code
+    /// may hint.
+    Unhintable,
+}
+
+/// One row of [`UPSTREAM_HINTS`]: for `tool`, any of `codes` selects
+/// `text` — at `Unassessed` reach too when `any_reach`, else at
+/// `Assessed` only; never at `Unhintable`.
+struct UpstreamHint {
+    tool: &'static str,
+    codes: &'static [i64],
+    any_reach: bool,
+    text: &'static str,
+}
+
+impl UpstreamHint {
+    /// A row hinted at `Assessed` reach only.
+    const fn assessed(tool: &'static str, codes: &'static [i64], text: &'static str) -> Self {
+        Self {
+            tool,
+            codes,
+            any_reach: false,
+            text,
+        }
+    }
+
+    /// A row hinted at `Unassessed` reach too.
+    const fn any_reach(tool: &'static str, codes: &'static [i64], text: &'static str) -> Self {
+        Self {
+            tool,
+            codes,
+            any_reach: true,
+            text,
+        }
+    }
+}
+
+/// Bugzilla's `product_edit_denied`, thrown ahead of every check that
+/// reads a bug — the one code hinted at `Unassessed` reach.
+const PRODUCT_EDIT_DENIED: &str =
+    "The Bugzilla account in use may not edit bugs in this bug's product.";
+
+/// Bugzilla's `comment_too_long`.
+const COMMENT_TOO_LONG: &str = "The comment is longer than Bugzilla accepts; shorten or split it.";
+
+/// The hints a write tool may append to its fixed failure line, keyed on
+/// (tool, Bugzilla error code). An allowlist: a code it does not list —
+/// 100/101/102, 116, 118, the ±32000 fallbacks, the auth codes — gives
+/// the bare line.
+const UPSTREAM_HINTS: &[UpstreamHint] = &[
+    UpstreamHint::assessed("add_comment", &[50], "The comment is empty."),
+    UpstreamHint::any_reach("add_comment", &[109], PRODUCT_EDIT_DENIED),
+    UpstreamHint::assessed(
+        "add_comment",
+        &[113],
+        "Private comments need Bugzilla's insider group, which the account in use lacks; retry with is_private false.",
+    ),
+    UpstreamHint::assessed("add_comment", &[114], COMMENT_TOO_LONG),
+    UpstreamHint::assessed("update_bug_status", &[50], "The status is empty."),
+    UpstreamHint::assessed(
+        "update_bug_status",
+        &[51],
+        "Bugzilla does not know this status; bug_fields lists the legal values where discovery is enabled.",
+    ),
+    UpstreamHint::any_reach("update_bug_status", &[109], PRODUCT_EDIT_DENIED),
+    UpstreamHint::assessed("update_bug_status", &[114], COMMENT_TOO_LONG),
+    UpstreamHint::assessed(
+        "update_bug_status",
+        &[115],
+        "The Bugzilla account in use may not make this status change on this bug.",
+    ),
+    UpstreamHint::assessed(
+        "update_bug_status",
+        &[121],
+        "Closing this bug needs a resolution.",
+    ),
+    UpstreamHint::assessed(
+        "update_bug_status",
+        &[123],
+        "Bugzilla does not allow this status change from the bug's current status: its workflow forbids the transition, or the account in use may not make it.",
+    ),
+    UpstreamHint::assessed("assign_bug", &[50], "The assignee is empty."),
+    UpstreamHint::assessed(
+        "assign_bug",
+        &[51, 504],
+        "Bugzilla did not accept this assignee: the login is unknown or may not be assigned bugs in this product.",
+    ),
+    UpstreamHint::any_reach("assign_bug", &[109], PRODUCT_EDIT_DENIED),
+    UpstreamHint::assessed("assign_bug", &[114], COMMENT_TOO_LONG),
+    UpstreamHint::assessed(
+        "assign_bug",
+        &[115],
+        "The Bugzilla account in use may not reassign this bug.",
+    ),
+    UpstreamHint::assessed(
+        "update_bug_fields",
+        &[51],
+        "Bugzilla does not know one of the values given (priority, severity, version, target milestone or keyword); bug_fields and bugzilla_products list the legal values where discovery is enabled.",
+    ),
+    UpstreamHint::assessed(
+        "update_bug_fields",
+        &[104],
+        "The summary is longer than Bugzilla accepts.",
+    ),
+    UpstreamHint::assessed(
+        "update_bug_fields",
+        &[107],
+        "The summary is empty once Bugzilla trims it.",
+    ),
+    UpstreamHint::any_reach("update_bug_fields", &[109], PRODUCT_EDIT_DENIED),
+    UpstreamHint::assessed("update_bug_fields", &[114], COMMENT_TOO_LONG),
+    UpstreamHint::assessed(
+        "update_bug_fields",
+        &[115],
+        "The Bugzilla account in use may not change one of these fields on this bug.",
+    ),
+    UpstreamHint::any_reach("update_bug_dependencies", &[109], PRODUCT_EDIT_DENIED),
+    UpstreamHint::assessed("add_cc_to_bug", &[50], "The CC address is blank."),
+    UpstreamHint::assessed(
+        "add_cc_to_bug",
+        &[51, 504],
+        "Bugzilla did not accept this CC address: the login is unknown or may not be added in this product.",
+    ),
+    UpstreamHint::any_reach("add_cc_to_bug", &[109], PRODUCT_EDIT_DENIED),
+    UpstreamHint::any_reach("mark_as_duplicate", &[109], PRODUCT_EDIT_DENIED),
+];
+
+/// The hint `tool`'s failure may carry for Bugzilla's `code` at `reach`.
+/// No HTTP-status parameter on purpose: Bugzilla's REST layer maps the
+/// existence oracle's two codes to different statuses.
+fn upstream_hint(tool: &str, code: i64, reach: UpstreamReach) -> Option<&'static str> {
+    UPSTREAM_HINTS
+        .iter()
+        .find(|row| {
+            row.tool == tool
+                && row.codes.contains(&code)
+                && match reach {
+                    UpstreamReach::Assessed => true,
+                    UpstreamReach::Unassessed => row.any_reach,
+                    UpstreamReach::Unhintable => false,
+                }
+        })
+        .map(|row| row.text)
+}
+
+/// A write tool's failure text for an upstream refusal: its fixed first
+/// line — the audit gate's refusal, so an unhinted failure and the gate
+/// refusal are byte-identical — plus the hint `code` selects, if any.
+fn upstream_failure_text(tool: &str, code: Option<i64>, reach: UpstreamReach) -> String {
+    let mut text = refusal_line(tool);
+    if let Some(hint) = code.and_then(|code| upstream_hint(tool, code, reach)) {
+        text.push('\n');
+        text.push_str(hint);
+    }
+    text
+}
+
+/// The reach of a `Bug.update` payload: `see_also` is Unhintable outright;
+/// otherwise an allowlist of the keys Bugzilla validates against the bug
+/// itself and instance vocabulary, so a key added later is Unassessed
+/// until it is argued in.
+fn payload_reach(payload: &serde_json::Map<String, Value>) -> UpstreamReach {
+    const ASSESSED_KEYS: &[&str] = &[
+        "status",
+        "assigned_to",
+        "cc",
+        "comment",
+        "priority",
+        "severity",
+        "summary",
+        "url",
+        "whiteboard",
+        "version",
+        "target_milestone",
+        "keywords",
+    ];
+    if payload.contains_key("see_also") {
+        UpstreamReach::Unhintable
+    } else if payload
+        .keys()
+        .all(|key| ASSESSED_KEYS.contains(&key.as_str()))
+    {
+        UpstreamReach::Assessed
+    } else {
+        UpstreamReach::Unassessed
+    }
+}
+
+/// A write tool's result for an upstream failure, logged on two lines:
+/// `warn` with the status and code and no text, `debug` with Bugzilla's
+/// message, which can echo the content the tool-entry trace keeps out of
+/// the log. A transport error has neither status nor code.
+fn upstream_refusal(
+    tool: &'static str,
+    bug_id: u64,
+    reach: UpstreamReach,
+    e: &anyhow::Error,
+) -> CallToolResult {
+    let bz = e.downcast_ref::<bugwarden_core::client::BugzillaError>();
+    let code = bz.and_then(|bz| bz.code());
+    tracing::warn!(
+        bug_id,
+        http_status = bz.map(|bz| bz.http_status()),
+        bugzilla_code = code,
+        "{tool}: upstream refused"
+    );
+    tracing::debug!(bug_id, error = ?QuotedError(e), "{tool}: upstream refusal text");
+    err_text(upstream_failure_text(tool, code, reach))
 }
 
 /// Keys of client-authored tool parameters whose VALUES may enter an audit
@@ -3413,7 +3646,12 @@ impl BugWarden {
             .await
         {
             Ok(result) => Ok(ok_json(result)),
-            Err(e) => Ok(err_text(format!("Failed to create a comment\n{e}"))),
+            Err(e) => Ok(upstream_refusal(
+                "add_comment",
+                p.bug_id,
+                UpstreamReach::Assessed,
+                &e,
+            )),
         }
     }
 
@@ -3453,13 +3691,14 @@ impl BugWarden {
         }
         attach_comment(&mut payload, &p.comment);
 
+        let reach = payload_reach(&payload);
         match self
             .bz
             .update_bug(&key, p.bug_id, Value::Object(payload))
             .await
         {
             Ok(result) => Ok(ok_json(result)),
-            Err(e) => Ok(err_text(format!("Failed to update bug status\n{e}"))),
+            Err(e) => Ok(upstream_refusal("update_bug_status", p.bug_id, reach, &e)),
         }
     }
 
@@ -3493,13 +3732,14 @@ impl BugWarden {
         let mut payload = serde_json::Map::new();
         payload.insert("assigned_to".to_string(), json!(p.assignee));
         attach_comment(&mut payload, &p.comment);
+        let reach = payload_reach(&payload);
         match self
             .bz
             .update_bug(&key, p.bug_id, Value::Object(payload))
             .await
         {
             Ok(result) => Ok(ok_json(result)),
-            Err(e) => Ok(err_text(format!("Failed to assign bug\n{e}"))),
+            Err(e) => Ok(upstream_refusal("assign_bug", p.bug_id, reach, &e)),
         }
     }
 
@@ -3639,13 +3879,14 @@ impl BugWarden {
         }
         note(p.bug_id, Verdict::Served);
 
+        let reach = payload_reach(&payload);
         match self
             .bz
             .update_bug(&key, p.bug_id, Value::Object(payload))
             .await
         {
             Ok(result) => Ok(ok_json(result)),
-            Err(e) => Ok(err_text(format!("Failed to update bug fields\n{e}"))),
+            Err(e) => Ok(upstream_refusal("update_bug_fields", p.bug_id, reach, &e)),
         }
     }
 
@@ -3759,7 +4000,12 @@ impl BugWarden {
             .await
         {
             Ok(result) => Ok(ok_json(result)),
-            Err(e) => Ok(err_text(format!("Failed to update bug dependencies\n{e}"))),
+            Err(e) => Ok(upstream_refusal(
+                "update_bug_dependencies",
+                p.bug_id,
+                UpstreamReach::Unassessed,
+                &e,
+            )),
         }
     }
 
@@ -3790,10 +4036,16 @@ impl BugWarden {
         {
             return Ok(denied);
         }
-        let payload = json!({ "cc": { "add": [p.cc_email] } });
-        match self.bz.update_bug(&key, p.bug_id, payload).await {
+        let mut payload = serde_json::Map::new();
+        payload.insert("cc".to_string(), json!({ "add": [p.cc_email] }));
+        let reach = payload_reach(&payload);
+        match self
+            .bz
+            .update_bug(&key, p.bug_id, Value::Object(payload))
+            .await
+        {
             Ok(result) => Ok(ok_json(result)),
-            Err(e) => Ok(err_text(format!("Failed to add CC\n{e}"))),
+            Err(e) => Ok(upstream_refusal("add_cc_to_bug", p.bug_id, reach, &e)),
         }
     }
 
@@ -3868,7 +4120,12 @@ impl BugWarden {
             .await
         {
             Ok(result) => Ok(ok_json(result)),
-            Err(e) => Ok(err_text(format!("Failed to mark as duplicate\n{e}"))),
+            Err(e) => Ok(upstream_refusal(
+                "mark_as_duplicate",
+                p.bug_id,
+                UpstreamReach::Unassessed,
+                &e,
+            )),
         }
     }
 
@@ -6413,6 +6670,201 @@ mod tests {
         );
     }
 
+    // ---------- upstream failures of the write tools ----------
+
+    /// The seven bug-update tools, the only names the hint table may carry.
+    const UPDATE_TOOLS: [&str; 7] = [
+        "add_comment",
+        "update_bug_status",
+        "assign_bug",
+        "update_bug_fields",
+        "update_bug_dependencies",
+        "add_cc_to_bug",
+        "mark_as_duplicate",
+    ];
+
+    #[test]
+    fn upstream_hint_is_found_by_key_and_gated_by_reach() {
+        for row in UPSTREAM_HINTS {
+            for &code in row.codes {
+                assert_eq!(
+                    upstream_hint(row.tool, code, UpstreamReach::Assessed),
+                    Some(row.text),
+                    "{} {code} at Assessed",
+                    row.tool
+                );
+                let at_unassessed = upstream_hint(row.tool, code, UpstreamReach::Unassessed);
+                if code == 109 {
+                    assert_eq!(at_unassessed, Some(row.text), "109 is hinted at any reach");
+                } else {
+                    assert_eq!(
+                        at_unassessed, None,
+                        "{} {code} must not be hinted at Unassessed",
+                        row.tool
+                    );
+                }
+                assert_eq!(
+                    upstream_hint(row.tool, code, UpstreamReach::Unhintable),
+                    None,
+                    "{} {code} must not be hinted at Unhintable",
+                    row.tool
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn upstream_hint_table_invariants() {
+        // The existence oracle, the loop codes, the unlisted-error
+        // fallbacks and the authentication codes may never select a hint.
+        const FORBIDDEN: &[i64] = &[
+            100, 101, 102, 116, 118, 32000, -32000, 300, 301, 302, 303, 304, 305, 306, 307, 410,
+        ];
+        let mut keys = BTreeSet::new();
+        for row in UPSTREAM_HINTS {
+            assert!(
+                UPDATE_TOOLS.contains(&row.tool),
+                "{} is not a bug-update tool",
+                row.tool
+            );
+            assert!(!row.codes.is_empty(), "{}: a row without codes", row.tool);
+            for &code in row.codes {
+                assert!(
+                    !FORBIDDEN.contains(&code),
+                    "{} lists forbidden code {code}",
+                    row.tool
+                );
+                assert_eq!(
+                    row.any_reach,
+                    code == 109,
+                    "{} {code}: any_reach exactly on 109",
+                    row.tool
+                );
+                assert!(
+                    keys.insert((row.tool, code)),
+                    "duplicate key {} {code}",
+                    row.tool
+                );
+            }
+            if matches!(row.tool, "update_bug_dependencies" | "mark_as_duplicate") {
+                assert_eq!(row.codes, &[109], "{} may hint nothing but 109", row.tool);
+            }
+        }
+        for tool in UPDATE_TOOLS {
+            assert!(keys.contains(&(tool, 109)), "{tool} has no 109 row");
+        }
+    }
+
+    #[test]
+    fn create_bug_and_add_attachment_never_get_a_hint() {
+        for tool in ["create_bug", "add_attachment"] {
+            assert!(
+                !UPSTREAM_HINTS.iter().any(|row| row.tool == tool),
+                "{tool} must not be in the table"
+            );
+            for code in [
+                50, 51, 104, 107, 109, 113, 114, 115, 121, 123, 504, 600, 601, 604, 606,
+            ] {
+                for reach in [UpstreamReach::Assessed, UpstreamReach::Unassessed] {
+                    assert_eq!(upstream_hint(tool, code, reach), None, "{tool} {code}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn upstream_hint_texts_carry_no_digit_hash_or_newline() {
+        // A digit or a `#` would read as a bug id or a code; a newline
+        // would add a line to a two-line contract.
+        for row in UPSTREAM_HINTS {
+            assert!(!row.text.is_empty(), "{}: an empty hint", row.tool);
+            assert!(
+                !row.text
+                    .chars()
+                    .any(|c| c.is_ascii_digit() || c == '#' || c == '\n'),
+                "{}: {}",
+                row.tool,
+                row.text
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_failure_text_starts_with_the_audit_refusal_line() {
+        for tool in UPDATE_TOOLS {
+            let line = audit_refusal_text(tool).expect("every bug-update tool has a line");
+            assert_eq!(
+                upstream_failure_text(tool, None, UpstreamReach::Assessed),
+                line,
+                "{tool}: a code-less failure is exactly line 1"
+            );
+            assert_eq!(
+                upstream_failure_text(tool, Some(-32000), UpstreamReach::Assessed),
+                line,
+                "{tool}: an unlisted code is exactly line 1"
+            );
+            assert_eq!(
+                upstream_failure_text(tool, Some(109), UpstreamReach::Unassessed),
+                format!("{line}\n{PRODUCT_EDIT_DENIED}"),
+                "{tool}: 109 hints at any reach, on a second line"
+            );
+            assert_eq!(
+                upstream_failure_text(tool, Some(109), UpstreamReach::Unhintable),
+                line,
+                "{tool}: nothing hints at Unhintable, 109 included"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_reach_is_an_allowlist_of_assessed_keys() {
+        let map = |keys: &[&str]| -> serde_json::Map<String, Value> {
+            keys.iter().map(|k| (k.to_string(), json!("x"))).collect()
+        };
+        for key in [
+            "resolution",
+            "cf_fixed_in",
+            "dupe_of",
+            "blocks",
+            "depends_on",
+            "something_new",
+        ] {
+            assert_eq!(
+                payload_reach(&map(&["status", key])),
+                UpstreamReach::Unassessed,
+                "{key} makes the request Unassessed"
+            );
+        }
+        // see_also is Unhintable whatever else is sent, Unassessed keys
+        // included.
+        for keys in [
+            &["see_also"][..],
+            &["status", "see_also"],
+            &["see_also", "resolution"],
+            &["cf_fixed_in", "see_also"],
+        ] {
+            assert_eq!(
+                payload_reach(&map(keys)),
+                UpstreamReach::Unhintable,
+                "{keys:?} makes the request Unhintable"
+            );
+        }
+        assert_eq!(
+            payload_reach(&map(&["status", "comment"])),
+            UpstreamReach::Assessed
+        );
+        assert_eq!(payload_reach(&map(&["priority"])), UpstreamReach::Assessed);
+    }
+
+    #[test]
+    fn a_transport_error_gives_the_bare_line() {
+        // No BugzillaError to downcast to, so no code and no hint.
+        let e = anyhow::anyhow!("error sending request");
+        let result = upstream_refusal("add_comment", 7, UpstreamReach::Assessed, &e);
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(text_of(&result), "Failed to create a comment");
+    }
+
     #[test]
     fn allowlist_reduces_free_text_to_length_only() {
         let args = json!({
@@ -7062,6 +7514,43 @@ mod tests {
             AuditEventKind::AuditGap(gap) => assert_eq!(gap.dropped, 4),
             other => panic!("expected audit_gap first after recovery, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn closed_writes_denials_swaps_a_hinted_upstream_refusal_for_the_bare_line() {
+        // The post-dispatch swap reached with a WRITE result: the sibling
+        // test above fails its sink before the handshake, so its write
+        // never gets past the pre-dispatch gate.
+        let mock = MockServer::start().await;
+        mount_bug7(&mock).await;
+        Mock::given(method("POST"))
+            .and(path("/rest/bug/7/comment"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": true, "code": 114, "message": "Comment too long."
+            })))
+            .expect(2)
+            .mount(&mock)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, _audit_path) = audit_state(dir.path(), FailMode::ClosedWritesDenials);
+        let client = mcp_client("", &mock.uri(), Some(Arc::clone(&audit))).await;
+        let args = json!({ "bug_id": 7, "comment": "hi" });
+
+        // Healthy sink: the refusal carries its hint.
+        let hinted = call(&client, "add_comment", args.clone()).await;
+        assert!(is_error(&hinted));
+        assert_eq!(
+            text_of(&hinted),
+            format!("Failed to create a comment\n{COMMENT_TOO_LONG}")
+        );
+
+        // Nothing has dropped yet, so the gate is still open: the call is
+        // dispatched (the POST is the mock's second expected request), the
+        // record fails, and the swap strips the hint with everything else.
+        audit.sink.set_fail_writes(true);
+        let swapped = call(&client, "add_comment", args).await;
+        assert!(is_error(&swapped));
+        assert_eq!(text_of(&swapped), "Failed to create a comment");
     }
 
     #[tokio::test]
