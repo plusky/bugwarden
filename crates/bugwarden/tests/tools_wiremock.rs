@@ -32,7 +32,19 @@
 //!   be served), or looking field types up for a body;
 //! - bug_history skipping the field-type lookup, bypassing its cache,
 //!   looking up every field name instead of the `cf_` ones, reading an
-//!   unknown or an Other field as no link, or scrubbing without the kinds.
+//!   unknown field as no link or an Other field as one, or scrubbing
+//!   without the kinds;
+//! - dropping the Bug ID custom field targets from update_bug_fields' or
+//!   create_bug's assessed set, passing an unassessable value through,
+//!   assessing an Other field's value, answering a write's lookup from
+//!   the cache, counting the cap after a request, skipping the target
+//!   assessment when the create gate refused, answering a create's
+//!   target denial with anything but the padded create refusal,
+//!   resolving the caller for a create without targets, lifting the
+//!   custom-field count cap (which lets a client buy lookups by the key),
+//!   moving it behind the key lookup, counting values instead of keys, or
+//!   answering the unassessable-value refusal before the bug's own check,
+//!   which would tell a caller without `fields` a field's kind by name.
 
 use std::sync::Arc;
 
@@ -270,6 +282,8 @@ async fn create_bug_success_reaches_bugzilla_untouched() {
 
 #[tokio::test]
 async fn create_bug_custom_field_reaches_the_post_body() {
+    // A custom field Bugzilla reports as free text is forwarded as sent;
+    // learning that costs the one type lookup, before the POST.
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/rest/bug"))
@@ -278,11 +292,26 @@ async fn create_bug_custom_field_reaches_the_post_body() {
         .expect(1)
         .mount(&mock)
         .await;
+    mount_field_types(&mock, &[("cf_fixed_in", 1)]).await;
     let client = client_for("", &mock).await;
     let mut args = create_args("openSUSE");
     args["custom_fields"] = json!({ "cf_fixed_in": "1.2.3" });
     let result = call(&client, "create_bug", args).await;
     assert!(!is_error(&result), "a cf_* key must reach the POST body");
+    let requests: Vec<(String, String)> = mock
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.method.to_string(), r.url.path().to_string()))
+        .collect();
+    assert_eq!(
+        requests,
+        vec![
+            ("GET".to_string(), "/rest/field/bug".to_string()),
+            ("POST".to_string(), "/rest/bug".to_string()),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -3543,6 +3572,21 @@ fn bugzilla_refusal(status: u16, code: Option<i64>) -> ResponseTemplate {
 /// the answer to an upstream refusal and never a local gate's.
 async fn refused_write(tool: &str, args: Value, response: ResponseTemplate) -> String {
     let mock = MockServer::start().await;
+    // A write carrying custom_fields first learns their kinds; answering
+    // free text lets the request under test reach Bugzilla's refusal.
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(|req: &wiremock::Request| {
+            let fields: Vec<Value> = req
+                .url
+                .query_pairs()
+                .filter(|(k, _)| k == "names")
+                .map(|(_, name)| json!({ "name": name, "type": 1 }))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({ "fields": fields }))
+        })
+        .mount(&mock)
+        .await;
     for id in [7u64, 8] {
         Mock::given(method("GET"))
             .and(path("/rest/bug"))
@@ -4140,4 +4184,733 @@ async fn bug_history_looks_a_custom_field_up_once_per_process() {
         );
     }
     assert_eq!(field_lookups(&mock).await.len(), 1);
+}
+
+// ---------- Bug ID custom fields (I8 on writes) ----------
+
+/// The fixed refusal for a custom field value the guard cannot judge.
+fn unassessable_refusal(field: &str) -> String {
+    format!(
+        "Custom field '{field}' may hold a bug id: give a numeric bug id, or an empty value \
+         to clear it"
+    )
+}
+
+/// Mount the world-readable bug 7, the policy-hidden bug 999, and a PUT on
+/// bug 7 expected `puts` times.
+async fn mount_update_target(mock: &MockServer, puts: u64) {
+    mount_bug_and_padding(mock, world_readable_bug(7)).await;
+    let mut secret = world_readable_bug(999);
+    secret["product"] = json!("SecretSauce");
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "999"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [secret] })))
+        .mount(mock)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/rest/bug/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [{ "id": 7 }] })))
+        .expect(puts)
+        .mount(mock)
+        .await;
+}
+
+/// The `id` of every classify fetch (`GET /rest/bug?id=..`) wiremock saw.
+async fn classified_ids(mock: &MockServer) -> Vec<String> {
+    mock.received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method == "GET" && r.url.path() == "/rest/bug")
+        .flat_map(|r| {
+            r.url
+                .query_pairs()
+                .filter(|(k, _)| k == "id")
+                .map(|(_, v)| v.into_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn update_fields_bug_id_custom_field_targets_respect_the_guard() {
+    // The issue's scenario: a Bug ID custom field is a link like see_also,
+    // so its target takes the Summary bar (I8/I14) and a hidden one draws
+    // the uniform denial (I2) with nothing PUT — in every spelling Bugzilla
+    // resolves to the same bug.
+    let mock = MockServer::start().await;
+    mount_update_target(&mock, 0).await;
+    mount_field_types(&mock, &[("cf_regression_of", 6)]).await;
+    let client = client_for(HIDE_SECRET_POLICY, &mock).await;
+
+    for value in [json!(999), json!("#999"), json!(" 999 ")] {
+        let result = call(
+            &client,
+            "update_bug_fields",
+            json!({ "bug_id": 7, "custom_fields": { "cf_regression_of": value } }),
+        )
+        .await;
+        assert!(is_error(&result), "{value}");
+        assert_eq!(
+            text_of(&result),
+            "Bug 999 is not accessible through this server",
+            "a hidden Bug ID custom field target takes the uniform denial: {value}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_fields_unassessable_bug_id_custom_field_value_is_refused() {
+    // Bugzilla resolves anything that is not an id as an alias, and an
+    // object by its id: the guard cannot judge those, so it refuses with a
+    // fixed text after the type lookup and before any classification.
+    let mock = MockServer::start().await;
+    mount_update_target(&mock, 0).await;
+    mount_field_types(&mock, &[("cf_regression_of", 6)]).await;
+    let client = client_for(HIDE_SECRET_POLICY, &mock).await;
+
+    let values = [
+        json!("CVE-x"),
+        json!(999.0),
+        json!({ "id": 999 }),
+        json!([999]),
+        json!(true),
+    ];
+    for value in &values {
+        let result = call(
+            &client,
+            "update_bug_fields",
+            json!({ "bug_id": 7, "custom_fields": { "cf_regression_of": value } }),
+        )
+        .await;
+        assert!(is_error(&result), "{value}");
+        assert_eq!(
+            text_of(&result),
+            unassessable_refusal("cf_regression_of"),
+            "{value}"
+        );
+    }
+    let paths: Vec<String> = mock
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    let per_call: Vec<String> = (0..values.len())
+        .flat_map(|_| ["/rest/field/bug".to_string(), "/rest/bug".to_string()])
+        .collect();
+    assert_eq!(
+        paths, per_call,
+        "each call costs the lookup and the bug's own check, and nothing is PUT"
+    );
+}
+
+#[tokio::test]
+async fn update_fields_custom_field_refusal_never_precedes_the_bugs_own_denial() {
+    // The fixed refusal names a field's kind, so it must come after the
+    // named bug's own check: against a hidden bug every probe — a field
+    // Bugzilla does not know, a free-text field, a numeric value — draws
+    // the uniform denial (I2), with the bug classified all the same and
+    // nothing PUT. Issued first, the refusal would be a field-name and
+    // field-kind oracle open to a caller with no access at all.
+    let mock = MockServer::start().await;
+    let mut secret = world_readable_bug(999);
+    secret["product"] = json!("SecretSauce");
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "999"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [secret] })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "8"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "bugs": [world_readable_bug(8)] })),
+        )
+        .mount(&mock)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/rest/bug/999"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [{ "id": 999 }] })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    mount_field_types(&mock, &[("cf_foundby", 1)]).await;
+    let client = client_for(HIDE_SECRET_POLICY, &mock).await;
+
+    for (fields, classified) in [
+        (json!({ "cf_bogus": "x" }), 1),
+        (json!({ "cf_foundby": "x" }), 1),
+        (json!({ "cf_foundby": 8 }), 1),
+        (json!({ "cf_bogus": 8 }), 2),
+    ] {
+        let before = mock.received_requests().await.unwrap().len();
+        let result = call(
+            &client,
+            "update_bug_fields",
+            json!({ "bug_id": 999, "custom_fields": fields }),
+        )
+        .await;
+        assert!(is_error(&result), "{fields}");
+        assert_eq!(
+            text_of(&result),
+            "Bug 999 is not accessible through this server",
+            "the bug's uniform denial wins over any custom field verdict: {fields}"
+        );
+        let paths: Vec<String> = mock.received_requests().await.unwrap()[before..]
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        let mut expected = vec!["/rest/field/bug".to_string()];
+        expected.extend(vec!["/rest/bug".to_string(); classified]);
+        assert_eq!(
+            paths, expected,
+            "the lookup, then the bug and every target classified: {fields}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_fields_non_link_custom_field_is_not_assessed() {
+    // A field Bugzilla reports as some other type never names a bug: its
+    // value is not classified, whatever digits it holds, and reaches the PUT.
+    let mock = MockServer::start().await;
+    mount_bug_and_padding(&mock, world_readable_bug(7)).await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "999"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/rest/bug/7"))
+        .and(body_partial_json(json!({ "cf_build": 999 })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [{ "id": 7 }] })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    mount_field_types(&mock, &[("cf_build", 1)]).await;
+    let client = client_for(HIDE_SECRET_POLICY, &mock).await;
+
+    let result = call(
+        &client,
+        "update_bug_fields",
+        json!({ "bug_id": 7, "custom_fields": { "cf_build": 999 } }),
+    )
+    .await;
+    assert!(!is_error(&result), "{}", text_of(&result));
+}
+
+#[tokio::test]
+async fn update_fields_fails_closed_when_the_type_lookup_fails() {
+    // With the kinds unknown every custom field may hold a bug id: a numeric
+    // value is assessed as one, and text — which Bugzilla would resolve as
+    // an alias — is refused. Nothing is PUT either way.
+    let mock = MockServer::start().await;
+    mount_update_target(&mock, 0).await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock)
+        .await;
+    let client = client_for(HIDE_SECRET_POLICY, &mock).await;
+
+    let numeric = call(
+        &client,
+        "update_bug_fields",
+        json!({ "bug_id": 7, "custom_fields": { "cf_build": 999 } }),
+    )
+    .await;
+    assert!(is_error(&numeric));
+    assert_eq!(
+        text_of(&numeric),
+        "Bug 999 is not accessible through this server",
+        "a numeric value is assessed as a bug id when the kind is unknown"
+    );
+    let text = call(
+        &client,
+        "update_bug_fields",
+        json!({ "bug_id": 7, "custom_fields": { "cf_notes": "fixed" } }),
+    )
+    .await;
+    assert!(is_error(&text));
+    assert_eq!(
+        text_of(&text),
+        unassessable_refusal("cf_notes"),
+        "text is refused when the kind is unknown"
+    );
+}
+
+#[tokio::test]
+async fn update_fields_fails_closed_when_bugzilla_does_not_know_a_name() {
+    // One name Bugzilla does not know fails the whole lookup (404, code
+    // 51), so every key of that write reads Unknown, the real free-text
+    // field included: a numeric value is assessed as a bug id and text is
+    // refused — naming the first field in key order it could not judge,
+    // which here is the legitimate one — both after the bug's own check
+    // and with nothing PUT.
+    let mock = MockServer::start().await;
+    mount_update_target(&mock, 0).await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "8"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "bugs": [world_readable_bug(8)] })),
+        )
+        .mount(&mock)
+        .await;
+    mount_field_types(&mock, &[("cf_build", 1)]).await;
+    let client = client_for(HIDE_SECRET_POLICY, &mock).await;
+
+    let numeric = call(
+        &client,
+        "update_bug_fields",
+        json!({ "bug_id": 7, "custom_fields": { "cf_build": 999, "cf_zz": 8 } }),
+    )
+    .await;
+    assert!(is_error(&numeric));
+    assert_eq!(
+        text_of(&numeric),
+        "Bug 999 is not accessible through this server",
+        "the free-text field's number is assessed once its kind is unknown"
+    );
+    let text = call(
+        &client,
+        "update_bug_fields",
+        json!({ "bug_id": 7, "custom_fields": { "cf_build": "fixed", "cf_zz": "x" } }),
+    )
+    .await;
+    assert!(is_error(&text));
+    assert_eq!(
+        text_of(&text),
+        unassessable_refusal("cf_build"),
+        "the refusal names the first field it could not judge, not the bogus one"
+    );
+    let paths: Vec<String> = mock
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "/rest/field/bug",
+            "/rest/bug",
+            "/rest/bug",
+            "/rest/bug",
+            "/rest/field/bug",
+            "/rest/bug"
+        ]
+        .map(String::from),
+        "a lookup, then bug 7, 8 and 999 classified; a lookup, then bug 7 classified"
+    );
+}
+
+#[tokio::test]
+async fn update_fields_clearing_a_bug_id_custom_field_assesses_nothing() {
+    // null, "" and 0 are how Bugzilla clears the field: no target, so only
+    // the bug itself is classified and the PUT carries the clear.
+    let mock = MockServer::start().await;
+    mount_update_target(&mock, 3).await;
+    mount_field_types(&mock, &[("cf_regression_of", 6)]).await;
+    let client = client_for(HIDE_SECRET_POLICY, &mock).await;
+
+    for value in [json!(null), json!(""), json!(0)] {
+        let result = call(
+            &client,
+            "update_bug_fields",
+            json!({ "bug_id": 7, "custom_fields": { "cf_regression_of": value } }),
+        )
+        .await;
+        assert!(!is_error(&result), "{value}: {}", text_of(&result));
+    }
+    let ids = classified_ids(&mock).await;
+    assert_eq!(
+        ids,
+        vec!["7".to_string(); 3],
+        "only the bug itself is classified"
+    );
+}
+
+#[tokio::test]
+async fn update_fields_without_custom_fields_makes_no_lookup() {
+    let mock = MockServer::start().await;
+    mount_update_target(&mock, 1).await;
+    mount_no_field_lookup(&mock).await;
+    let client = client_for(HIDE_SECRET_POLICY, &mock).await;
+
+    let result = call(
+        &client,
+        "update_bug_fields",
+        json!({ "bug_id": 7, "priority": "P1" }),
+    )
+    .await;
+    assert!(!is_error(&result), "{}", text_of(&result));
+}
+
+#[tokio::test]
+async fn update_fields_looks_custom_field_kinds_up_afresh_on_every_write() {
+    // A write judges the field as it is now, never as an earlier call saw
+    // it: two writes, two lookups.
+    let mock = MockServer::start().await;
+    mount_update_target(&mock, 2).await;
+    mount_field_types(&mock, &[("cf_build", 1)]).await;
+    let client = client_for(HIDE_SECRET_POLICY, &mock).await;
+
+    for _ in 0..2 {
+        let result = call(
+            &client,
+            "update_bug_fields",
+            json!({ "bug_id": 7, "custom_fields": { "cf_build": "1" } }),
+        )
+        .await;
+        assert!(!is_error(&result), "{}", text_of(&result));
+    }
+    assert_eq!(field_lookups(&mock).await.len(), 2);
+}
+
+#[tokio::test]
+async fn custom_field_targets_count_toward_the_id_cap_at_zero_requests() {
+    // The cap is judged on every custom field value that could name a bug,
+    // before any lookup, so both refusals are decided from the request
+    // alone and contact Bugzilla not at all.
+    let mock = MockServer::start().await;
+    let client = client_for("", &mock).await;
+
+    let see_also: Vec<String> = (101..=124)
+        .map(|id| format!("{}/show_bug.cgi?id={id}", mock.uri()))
+        .collect();
+    let update = call(
+        &client,
+        "update_bug_fields",
+        json!({
+            "bug_id": 7,
+            "see_also_add": see_also,
+            "custom_fields": { "cf_regression_of": "999" },
+        }),
+    )
+    .await;
+    assert!(is_error(&update));
+    assert_eq!(
+        text_of(&update),
+        "At most 25 bug ids may be named in one call, got 26",
+        "bug 7, 24 see_also targets and the custom field value are 26"
+    );
+
+    let mut args = create_args("openSUSE");
+    let links: serde_json::Map<String, Value> = (1..=26)
+        .map(|i| (format!("cf_link{i}"), json!(i)))
+        .collect();
+    args["custom_fields"] = Value::Object(links);
+    let create = call(&client, "create_bug", args).await;
+    assert!(is_error(&create));
+    assert_eq!(
+        text_of(&create),
+        "At most 25 bug ids may be named in one call, got 26"
+    );
+    assert!(
+        mock.received_requests().await.unwrap().is_empty(),
+        "both refusals cost zero requests"
+    );
+}
+
+/// Mount the create refusal's padding classify against bug id 0, expected
+/// `hits` times.
+async fn mount_pad(mock: &MockServer, hits: u64) {
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .expect(hits)
+        .mount(mock)
+        .await;
+}
+
+/// Mount `POST /rest/bug` answering `status` with `body`, expected `hits`
+/// times.
+async fn mount_post(mock: &MockServer, status: u16, body: Value, hits: u64) {
+    Mock::given(method("POST"))
+        .and(path("/rest/bug"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(body))
+        .expect(hits)
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn create_bug_bug_id_custom_field_refusals_are_one_refusal() {
+    // Four ways a create carrying a Bug ID custom field is refused — the
+    // policy withholds the product, the target is hidden, Bugzilla rejects
+    // the POST, a value is unassessable beside a visible target — all give
+    // CREATE_DENIAL after the same three requests: the type lookup, the
+    // target classify, then the POST or the padding classify. The target is
+    // classified even when the policy already refused, so neither text nor
+    // count tells the legs apart.
+    let types: &[(&str, u64)] = &[("cf_regression_of", 6), ("cf_alias", 6)];
+    let bad_version = json!({
+        "error": true,
+        "message": "There is no version named '1.0' in the 'openSUSE' product."
+    });
+
+    // Leg 1: policy refusal, visible target — classified all the same.
+    let leg1 = MockServer::start().await;
+    mount_classify(&leg1, world_readable_bug(8)).await;
+    mount_pad(&leg1, 1).await;
+    mount_post(&leg1, 200, json!({ "id": 1 }), 0).await;
+    mount_field_types(&leg1, types).await;
+    let client = client_for(HIDE_SECRET_POLICY, &leg1).await;
+    let mut args = create_args("SecretSauce");
+    args["custom_fields"] = json!({ "cf_regression_of": 8 });
+    let refused = call(&client, "create_bug", args).await;
+    assert!(is_error(&refused));
+    assert_eq!(text_of(&refused), CREATE_DENIAL);
+    assert_eq!(leg1.received_requests().await.unwrap().len(), 3);
+
+    // Leg 2: hidden target.
+    let leg2 = MockServer::start().await;
+    let mut secret = world_readable_bug(999);
+    secret["product"] = json!("SecretSauce");
+    mount_classify(&leg2, secret).await;
+    mount_pad(&leg2, 1).await;
+    mount_post(&leg2, 200, json!({ "id": 1 }), 0).await;
+    mount_field_types(&leg2, types).await;
+    let client = client_for(HIDE_SECRET_POLICY, &leg2).await;
+    let mut args = create_args("openSUSE");
+    args["custom_fields"] = json!({ "cf_regression_of": 999 });
+    let refused = call(&client, "create_bug", args).await;
+    assert!(is_error(&refused));
+    assert_eq!(
+        text_of(&refused),
+        CREATE_DENIAL,
+        "a hidden target is the create refusal, never the bug's own denial"
+    );
+    assert_eq!(leg2.received_requests().await.unwrap().len(), 3);
+
+    // Leg 3: visible target, Bugzilla rejects the POST.
+    let leg3 = MockServer::start().await;
+    mount_classify(&leg3, world_readable_bug(8)).await;
+    mount_pad(&leg3, 0).await;
+    mount_post(&leg3, 400, bad_version, 1).await;
+    mount_field_types(&leg3, types).await;
+    let client = client_for(HIDE_SECRET_POLICY, &leg3).await;
+    let mut args = create_args("openSUSE");
+    args["custom_fields"] = json!({ "cf_regression_of": 8 });
+    let refused = call(&client, "create_bug", args).await;
+    assert!(is_error(&refused));
+    assert_eq!(text_of(&refused), CREATE_DENIAL);
+    assert_eq!(leg3.received_requests().await.unwrap().len(), 3);
+
+    // Leg 4: an unassessable value beside a visible target.
+    let leg4 = MockServer::start().await;
+    mount_classify(&leg4, world_readable_bug(8)).await;
+    mount_pad(&leg4, 1).await;
+    mount_post(&leg4, 200, json!({ "id": 1 }), 0).await;
+    mount_field_types(&leg4, types).await;
+    let client = client_for(HIDE_SECRET_POLICY, &leg4).await;
+    let mut args = create_args("openSUSE");
+    args["custom_fields"] = json!({ "cf_regression_of": 8, "cf_alias": "CVE-x" });
+    let refused = call(&client, "create_bug", args).await;
+    assert!(is_error(&refused));
+    assert_eq!(
+        text_of(&refused),
+        CREATE_DENIAL,
+        "an unassessable value folds into the padded refusal on create"
+    );
+    assert_eq!(leg4.received_requests().await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn create_bug_fails_closed_when_the_type_lookup_fails() {
+    // With the kinds unknown a free-text custom field value is unassessable
+    // and the filing is refused — the padded refusal, after the failed
+    // lookup and the pad, with nothing POSTed.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    mount_pad(&mock, 1).await;
+    mount_post(&mock, 200, json!({ "id": 1 }), 0).await;
+    let client = client_for("", &mock).await;
+
+    let mut args = create_args("openSUSE");
+    args["custom_fields"] = json!({ "cf_fixed_in": "1.2.3" });
+    let refused = call(&client, "create_bug", args).await;
+    assert!(is_error(&refused));
+    assert_eq!(text_of(&refused), CREATE_DENIAL);
+    assert_eq!(mock.received_requests().await.unwrap().len(), 2);
+}
+
+/// A policy that lets anyone file anywhere while existing group-restricted
+/// bugs are readable only by their own reporter.
+const FILE_ANYWHERE_OWN_REPORTS_POLICY: &str = concat!(
+    "[[rule]]\nname = \"file-anywhere\"\naction = \"restrict\"\n",
+    "capabilities = [\"create\"]\noperations = [\"create\"]\n",
+    "[rule.match]\nproducts = [\"*\"]\n",
+    "[[rule]]\nname = \"my-own-reports\"\naction = \"restrict\"\n",
+    "capabilities = [\"read\"]\noperations = [\"access\"]\n",
+    "[rule.match]\ncreated_by_me = true\n",
+    "[[rule]]\nname = \"group-restricted\"\naction = \"deny\"\n",
+    "[rule.match]\ngroup_restricted = true\n",
+);
+
+#[tokio::test]
+async fn create_bug_assesses_a_custom_field_target_as_the_caller() {
+    // The create gate never resolves the caller (it forces created_by_me
+    // itself), but a link target is an existing bug the caller may see only
+    // as their own report: one whoami for the targets, and the filing goes
+    // through.
+    let mock = MockServer::start().await;
+    mount_whoami(&mock, "reporter@example.com", 1).await;
+    mount_classify(&mock, restricted_bug(8, "reporter@example.com")).await;
+    mount_field_types(&mock, &[("cf_regression_of", 6)]).await;
+    Mock::given(method("POST"))
+        .and(path("/rest/bug"))
+        .and(body_partial_json(json!({ "cf_regression_of": 8 })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 4245 })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let client = client_for(FILE_ANYWHERE_OWN_REPORTS_POLICY, &mock).await;
+
+    let mut args = create_args("openSUSE");
+    args["custom_fields"] = json!({ "cf_regression_of": 8 });
+    let result = call(&client, "create_bug", args).await;
+    assert!(!is_error(&result), "{}", text_of(&result));
+    assert!(text_of(&result).contains("4245"));
+    assert_eq!(
+        mock.received_requests().await.unwrap().len(),
+        4,
+        "the lookup, one whoami, the target classify and the POST"
+    );
+}
+
+/// Mount `GET /rest/field/bug` answering type 1 (free text) for every name
+/// asked, expected `hits` times.
+async fn mount_free_text_fields(mock: &MockServer, hits: u64) {
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(|req: &wiremock::Request| {
+            let fields: Vec<Value> = req
+                .url
+                .query_pairs()
+                .filter(|(k, _)| k == "names")
+                .map(|(_, name)| json!({ "name": name, "type": 1 }))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({ "fields": fields }))
+        })
+        .expect(hits)
+        .mount(mock)
+        .await;
+}
+
+/// `n` free-text custom fields, `cf_f00` onwards.
+fn free_text_fields(n: usize) -> Value {
+    Value::Object(
+        (0..n)
+            .map(|i| (format!("cf_f{i:02}"), json!("x")))
+            .collect(),
+    )
+}
+
+#[tokio::test]
+async fn update_fields_caps_the_custom_field_count_at_one_lookup() {
+    // Every key costs lookup work, so the count is capped at one lookup's
+    // worth and refused at zero requests like the id cap: 51 keys never
+    // reach Bugzilla, 50 cost exactly one lookup and reach the PUT.
+    let mock = MockServer::start().await;
+    mount_update_target(&mock, 1).await;
+    mount_free_text_fields(&mock, 1).await;
+    let client = client_for(HIDE_SECRET_POLICY, &mock).await;
+
+    // Keys are counted, not values: a null value is still a key, and a
+    // list value is still one key.
+    let mut over = free_text_fields(51);
+    over["cf_f00"] = Value::Null;
+    let refused = call(
+        &client,
+        "update_bug_fields",
+        json!({ "bug_id": 7, "custom_fields": over }),
+    )
+    .await;
+    assert!(is_error(&refused));
+    assert_eq!(
+        text_of(&refused),
+        "At most 50 custom fields may be set in one call, got 51"
+    );
+    assert!(
+        mock.received_requests().await.unwrap().is_empty(),
+        "the cap refuses before any request"
+    );
+
+    let mut at_cap = free_text_fields(50);
+    at_cap["cf_f00"] = json!(["a", "b"]);
+    let accepted = call(
+        &client,
+        "update_bug_fields",
+        json!({ "bug_id": 7, "custom_fields": at_cap }),
+    )
+    .await;
+    assert!(!is_error(&accepted), "{}", text_of(&accepted));
+    assert_eq!(
+        field_lookups(&mock).await.len(),
+        1,
+        "50 keys cost exactly one lookup"
+    );
+}
+
+#[tokio::test]
+async fn create_bug_caps_the_custom_field_count_at_one_lookup() {
+    let mock = MockServer::start().await;
+    mount_free_text_fields(&mock, 1).await;
+    mount_post(&mock, 200, json!({ "id": 4247 }), 1).await;
+    let client = client_for("", &mock).await;
+
+    let mut args = create_args("openSUSE");
+    let mut over = free_text_fields(51);
+    over["cf_f00"] = Value::Null;
+    args["custom_fields"] = over;
+    let refused = call(&client, "create_bug", args).await;
+    assert!(is_error(&refused));
+    assert_eq!(
+        text_of(&refused),
+        "At most 50 custom fields may be set in one call, got 51"
+    );
+    assert!(
+        mock.received_requests().await.unwrap().is_empty(),
+        "the cap refuses before any request"
+    );
+
+    let mut args = create_args("openSUSE");
+    let mut at_cap = free_text_fields(50);
+    at_cap["cf_f00"] = json!(["a", "b"]);
+    args["custom_fields"] = at_cap;
+    let accepted = call(&client, "create_bug", args).await;
+    assert!(!is_error(&accepted), "{}", text_of(&accepted));
+    assert_eq!(
+        field_lookups(&mock).await.len(),
+        1,
+        "50 keys cost exactly one lookup"
+    );
+}
+
+#[tokio::test]
+async fn create_bug_without_custom_fields_makes_no_whoami() {
+    let mock = MockServer::start().await;
+    mount_whoami(&mock, "reporter@example.com", 0).await;
+    mount_no_field_lookup(&mock).await;
+    mount_post(&mock, 200, json!({ "id": 4246 }), 1).await;
+    let client = client_for(FILE_ANYWHERE_OWN_REPORTS_POLICY, &mock).await;
+
+    let result = call(&client, "create_bug", create_args("openSUSE")).await;
+    assert!(!is_error(&result), "{}", text_of(&result));
+    assert_eq!(mock.received_requests().await.unwrap().len(), 1);
 }

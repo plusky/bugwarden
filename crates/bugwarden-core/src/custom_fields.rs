@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::client::{BugzillaClient, BugzillaError};
 use crate::quoted::QuotedError;
@@ -33,8 +33,9 @@ const FIELD_TYPE_BUG_URLS: u64 = 7;
 /// field cannot work with it either, for the same reason.
 const FIELD_TYPE_BUG_LIST: u64 = 22;
 
-/// Names per lookup request, which bounds the URL.
-const LOOKUP_CHUNK: usize = 50;
+/// Names per lookup request, which bounds the URL. A write caps its custom
+/// fields at this many, so it costs one lookup however many a client sends.
+pub const LOOKUP_CHUNK: usize = 50;
 
 /// What a custom field can hold, as far as bug links are concerned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +206,130 @@ impl FieldTypeCache {
     }
 }
 
+/// What a custom field value a client wants to WRITE says about bug links,
+/// read the way Bugzilla's `_check_bugid_field` will read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomLinkValue {
+    /// Names no bug: null, an empty string or `0`, which Bugzilla clears
+    /// the field on (`return undef if !$value`), and spellings such as
+    /// `00`, `#0` or blanks, which it rejects as bug 0 or an invalid id —
+    /// nothing to assess either way.
+    Clear,
+    /// One bug id, as Bugzilla will resolve it: a number, or ASCII digits
+    /// after a trim and at most one leading `#`, which is what
+    /// `Bug->check` and `Bug->new` accept as an id.
+    Target(u64),
+    /// Anything Bugzilla would resolve some other way — an alias, an
+    /// `{"id": N}` object, a float, a bool, a list, non-ASCII digits or
+    /// edges — which the guard cannot judge and therefore refuses.
+    Unassessable,
+}
+
+impl CustomLinkValue {
+    /// Read one JSON value.
+    pub fn parse(value: &Value) -> Self {
+        match value {
+            Value::Null => Self::Clear,
+            Value::Number(n) => match n.as_u64() {
+                Some(0) => Self::Clear,
+                Some(id) => Self::Target(id),
+                None => Self::Unassessable,
+            },
+            Value::String(s) => Self::parse_str(s),
+            Value::Bool(_) | Value::Array(_) | Value::Object(_) => Self::Unassessable,
+        }
+    }
+
+    /// Read one string as `Bug->check` does — a trim, one optional `#`,
+    /// then digits that fit an id — but narrower: Bugzilla's trim strips
+    /// Perl `\s` (Unicode White_Space), this one ASCII whitespace only, so
+    /// a Unicode-space edge stays unassessable and is refused.
+    fn parse_str(s: &str) -> Self {
+        let s = s.trim_matches(|c: char| c.is_ascii_whitespace());
+        if s.is_empty() {
+            return Self::Clear;
+        }
+        let digits = s.strip_prefix('#').unwrap_or(s);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Self::Unassessable;
+        }
+        match digits.parse::<u64>() {
+            Ok(0) => Self::Clear,
+            Ok(id) => Self::Target(id),
+            Err(_) => Self::Unassessable,
+        }
+    }
+}
+
+/// Every link a list-shaped value could carry: the items of an array, the
+/// comma pieces of a string, or the one scalar.
+fn link_values(value: &Value) -> Vec<CustomLinkValue> {
+    match value {
+        Value::Array(items) => items.iter().map(CustomLinkValue::parse).collect(),
+        Value::String(s) if s.contains(',') => {
+            s.split(',').map(CustomLinkValue::parse_str).collect()
+        }
+        other => vec![CustomLinkValue::parse(other)],
+    }
+}
+
+/// Every bug id the values of `fields` could name, whatever the fields'
+/// kinds: an upper bound on [`custom_links`]' targets that is a function of
+/// the request alone, for a cap that must refuse before any request.
+pub fn candidate_ids(fields: &Map<String, Value>) -> BTreeSet<u64> {
+    fields
+        .values()
+        .flat_map(link_values)
+        .filter_map(|v| match v {
+            CustomLinkValue::Target(id) => Some(id),
+            CustomLinkValue::Clear | CustomLinkValue::Unassessable => None,
+        })
+        .collect()
+}
+
+/// The bug links a write's custom fields carry, judged by kind.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CustomLinks<'a> {
+    /// Every bug id the write would link to.
+    pub targets: BTreeSet<u64>,
+    /// The first field (in key order) holding a value the guard cannot
+    /// judge, which the write must refuse.
+    pub unassessable: Option<&'a str>,
+}
+
+/// Judge the custom field values a client wants to write. A Bug ID field
+/// and a field of unknown kind hold one scalar; a Bug List field holds
+/// array items or comma pieces, each judged the same way; a field of any
+/// other kind is never a link and is skipped.
+pub fn custom_links<'a>(
+    fields: &'a Map<String, Value>,
+    kinds: &BTreeMap<String, CustomFieldKind>,
+) -> CustomLinks<'a> {
+    let mut out = CustomLinks::default();
+    for (name, value) in fields {
+        let kind = kinds.get(name).copied().unwrap_or(CustomFieldKind::Unknown);
+        let pieces = match kind {
+            CustomFieldKind::Other => continue,
+            CustomFieldKind::BugList => link_values(value),
+            CustomFieldKind::BugId | CustomFieldKind::Unknown => {
+                vec![CustomLinkValue::parse(value)]
+            }
+        };
+        for piece in pieces {
+            match piece {
+                CustomLinkValue::Clear => {}
+                CustomLinkValue::Target(id) => {
+                    out.targets.insert(id);
+                }
+                CustomLinkValue::Unassessable => {
+                    out.unassessable.get_or_insert(name.as_str());
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +411,124 @@ mod tests {
         assert!(CustomFieldKind::BugList.may_link());
         assert!(CustomFieldKind::Unknown.may_link(), "unknown fails closed");
         assert!(!CustomFieldKind::Other.may_link());
+    }
+
+    #[test]
+    fn write_values_are_read_as_bugzilla_resolves_them() {
+        use CustomLinkValue::{Clear, Target, Unassessable};
+        // Bugzilla clears on null, "" and 0, rejects `00`, `#0` and blanks
+        // as no bug, trims, strips one `#`, and looks anything else up as an
+        // alias — which the guard cannot judge.
+        let table = [
+            (json!(null), Clear),
+            (json!(""), Clear),
+            (json!("0"), Clear),
+            (json!(0), Clear),
+            (json!("00"), Clear),
+            (json!(7), Target(7)),
+            (json!("7"), Target(7)),
+            (json!(" #7\n"), Target(7)),
+            (json!("007"), Target(7)),
+            (json!("##7"), Unassessable),
+            (json!("#"), Unassessable),
+            (json!("+7"), Unassessable),
+            (json!("abc"), Unassessable),
+            (json!(-7), Unassessable),
+            (json!(7.0), Unassessable),
+            (json!(1e3), Unassessable),
+            (json!(true), Unassessable),
+            (json!([7]), Unassessable),
+            (json!({ "id": 7 }), Unassessable),
+            (json!("18446744073709551616"), Unassessable),
+            (json!("٧"), Unassessable),
+            (json!("\u{a0}7"), Unassessable),
+            (json!("7, 8"), Unassessable),
+        ];
+        for (value, expected) in table {
+            assert_eq!(CustomLinkValue::parse(&value), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn custom_links_are_judged_by_kind() {
+        let kinds: BTreeMap<String, CustomFieldKind> = [
+            ("cf_id".to_string(), CustomFieldKind::BugId),
+            ("cf_list".to_string(), CustomFieldKind::BugList),
+            ("cf_text".to_string(), CustomFieldKind::Other),
+        ]
+        .into_iter()
+        .collect();
+        let fields = |v: Value| v.as_object().cloned().expect("object");
+
+        // A Bug ID field and an unknown field hold one id; a Bug List field
+        // holds a list; an Other field is skipped whatever it holds.
+        let ok = fields(json!({
+            "cf_id": "#7",
+            "cf_list": "8, 9",
+            "cf_text": "10",
+            "cf_new": 11,
+            "cf_cleared": "",
+        }));
+        assert_eq!(
+            custom_links(&ok, &kinds),
+            CustomLinks {
+                targets: [7, 8, 9, 11].into_iter().collect(),
+                unassessable: None,
+            }
+        );
+
+        // Array items of a list are judged one by one; one bad item taints
+        // the field, and the first offending key is named.
+        let bad_item = fields(json!({ "cf_list": [12, "x"], "cf_id": "CVE-x" }));
+        let links = custom_links(&bad_item, &kinds);
+        assert_eq!(links.unassessable, Some("cf_id"), "first in key order");
+        assert_eq!(links.targets, [12].into_iter().collect());
+
+        // A Bug ID or unknown field never splits: a comma list and an array
+        // are unassessable there; and text in an unknown field is refused.
+        for value in [json!("1, 2"), json!([1, 2]), json!("fixed in 1.2")] {
+            let one = fields(json!({ "cf_id": value }));
+            assert_eq!(
+                custom_links(&one, &kinds).unassessable,
+                Some("cf_id"),
+                "{value}"
+            );
+            let unknown = fields(json!({ "cf_new": value }));
+            assert_eq!(
+                custom_links(&unknown, &kinds).unassessable,
+                Some("cf_new"),
+                "{value}"
+            );
+        }
+        let other = fields(json!({ "cf_text": "fixed in 1.2", "cf_text2": null }));
+        let kinds_other: BTreeMap<String, CustomFieldKind> = [
+            ("cf_text".to_string(), CustomFieldKind::Other),
+            ("cf_text2".to_string(), CustomFieldKind::Other),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(custom_links(&other, &kinds_other), CustomLinks::default());
+    }
+
+    #[test]
+    fn candidate_ids_bound_the_targets_whatever_the_kinds() {
+        // The cap runs before any lookup, so it counts every id a value
+        // could name under any kind: scalars, array items and comma pieces.
+        let fields = json!({
+            "cf_a": 7,
+            "cf_b": "#8",
+            "cf_c": "9, 10",
+            "cf_d": [11, "12", "x"],
+            "cf_e": "fixed in 13",
+            "cf_f": null,
+            "cf_g": 0,
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+        assert_eq!(
+            candidate_ids(&fields),
+            [7, 8, 9, 10, 11, 12].into_iter().collect()
+        );
     }
 }

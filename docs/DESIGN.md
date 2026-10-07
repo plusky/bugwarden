@@ -80,9 +80,10 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
   so no custom field can shadow one. The
   bar is `Capability::Summary` — the same one the write
   paths apply before CREATING such a link (I8/I11: dependency targets,
-  `duplicate_of`, and the local-instance targets of `update_bug_fields`'
-  `see_also_add`/`see_also_remove`), since a link read out and a link
-  written in disclose the same fact. Candidate ids come from Bugzilla,
+  `duplicate_of`, the local-instance targets of `update_bug_fields`'
+  `see_also_add`/`see_also_remove`, and the Bug ID custom field targets of
+  `update_bug_fields.custom_fields` and `create_bug.custom_fields`), since
+  a link read out and a link written in disclose the same fact. Candidate ids come from Bugzilla,
   not the client, so they are assessed in ONE batched request (Guard::
   disclosable) rather than per id; a failed fetch scrubs everything (I4).
   Applies to bug_info, bugs_quicksearch (the client picks the projection, so
@@ -107,14 +108,16 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
   field whose kind is unknown is judged as a bug id, so the audit record's
   `suppressed_ids` can carry such a number that is no bug (operator
   noise, never a client-visible difference); a field's kind is cached
-  until restart, so a custom field deleted and recreated under its own
-  name with another type is misjudged in history until then; the first
+  until restart, or until a write naming the field refreshes the cache,
+  so a custom field deleted and recreated under its own name with another
+  type is misjudged in history until then; the first
   history naming a `cf_` field costs one type lookup (a fraction of a
   second), so a stopwatch may learn, once per field per process while
   lookups succeed, that a history held a `cf_` change the scrub then
-  removed entirely — a failing lookup (a 5xx, a 404/51, a fork whose 200
-  omits the name) is retried, and warn-logged, on every such call, up to
-  the client's 30 s timeout each time (accepted: the alternative, a lookup
+  removed entirely — a lookup that settles nothing (a 5xx or a 404/51,
+  each warn-logged; a fork whose 200 omits the name, which is not) is
+  retried on every such call, up to the client's 30 s timeout each time
+  (accepted: the alternative, a lookup
   on every granted history, would cost a request on every call to spare
   one bit once); the six Bug.update-backed tools — update_bug_fields,
   update_bug_status, assign_bug, update_bug_dependencies, add_cc_to_bug
@@ -139,10 +142,41 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
   before `may_create` and before any upstream request; unlike the padded,
   uniform create refusal, this early error is safe to distinguish because
   its outcome is a pure function of the client's own key names, not of
-  policy or upstream state.
+  policy or upstream state. The 25-id cap (`too_many_ids`) is judged the
+  same way, at zero requests: it counts an UPPER BOUND — the bug, the local
+  see_also targets, and every custom field value that could name a bug
+  (`custom_fields::candidate_ids`: a number, digits with one `#`, and the
+  items or comma pieces of a list) — taken before the fields' kinds are
+  known, so it too is a function of the request alone. The number of
+  `custom_fields` keys is capped the same way, at `LOOKUP_CHUNK` (50, one
+  lookup's worth) and refused at zero requests with `At most 50 custom
+  fields may be set in one call, got <n>`, so a write costs at most one
+  type lookup however many keys a client sends — without it a 4 MiB
+  frame of `cf_` keys would buy thousands of authenticated GETs. Whether
+  a `cf_` field CAN hold a bug id is upstream schema, looked up by name
+  afresh for
+  every write (see "Custom field types"), and a value in such a field that
+  the guard cannot judge the way Bugzilla will (an alias, an `{"id": N}`
+  object, a float, a bool, a list, non-ASCII digits or edges —
+  `CustomLinkValue::Unassessable`) is refused: on `update_bug_fields` with
+  the fixed text `Custom field '<name>' may hold a bug id: give a numeric
+  bug id, or an empty value to clear it` after the lookup AND after the
+  named bug's own `fields` check — its uniform denial comes first, so the
+  refusal tells a field's kind only to a caller already holding `fields`
+  on that bug, and the other fields' targets are classified all the same,
+  which keeps the count a function of request and schema — the same text
+  for a known and an unknown name, naming the first field, in key order,
+  the guard could not judge (after a 404/51 that is every field of the
+  write, so the named one may be a legitimate free-text field rather
+  than the unknown name); on
+  `create_bug` folded into the padded create refusal, because that verdict
+  depends on upstream state and the create refusal must stay one refusal.
 - **I8** Every tool that takes a bug id performs guard assessment BEFORE any
   side effect or data return. Exception: `bug_url` (computes a URL string
-  locally, contacts nothing).
+  locally, contacts nothing). A bug id a client names INSIDE a value counts:
+  the Bug ID custom field targets of `update_bug_fields.custom_fields` and
+  `create_bug.custom_fields` are assessed at the `Capability::Summary` bar,
+  like dependency and see_also targets, before the PUT or the POST.
 - **I9** CLI/env can only tighten policy: `--read-only` ORs into
   `global.read_only`.
 - **I10** No tool may echo incoming request headers back to the client —
@@ -623,6 +657,27 @@ impl FieldTypeCache {
     pub async fn kinds_fresh(&self, bz: &BugzillaClient, key: &str, names: &BTreeSet<String>)
         -> BTreeMap<String, CustomFieldKind>;
 }
+
+/// A custom field value a client wants to WRITE, read as Bugzilla's
+/// _check_bugid_field will: Clear names no bug (null, "" and 0, which
+/// Bugzilla clears on, and `00`, `#0` or blanks, which it rejects as no
+/// bug); Target is a number, or ASCII digits with one leading `#` after an
+/// ASCII trim; anything else — an alias, an {"id": N} object, a float, a
+/// bool, a list, non-ASCII digits or edges — is Unassessable and refused.
+pub enum CustomLinkValue { Clear, Target(u64), Unassessable }
+impl CustomLinkValue { pub fn parse(value: &Value) -> Self; }
+/// Every id the values of `fields` could name under ANY kind — scalars,
+/// array items and comma pieces — the request-only upper bound the id cap
+/// is judged on before the kinds are known.
+pub fn candidate_ids(fields: &Map<String, Value>) -> BTreeSet<u64>;
+/// `targets`: every bug id the write would link to; `unassessable`: the
+/// first key, in key order, holding a value the guard cannot judge.
+pub struct CustomLinks<'a> { pub targets: BTreeSet<u64>, pub unassessable: Option<&'a str> }
+/// Judge by kind: BugId and Unknown hold one scalar (a list there is
+/// unassessable), BugList its array items or comma pieces one by one, and
+/// Other is skipped whatever it holds.
+pub fn custom_links<'a>(fields: &'a Map<String, Value>, kinds: &BTreeMap<String, CustomFieldKind>)
+    -> CustomLinks<'a>;
 ```
 
 A `type` is read as an integer or a digit string; 6 is `BugId`, 22 (BMO)
@@ -852,7 +907,10 @@ where every other criterion describes bug content. Decisions, all deliberate:
   under EITHER source — a policy that never consults identity costs ZERO
   lookups, so pre-identity deployments keep their exact upstream request
   pattern. A create-scoped-only identity rule does not trigger lookups
-  either: the create gate forces the answer (below).
+  either: the create gate forces the answer (below). `create_bug` resolves
+  the caller once, and only when its `custom_fields` name Bug ID targets —
+  existing bugs, which an access-scoped identity rule may show the caller
+  as their own reports — never for the gate.
 - **At most once per MCP tool call.** Each tool resolves the caller at most
   once, near its entry, and threads the result to EVERY classification in
   that call — `Guard::assess`, `quicksearch_window`, `disclosable`,
@@ -886,7 +944,10 @@ where every other criterion describes bug content. Decisions, all deliberate:
   bugwarden's typed `create_bug` parameters cannot claim it. No whoami is
   ever performed for the create gate. So a create-covering rule with
   `created_by_me = true` matches every create request that reaches it, and
-  one with `created_by_me = false` can never match a create.
+  one with `created_by_me = false` can never match a create. The one
+  whoami `create_bug` can make is for its Bug ID custom field TARGETS
+  (existing bugs, assessed at Summary under the access rules), and only
+  when there are any — a create naming none costs no identity lookup.
 - **Cannot widen exposure beyond the credential.** Bugzilla still enforces
   its own access control on every fetch, so an authorship rule only
   surfaces bugs the API key's account could already read — it narrows the
@@ -1137,24 +1198,38 @@ the life of the process (`bugwarden_core::custom_fields`, which records
 why the whole field list is never fetched). No request at startup:
 `BugWarden::new` stays synchronous and request-free, and `preflight`
 never looks a field up, so every construction site and the zero-request
-preflight row below are unchanged. The trigger is a GRANTED `bug_history`
+preflight row below are unchanged. Three triggers. A GRANTED `bug_history`
 whose history records a change to at least one `cf_` field: after the
 history fetch and before the link-disclosure classify, the distinct `cf_`
 names in `history[].changes[].field_name` are looked up CACHE-FIRST — one
 batched GET per 50 uncached names, with the caller's key — and a history
-naming no `cf_` field makes no lookup at all. A lookup that fails (a
-timeout, a 5xx, or the 404/code-51 a batch holding one unknown name
-draws) leaves every name of that batch Unknown — a possible bug link, read
-leniently in history — and caches nothing, so the next call asks again;
-each failed batch is one `warn!` line, through `QuotedError`. The lookup
-runs on the calling task through `BugzillaClient::send`, so it is counted
-in the triggering call's `upstream.requests` like every other request the
-call made (see "Upstream accounting"). The field list is instance-level,
+naming no `cf_` field makes no lookup at all. `update_bug_fields` and
+`create_bug` with a non-empty `custom_fields`: every key is looked up
+AFRESH (`kinds_fresh`, which refreshes the cache but never answers from
+it) in ONE GET — a write names at most 50 custom fields, the key-count
+cap refusing more at zero requests (I7) — after the request-only
+refusals (the I7 gate, the two caps) and the key, and before any
+classification — a write must judge a field as it is now, not as some
+earlier read saw it. A lookup that
+fails (a timeout, a 5xx, or the 404/code-51 a batch holding one unknown
+name draws — a bogus `cf_` name in a write is exactly that) leaves every
+name of that batch Unknown — a possible bug link, read leniently in
+history and judged on a write — and caches nothing, so the next call asks
+again; each failed batch is one text-free `warn!` line (HTTP status,
+Bugzilla code, batch size), its message at `debug!` through `QuotedError`,
+since a 404/51 echoes a client-chosen name. The
+lookup runs on the calling task through `BugzillaClient::send`, so it is
+counted in the triggering call's `upstream.requests` like every other
+request the call made (see "Upstream accounting"). The field list is instance-level,
 so one caller's answer is valid for every caller — a field's kind cannot
 differ per user, and the only per-user difference a non-stock deployment
 could introduce is a field's absence, which maps to Unknown and fails
 closed. It is read regardless of `global.allow_discovery` and never
-served: a field's kind is schema, not bug data. The residual the cache
+served: a field's kind is schema, not bug data — though a write's fixed
+refusal, issued after the named bug's own check, lets a caller holding
+`fields` on it infer per name that a cf field is link-typed or does not
+exist — schema stock Bugzilla's Bug.fields answers to any account,
+discovery on or off here. The residual the cache
 leaves — the first history naming a field costs one lookup, so a stopwatch
 may learn once per field per process, while lookups succeed, that a `cf_`
 change existed; a failing lookup is retried, and warn-logged, on every
@@ -1202,12 +1277,12 @@ constraints the model must know.
 | bug_history | id, new_since?: DateTime<Utc>, head?: u32, tail?: u32 | history | a history recording a change to a `cf_` field first learns those fields' kinds (`FieldTypeCache::kinds`, cache-first, with no request when the history names no `cf_` field — see "Custom field types") so a Bug ID custom field change is scrubbed like a `depends_on` one and a free-text field's digits are left alone (I14; a failed lookup reads the field leniently, which only narrows what is served); head/tail window the SCRUBBED history (first/last N entries; head + tail >= the entry count keeps everything): with either set the response is an envelope `{"history": [...], "truncation": {"omitted_entries": N, "shown_entries": M}}` instead of the bare array; a window that actually omits entries is audited as a `history_window` redaction, which PRESERVES the granting rule (the client asked for less; no rule decided it — see "The `guard.rule` encoding"). The window runs on the post-scrub (I14) list — `omitted_entries` counts only entries the client may see, so a scrub-dropped entry cannot leak by arithmetic (I3). `head: 0` / `tail: 0` omit everything; a zero is a window of zero entries, never "no limit" (absent is the only "no limit"). Documented exception: a non-array `history` from upstream is served unchanged and WITHOUT the envelope — a presentation control must not drop an odd shape; `Guard::scrub_history` likewise early-returns on a non-array, so that shape is unscrubbed (pre-existing) |
 | bug_comments | id, include_private: bool = false, new_since?, head?: u32, tail?: u32, max_comment_chars?: u32 | comments | filter_comments applied (I5). Optional windowing: with ANY of head/tail/max_comment_chars set the response is an envelope `{"comments":[..], "truncation":{"omitted_comments":N,"shown_comments":M}}`, else the bare array it always was. Windowing runs LAST, on the post-filter (I5), post-duplicate-marker-scrub (I14) list — `omitted_comments` counts only comments the client may see, so private-comment existence cannot leak by arithmetic. head keeps the first N (comment 0 is the report), tail the last N; overlap keeps everything and omits nothing. A comment capped by max_comment_chars carries a sibling `text_truncated: {"shown_chars","total_chars"}` — never an in-text marker, which free-form comment text would absorb. The name is max_comment_chars, not download_attachment's max_chars, on purpose: same unit, different scope — this caps EACH comment, that caps the WHOLE response — so do not converge the two into one name. summarize_bug is deliberately NOT windowed (its prompt needs every comment). Audit: `note_redacted_client_window("comments_window")` when omission or a cap actually fired — that note PRESERVES the granting rule, unlike the I5 suppression noted beside it (see "The `guard.rule` encoding") |
 | bugs_quicksearch | query, status: String = "ALL", include_fields: String = "id,product,component,assigned_to,status,resolution,summary,last_change_time", limit: u32 = 50, offset: u32 = 0, group_by?: String | post-filter | fetch include_fields = requested ∪ CLASSIFY_FIELDS; after filter, project kept bugs to requested fields (keep `_redacted` marker); envelope `{"bugs":[..]}` — or `{"groups":[..]}` under `group_by`, see below — only (I3), except an advisory `note` when the query is nothing but bug ids (comma/whitespace-separated, optional `#` per id) steering exact id sets to bug_info — the note is a pure function of the CLIENT'S REQUEST (the query and status strings), never of results, verdicts, or anything upstream said (no new oracle), and the `bugs` array is byte-identical with or without it (the query is still searched, never rerouted); its wording tracks the request: a non-empty status is prefixed to the query so upstream content-matches the whole expression, while an empty status sends the query bare and Bugzilla routes a bare all-number query to an exact id lookup (bug_id + anyexact) — on that path the note drops the content-matching claim — and a query naming more distinct ids than MAX_ASSESS_IDS steers to batched bug_info calls (the cap is already public in the too_many_ids refusal text) instead of straight into that refusal | **limit/offset address the bugs the client may SEE, not upstream rows** (Guard::quicksearch_window): filtering an already-paginated page left a hole exactly where a hidden bug sat — a short page the next offset contradicted — and since quicksearch matches summary text that hole was a probe for the hidden title, one word at a time. The guard now scans upstream from row 0 in 200-row chunks, classifies each, and fills the window from the survivors; rows are deduped on the server-reported id (relevance order is not stable between calls) and an id-less row is dropped (I4). A short page is NOT read as end-of-results — Bugzilla is free to cap a page below the requested chunk size (an admin-configured `max_search_results`, for instance), and that cap looks identical to a short page at the genuine end of a result set; only an empty page ends the scan early. Bounds, independent of each other: MAX_SEARCH_WINDOW=1000 addressable, 2000 rows scanned, and 10 sequential requests; hitting any of the three truncates, which looks exactly like the end of results. The objects returned are the ones classified. The scan target is quantised to whole chunks so the stopping point does not track the client's `limit`; without that, `limit` could be binary-searched against the clock to recover each block's exact hidden count. Residual, accepted: filling a window of VISIBLE bugs needs more rows when bugs are hidden, so a stopwatch still learns one bit per scanned block ("not entirely visible"). Removing that would mean scanning the worst case on every search, or letting pages go short again. Search failure returns a bare "Search failed"; the upstream text is logged server-side only (it can name a bug and say whether it exists). The scan's accounting — rows examined, verdict-dropped ids — goes to the audit record only (`guard.scan` plus the suppressed-ids machinery, issue #29); the response is byte-identical with or without drops. Optional `group_by` (issue #143): a comma-separated subset of GROUP_BY_FIELDS = product, component, status, resolution, severity, priority, deduped, unknown name refused BEFORE the upstream call (a silently ungrouped typo looks like a broken feature; the text quotes only what the client sent, so it is no oracle) while a spec naming NOTHING (`""`, bare commas) means "no grouping" rather than an error — that is what a client filling in every declared param sends, and the sibling `include_fields` reads an empty segment the same way. The response becomes `{"groups":[{"bugs":[..], <field>:<value>, ..}]}` and each grouped field is reported once per group instead of once per bug. Header key order is NOT caller order and is not promised anywhere client-facing: serde_json is built without `preserve_order`, so its Map is a BTreeMap and a header serializes with keys sorted, `bugs` first — `group_by=status,product` and `product,status` return identical bytes. GROUP_BY_FIELDS is a HAND-PICKED subset of the CLASSIFY_FIELDS ∩ SUMMARY_FIELDS intersection (which is all ten SUMMARY_FIELDS), restricted to low-cardinality enum-ish values; that membership is what makes grouping free of policy consequences — no extra upstream field is pulled, and a summary-redacted row carries all six so it buckets like any other row instead of needing one of its own. Membership is NOT the I14 argument: the same intersection holds `summary`, which routinely reads "regression from bug 12345". What keeps a header clean is ORDERING — a grouped field is FORCED into `requested` the way `id` is, so grouping runs on the served, link-scrubbed projection, a value can only reach a header by the same path that would have put it on the bug, and grouping never surfaces a field the projection dropped. Group order and within-group order are first appearance in the served window, so grouping cannot reorder by verdict, and a group exists only where a served bug put it: no empty buckets, no header naming a hidden bug's product (I3). It runs LAST, after the audit block has read the flat projection, so a call's record is identical whether or not the client asked for groups; `group_by` is in PARAM_ALLOWLIST (a vocabulary field, not free text) so the record carries it verbatim. The envelope key is `groups`, deliberately the same word as Bugzilla's per-bug `groups` security-group list which a client may project into the bugs nested inside it — parallel to `bugs` at the same level, and depth disambiguates; do not rename one to "fix" the collision without also moving the other |
-| create_bug | product, component, summary, version, description = "", severity?, priority?, op_sys?, platform?, keywords?: Vec<String>, groups?: Vec<String>, custom_fields?: JsonObject | create (write), judged on the prospective bug AS IT WILL BE FILED (Guard::may_create) | there is no bug id to assess, so the request itself is classified BEFORE any upstream call (I8): the rules that hide a product by name refuse filing into it, a field the request omits fails closed (I4), and a client-claimed `groups` list is never trusted — Bugzilla unions the product's mandatory groups in server-side, so may_create forces groups to unknown, which means a group-consulting rule refuses every create request that REACHES it — creation is possible only where an earlier rule covering the create operation grants it (a rule carrying `operations = ["create"]`, placed ahead of the group-consulting rules, is how an operator permits filing without that grant shadowing reads of existing bugs — issue #26), and a policy with no such grant refuses all creation. **Judged is filed.** Bugzilla rewrites a create request before it resolves anything: it trims names (Perl `\s`), turns every run of ASCII control characters in the summary into one space and trims it (`clean_text`), and skips a keyword that is `""` or `"0"` — testing that falsiness on the RAW element, before the trim it applies to the ones it goes on to resolve. Judged raw, `product: " Security Response"` walked past a `products = ["Security*"]` deny rule into the grant behind it and was filed into Security Response all the same. So `may_create` rewrites the payload the same way IN PLACE, classifies the rewrite, and create_bug POSTs that very object — the rewritten names are ones Bugzilla's own trim leaves alone, so the name Bugzilla looks up is the name that was judged; which object that lookup returns, and whether the priority survives, are the two limits below. The NAME trim is deliberately a SUPERSET of Bugzilla's: Unicode White_Space plus U+180E, which Perl counted as `\s` until 5.20 and Rust's `is_whitespace` does not — that arm is load-bearing, not decoration. A superset is safe only because the POST carries the trimmed value and a name resolves to its stored spelling anyway; trimming less is the bug. The SUMMARY is stored as sent, so it is trimmed with White_Space alone and nothing Bugzilla keeps is dropped: an edge U+180E stays in what is judged and POSTed, a Perl before 5.20 strips it itself and a later one keeps it, so on every Perl the stored summary is the one the raw request would have produced. The judged summary therefore contains the stored one, and `summary_contains` is a positive substring test, so every needle the filed summary carries the judged one carries too. WHICH fields are rewritten is a rule rather than a list: every field create_bug sends that a Matcher reads (product, component, summary, severity, priority, keywords). Bugzilla also trims version, op_sys and platform, which no criterion reads — rewriting them would decide nothing, and a new criterion over such a field must extend the rewrite with it or reopen this bug. Evidence also needs the SHAPE create_bug sends: BugMeta reads component and keywords leniently (a lone string, an array, `{"name": ..}` objects) where Bugzilla splits a keyword string, resolves such objects itself, and refuses a list where it wants a name — so a non-string component is unknown, a keyword element the trim would turn false stays exactly as it came for Bugzilla to resolve or refuse, and a list holding one is unknown as a whole (a partly rewritten list reads as a shorter one). A list Bugzilla would skip entirely is dropped, as create_bug drops an empty one. A rewritten field that came out empty is still POSTed, so the upstream refusal answers it — `require_summary`, `require_component`, and `object_not_specified` for product, severity and (with `letsubmitterchoosepriority` on; off, the second limit below applies) priority — behind the same refusal text at the same cost. The audit record keeps the client's RAW arguments while the POST carries the rewrite: audited is what was asked, filed is what was judged. Two known limits remain, both about what the filed bug ends up carrying. First, the lookup compares under the DATABASE's collation, which can treat two spellings as equal — or a character as weightless — where a glob cannot: measured on MariaDB 10.6, the stored `Security Response` is matched by `"Śecurity Response"` under `utf8mb3_general_ci`, and under the UCA `utf8mb4_unicode_ci` by its decomposed spelling and by a leading zero-width space, BOM, word joiner or RLO; this gate judges each of those as a different product and POSTs it verbatim. ASCII-only product names are therefore no protection either, and a name glob is not a boundary on such an instance. Components, keywords, severities and priorities are looked up by name through the same comparison (`Bugzilla::Object` via `sql_istrcmp`; a component by `name = ?`, which MySQL also compares under the collation), so by reading the code, not by measurement, the limit covers their criteria too. What narrows it is an allowlist-shaped create grant ahead of a rule refusing every other create request, as the shipped example does: a spelling the allowlist does not match is refused, which leaves only products whose names the database equates with a name the allowlist does match. Issue #330 carries the measurements and the options and is open and DEFERRED: stripping or refusing such characters was rejected because it would change what the reporter filed, so nothing here closes the limit (PostgreSQL's `LOWER()` against Rust's `to_lowercase` is the same class, by reasoning, not measurement). Second, with `letsubmitterchoosepriority` off Bugzilla replaces the requested priority with `defaultpriority`, so a `priorities` criterion judges a priority the filed bug may not carry. **Both refusals are one refusal**: a policy refusal and an upstream failure return the same fixed create_denial text after the same single upstream request — the refused path burns one classify call against bug id 0 (never a valid id, creates nothing; download_attachment's padding precedent) instead of the POST. Two texts, or 0 vs 1 requests, would be a free policy-enumeration oracle: send a guaranteed-invalid `version` plus a probe product and read the policy off which refusal (or which latency) comes back, with nothing created. Residual, accepted: a SUCCESSFUL create still confirms the product is allowed — that is the tool doing its job, and it costs a real, attributable bug; and the padding equalizes request count, not the upstream handler's exact latency (GET classify vs rejected POST). Bugzilla's failure message is logged server-side only (it can say whether a product/component exists). `custom_fields` keys must start with `cf_` (I7): the gate runs before `may_create` and errors with ZERO upstream requests on a non-`cf_` key — distinguishable from the padded create refusal on purpose, since it decides nothing about policy or Bugzilla. No Matcher criterion reads `cf_*`, so a custom field cannot move a prospective bug between rules the way `product`/`component` do. `custom_fields` is not in `PARAM_ALLOWLIST`, so the audit stream records it as `_len`, same as the updater |
+| create_bug | product, component, summary, version, description = "", severity?, priority?, op_sys?, platform?, keywords?: Vec<String>, groups?: Vec<String>, custom_fields?: JsonObject | create (write), judged on the prospective bug AS IT WILL BE FILED (Guard::may_create) | there is no bug id to assess, so the request itself is classified BEFORE any upstream call (I8): the rules that hide a product by name refuse filing into it, a field the request omits fails closed (I4), and a client-claimed `groups` list is never trusted — Bugzilla unions the product's mandatory groups in server-side, so may_create forces groups to unknown, which means a group-consulting rule refuses every create request that REACHES it — creation is possible only where an earlier rule covering the create operation grants it (a rule carrying `operations = ["create"]`, placed ahead of the group-consulting rules, is how an operator permits filing without that grant shadowing reads of existing bugs — issue #26), and a policy with no such grant refuses all creation. **Judged is filed.** Bugzilla rewrites a create request before it resolves anything: it trims names (Perl `\s`), turns every run of ASCII control characters in the summary into one space and trims it (`clean_text`), and skips a keyword that is `""` or `"0"` — testing that falsiness on the RAW element, before the trim it applies to the ones it goes on to resolve. Judged raw, `product: " Security Response"` walked past a `products = ["Security*"]` deny rule into the grant behind it and was filed into Security Response all the same. So `may_create` rewrites the payload the same way IN PLACE, classifies the rewrite, and create_bug POSTs that very object — the rewritten names are ones Bugzilla's own trim leaves alone, so the name Bugzilla looks up is the name that was judged; which object that lookup returns, and whether the priority survives, are the two limits below. The NAME trim is deliberately a SUPERSET of Bugzilla's: Unicode White_Space plus U+180E, which Perl counted as `\s` until 5.20 and Rust's `is_whitespace` does not — that arm is load-bearing, not decoration. A superset is safe only because the POST carries the trimmed value and a name resolves to its stored spelling anyway; trimming less is the bug. The SUMMARY is stored as sent, so it is trimmed with White_Space alone and nothing Bugzilla keeps is dropped: an edge U+180E stays in what is judged and POSTed, a Perl before 5.20 strips it itself and a later one keeps it, so on every Perl the stored summary is the one the raw request would have produced. The judged summary therefore contains the stored one, and `summary_contains` is a positive substring test, so every needle the filed summary carries the judged one carries too. WHICH fields are rewritten is a rule rather than a list: every field create_bug sends that a Matcher reads (product, component, summary, severity, priority, keywords). Bugzilla also trims version, op_sys and platform, which no criterion reads — rewriting them would decide nothing, and a new criterion over such a field must extend the rewrite with it or reopen this bug. Evidence also needs the SHAPE create_bug sends: BugMeta reads component and keywords leniently (a lone string, an array, `{"name": ..}` objects) where Bugzilla splits a keyword string, resolves such objects itself, and refuses a list where it wants a name — so a non-string component is unknown, a keyword element the trim would turn false stays exactly as it came for Bugzilla to resolve or refuse, and a list holding one is unknown as a whole (a partly rewritten list reads as a shorter one). A list Bugzilla would skip entirely is dropped, as create_bug drops an empty one. A rewritten field that came out empty is still POSTed, so the upstream refusal answers it — `require_summary`, `require_component`, and `object_not_specified` for product, severity and (with `letsubmitterchoosepriority` on; off, the second limit below applies) priority — behind the same refusal text at the same cost. The audit record keeps the client's RAW arguments while the POST carries the rewrite: audited is what was asked, filed is what was judged. Two known limits remain, both about what the filed bug ends up carrying. First, the lookup compares under the DATABASE's collation, which can treat two spellings as equal — or a character as weightless — where a glob cannot: measured on MariaDB 10.6, the stored `Security Response` is matched by `"Śecurity Response"` under `utf8mb3_general_ci`, and under the UCA `utf8mb4_unicode_ci` by its decomposed spelling and by a leading zero-width space, BOM, word joiner or RLO; this gate judges each of those as a different product and POSTs it verbatim. ASCII-only product names are therefore no protection either, and a name glob is not a boundary on such an instance. Components, keywords, severities and priorities are looked up by name through the same comparison (`Bugzilla::Object` via `sql_istrcmp`; a component by `name = ?`, which MySQL also compares under the collation), so by reading the code, not by measurement, the limit covers their criteria too. What narrows it is an allowlist-shaped create grant ahead of a rule refusing every other create request, as the shipped example does: a spelling the allowlist does not match is refused, which leaves only products whose names the database equates with a name the allowlist does match. Issue #330 carries the measurements and the options and is open and DEFERRED: stripping or refusing such characters was rejected because it would change what the reporter filed, so nothing here closes the limit (PostgreSQL's `LOWER()` against Rust's `to_lowercase` is the same class, by reasoning, not measurement). Second, with `letsubmitterchoosepriority` off Bugzilla replaces the requested priority with `defaultpriority`, so a `priorities` criterion judges a priority the filed bug may not carry. **Every refusal is one refusal**: a policy refusal, a refused Bug ID custom field target, an unassessable custom field value and an upstream failure all return the same fixed create_denial text after the same upstream request count — the refused path burns one classify call against bug id 0 (never a valid id, creates nothing; download_attachment's padding precedent) instead of the POST. That count is a function of the request and the field kinds as learned (a failed lookup reads every field as Unknown, so a number anywhere becomes a target): `N = [one type lookup, when custom_fields is non-empty — at most 50 keys, the cap refusing more at zero requests] + [one whoami, when there are Bug ID targets and the policy consults identity through whoami] + [one classify per distinct target] + 1 (the POST, or the pad)`. No term depends on `may_create`'s verdict, on a target's verdict or existence, or on the POST's outcome — the targets are assessed even when the gate already refused, and a hidden target answers with create_denial, never with that bug's own uniform denial. Two texts, or differing counts, would be a free policy-enumeration oracle: send a guaranteed-invalid `version` plus a probe product and read the policy off which refusal (or which latency) comes back, with nothing created. Residual, accepted: a SUCCESSFUL create still confirms the product is allowed — that is the tool doing its job, and it costs a real, attributable bug; and the padding equalizes request count, not the upstream handler's exact latency (GET classify vs rejected POST). Bugzilla's failure message is logged server-side only (it can say whether a product/component exists). `custom_fields` keys must start with `cf_` (I7): the gate runs before `may_create` and errors with ZERO upstream requests on a non-`cf_` key — distinguishable from the padded create refusal on purpose, since it decides nothing about policy or Bugzilla; the 25-id cap over the custom field values that could name a bug and the 50-key cap on `custom_fields` refuse at zero requests the same way (I7). The caller is resolved for the targets only, never for the gate (see "Identity resolution"). No Matcher criterion reads `cf_*`, so a custom field cannot move a prospective bug between rules the way `product`/`component` do, and `may_create`'s rewrite never touches a `cf_*` value. `custom_fields` is not in `PARAM_ALLOWLIST`, so the audit stream records it as `_len`, same as the updater |
 | add_attachment | bug_id, data (base64), file_name, summary, content_type, comment = "", is_private = false, is_patch = false | attach (write) on bug_id | guard assessment before the upload (I8), uniform denial (I2); then global.max_attachment_bytes caps the DECODED size of `data` (0 = no cap) — the ceiling the operator set on downloads binds uploads through the same server too, measured after base64 expansion is stripped so encoding overhead cannot shrink it. The refusal names neither the payload's size nor the cap value (max_attachment_bytes is not I1-disclosable, exactly as on the download path). Over http that non-disclosure is partial and knowingly so: the transport's POST body cap is derived from this same value (#52), so its 413 boundary is probeable once the cap exceeds ~2.25 MiB decoded — accepted, with the reasoning, under "rmcp 3.5 usage notes" below. Nothing here changes: this refusal still names neither size nor cap. `comment` travels as a PLAIN string — Bug.add_attachment documents it so; the `{"comment": {"body": ..}}` shape belongs to Bug.update only |
 | add_comment | bug_id, comment, is_private: bool = false | comment (write) | an upstream refusal is the fixed line plus at most one code-selected hint — see "Upstream failures of the write tools" |
 | update_bug_status | bug_id, status, resolution?, comment: String = "" | status (write) | payload always carries `status`; `resolution` only when the caller gives a non-empty one — no local workflow assumption, no synthesised empty resolution. Bugzilla enforces `missing_resolution` on a closing status with none, and auto-clears any resolution when the target status is open; an upstream refusal is the fixed line plus at most one code-selected hint, and a request carrying `resolution` gets none but 109 — see "Upstream failures of the write tools" |
 | assign_bug | bug_id, assignee (email), comment = "" | assign (write) | payload `{"assigned_to": ..}`; an upstream refusal is the fixed line plus at most one code-selected hint — see "Upstream failures of the write tools" |
-| update_bug_fields | bug_id, priority?, severity?, resolution?, summary?, url?, whiteboard?, version?, target_milestone?, keywords_add?/keywords_remove?: Vec<String>, see_also_add?/see_also_remove?: Vec<String> (bug URLs), custom_fields?: JsonObject, comment = "" | fields (write) on bug_id + summary on every LOCAL see_also target (I8/I14) | at least one field required — the named params all count, so a call touching only the newer fields is valid, and a call carrying nothing but empty strings/lists still errors without contacting Bugzilla; empty strings and empty lists are ignored (clearing a field is unsupported); keywords and see_also travel as `{"add": [..], "remove": [..]}`, NEVER the replace-all `set` variant; a see_also entry that points at THIS instance is a bug-id link, so its target is assessed like a dependency target — at least `summary`, uniform denial (I2), no PUT on refusal — while entries for other trackers carry no local id and pass through unassessed; custom_fields keys must start with `cf_` (I7) — `see_also` and `keywords` are named params now, and as custom_fields keys they still error before Bugzilla is contacted; free-text values (summary/whiteboard/url) never enter the server log — only which fields a call touched (see "Update-field surface"); an upstream refusal is the fixed line plus at most one code-selected hint — a request carrying `resolution` or a `cf_*` key gets none but 109, one carrying `see_also` none at all — see "Upstream failures of the write tools" |
+| update_bug_fields | bug_id, priority?, severity?, resolution?, summary?, url?, whiteboard?, version?, target_milestone?, keywords_add?/keywords_remove?: Vec<String>, see_also_add?/see_also_remove?: Vec<String> (bug URLs), custom_fields?: JsonObject, comment = "" | fields (write) on bug_id + summary on every LOCAL see_also target and on every Bug ID custom field target (I8/I14) | a non-empty `custom_fields` — at most 50 keys, refused at zero requests past that (I7) — costs exactly one fresh type lookup (never the cache: a write judges the field as it is now) after the caps and the key and before the caller is resolved; a Bug ID, Bug List or unknown-kind field's value is read as Bugzilla will (`CustomLinkValue`: null/""/0 clear, a number or digits with one `#` name a target, anything else is unassessable and draws the fixed refusal `Custom field '<name>' may hold a bug id: give a numeric bug id, or an empty value to clear it` — issued only once the bug's own check has passed, so its uniform denial wins and a caller without `fields` learns no field's kind; the targets are classified all the same and nothing is PUT), a field of any other kind is forwarded unassessed whatever it holds, and the targets join the assessed set at the Summary bar with the uniform denial (I2); a failed lookup reads every field as unknown, so a number is assessed and text refused (I4); at least one field required — the named params all count, so a call touching only the newer fields is valid, and a call carrying nothing but empty strings/lists still errors without contacting Bugzilla; empty strings and empty lists in the NAMED params are ignored (clearing a named field is unsupported; a custom field clears on an empty value, above); keywords and see_also travel as `{"add": [..], "remove": [..]}`, NEVER the replace-all `set` variant; a see_also entry that points at THIS instance is a bug-id link, so its target is assessed like a dependency target — at least `summary`, uniform denial (I2), no PUT on refusal — while entries for other trackers carry no local id and pass through unassessed; custom_fields keys must start with `cf_` (I7) — `see_also` and `keywords` are named params now, and as custom_fields keys they still error before Bugzilla is contacted; free-text values (summary/whiteboard/url) never enter the server log — only which fields a call touched (see "Update-field surface"); an upstream refusal is the fixed line plus at most one code-selected hint — a request carrying `resolution` or a `cf_*` key gets none but 109, one carrying `see_also` none at all — see "Upstream failures of the write tools" |
 | update_bug_dependencies | bug_id, blocks_add?/blocks_remove?/depends_on_add?/depends_on_remove?: Vec<u64>, comment = "" | deps (write) | at least one change required; payload uses `{"blocks": {"add": [..], "remove": [..]}}` shape; an upstream refusal is the fixed line, plus the 109 hint alone — see "Upstream failures of the write tools" |
 | add_cc_to_bug | bug_id, cc_email | cc (write) | payload `{"cc": {"add": [email]}}`; an upstream refusal is the fixed line plus at most one code-selected hint — see "Upstream failures of the write tools" |
 | mark_as_duplicate | bug_id, duplicate_of, comment = "" | status on bug_id + summary on duplicate_of (I11) | default comment "Marking as duplicate of bug {duplicate_of}"; payload carries only `dupe_of` (+ comment) — Bugzilla's `set_dup_id` applies the instance's `duplicate_or_move_bug_status` and resolution DUPLICATE itself, so the resulting status is instance-defined, not necessarily CLOSED; an upstream refusal is the fixed line, plus the 109 hint alone — see "Upstream failures of the write tools" |
@@ -1412,7 +1487,7 @@ Exposed:
 
 | REST param | tool / param | capability |
 |---|---|---|
-| `priority`, `severity`, `resolution`, `cf_*` | `update_bug_fields` | `fields` |
+| `priority`, `severity`, `resolution`, `cf_*` | `update_bug_fields` (a `cf_*` field that holds a bug id — type 6, learned by name — takes a numeric bug id or an empty value; its target needs `summary`, and an unassessable value is refused with a fixed text) | `fields`, plus at least `summary` on every Bug ID custom field target (I8/I14) |
 | `summary` | `update_bug_fields.summary` | `fields` |
 | `url` | `update_bug_fields.url` | `fields` |
 | `whiteboard` | `update_bug_fields.whiteboard` | `fields` |
@@ -1967,9 +2042,9 @@ Decisions, all deliberate:
   systematically undercount: a handler cannot see the guard's per-id
   classify fetches, `resolve_caller`'s whoami, the search window's chunk
   scan (up to ten requests), `disclosable`'s I2 link padding,
-  `create_bug`'s padding classify, or `bug_history`'s custom field type
-  lookup — all of which are requests the call
-  really made and an operator really pays for. The scope is a
+  `create_bug`'s padding classify, or the custom field type lookups of
+  `bug_history` and the two custom-field writes — all of which are
+  requests the call really made and an operator really pays for. The scope is a
   `tokio::task_local`, which is why `bugwarden-core` names tokio as a
   direct dependency; that is a runtime edge core already had through
   reqwest, and it was preferred over threading a stats handle through
@@ -3763,7 +3838,18 @@ wired, `server.rs` and `main.rs` are the reference.
   answered sibling is cached, 60 names go out as 50 + 10 with every name
   asked exactly once, the fresh variant requests despite the cache and
   refreshes it, an empty name list is refused with `expect(0)` requests,
-  and no error text carries the API key (I12).
+  and no error text carries the API key (I12); and the write side —
+  `CustomLinkValue::parse` read as Bugzilla's `_check_bugid_field` reads
+  (null, `""`, `"0"`, `0` and `"00"` name no bug; `7`, `"7"`, `" #7\n"` and
+  `"007"` name 7; `"##7"`, `"#"`, `"+7"`, `"abc"`, `-7`, `7.0`, `1e3`,
+  `true`, `[7]`, `{"id": 7}`, a u64 overflow, an Arabic-Indic digit, a
+  NBSP edge and `"7, 8"` are unassessable), `custom_links` judges a Bug ID
+  or unknown field as one scalar (a comma list, an array and text are
+  unassessable there), a Bug List field item by item with one bad item
+  tainting the field and the first offending key named, and skips an
+  Other field whatever it holds, and `candidate_ids` counts every id a
+  value could name under any kind — scalars, array items and comma pieces
+  — as the request-only upper bound the cap is judged on.
 - Integration tests (crates/bugwarden/tests/tools_wiremock.rs, wiremock +
   rmcp client over an in-memory duplex transport): the tools are CALLED
   through a real MCP session, so a tool that stops calling its guard fails
@@ -3835,7 +3921,45 @@ wired, `server.rs` and `main.rs` are the reference.
   for exactly the history's `cf_` names; a lookup answering 500 fails
   closed (both digit values scrubbed, `fixed in 9` kept); a history with no
   `cf_` change makes no lookup (`expect(0)`); and a second history naming
-  the same field is answered from the cache (`expect(1)`); and identity
+  the same field is answered from the cache (`expect(1)`); Bug ID custom
+  fields on writes (I7/I8/I14) — `update_bug_fields` draws the uniform
+  denial for a hidden target spelled `999`, `"#999"` and `" 999 "` with
+  `expect(0)` PUTs, the fixed refusal for `"CVE-x"`, `999.0`,
+  `{"id": 999}`, `[999]` and `true` with the lookup and the bug's own check
+  as each call's only requests and nothing PUT, draws the bug's uniform
+  denial for every probe against a hidden bug — a name Bugzilla does not
+  know, a free-text field, a numeric value — with the bug and every target
+  classified all the same (the refusal issued first would be a
+  field-name and field-kind oracle for a caller with no access at all),
+  forwards a type-1 field's `999` unassessed (classify
+  `expect(0)`, PUT `expect(1)`), fails closed on a lookup 500 and on the
+  404/51 one unknown name draws for the whole batch — a free-text field's
+  number is then assessed (the hidden id's uniform denial) and its text
+  refused naming that field, the first in key order it could not judge,
+  with the bug classified first and nothing PUT — (a number is
+  assessed, text refused), clears on `null`, `""` and `0` classifying only
+  the bug itself, makes no lookup without `custom_fields`, and looks up
+  afresh on every write (two writes, two lookups); the cap counts custom
+  field values on both tools (bug 7 + 24 see_also + `"999"`, and a create
+  with 26 numeric values, both `got 26` at zero requests); `create_bug`'s
+  four refusal legs — the policy withholds the product (the visible target
+  still classified, `expect(1)`), a hidden target, a visible target with a
+  POST 400, and an unassessable value beside a visible target — each
+  return CREATE_DENIAL after exactly three requests on a fresh server; a
+  lookup 500 on create is CREATE_DENIAL after two requests with POST
+  `expect(0)`; under a file-anywhere plus my-own-reports policy a target
+  visible only as the caller's own report is filed after one whoami (four
+  requests), while a create without `custom_fields` makes no whoami and no
+  lookup; the existing free-text custom field create pins the request
+  list `[GET /rest/field/bug, POST /rest/bug]`; and the key-count cap on
+  both tools — 51 custom fields, one of them null, are refused with the
+  fixed text and no request at all (`received_requests` empty), 50, one of
+  them a two-item list, are accepted after exactly one lookup (the lookup
+  mock's `expect(1)`, the PUT or the POST reached) — keys are counted,
+  never values — while a server.rs unit test drives both tools under
+  per-request key custody with no key header: 51 fields draw the cap text
+  as a tool result where one field draws the missing-header protocol
+  error, so the cap precedes the key lookup; and identity
   end to end —
   issue #33's exact scenario (a my-own-reports restrict rule above a
   group_restricted deny: with whoami answering the caller, a
