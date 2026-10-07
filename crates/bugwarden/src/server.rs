@@ -17,6 +17,7 @@ use std::time::Instant;
 
 use base64::{engine::general_purpose, Engine as _};
 use bugwarden_core::client::{with_upstream_stats, BugzillaClient, UpstreamStats, CLASSIFY_FIELDS};
+use bugwarden_core::custom_fields::FieldTypeCache;
 use bugwarden_core::guard::{Guard, SearchRequest, SearchWindow};
 use bugwarden_core::policy::{Access, Action, Capability, IdentitySource};
 use bugwarden_core::quoted::QuotedError;
@@ -2354,6 +2355,9 @@ pub struct BugWarden {
     /// authenticated http only: stdio has no per-request credential, and
     /// `--insecure-no-auth` issues none.
     enforce_scopes: bool,
+    /// Custom field kinds learned from Bugzilla by name, on first use and
+    /// never at construction; shared by every per-session clone.
+    fields: Arc<FieldTypeCache>,
 }
 
 impl BugWarden {
@@ -2456,6 +2460,7 @@ impl BugWarden {
             key_custody,
             audit: None,
             enforce_scopes: false,
+            fields: Arc::default(),
         })
     }
 
@@ -3154,7 +3159,17 @@ impl BugWarden {
                 // OTHER bugs in their added/removed values, so history is a
                 // way to read out the existence of bugs the policy hides.
                 let base_url = self.bz.base_url();
-                let named = Guard::history_bug_ids(&history, base_url);
+                // So does a Bug ID custom field. Which cf_ fields are of that
+                // kind is learned by name, cache first, and only when the
+                // history names some; a lookup failure reads as Unknown and
+                // fails closed.
+                let custom = Guard::history_custom_fields(&history);
+                let kinds = if custom.is_empty() {
+                    BTreeMap::new()
+                } else {
+                    self.fields.kinds(&self.bz, &key, &custom).await
+                };
+                let named = Guard::history_bug_ids(&history, base_url, &kinds);
                 let disclosable = self
                     .guard
                     .disclosable(&self.bz, &key, &named, caller.as_deref())
@@ -3165,7 +3180,7 @@ impl BugWarden {
                         cell.note_suppressed(hidden);
                     }
                 }
-                let scrubbed = Guard::scrub_history(history, base_url, &disclosable);
+                let scrubbed = Guard::scrub_history(history, base_url, &disclosable, &kinds);
                 if p.head.is_none() && p.tail.is_none() {
                     return Ok(ok_json(scrubbed));
                 }
