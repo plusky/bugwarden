@@ -9,12 +9,12 @@
 //! bugwarden caps the client strings it logs at the CALL SITE
 //! (`server::Capped`), which bounds its own lines and nothing else. rmcp
 //! writes to the same stderr and into the same OTLP diagnostics stream,
-//! and bounds nothing: `service.rs:1373` logs the whole `initialize`
-//! parameters (`?peer_info`), `:1631` every client notification whole,
-//! and `:1619` a JSON-RPC request id raw on every error reply (`%id`).
-//! Raise the level and `service/server.rs:505` adds the declared protocol
-//! version raw, `service.rs:1569` the whole of every request at debug
-//! and `:1469` the whole of every loop event at trace. A cap that lives
+//! and bounds nothing: `service.rs:1367` logs the whole `initialize`
+//! parameters (`?peer_info`), `:1625` every client notification whole,
+//! and `:1613` a JSON-RPC request id raw on every error reply (`%id`).
+//! Raise the level and `service/server.rs:511` adds the declared protocol
+//! version raw, `service.rs:1563` the whole of every request at debug
+//! and `:1463` the whole of every loop event at trace. A cap that lives
 //! at a call site reaches none of them, and a
 //! level filter that hides them is undone by the next `RUST_LOG` an
 //! operator sets — so the bound goes where every line passes instead:

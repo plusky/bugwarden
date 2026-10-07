@@ -454,7 +454,7 @@ async fn guard_denies_uniformly_over_http() {
 
 #[tokio::test]
 async fn a_client_addressing_the_server_by_name_is_served() {
-    // rmcp 3.4's `allowed_hosts` default is loopback only, so inheriting it
+    // rmcp 3.5's `allowed_hosts` default is loopback only, so inheriting it
     // would answer every request whose `Host` is the name the operator
     // actually deployed under — every containerised one — with a rejection.
     // main.rs disables that validation by name; this pins the decision,
@@ -576,7 +576,7 @@ async fn an_allowed_hosts_entry_naming_no_host_leaves_validation_off() {
 
 #[tokio::test]
 async fn an_unparsable_allowed_hosts_entry_is_a_startup_error() {
-    // The same path `serve_http` and `main` take: rmcp 3.4.1 would store
+    // The same path `serve_http` and `main` take: rmcp 3.5.0 would store
     // `*` as a host that matches only `Host: *`, turning validation on as
     // a silent deny-all. Refusing here is what the operator sees instead
     // of one 403 at a time.
@@ -599,7 +599,7 @@ async fn an_unparsable_allowed_hosts_entry_is_a_startup_error() {
 
 #[tokio::test]
 async fn a_handshake_free_call_is_refused_and_never_names_a_client() {
-    // rmcp 3.4.1 routes to its handshake-free lifecycle when the request's
+    // rmcp 3.5.0 routes to its handshake-free lifecycle when the request's
     // revision is 2026-07-28 or newer, or `_meta` carries BOTH
     // `protocolVersion` and `clientCapabilities` — not for `initialize`,
     // which always takes the session path (#1228). The body below sends
@@ -892,7 +892,7 @@ async fn traceparent_over_http_lands_in_the_audit_record() {
     // `CallToolRequestParams.meta` arrives `None` here — and delivers it
     // to the handler as the extensions-backed `RequestContext.meta`, so
     // this test pins the `context.meta` fallback that every serialized
-    // transport depends on (see the rmcp 3.4 usage notes in DESIGN.md).
+    // transport depends on (see the rmcp 3.5 usage notes in DESIGN.md).
     let mock = MockServer::start().await;
     mount_bug_for_key(&mock, world_readable_bug(7), "srv-key").await;
 
@@ -1525,7 +1525,7 @@ async fn a_per_request_call_naming_no_client_is_served_and_names_no_placeholder(
     // The mutation this kills is `client_of` reading `ctx.client_info()` or
     // `peer_info()` on this path: rmcp synthesises the stateless peer with
     // `Implementation::default()`, so either would put
-    // `{"name":"rmcp","version":"3.4.1"}` into the record — not a missing
+    // `{"name":"rmcp","version":"3.5.0"}` into the record — not a missing
     // field but a plausible wrong one. The whole file is checked for the
     // string, not just this record's field, because a placeholder that
     // leaked into any other record would be the same defect.
@@ -1950,6 +1950,156 @@ async fn a_header_only_2026_declaration_is_refused_by_the_transport() {
 }
 
 #[tokio::test]
+async fn an_initialize_whose_mcp_method_header_contradicts_its_body_mints_no_session() {
+    // rmcp 3.5 (#1275, closing #1271) runs the SEP-2243 check on
+    // `initialize` before a session exists: at a 2026-07-28 header a
+    // supplied `Mcp-Method` must be exactly one `initialize` — both refused
+    // legs below hit that arm's own check. The refusal is the transport's (-32020),
+    // so no session is minted, no handler runs and nothing is recorded —
+    // the genre of the header-only refusal above, pinned because the audit
+    // stream's session anchor rests on rmcp refusing BEFORE it mints. A
+    // matching header is served and mints as usual: that leg is the
+    // liveness guard. (The rmcp client sends no header on `initialize` and
+    // is untouched either way.)
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("audit temp dir");
+    let file = key_file("srv-key\n");
+    let (addr, audit_path) = served_with_audit(&mock, &dir, &file).await;
+
+    let initialize = |methods: &[&str]| {
+        let mut builder = mcp_post(addr, None).header("MCP-Protocol-Version", PER_REQUEST_REVISION);
+        for method in methods {
+            builder = builder.header("Mcp-Method", *method);
+        }
+        builder.json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": PER_REQUEST_REVISION,
+                "capabilities": {},
+                "clientInfo": { "name": "contradicting-client", "version": "1" }
+            }
+        }))
+    };
+
+    for (methods, why) in [
+        (&["tools/list"][..], "a contradicting Mcp-Method"),
+        (&["initialize", "initialize"][..], "a duplicated Mcp-Method"),
+    ] {
+        let response = initialize(methods)
+            .send()
+            .await
+            .expect("the initialize must reach the server");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{why}: the transport refuses before any handler"
+        );
+        assert!(
+            response.headers().get("mcp-session-id").is_none(),
+            "{why}: a refused initialize mints no session"
+        );
+        let body = response.text().await.expect("a body");
+        assert!(
+            body.contains("-32020"),
+            "{why}: refused as a header mismatch: {body}"
+        );
+    }
+    assert!(
+        !std::path::Path::new(&audit_path).exists() || audit_events(&audit_path).is_empty(),
+        "an initialize the handler never saw records nothing"
+    );
+    let upstream = mock.received_requests().await.unwrap_or_default();
+    assert!(upstream.is_empty(), "and contacts no upstream");
+
+    let response = initialize(&["initialize"])
+        .send()
+        .await
+        .expect("the matching initialize must reach the server");
+    assert!(
+        response.status().is_success(),
+        "a matching Mcp-Method is served, got {}",
+        response.status()
+    );
+    assert!(
+        response.headers().get("mcp-session-id").is_some(),
+        "and a served initialize mints a session"
+    );
+    let body = response.text().await.expect("a body");
+    assert!(
+        body.contains(r#""protocolVersion":"2025-11-25""#),
+        "answered with the handshake-era fallback, never 2026-07-28: {body}"
+    );
+    // The served leg records: the refused legs' silence above was real.
+    let initializes = audit_events(&audit_path)
+        .iter()
+        .filter(|e| matches!(e.kind, AuditEventKind::Initialize(_)))
+        .count();
+    assert_eq!(initializes, 1, "exactly the served initialize is on record");
+}
+
+#[tokio::test]
+async fn a_duplicated_sep_2243_header_is_refused_before_any_handler() {
+    // rmcp 3.5 (#1274): `header_str` reads `Mcp-Method`, `Mcp-Name` and an
+    // annotated `Mcp-Param-*` as singletons and refuses a repeat, where
+    // 3.4 took the first value and served the call. The refusal is the
+    // transport's (-32020, naming the header and nothing else), before
+    // `lifecycle_of`, the guard or the router — no record, no upstream
+    // leg: the genre of `a_pre_dispatch_rmcp_refusal_writes_no_tool_call_record`.
+    // Fail-closed, and pinned so a bump that serves the first value again
+    // fails here. Against the 3.4.1 lock both legs are served 200.
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("audit temp dir");
+    let file = key_file("srv-key\n");
+    let (addr, audit_path) = served_with_audit(&mock, &dir, &file).await;
+
+    for (name, value) in [("Mcp-Method", "tools/call"), ("Mcp-Name", "bug_info")] {
+        let response = mcp_post(addr, None)
+            .header("MCP-Protocol-Version", PER_REQUEST_REVISION)
+            .header("Mcp-Method", "tools/call")
+            .header("Mcp-Name", "bug_info")
+            .header(name, value)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "bug_info",
+                    "arguments": { "bug_ids": [7] },
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": PER_REQUEST_REVISION,
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            }))
+            .send()
+            .await
+            .expect("the duplicated-header call must reach the server");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "a duplicated {name} is refused by the transport"
+        );
+        let body = response.text().await.expect("a body");
+        assert!(
+            body.contains("-32020") && body.contains(&format!("duplicate {name} header")),
+            "a duplicated {name} is refused as such: {body}"
+        );
+        assert!(
+            !body.contains(value),
+            "the refusal names the header, never its value: {body}"
+        );
+    }
+    assert!(
+        !std::path::Path::new(&audit_path).exists() || audit_events(&audit_path).is_empty(),
+        "a call the handler never saw records nothing"
+    );
+    let upstream = mock.received_requests().await.unwrap_or_default();
+    assert!(upstream.is_empty(), "and contacts no upstream");
+}
+
+#[tokio::test]
 async fn a_pre_dispatch_rmcp_refusal_writes_no_tool_call_record() {
     // Issue #182: rmcp refuses these in the blanket `Service` impl before
     // `call_tool`, so the stream has no record. Logged (`tracing::warn`
@@ -2158,21 +2308,21 @@ async fn a_per_request_denial_is_uniform_with_a_nonexistent_bug_i2() {
     );
 }
 
-/// One per-request `tools/call` POST for `tool`, optionally carrying a stray
-/// SEP-2243 `Mcp-Param-*` header, as `(status, body)`.
+/// One per-request `tools/call` POST for `tool`, carrying a stray SEP-2243
+/// `Mcp-Param-*` header `canaries` times, as `(status, body)`.
 ///
 /// Inlined rather than widening [`per_request_post`]: exactly one caller
 /// wants the extra header, and no other test should grow a parameter for it.
 async fn per_request_call_with_canary(
     addr: SocketAddr,
     tool: &str,
-    canary: bool,
+    canaries: usize,
 ) -> (reqwest::StatusCode, String) {
     let mut builder = mcp_post(addr, None)
         .header("MCP-Protocol-Version", PER_REQUEST_REVISION)
         .header("Mcp-Method", "tools/call")
         .header("Mcp-Name", tool.to_owned());
-    if canary {
+    for _ in 0..canaries {
         builder = builder.header("Mcp-Param-X-Bugwarden-Canary", "1");
     }
     let response = builder
@@ -2204,13 +2354,15 @@ async fn a_stray_mcp_param_header_is_inert_on_the_per_request_path() {
     // none — `no_served_tool_authors_an_x_mcp_header_annotation` in
     // server.rs keeps it that way — so the loop has nothing to iterate and a
     // stray `Mcp-Param-*` header changes NEITHER answer: each leg is
-    // byte-identical to itself with and without one, whether `get_tool`
+    // byte-identical to itself with one, without one, and with it twice —
+    // rmcp 3.5 (#1274) rejects a duplicated header only where it reads one,
+    // and an unannotated `Mcp-Param-*` is never read — whether `get_tool`
     // found the schema or not. (The two legs differ from each other, of
     // course — one is served, one refused.) That per-leg invariance is what
     // makes the missing `RequestContext` on `get_tool` a bounded leak rather
     // than a live one.
     //
-    // Honest caveat: the two EQUALITY oracles below pin the SDK, not our
+    // Honest caveat: the EQUALITY oracles below pin the SDK, not our
     // code — no bugwarden mutant is uniquely caught by them, and their
     // failure mode is an rmcp bump that starts rejecting or promoting
     // unannotated `Mcp-Param-*` headers, the same genre as
@@ -2224,31 +2376,36 @@ async fn a_stray_mcp_param_header_is_inert_on_the_per_request_path() {
 
     // Schema found. Serving it is also the liveness guard: two identical
     // refusals would prove nothing.
-    let plain = per_request_call_with_canary(addr, "bug_info", false).await;
-    let canaried = per_request_call_with_canary(addr, "bug_info", true).await;
+    let plain = per_request_call_with_canary(addr, "bug_info", 0).await;
     assert!(
         plain.1.contains("a plain bug"),
         "the schema-found leg must really be served: {plain:?}"
     );
-    assert_eq!(
-        plain, canaried,
-        "a stray Mcp-Param-* header must change nothing for a tool with a schema"
-    );
+    for canaries in [1, 2] {
+        let canaried = per_request_call_with_canary(addr, "bug_info", canaries).await;
+        assert_eq!(
+            plain, canaried,
+            "{canaries} stray Mcp-Param-* header(s) must change nothing for a tool with a schema"
+        );
+    }
 
     // Schema absent. Counting upstream requests rather than matching a path
     // prefix: `bug_info` and `create_bug` both hit `/rest/bug` with no
     // trailing segment, so a prefix match would pass vacuously.
     let before = mock.received_requests().await.unwrap_or_default().len();
-    let missing = per_request_call_with_canary(addr, "no_such_tool_at_all", false).await;
-    let missing_canaried = per_request_call_with_canary(addr, "no_such_tool_at_all", true).await;
+    let missing = per_request_call_with_canary(addr, "no_such_tool_at_all", 0).await;
     assert!(
         missing.1.contains("\"error\""),
         "the schema-absent leg must be refused, not served: {missing:?}"
     );
-    assert_eq!(
-        missing, missing_canaried,
-        "a stray Mcp-Param-* header must change nothing for a tool without one"
-    );
+    for canaries in [1, 2] {
+        let missing_canaried =
+            per_request_call_with_canary(addr, "no_such_tool_at_all", canaries).await;
+        assert_eq!(
+            missing, missing_canaried,
+            "{canaries} stray Mcp-Param-* header(s) must change nothing for a tool without one"
+        );
+    }
     assert_eq!(
         mock.received_requests().await.unwrap_or_default().len(),
         before,

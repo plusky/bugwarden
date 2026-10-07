@@ -63,10 +63,13 @@ pub(crate) const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
 ];
 
 /// The revision offered when a client asks for one this build cannot
-/// serve, and the one `get_info` advertises. Pinned rather than left to
-/// `ProtocolVersion::default()`, whose value moves with the SDK: an
-/// rmcp release that advances `LATEST` past what [`SUPPORTED_PROTOCOL_VERSIONS`]
-/// lists would otherwise make the fallback a revision this build rejects.
+/// serve over a session, and the one `get_info` advertises. Pinned rather
+/// than left to `ProtocolVersion::default()`, which moves with the SDK:
+/// since rmcp 3.5 (#1105) that default is `2026-07-28`, a revision with
+/// no handshake, so inheriting it would make this handler's own
+/// `initialize` answer one no session can speak. The SDK names the same
+/// value `LATEST_WITH_INITIALIZE`; it is pinned here, not referenced, so
+/// the next move upstream fails a test instead of changing the wire.
 const DEFAULT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
 
 /// The name this server reports as its own, in the handshake and in
@@ -548,7 +551,7 @@ fn allowlisted(params: Option<&JsonObject>) -> BTreeMap<String, Value> {
 /// * [`Lifecycle::PerRequest`] — the request's own `_meta`. **Never
 ///   `ctx.client_info()`**: that convenience accessor falls back to
 ///   `peer_info().client_info` unless `request_metadata_required()`, which
-///   rmcp 3.4.1 sets only on the stdio handshake-free path
+///   rmcp 3.5.0 sets only on the stdio handshake-free path
 ///   (`service/server.rs`), so over streamable http it IS the
 ///   `{"name":"rmcp",…}` placeholder rmcp synthesises for a peer that
 ///   never handshook (`peer_info_for_stateless_request`, #34 §3c) — and
@@ -680,7 +683,7 @@ enum Lifecycle {
 /// what gets served and who gets recorded cannot diverge by call-site
 /// ordering.
 ///
-/// rmcp 3.4.1 routes on `_meta` shape, not on the negotiated revision and
+/// rmcp 3.5.0 routes on `_meta` shape, not on the negotiated revision and
 /// not on [`SUPPORTED_PROTOCOL_VERSIONS`]: `is_legacy_request`
 /// (`transport/streamable_http_server/tower.rs`) returns true — the session
 /// path — for every `initialize` (rmcp #1228), and otherwise sends a POST
@@ -755,7 +758,7 @@ fn read_scope_serves(tool: &str) -> bool {
 /// The refusal for a tool this request's credential does not reach.
 ///
 /// Byte-identical to what `ToolRouter` answers for a name it does not route
-/// (rmcp 3.4 `handler/server/router/tool.rs`), so a scope-hidden tool is
+/// (rmcp 3.5 `handler/server/router/tool.rs`), so a scope-hidden tool is
 /// indistinguishable from one that does not exist — the same
 /// indistinguishability read-only mode already gives every caller (I13), and
 /// no oracle about which tools the deployment serves (I2).
@@ -2255,7 +2258,7 @@ impl BugWarden {
     /// there is one place where the policy field is read. Call it before
     /// the server moves into the service closure.
     ///
-    /// These rmcp 3.4 defaults are set by name rather than inherited,
+    /// These rmcp 3.5 defaults are set by name rather than inherited,
     /// because inheriting them changes how a deployment behaves without
     /// anyone choosing it:
     ///
@@ -2299,7 +2302,7 @@ impl BugWarden {
     /// have recorded the attempt — though rmcp's own refusal body prints
     /// the number outright. That the boundary is observable to an
     /// unauthenticated client, and what it discloses, is recorded in
-    /// DESIGN.md under "rmcp 3.4 usage notes".
+    /// DESIGN.md under "rmcp 3.5 usage notes".
     ///
     /// `allowed_origins` is the browser-facing sibling of `allowed_hosts`
     /// and the same reasoning covers it, but it is left inherited: its
@@ -2307,7 +2310,7 @@ impl BugWarden {
     /// nothing. Anything that changes the `allowed_hosts` call below should
     /// decide this one too rather than leave it behind. The remaining
     /// fields, and why each stays inherited, are inventoried in DESIGN.md
-    /// under "rmcp 3.4 usage notes"; the caller in `main` adds
+    /// under "rmcp 3.5 usage notes"; the caller in `main` adds
     /// `cancellation_token` so a SIGINT or SIGTERM reaches the live
     /// transport (issue #114).
     ///
@@ -4738,7 +4741,7 @@ impl ServerHandler for BugWarden {
             Reach::ReadOnly => tools.retain(|tool| read_scope_serves(&tool.name)),
             Reach::Nothing => tools.clear(),
         }
-        // The SEP-2549 hints are ours to gate: rmcp 3.4.1 strips
+        // The SEP-2549 hints are ours to gate: rmcp 3.5.0 strips
         // `resultType` for a legacy peer and leaves these two alone. The
         // predicate is HAND-COPIED from its `sep_2322_supported` — no shared
         // constant, no test pinning the agreement — so re-read both on an
@@ -5274,6 +5277,28 @@ mod tests {
             server.get_info().protocol_version,
             DEFAULT_PROTOCOL_VERSION,
             "the advertised default is pinned here, not taken from the SDK's LATEST"
+        );
+        // The assertion above is non-vacuous only while the SDK's default
+        // differs from the pin — true since rmcp 3.5 (#1105) made it
+        // `2026-07-28`, a revision with no handshake. Before that the two
+        // were equal and dropping the pin passed every test.
+        assert!(
+            ProtocolVersion::default().as_str() >= ProtocolVersion::V_2026_07_28.as_str(),
+            "the SDK default is handshake-era again: the pin is vacuous and \
+             DESIGN.md's protocol-revisions bullet is stale"
+        );
+        // The SDK's `LATEST_WITH_INITIALIZE`, and today also the newest
+        // handshake-era entry of this build's own list, which is what rmcp
+        // substitutes for a fallback without a handshake. Deliberate, not
+        // required: a bump that teaches the SDK a newer one fails here.
+        let newest_with_handshake = ProtocolVersion::KNOWN_VERSIONS
+            .iter()
+            .filter(|v| v.as_str() < ProtocolVersion::V_2026_07_28.as_str())
+            .max_by(|a, b| a.as_str().cmp(b.as_str()))
+            .expect("the SDK knows a handshake-era revision");
+        assert_eq!(
+            newest_with_handshake, &DEFAULT_PROTOCOL_VERSION,
+            "the pin must be the newest handshake-era revision the SDK knows"
         );
         for version in SUPPORTED_PROTOCOL_VERSIONS {
             assert!(
@@ -5865,7 +5890,7 @@ mod tests {
         }
     }
 
-    /// SEP-2243's schema annotation, byte-exact as rmcp 3.4.1 reads it —
+    /// SEP-2243's schema annotation, byte-exact as rmcp 3.5.0 reads it —
     /// `schema.get("x-mcp-header")` in `transport/common/mcp_headers.rs`
     /// (`param_header_annotations`, `validate_param_header_annotations`,
     /// `reject_nested_annotations`). Upstream exports no constant for the
@@ -5883,7 +5908,7 @@ mod tests {
     /// with no recursion arms to keep in lockstep, which is the maintenance
     /// surface `schema_portability_error` above has to carry.
     ///
-    /// Deliberately broader than rmcp's functional read, which in 3.4.1 is
+    /// Deliberately broader than rmcp's functional read, which in 3.5.0 is
     /// top-level `properties` and string-valued only: the key is banned
     /// everywhere, at any value type, because upstream's depth rules are
     /// version-specific. It will also trip on the substring appearing in a
