@@ -17,7 +17,9 @@ use std::time::Instant;
 
 use base64::{engine::general_purpose, Engine as _};
 use bugwarden_core::client::{with_upstream_stats, BugzillaClient, UpstreamStats, CLASSIFY_FIELDS};
-use bugwarden_core::custom_fields::{candidate_ids, custom_links, FieldTypeCache, LOOKUP_CHUNK};
+use bugwarden_core::custom_fields::{
+    candidate_ids, custom_links, CustomFieldKind, FieldTypeCache, LOOKUP_CHUNK,
+};
 use bugwarden_core::guard::{Guard, SearchRequest, SearchWindow};
 use bugwarden_core::policy::{Access, Action, Capability, IdentitySource};
 use bugwarden_core::quoted::QuotedError;
@@ -175,6 +177,23 @@ fn ok_json(value: Value) -> CallToolResult {
 /// Tool-level failure: error result with a text block (NOT a protocol error).
 fn err_text(msg: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(msg.into())])
+}
+
+/// Serve a `Bug.update` result naming no bug but those in `assessed`,
+/// the ids this call checked. Any other id is blanked with no request
+/// and no policy lookup, so the bytes cannot tell a hidden bug from a
+/// visible one. `kinds` judges `cf_` changes as the call already learned
+/// them; a field of unknown kind is split like a list, the most
+/// restrictive reading.
+fn update_response(
+    mut result: Value,
+    base_url: &str,
+    assessed: &[u64],
+    kinds: &BTreeMap<String, CustomFieldKind>,
+) -> CallToolResult {
+    let nameable: BTreeSet<u64> = assessed.iter().copied().collect();
+    Guard::scrub_update_changes(&mut result, base_url, &nameable, kinds);
+    ok_json(result)
 }
 
 fn action_name(action: Action) -> &'static str {
@@ -3697,7 +3716,12 @@ impl BugWarden {
             .add_comment(&key, p.bug_id, &p.comment, p.is_private)
             .await
         {
-            Ok(result) => Ok(ok_json(result)),
+            Ok(result) => Ok(update_response(
+                result,
+                self.bz.base_url(),
+                &[p.bug_id],
+                &BTreeMap::new(),
+            )),
             Err(e) => Ok(upstream_refusal(
                 "add_comment",
                 p.bug_id,
@@ -3749,7 +3773,12 @@ impl BugWarden {
             .update_bug(&key, p.bug_id, Value::Object(payload))
             .await
         {
-            Ok(result) => Ok(ok_json(result)),
+            Ok(result) => Ok(update_response(
+                result,
+                self.bz.base_url(),
+                &[p.bug_id],
+                &BTreeMap::new(),
+            )),
             Err(e) => Ok(upstream_refusal("update_bug_status", p.bug_id, reach, &e)),
         }
     }
@@ -3790,7 +3819,12 @@ impl BugWarden {
             .update_bug(&key, p.bug_id, Value::Object(payload))
             .await
         {
-            Ok(result) => Ok(ok_json(result)),
+            Ok(result) => Ok(update_response(
+                result,
+                self.bz.base_url(),
+                &[p.bug_id],
+                &BTreeMap::new(),
+            )),
             Err(e) => Ok(upstream_refusal("assign_bug", p.bug_id, reach, &e)),
         }
     }
@@ -3917,9 +3951,10 @@ impl BugWarden {
         // refused rather than forwarded, but only once the bug's own check
         // has passed, so the refusal tells a field's kind to nobody else.
         let mut unassessable = None;
+        let mut kinds: BTreeMap<String, CustomFieldKind> = BTreeMap::new();
         if let Some(cf) = custom_fields {
             let names = cf.keys().cloned().collect();
-            let kinds = self.fields.kinds_fresh(&self.bz, &key, &names).await;
+            kinds = self.fields.kinds_fresh(&self.bz, &key, &names).await;
             let links = custom_links(cf, &kinds);
             unassessable = links.unassessable;
             ids.extend(links.targets);
@@ -3970,7 +4005,7 @@ impl BugWarden {
             .update_bug(&key, p.bug_id, Value::Object(payload))
             .await
         {
-            Ok(result) => Ok(ok_json(result)),
+            Ok(result) => Ok(update_response(result, self.bz.base_url(), &ids, &kinds)),
             Err(e) => Ok(upstream_refusal("update_bug_fields", p.bug_id, reach, &e)),
         }
     }
@@ -4084,7 +4119,12 @@ impl BugWarden {
             .update_bug(&key, p.bug_id, Value::Object(payload))
             .await
         {
-            Ok(result) => Ok(ok_json(result)),
+            Ok(result) => Ok(update_response(
+                result,
+                self.bz.base_url(),
+                &ids,
+                &BTreeMap::new(),
+            )),
             Err(e) => Ok(upstream_refusal(
                 "update_bug_dependencies",
                 p.bug_id,
@@ -4129,7 +4169,12 @@ impl BugWarden {
             .update_bug(&key, p.bug_id, Value::Object(payload))
             .await
         {
-            Ok(result) => Ok(ok_json(result)),
+            Ok(result) => Ok(update_response(
+                result,
+                self.bz.base_url(),
+                &[p.bug_id],
+                &BTreeMap::new(),
+            )),
             Err(e) => Ok(upstream_refusal("add_cc_to_bug", p.bug_id, reach, &e)),
         }
     }
@@ -4204,7 +4249,12 @@ impl BugWarden {
             .update_bug(&key, p.bug_id, Value::Object(payload))
             .await
         {
-            Ok(result) => Ok(ok_json(result)),
+            Ok(result) => Ok(update_response(
+                result,
+                self.bz.base_url(),
+                &ids,
+                &BTreeMap::new(),
+            )),
             Err(e) => Ok(upstream_refusal(
                 "mark_as_duplicate",
                 p.bug_id,

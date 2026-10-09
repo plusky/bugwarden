@@ -4914,3 +4914,572 @@ async fn create_bug_without_custom_fields_makes_no_whoami() {
     assert!(!is_error(&result), "{}", text_of(&result));
     assert_eq!(mock.received_requests().await.unwrap().len(), 1);
 }
+
+// ---------- write responses name only assessed bugs (I14) ----------
+
+/// An id no mock port or fixture timestamp can hold by accident.
+const UNASSESSED: u64 = 900_001;
+
+/// Mount `PUT /rest/bug/7` answering with `changes`, expected once.
+async fn mount_update_result(mock: &MockServer, changes: Value) {
+    Mock::given(method("PUT"))
+        .and(path("/rest/bug/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": [{
+                "id": 7,
+                "alias": [],
+                "last_change_time": "2026-01-01T00:00:00Z",
+                "changes": changes,
+            }]
+        })))
+        .expect(1)
+        .mount(mock)
+        .await;
+}
+
+/// Mount a lookup of [`UNASSESSED`] answering with `bug`, expected
+/// never: scrubbing a write response must not consult policy.
+async fn mount_lookup_trap(mock: &MockServer, bug: Value) {
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", UNASSESSED.to_string()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": [bug]
+        })))
+        .expect(0)
+        .mount(mock)
+        .await;
+}
+
+/// The `changes` of a successful `Bug.update` tool call.
+fn changes_of(result: &CallToolResult) -> Value {
+    assert!(!is_error(result), "result: {}", text_of(result));
+    let v: Value = serde_json::from_str(&text_of(result)).expect("result is JSON");
+    v["bugs"][0]["changes"].clone()
+}
+
+#[tokio::test]
+async fn reopening_a_duplicate_does_not_name_its_former_target() {
+    // Reopening clears the duplicate, and Bugzilla reports the old
+    // target as `removed`. The write blanks it whether hidden or
+    // visible, without a lookup, so both answers are the same bytes.
+    let policy = concat!(
+        "[[rule]]\nname = \"hide-secret\"\naction = \"deny\"\n",
+        "[rule.match]\nproducts = [\"Secret*\"]\n",
+    );
+    let mut texts = Vec::new();
+    for product in ["SecretSauce", "openSUSE"] {
+        let mock = MockServer::start().await;
+        mount_classify(&mock, world_readable_bug(7)).await;
+        let mut former = world_readable_bug(UNASSESSED);
+        former["product"] = json!(product);
+        mount_lookup_trap(&mock, former).await;
+        mount_update_result(
+            &mock,
+            json!({
+                "status": { "removed": "RESOLVED", "added": "REOPENED" },
+                "resolution": { "removed": "DUPLICATE", "added": "" },
+                "dupe_of": {
+                    "removed": UNASSESSED.to_string(),
+                    "added": ""
+                },
+            }),
+        )
+        .await;
+        let client = client_for(policy, &mock).await;
+        let result = call(
+            &client,
+            "update_bug_status",
+            json!({ "bug_id": 7, "status": "REOPENED" }),
+        )
+        .await;
+        assert_eq!(
+            changes_of(&result),
+            json!({
+                "status": { "removed": "RESOLVED", "added": "REOPENED" },
+                "resolution": { "removed": "DUPLICATE", "added": "" },
+            }),
+            "former target in {product}"
+        );
+        texts.push(text_of(&result));
+    }
+    assert_eq!(texts[0], texts[1], "the verdict must not show");
+}
+
+#[tokio::test]
+async fn re_marking_a_duplicate_keeps_the_assessed_target_only() {
+    // 8 passed this call's summary check, so it may be named; the
+    // previous target was never assessed.
+    let mock = MockServer::start().await;
+    mount_classify(&mock, world_readable_bug(7)).await;
+    mount_classify(&mock, world_readable_bug(8)).await;
+    mount_lookup_trap(&mock, world_readable_bug(UNASSESSED)).await;
+    mount_update_result(
+        &mock,
+        json!({ "dupe_of": {
+            "removed": UNASSESSED.to_string(),
+            "added": "8"
+        } }),
+    )
+    .await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "mark_as_duplicate",
+        json!({ "bug_id": 7, "duplicate_of": 8 }),
+    )
+    .await;
+    assert_eq!(
+        changes_of(&result),
+        json!({ "dupe_of": { "removed": "", "added": "8" } })
+    );
+}
+
+#[tokio::test]
+async fn every_bug_update_tool_names_only_the_bugs_it_assessed() {
+    // Each `Bug.update` tool serves `changes` from its own match arm,
+    // so each is its own place to forget the scrub. Bug 8 survives
+    // exactly where the call assessed it.
+    type Case = (&'static str, fn(&str) -> Value, Option<u64>);
+    let local = |uri: &str, id: u64| format!("{uri}/show_bug.cgi?id={id}");
+    // A URL holding a comma: data, never a separator.
+    let comma_url = "https://example.com/?q=50.1,14.4".to_string();
+    let cases: [Case; 6] = [
+        (
+            "update_bug_status",
+            |_| json!({ "bug_id": 7, "status": "REOPENED" }),
+            None,
+        ),
+        (
+            "assign_bug",
+            |_| json!({ "bug_id": 7, "assignee": "dev@example.com" }),
+            None,
+        ),
+        (
+            "add_cc_to_bug",
+            |_| json!({ "bug_id": 7, "cc_email": "dev@example.com" }),
+            None,
+        ),
+        (
+            "update_bug_fields",
+            |_| json!({ "bug_id": 7, "priority": "P1" }),
+            None,
+        ),
+        (
+            "update_bug_fields",
+            |uri| {
+                json!({ "bug_id": 7,
+                        "see_also_add": [format!("{uri}/show_bug.cgi?id=8")] })
+            },
+            Some(8),
+        ),
+        (
+            "update_bug_dependencies",
+            |_| json!({ "bug_id": 7, "blocks_add": [8] }),
+            Some(8),
+        ),
+    ];
+    for (tool, args, target) in cases {
+        let mock = MockServer::start().await;
+        let uri = mock.uri();
+        mount_classify(&mock, world_readable_bug(7)).await;
+        if let Some(id) = target {
+            mount_classify(&mock, world_readable_bug(id)).await;
+        }
+        mount_lookup_trap(&mock, world_readable_bug(UNASSESSED)).await;
+        let with_target = |value: String| match target {
+            Some(id) => format!("{id}, {value}"),
+            None => value,
+        };
+        mount_update_result(
+            &mock,
+            json!({
+                "priority": { "removed": "P3", "added": "P1" },
+                "blocks": { "removed": "",
+                            "added": with_target(UNASSESSED.to_string()) },
+                "dupe_of": {
+                    "removed": UNASSESSED.to_string(),
+                    "added": target.map(|t| t.to_string())
+                        .unwrap_or_default()
+                },
+                "see_also": {
+                    "removed": "",
+                    "added": target.map_or(
+                        local(&uri, UNASSESSED),
+                        |t| format!("{}, {}",
+                            local(&uri, t), local(&uri, UNASSESSED)),
+                    ),
+                },
+                "url": { "removed": local(&uri, UNASSESSED),
+                         "added": comma_url },
+            }),
+        )
+        .await;
+        let client = client_for("", &mock).await;
+        let result = call(&client, tool, args(&uri)).await;
+
+        let mut expected = json!({ "priority": { "removed": "P3", "added": "P1" },
+                    "url": { "removed": "", "added": comma_url } });
+        if let Some(t) = target {
+            expected["blocks"] = json!({ "removed": "",
+                                          "added": t.to_string() });
+            expected["dupe_of"] = json!({ "removed": "",
+                                           "added": t.to_string() });
+            expected["see_also"] = json!({ "removed": "", "added": local(&uri, t) });
+        }
+        assert_eq!(changes_of(&result), expected, "{tool}");
+        assert!(
+            !text_of(&result).contains(&UNASSESSED.to_string()),
+            "{tool}: {}",
+            text_of(&result)
+        );
+    }
+
+    // `mark_as_duplicate` is the seventh arm; `add_comment` answers
+    // with a comment id, which names no bug and passes through.
+    let mock = MockServer::start().await;
+    mount_classify(&mock, world_readable_bug(7)).await;
+    mount_classify(&mock, world_readable_bug(8)).await;
+    mount_lookup_trap(&mock, world_readable_bug(UNASSESSED)).await;
+    mount_update_result(
+        &mock,
+        json!({ "dupe_of": {
+            "removed": UNASSESSED.to_string(),
+            "added": "8"
+        } }),
+    )
+    .await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "mark_as_duplicate",
+        json!({ "bug_id": 7, "duplicate_of": 8 }),
+    )
+    .await;
+    assert_eq!(
+        changes_of(&result),
+        json!({ "dupe_of": { "removed": "", "added": "8" } })
+    );
+
+    let mock = MockServer::start().await;
+    mount_classify(&mock, world_readable_bug(7)).await;
+    mount_lookup_trap(&mock, world_readable_bug(UNASSESSED)).await;
+    Mock::given(method("POST"))
+        .and(path("/rest/bug/7/comment"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 42
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "add_comment",
+        json!({ "bug_id": 7, "comment": "hi" }),
+    )
+    .await;
+    assert!(!is_error(&result), "{}", text_of(&result));
+    assert_eq!(text_of(&result), "{\"id\":42}");
+}
+
+#[tokio::test]
+async fn write_response_judges_url_as_one_scalar() {
+    // A comma inside a URL is data: the assessed target's URL is kept
+    // whole, and the unassessed old value is blanked whole, never cut
+    // at the comma.
+    let mock = MockServer::start().await;
+    let uri = mock.uri();
+    mount_classify(&mock, world_readable_bug(7)).await;
+    mount_classify(&mock, world_readable_bug(8)).await;
+    mount_lookup_trap(&mock, world_readable_bug(UNASSESSED)).await;
+    let kept = format!("{uri}/show_bug.cgi?id=8&w=1,2");
+    let dropped = format!("{uri}/show_bug.cgi?id={UNASSESSED}&w=1,2");
+    mount_update_result(
+        &mock,
+        json!({ "url": { "removed": dropped, "added": kept } }),
+    )
+    .await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "update_bug_dependencies",
+        json!({ "bug_id": 7, "blocks_add": [8] }),
+    )
+    .await;
+    assert_eq!(
+        changes_of(&result),
+        json!({ "url": { "removed": "", "added": kept } }),
+        "the kept URL is whole, the other blanked: {}",
+        text_of(&result)
+    );
+}
+
+#[tokio::test]
+async fn write_response_judges_custom_field_changes_by_the_kinds_learned() {
+    // The write already learned the field's kind, so the response is
+    // judged by it with no second lookup: the assessed target kept,
+    // the other blanked.
+    let mock = MockServer::start().await;
+    mount_classify(&mock, world_readable_bug(7)).await;
+    mount_classify(&mock, world_readable_bug(8)).await;
+    mount_lookup_trap(&mock, world_readable_bug(UNASSESSED)).await;
+    mount_field_types(&mock, &[("cf_regression_of", 6)]).await;
+    mount_update_result(
+        &mock,
+        json!({ "cf_regression_of": {
+            "removed": UNASSESSED.to_string(),
+            "added": "8"
+        } }),
+    )
+    .await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "update_bug_fields",
+        json!({ "bug_id": 7,
+                "custom_fields": { "cf_regression_of": 8 } }),
+    )
+    .await;
+    assert_eq!(
+        changes_of(&result),
+        json!({ "cf_regression_of": { "removed": "", "added": "8" } })
+    );
+    assert_eq!(
+        field_lookups(&mock).await.len(),
+        1,
+        "the write's own lookup judges the response too"
+    );
+}
+
+#[tokio::test]
+async fn bug_history_judges_url_as_one_scalar() {
+    // The same scalar rule on the read path: a comma URL is kept
+    // whole, and a URL naming a hidden bug is blanked whole.
+    let mock = MockServer::start().await;
+    let uri = mock.uri();
+    let foreign = "https://example.com/?q=50.1,14.4".to_string();
+    let hidden = format!("{uri}/show_bug.cgi?id=9&w=1,2");
+    mount_history_naming_hidden_9(
+        &mock,
+        json!([
+            { "field_name": "url", "added": foreign, "removed": "" },
+            { "field_name": "url", "added": "", "removed": hidden },
+        ]),
+    )
+    .await;
+    mount_field_types(&mock, &[]).await;
+    let client = client_for(HIDE_SECRET_POLICY, &mock).await;
+    let result = call(&client, "bug_history", json!({ "id": 7 })).await;
+    assert!(!is_error(&result), "{}", text_of(&result));
+    let v: Value = serde_json::from_str(&text_of(&result)).expect("history is JSON");
+    let changes = v[0]["changes"].as_array().expect("changes array");
+    assert_eq!(changes.len(), 1, "the blanked change is dropped: {v}");
+    assert_eq!(changes[0]["added"], json!(foreign), "kept whole");
+    assert!(
+        !text_of(&result).contains("id=9"),
+        "no hidden id leaks: {}",
+        text_of(&result)
+    );
+}
+
+#[tokio::test]
+async fn write_response_splits_unknown_kind_comma_lists() {
+    // An unknown `cf_` change is split like a list on the write
+    // path: the assessed id is kept, the hidden one blanked.
+    let hidden = UNASSESSED.to_string();
+    // A failed lookup leaves every key unknown, yet the comma
+    // list must still be split.
+    let mock = MockServer::start().await;
+    mount_classify(&mock, world_readable_bug(7)).await;
+    mount_classify(&mock, world_readable_bug(8)).await;
+    mount_lookup_trap(&mock, world_readable_bug(UNASSESSED)).await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    mount_update_result(
+        &mock,
+        json!({ "cf_related": {
+            "removed": format!("8, {hidden}"),
+            "added": "",
+        } }),
+    )
+    .await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "update_bug_fields",
+        json!({ "bug_id": 7,
+                "custom_fields": { "cf_related": 8 } }),
+    )
+    .await;
+    assert_eq!(
+        changes_of(&result),
+        json!({ "cf_related": { "removed": "8", "added": "" } }),
+        "500 lookup still splits the list: {}",
+        text_of(&result)
+    );
+    assert!(
+        !text_of(&result).contains(&hidden),
+        "no hidden id leaks: {}",
+        text_of(&result)
+    );
+
+    // An empty-kinds tool carrying a `cf_` side-effect change
+    // splits it the same way.
+    let mock = MockServer::start().await;
+    mount_classify(&mock, world_readable_bug(7)).await;
+    mount_classify(&mock, world_readable_bug(8)).await;
+    mount_lookup_trap(&mock, world_readable_bug(UNASSESSED)).await;
+    mount_update_result(
+        &mock,
+        json!({ "cf_related": {
+            "removed": format!("8, {hidden}"),
+            "added": "",
+        } }),
+    )
+    .await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "update_bug_dependencies",
+        json!({ "bug_id": 7, "blocks_add": [8] }),
+    )
+    .await;
+    assert_eq!(
+        changes_of(&result),
+        json!({ "cf_related": { "removed": "8", "added": "" } }),
+        "empty kinds still split the list: {}",
+        text_of(&result)
+    );
+    assert!(
+        !text_of(&result).contains(&hidden),
+        "no hidden id leaks: {}",
+        text_of(&result)
+    );
+}
+
+#[tokio::test]
+async fn write_response_uses_the_write_kinds_not_an_empty_map() {
+    // The response is judged by the kinds the write learned: an
+    // `Other` numeric is kept, a `BugId` text blanked, with one
+    // lookup proving the hoisted map is the one used.
+    let mock = MockServer::start().await;
+    mount_classify(&mock, world_readable_bug(7)).await;
+    mount_classify(&mock, world_readable_bug(8)).await;
+    mount_lookup_trap(&mock, world_readable_bug(UNASSESSED)).await;
+    mount_field_types(&mock, &[("cf_build", 1), ("cf_regression_of", 6)]).await;
+    mount_update_result(
+        &mock,
+        json!({
+            "cf_build": { "removed": "", "added": UNASSESSED.to_string() },
+            "cf_regression_of": { "removed": "8", "added": "hello" },
+        }),
+    )
+    .await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "update_bug_fields",
+        json!({ "bug_id": 7,
+                "custom_fields": {
+                    "cf_build": "hello",
+                    "cf_regression_of": 8,
+                } }),
+    )
+    .await;
+    assert_eq!(
+        changes_of(&result),
+        json!({
+            "cf_build": {
+                "removed": "",
+                "added": UNASSESSED.to_string(),
+            },
+            "cf_regression_of": { "removed": "8", "added": "" },
+        }),
+        "kept Other numeric, blanked BugId text: {}",
+        text_of(&result)
+    );
+    assert_eq!(
+        field_lookups(&mock).await.len(),
+        1,
+        "the write's own lookup judges the response too"
+    );
+}
+
+#[tokio::test]
+async fn write_response_strips_one_hash_before_judging() {
+    // A `#`-prefixed id names its bug: the hidden one is blanked,
+    // the assessed one kept verbatim.
+    let mock = MockServer::start().await;
+    mount_classify(&mock, world_readable_bug(7)).await;
+    mount_classify(&mock, world_readable_bug(8)).await;
+    mount_lookup_trap(&mock, world_readable_bug(UNASSESSED)).await;
+    mount_update_result(
+        &mock,
+        json!({
+            "blocks": {
+                "removed": format!("#{}", UNASSESSED),
+                "added": "#8",
+            },
+        }),
+    )
+    .await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "update_bug_dependencies",
+        json!({ "bug_id": 7, "blocks_add": [8] }),
+    )
+    .await;
+    assert_eq!(
+        changes_of(&result),
+        json!({ "blocks": { "removed": "", "added": "#8" } }),
+        "`#` ids are judged: {}",
+        text_of(&result)
+    );
+    assert!(
+        !text_of(&result).contains(&UNASSESSED.to_string()),
+        "no hidden id leaks: {}",
+        text_of(&result)
+    );
+}
+
+#[tokio::test]
+async fn write_response_judges_rest_bug_urls_like_show_bug_urls() {
+    // A `/rest/bug/` URL names its bug exactly as a `show_bug.cgi`
+    // URL does.
+    let mock = MockServer::start().await;
+    let uri = mock.uri();
+    mount_classify(&mock, world_readable_bug(7)).await;
+    mount_classify(&mock, world_readable_bug(8)).await;
+    mount_lookup_trap(&mock, world_readable_bug(UNASSESSED)).await;
+    let shown = format!("{uri}/rest/bug/8");
+    let hidden = format!("{uri}/rest/bug/{UNASSESSED}");
+    mount_update_result(
+        &mock,
+        json!({ "url": { "removed": hidden, "added": shown } }),
+    )
+    .await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "update_bug_dependencies",
+        json!({ "bug_id": 7, "blocks_add": [8] }),
+    )
+    .await;
+    assert_eq!(
+        changes_of(&result),
+        json!({ "url": { "removed": "", "added": shown } }),
+        "a rest URL is judged: {}",
+        text_of(&result)
+    );
+    assert!(
+        !text_of(&result).contains(&UNASSESSED.to_string()),
+        "no hidden id leaks: {}",
+        text_of(&result)
+    );
+}
