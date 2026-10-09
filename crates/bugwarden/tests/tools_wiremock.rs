@@ -5216,6 +5216,113 @@ async fn write_response_judges_url_as_one_scalar() {
 }
 
 #[tokio::test]
+async fn write_response_blanks_a_url_value_with_a_hidden_second_target() {
+    // One `url` value may hold two local URLs. The whole value is
+    // kept only when each named bug may be named.
+    let mock = MockServer::start().await;
+    let uri = mock.uri();
+    mount_classify(&mock, world_readable_bug(7)).await;
+    mount_classify(&mock, world_readable_bug(8)).await;
+    mount_lookup_trap(&mock, world_readable_bug(UNASSESSED)).await;
+    let shown = format!("{uri}/show_bug.cgi?id=8");
+    let hidden = format!("{uri}/rest/bug/{UNASSESSED}");
+    let joined = format!("{shown}, {hidden}");
+    mount_update_result(&mock, json!({ "url": { "removed": "", "added": joined } })).await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "update_bug_dependencies",
+        json!({ "bug_id": 7, "blocks_add": [8] }),
+    )
+    .await;
+    assert!(
+        changes_of(&result).get("url").is_none(),
+        "one hidden id blanks the joined value: {}",
+        text_of(&result)
+    );
+    assert!(
+        !text_of(&result).contains(&UNASSESSED.to_string()),
+        "no hidden id leaks: {}",
+        text_of(&result)
+    );
+
+    // Each named bug may be named, so the value stays whole.
+    let mock = MockServer::start().await;
+    let uri = mock.uri();
+    mount_classify(&mock, world_readable_bug(7)).await;
+    mount_classify(&mock, world_readable_bug(8)).await;
+    mount_lookup_trap(&mock, world_readable_bug(UNASSESSED)).await;
+    let first = format!("{uri}/show_bug.cgi?id=8");
+    let second = format!("{uri}/rest/bug/7");
+    let both = format!("{first}, {second}");
+    mount_update_result(
+        &mock,
+        json!({ "url": { "removed": "", "added": both.clone() } }),
+    )
+    .await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "update_bug_dependencies",
+        json!({ "bug_id": 7, "blocks_add": [8] }),
+    )
+    .await;
+    assert_eq!(
+        changes_of(&result),
+        json!({ "url": { "removed": "", "added": both } }),
+        "each named bug may be named: {}",
+        text_of(&result)
+    );
+}
+
+#[tokio::test]
+async fn write_response_keeps_only_assessed_envelope_ids() {
+    // The envelope's own `bugs[].id` is judged: only assessed
+    // entries are served.
+    let mock = MockServer::start().await;
+    mount_classify(&mock, world_readable_bug(7)).await;
+    mount_classify(&mock, world_readable_bug(8)).await;
+    mount_lookup_trap(&mock, world_readable_bug(UNASSESSED)).await;
+    Mock::given(method("PUT"))
+        .and(path("/rest/bug/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "bugs": [
+                { "id": 8,
+                  "changes": {
+                    "blocks": { "removed": "",
+                                "added": "8" } } },
+                { "id": UNASSESSED,
+                  "changes": {
+                    "blocks": { "removed": "",
+                                "added": UNASSESSED.to_string() } } },
+                { "changes": {
+                    "blocks": { "removed": "",
+                                "added": "8" } } },
+            ]
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "update_bug_dependencies",
+        json!({ "bug_id": 7, "blocks_add": [8] }),
+    )
+    .await;
+    assert!(!is_error(&result), "result: {}", text_of(&result));
+    let v: Value = serde_json::from_str(&text_of(&result)).expect("result is JSON");
+    let bugs = v["bugs"].as_array().expect("bugs array");
+    assert_eq!(bugs.len(), 1, "only the assessed entry stays: {v}");
+    assert_eq!(bugs[0]["id"], json!(8), "the assessed id stays: {v}");
+    assert!(
+        !text_of(&result).contains(&UNASSESSED.to_string()),
+        "no hidden id leaks: {}",
+        text_of(&result)
+    );
+}
+
+#[tokio::test]
 async fn write_response_judges_custom_field_changes_by_the_kinds_learned() {
     // The write already learned the field's kind, so the response is
     // judged by it with no second lookup: the assessed target kept,
@@ -5250,6 +5357,25 @@ async fn write_response_judges_custom_field_changes_by_the_kinds_learned() {
         1,
         "the write's own lookup judges the response too"
     );
+    // The type lookup must not carry a bug id: no request to the
+    // field endpoint may name the assessed bug or the hidden one.
+    let field_reqs: Vec<_> = mock
+        .received_requests()
+        .await
+        .expect("wiremock records requests by default")
+        .into_iter()
+        .filter(|r| r.url.path() == "/rest/field/bug")
+        .collect();
+    assert_eq!(field_reqs.len(), 1, "one lookup, no second one");
+    for req in &field_reqs {
+        let url = req.url.to_string();
+        assert!(
+            !url.contains(&UNASSESSED.to_string()),
+            "a type lookup names no bug: {url}"
+        );
+        let query = req.url.query().unwrap_or_default().to_string();
+        assert!(!query.contains('8'), "a type lookup names no bug: {url}");
+    }
 }
 
 #[tokio::test]
