@@ -108,7 +108,8 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
   field whose kind is unknown is judged as a bug id, so the audit record's
   `suppressed_ids` can carry such a number that is no bug (operator
   noise, never a client-visible difference); a field's kind is cached
-  until restart, or until a write naming the field refreshes the cache,
+  until restart, or until a write naming the field refreshes the cache —
+  or drops it, when a fresh lookup covering the field settles nothing —
   so a custom field deleted and recreated under its own name with another
   type is misjudged in history until then; the first
   history naming a `cf_` field costs one type lookup (a fraction of a
@@ -633,7 +634,7 @@ resolves each with `Bugzilla::Field->check`, and one unknown name fails the
 whole request (HTTP 404, code 51).
 
 ```rust
-pub enum CustomFieldKind { BugId /* 6 */, BugList /* 22 (BMO), and 7 */, Other, Unknown }
+pub enum CustomFieldKind { BugId /* 6 */, BugList /* 22 (BMO), and 7 */, Other /* audited stock non-link: 1-5, 8-10 */, Unknown }
 impl CustomFieldKind {
     pub fn may_link(self) -> bool; // everything but Other: Unknown fails closed (I4)
 }
@@ -645,8 +646,9 @@ impl FieldTypeCache {
     /// Cached names answered locally; the rest looked up with the caller's
     /// key in batches of at most 50 names (LOOKUP_CHUNK) per GET. Every
     /// name has an entry. A name the lookup could not settle — a failed
-    /// or 404/51 batch, a name a 200 omits, an unreadable `type` — is
-    /// Unknown and NOT cached, so a later call asks again; a failed batch
+    /// or 404/51 batch, a name a 200 omits, an unreadable `type`, or a
+    /// readable but unaudited code — is Unknown and NOT cached, so a later
+    /// call asks again; a failed batch
     /// is warn-logged without its message (HTTP status, Bugzilla code, batch
     /// size — a 404/51 message echoes a client-chosen name), the message at
     /// debug through QuotedError. No request when all are cached.
@@ -654,6 +656,9 @@ impl FieldTypeCache {
         -> BTreeMap<String, CustomFieldKind>;
     /// Every name looked up afresh and the cache refreshed with the answer:
     /// a write judges the field as it is now, not as an earlier read saw it.
+    /// A name the fresh answer does not settle — a failed batch, or a 200
+    /// that omits it — drops its cached reading, so the next cached read
+    /// asks again instead of reusing a stale kind.
     pub async fn kinds_fresh(&self, bz: &BugzillaClient, key: &str, names: &BTreeSet<String>)
         -> BTreeMap<String, CustomFieldKind>;
 }
@@ -685,7 +690,9 @@ and 7 are `BugList` — neither can be a working custom field: the stock
 admin dropdown offers 1-6, 9 and 10, BMO's lists 7 and 22 too, but
 `Field::create` adds a `bugs` column only for types in `SQL_DEFINITIONS`,
 which omits both (BMO's type 22 backs core fields only), so the mapping
-costs nothing — and every other readable code is `Other`. An entry the
+costs nothing — and only the audited stock non-link codes 1-5 and 8-10
+are `Other`: 0 and any future-added code may link, so they settle nothing
+(Unknown, uncached, re-asked). An entry the
 caller did not ask for is ignored, and a name listed twice reads as a link
 if any of its entries does.
 
@@ -3825,8 +3832,9 @@ wired, `server.rs` and `main.rs` are the reference.
   requests to either endpoint for one tool call.
 - Unit tests (#[cfg(test)] in crates/bugwarden-core/src/custom_fields.rs)
   and integration tests (crates/bugwarden-core/tests/custom_fields_wiremock.rs,
-  wiremock): the `type` code mapping — 6 is BugId, 22 and 7 are BugList, 1
-  and 2 are Other, a digit string reads like a number, a missing or
+  wiremock): the `type` code mapping — 6 is BugId, 22 and 7 are BugList,
+  1-5 and 8-10 are Other while 0 and future codes settle nothing and are
+  asked again, a digit string reads like a number, a missing or
   unreadable type and a name the answer omits settle nothing, an entry
   nobody asked for is ignored, and a name listed twice links if any entry
   does; only Other cannot link (Unknown fails closed); and the lookup on
@@ -3835,7 +3843,9 @@ wired, `server.rs` and `main.rs` are the reference.
   a widened set looks up only its new name, a 500 and a 404/code-51 batch
   leave every name of that batch Unknown and uncached so the next call
   asks again, a name a 200 omits is Unknown and asked again while its
-  answered sibling is cached, 60 names go out as 50 + 10 with every name
+  answered sibling is cached, a failed fresh lookup and a fresh answer
+  omitting the name each drop the stale cached reading so the next cached
+  read asks again, 60 names go out as 50 + 10 with every name
   asked exactly once, the fresh variant requests despite the cache and
   refreshes it, an empty name list is refused with `expect(0)` requests,
   and no error text carries the API key (I12); and the write side —

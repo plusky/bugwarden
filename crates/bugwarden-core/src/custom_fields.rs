@@ -44,7 +44,7 @@ pub enum CustomFieldKind {
     BugId,
     /// Type 22 (BMO) or 7: a list of bug ids.
     BugList,
-    /// Any other type Bugzilla reported: never a bug link.
+    /// An audited stock non-link type (1-5, 8-10): never a bug link.
     Other,
     /// Not known — the lookup failed, or Bugzilla did not name the field —
     /// and therefore a possible bug link (I4).
@@ -59,7 +59,8 @@ impl CustomFieldKind {
     }
 }
 
-/// The kind a `Bug.fields` `type` value denotes, `None` when unreadable.
+/// The kind a `Bug.fields` `type` value denotes, `None` when unreadable or
+/// outside the audited set — an unaudited code settles nothing (I4).
 fn kind_of_type(t: &Value) -> Option<CustomFieldKind> {
     let code = match t {
         Value::Number(n) => n.as_u64()?,
@@ -69,7 +70,12 @@ fn kind_of_type(t: &Value) -> Option<CustomFieldKind> {
     Some(match code {
         FIELD_TYPE_BUG_ID => CustomFieldKind::BugId,
         FIELD_TYPE_BUG_LIST | FIELD_TYPE_BUG_URLS => CustomFieldKind::BugList,
-        _ => CustomFieldKind::Other,
+        // Audited stock non-link types (Bugzilla Constants.pm: 1 freetext,
+        // 2 single select, 3 multi select, 4 textarea, 5 datetime, 8
+        // keywords, 9 date, 10 integer). Anything else — 0, or a
+        // future/BMO-added code — may link, so it settles nothing.
+        1 | 2 | 3 | 4 | 5 | 8 | 9 | 10 => CustomFieldKind::Other,
+        _ => return None,
     })
 }
 
@@ -178,7 +184,19 @@ impl FieldTypeCache {
                     let found = kinds_in(&envelope, chunk);
                     {
                         let mut known = self.lock();
-                        known.extend(found.iter().map(|(n, k)| (n.clone(), *k)));
+                        for name in chunk {
+                            match found.get(name) {
+                                Some(kind) => {
+                                    known.insert(name.clone(), *kind);
+                                }
+                                // A lookup that settles nothing for a name
+                                // drops any stale reading, so the next cached
+                                // read re-asks instead of reusing it.
+                                None => {
+                                    known.remove(name);
+                                }
+                            }
+                        }
                     }
                     out.extend(found);
                 }
@@ -193,6 +211,9 @@ impl FieldTypeCache {
                         "custom field type lookup failed; treating those fields as possible bug links"
                     );
                     tracing::debug!(error = ?QuotedError(&e), "custom field type lookup error");
+                    // The failed chunk settles nothing: drop any stale
+                    // readings it covers, so a later call asks again.
+                    self.lock().retain(|k, _| !chunk.contains(k));
                 }
             }
         }
@@ -341,10 +362,11 @@ mod tests {
 
     #[test]
     fn field_types_map_to_kinds() {
-        // 6 is the one Bug ID type; 22 (BMO) and 7 are lists; every other
-        // readable code is Other; a digit string reads like a number; a
-        // missing or unreadable type leaves the name out, as does an entry
-        // the caller never asked for.
+        // 6 is the one Bug ID type; 22 (BMO) and 7 are lists; only the
+        // audited stock non-link codes are Other — 0 and any future code
+        // settle nothing; a digit string reads like a number; a missing
+        // or unreadable type leaves the name out, as does an entry the
+        // caller never asked for.
         let envelope = json!({ "fields": [
             { "name": "cf_regression_of", "type": 6 },
             { "name": "cf_related", "type": 22 },
@@ -352,6 +374,8 @@ mod tests {
             { "name": "cf_build", "type": 1 },
             { "name": "cf_foundby", "type": 2 },
             { "name": "cf_quoted", "type": "6" },
+            { "name": "cf_zero", "type": 0 },
+            { "name": "cf_future", "type": 23 },
             { "name": "cf_untyped" },
             { "name": "cf_odd", "type": "six" },
             { "name": "blocks", "type": 22 },
@@ -363,6 +387,8 @@ mod tests {
             "cf_build",
             "cf_foundby",
             "cf_quoted",
+            "cf_zero",
+            "cf_future",
             "cf_untyped",
             "cf_odd",
             "cf_absent",
@@ -375,6 +401,8 @@ mod tests {
         assert_eq!(kind("cf_build"), Some(CustomFieldKind::Other));
         assert_eq!(kind("cf_foundby"), Some(CustomFieldKind::Other));
         assert_eq!(kind("cf_quoted"), Some(CustomFieldKind::BugId));
+        assert_eq!(kind("cf_zero"), None, "0 settles nothing");
+        assert_eq!(kind("cf_future"), None, "a future code settles nothing");
         assert_eq!(kind("cf_untyped"), None, "a missing type settles nothing");
         assert_eq!(kind("cf_odd"), None, "an unreadable type settles nothing");
         assert_eq!(
