@@ -4,9 +4,11 @@
 //! keys, `include_fields=name,type`), the cache (repeats answered locally, a
 //! new name looks up only itself), failure handling (a 500 and a 404/code
 //! 51 leave every name of that batch `Unknown` and uncached, so the next
-//! call asks again), a name a successful answer omits, chunking at the
-//! bound, the fresh variant for writes, and that no error text carries the
-//! API key (I12).
+//! call asks again), a name a successful answer omits, unaudited type
+//! codes (0, future) that settle nothing and are asked again, a fresh
+//! lookup that settles nothing evicting the stale cached reading,
+//! chunking at the bound, the fresh variant for writes, and that no error
+//! text carries the API key (I12).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -333,4 +335,125 @@ async fn a_lookup_error_carries_no_api_key() {
     let text = err.to_string();
     assert!(text.contains("404"), "the status is reported: {text}");
     assert!(!text.contains(KEY), "I12: {text}");
+}
+
+#[tokio::test]
+async fn an_unaudited_type_code_is_unknown_and_asked_again() {
+    // Type 0 and any future-added code were never audited as non-link, so
+    // they settle nothing: Unknown now, uncached, re-asked next call (I4).
+    let server = MockServer::start().await;
+    mount_types(
+        &server,
+        BTreeMap::from([("cf_zero", 0), ("cf_future", 23), ("cf_plain", 1)]),
+    )
+    .await;
+    let bz = client(&server);
+    let cache = FieldTypeCache::default();
+
+    let kinds = cache
+        .kinds(&bz, KEY, &set(&["cf_zero", "cf_future", "cf_plain"]))
+        .await;
+    assert_eq!(kinds.get("cf_zero"), Some(&CustomFieldKind::Unknown));
+    assert_eq!(kinds.get("cf_future"), Some(&CustomFieldKind::Unknown));
+    assert_eq!(kinds.get("cf_plain"), Some(&CustomFieldKind::Other));
+
+    let _ = cache
+        .kinds(&bz, KEY, &set(&["cf_zero", "cf_future", "cf_plain"]))
+        .await;
+    let seen = lookups(&server).await;
+    assert_eq!(seen.len(), 2);
+    let mut reasked = seen[1].clone();
+    reasked.sort();
+    assert_eq!(
+        reasked,
+        vec!["cf_future".to_string(), "cf_zero".to_string()],
+        "unaudited codes are asked again, the audited one is cached"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_fresh_lookup_evicts_the_stale_reading() {
+    // A field may change type after it was cached. When the fresh lookup
+    // fails it settles nothing, so the stale reading is dropped and the
+    // next cached read asks again instead of reusing it.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "fields": [{ "name": "cf_a", "type": 1 }] })),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let bz = client(&server);
+    let cache = FieldTypeCache::default();
+
+    let cached = cache.kinds(&bz, KEY, &set(&["cf_a"])).await;
+    assert_eq!(cached.get("cf_a"), Some(&CustomFieldKind::Other));
+    let fresh = cache.kinds_fresh(&bz, KEY, &set(&["cf_a"])).await;
+    assert_eq!(
+        fresh.get("cf_a"),
+        Some(&CustomFieldKind::Unknown),
+        "a failed fresh lookup settles nothing"
+    );
+    let after = cache.kinds(&bz, KEY, &set(&["cf_a"])).await;
+    assert_eq!(
+        after.get("cf_a"),
+        Some(&CustomFieldKind::Unknown),
+        "the stale reading was evicted, not reused"
+    );
+    assert_eq!(
+        lookups(&server).await.len(),
+        3,
+        "the cached read after a failed fresh lookup asks again"
+    );
+}
+
+#[tokio::test]
+async fn an_omitted_fresh_answer_evicts_the_stale_reading() {
+    // A name a successful fresh answer omits settles nothing either: the
+    // stale cached reading is dropped, so the next cached read re-asks.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "fields": [{ "name": "cf_a", "type": 1 }] })),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "fields": [] })))
+        .mount(&server)
+        .await;
+    let bz = client(&server);
+    let cache = FieldTypeCache::default();
+
+    let cached = cache.kinds(&bz, KEY, &set(&["cf_a"])).await;
+    assert_eq!(cached.get("cf_a"), Some(&CustomFieldKind::Other));
+    let fresh = cache.kinds_fresh(&bz, KEY, &set(&["cf_a"])).await;
+    assert_eq!(
+        fresh.get("cf_a"),
+        Some(&CustomFieldKind::Unknown),
+        "a fresh answer omitting the name settles nothing"
+    );
+    let after = cache.kinds(&bz, KEY, &set(&["cf_a"])).await;
+    assert_eq!(
+        after.get("cf_a"),
+        Some(&CustomFieldKind::Unknown),
+        "the stale reading was evicted, not reused"
+    );
+    assert_eq!(
+        lookups(&server).await.len(),
+        3,
+        "the cached read after an omitting fresh answer asks again"
+    );
 }
