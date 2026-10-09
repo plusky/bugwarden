@@ -5235,8 +5235,9 @@ async fn write_response_blanks_a_url_value_with_a_hidden_second_target() {
         json!({ "bug_id": 7, "blocks_add": [8] }),
     )
     .await;
-    assert!(
-        changes_of(&result).get("url").is_none(),
+    assert_eq!(
+        changes_of(&result),
+        json!({}),
         "one hidden id blanks the joined value: {}",
         text_of(&result)
     );
@@ -5315,6 +5316,11 @@ async fn write_response_keeps_only_assessed_envelope_ids() {
     let bugs = v["bugs"].as_array().expect("bugs array");
     assert_eq!(bugs.len(), 1, "only the assessed entry stays: {v}");
     assert_eq!(bugs[0]["id"], json!(8), "the assessed id stays: {v}");
+    assert_eq!(
+        bugs[0]["changes"],
+        json!({ "blocks": { "removed": "", "added": "8" } }),
+        "the kept entry keeps its scrubbed change: {v}"
+    );
     assert!(
         !text_of(&result).contains(&UNASSESSED.to_string()),
         "no hidden id leaks: {}",
@@ -5369,12 +5375,16 @@ async fn write_response_judges_custom_field_changes_by_the_kinds_learned() {
     assert_eq!(field_reqs.len(), 1, "one lookup, no second one");
     for req in &field_reqs {
         let url = req.url.to_string();
-        assert!(
-            !url.contains(&UNASSESSED.to_string()),
-            "a type lookup names no bug: {url}"
-        );
-        let query = req.url.query().unwrap_or_default().to_string();
-        assert!(!query.contains('8'), "a type lookup names no bug: {url}");
+        for (key, val) in req.url.query_pairs() {
+            assert!(
+                matches!(key.as_ref(), "names" | "include_fields" | "api_key"),
+                "a type lookup carries only its own keys: {url}"
+            );
+            assert!(
+                val != "7" && val != "8" && val != UNASSESSED.to_string(),
+                "a type lookup names no bug: {url}"
+            );
+        }
     }
 }
 

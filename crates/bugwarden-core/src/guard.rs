@@ -876,25 +876,88 @@ impl Guard {
         }
         let hay = value.to_ascii_lowercase();
         let mut out = BTreeSet::new();
-        for marker in ["/show_bug.cgi?id=", "/rest/bug/"] {
-            let needle = format!("{base}{marker}");
-            let mut at = 0;
-            while at <= hay.len() {
-                let Some(found) = hay[at..].find(needle.as_str()) else {
-                    break;
+        // Only an `id` query key names a bug; any other key
+        // never does. Percent-encoded shapes stay out of scope:
+        // Bugzilla emits plain `id=N` here, never escapes.
+        // Bug id 0 never exists, so it names nothing either.
+        fn query_ids(query: &str, out: &mut BTreeSet<u64>) {
+            let query = query.split('#').next().unwrap_or("");
+            for pair in query.split(['&', ';']) {
+                let Some((key, val)) = pair.split_once('=') else {
+                    continue;
                 };
-                let start = at + found + needle.len();
-                let digits: String = hay[start..]
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                if let Ok(id) = digits.parse::<u64>() {
-                    out.insert(id);
+                if key != "id" {
+                    continue;
                 }
-                at = start;
-                if at >= hay.len() {
-                    break;
+                // `?id=8,666` lists several bugs: every comma
+                // piece names its leading digit run.
+                for piece in val.split(',') {
+                    let digits: String = piece.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if let Ok(id) = digits.parse::<u64>() {
+                        if id != 0 {
+                            out.insert(id);
+                        }
+                    }
                 }
+            }
+        }
+        // A comma is data inside a query value, never a URL
+        // end; whitespace and quotes/brackets always are.
+        fn query_part(s: &str) -> &str {
+            let end = s
+                .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
+                .unwrap_or(s.len());
+            &s[..end]
+        }
+        let mut at = 0;
+        while at <= hay.len() {
+            let Some(found) = hay[at..].find(base) else {
+                break;
+            };
+            let pos = at + found;
+            // A host merely ending in ours is foreign, as the
+            // anchored whole-value match already holds: skip it.
+            let bounded = pos == 0
+                || !matches!(
+                    hay.as_bytes()[pos - 1],
+                    b'a'..=b'z'
+                        | b'A'..=b'Z'
+                        | b'0'..=b'9'
+                        | b'.'
+                        | b'-'
+                        | b':'
+                );
+            if !bounded {
+                at = pos + 1;
+                continue;
+            }
+            let rest = &hay[pos + base.len()..];
+            if let Some(after) = rest.strip_prefix("/show_bug.cgi") {
+                if let Some(query) = after.strip_prefix('?') {
+                    query_ids(query_part(query), &mut out);
+                }
+            } else if let Some(after) = rest.strip_prefix("/rest/bug") {
+                if let Some(path) = after.strip_prefix('/') {
+                    if let Some(query) = path.strip_prefix('?') {
+                        query_ids(query_part(query), &mut out);
+                    } else {
+                        for piece in path.split(',') {
+                            let digits: String =
+                                piece.chars().take_while(|c| c.is_ascii_digit()).collect();
+                            if let Ok(id) = digits.parse::<u64>() {
+                                if id != 0 {
+                                    out.insert(id);
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(query) = after.strip_prefix('?') {
+                    query_ids(query_part(query), &mut out);
+                }
+            }
+            at = pos + base.len();
+            if at >= hay.len() {
+                break;
             }
         }
         out
@@ -1918,6 +1981,116 @@ mod tests {
             json!({ "removed": "", "added": plain }),
             "plain text names no bug and is left alone"
         );
+    }
+
+    #[test]
+    fn embedded_scan_reads_id_query_param_in_any_position() {
+        // Free-text `url` may hold shapes beyond the canonical
+        // `?id=N`: the id param may sit after others, and the
+        // REST path has a query form. Only an `id` key names one.
+        let kinds = BTreeMap::new();
+        let cases = [
+            (format!("{BASE}/show_bug.cgi?foo=1&id=666"), vec![666]),
+            (format!("{BASE}/show_bug.cgi?id=666&foo=1"), vec![666]),
+            (format!("{BASE}/rest/bug?id=666"), vec![666]),
+            (format!("{BASE}/rest/bug/666"), vec![666]),
+            // `?id=8,666` is Bugzilla's multi-bug search:
+            // every comma piece names its leading run.
+            (format!("{BASE}/show_bug.cgi?id=8,666"), vec![8, 666]),
+            (format!("{BASE}/rest/bug/8,666"), vec![8, 666]),
+            (
+                "https://bugzilla.example.com/?q=50.1,14.4".to_string(),
+                vec![],
+            ),
+            (
+                "https://bugzilla.example.com/search?x=id=666".to_string(),
+                vec![],
+            ),
+        ];
+        for (url, want) in cases {
+            let history = json!([{ "changes":
+                [{ "field_name": "url", "added": url,
+                   "removed": "" }] }]);
+            let ids = Guard::history_bug_ids(&history, BASE, &kinds);
+            assert_eq!(
+                ids.into_iter().collect::<Vec<_>>(),
+                want,
+                "url shape: {url}"
+            );
+        }
+        // A comma list names every piece: one hidden id blanks all.
+        let allowed: BTreeSet<u64> = [7, 8].into_iter().collect();
+        let history = json!([{ "changes":
+            [{ "field_name": "url",
+               "added": format!("{BASE}/show_bug.cgi?id=8,666"),
+               "removed": "" }] }]);
+        let out = Guard::scrub_history(history, BASE, &allowed, &kinds);
+        assert_eq!(
+            out.as_array().map(Vec::len),
+            Some(0),
+            "one hidden id blanks the comma list: {out}"
+        );
+    }
+
+    #[test]
+    fn embedded_scan_needs_a_domain_boundary_on_the_left() {
+        // A host merely ending in ours is foreign: only a
+        // boundary before the host names a local URL.
+        let kinds = BTreeMap::new();
+        let evil = "https://evilbugzilla.example.com/show_bug.cgi?id=666";
+        let hidden = format!("{BASE}/show_bug.cgi?id=666");
+        for (url, want) in [(evil.to_string(), vec![]), (hidden.clone(), vec![666])] {
+            let history = json!([{ "changes":
+                [{ "field_name": "url", "added": url,
+                   "removed": "" }] }]);
+            let ids = Guard::history_bug_ids(&history, BASE, &kinds);
+            assert_eq!(ids.into_iter().collect::<Vec<_>>(), want, "boundary: {url}");
+        }
+        let allowed: BTreeSet<u64> = [7, 8].into_iter().collect();
+        let history = json!([{ "changes":
+            [{ "field_name": "url", "added": evil,
+               "removed": "" }] }]);
+        let out = Guard::scrub_history(history, BASE, &allowed, &kinds);
+        assert_eq!(
+            out[0]["changes"][0]["added"],
+            json!(evil),
+            "a foreign host stays whole"
+        );
+        let history = json!([{ "changes":
+            [{ "field_name": "url", "added": hidden,
+               "removed": "" }] }]);
+        let out = Guard::scrub_history(history, BASE, &allowed, &kinds);
+        assert_eq!(
+            out.as_array().map(Vec::len),
+            Some(0),
+            "a hidden local id blanks the value: {out}"
+        );
+    }
+
+    #[test]
+    fn embedded_scan_ignores_zero_ids() {
+        // Bug id 0 never exists, as the scalar parser holds:
+        // such URLs name nothing and stay whole.
+        let kinds = BTreeMap::new();
+        for url in [
+            format!("{BASE}/show_bug.cgi?id=0"),
+            format!("{BASE}/show_bug.cgi?foo=1&id=0"),
+            format!("{BASE}/rest/bug/0"),
+            format!("{BASE}/rest/bug?id=0"),
+        ] {
+            let history = json!([{ "changes":
+                [{ "field_name": "url", "added": url,
+                   "removed": "" }] }]);
+            let ids = Guard::history_bug_ids(&history, BASE, &kinds);
+            assert!(ids.is_empty(), "id 0 names no bug: {url} gave {ids:?}");
+            let allowed: BTreeSet<u64> = [7, 8].into_iter().collect();
+            let out = Guard::scrub_history(history, BASE, &allowed, &kinds);
+            assert_eq!(
+                out[0]["changes"][0]["added"],
+                json!(url),
+                "a zero id stays whole: {url}"
+            );
+        }
     }
 
     #[test]

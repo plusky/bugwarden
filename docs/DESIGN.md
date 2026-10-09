@@ -145,16 +145,23 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
    an old value bug_info serves, under the ordinary scrub, until the write
    clears it.
    The `url` change is judged as one scalar against the same assessed
-   set, scanning for every embedded local URL: one hidden id blanks
-   the whole value, and the history collector gathers each one; its
-   `added` half is the client's own input echoed, but it is still
-   blanked unless assessed — Bugzilla never resolves `bug_file_loc`
-   (`_check_bug_file_loc` only trims), so echoing would be safe, but one
-   rule for both halves keeps the blanking decision a function of request
-   and schema alone (the envelope still carries upstream state). The
-   blanked ids reach no verdict, so they are not guard suppressions and
-   stay out of the audit record's `suppressed_ids`, which records only
-   read-path scrubs against a verdict;
+   set, scanning for every embedded local URL: `show_bug.cgi` names a bug
+   through its `id` query param in any position, and `rest/bug` through
+   its path id or its `id` query param — only an `id` key ever names one,
+   so a `q` param or another path holding `id=` does not; an `id` value
+   holding a comma list names every piece, as Bugzilla's multi-bug
+   search does; the host needs
+   a left domain boundary, so a longer host ending in ours stays foreign;
+   id 0 names nothing, as elsewhere. One hidden id blanks the whole
+   value, and the history collector gathers each one; its `added` half is
+   the client's own input echoed, but it is still blanked unless assessed
+   — Bugzilla never resolves `bug_file_loc` (`_check_bug_file_loc` only
+   trims), so echoing would be safe, but one rule for both halves keeps
+   the blanking decision a function of request and schema alone (the
+   envelope still carries upstream state). The blanked ids reach no
+   verdict, so they are not guard suppressions and stay out of the audit
+   record's `suppressed_ids`, which records only read-path scrubs against
+   a verdict;
    and a write Bugzilla refuses because of a hidden bug — a dependency
   loop running through one, say — still fails where the same write would
   otherwise succeed, which is one bit per attempt, paid for with a real
@@ -3757,7 +3764,10 @@ wired, `server.rs` and `main.rs` are the reference.
   one opaque scalar, never split — a comma inside a URL is kept
   verbatim, a value naming a local bug is blanked unless each named bug
   may be named and kept whole when each may, a URL pointing elsewhere
-  is left alone, and `history_bug_ids` gathers each embedded id; and a
+  is left alone, and `history_bug_ids` gathers each embedded id,
+  including `show_bug.cgi` with the `id` param after others and
+  `rest/bug` by query id, while a `q` param, a non-link path holding
+  `id=`, a host merely ending in ours, and id 0 name nothing; and a
   `Bug.update` response serves only `bugs[]` entries whose `id` was
   assessed (one with no numeric `id` dropped), drops a `bugs` key that
   is present but not an array while leaving a missing one alone, keeps
@@ -4027,10 +4037,11 @@ wired, `server.rs` and `main.rs` are the reference.
   the old one; each `Bug.update` tool serves `changes` naming an
   unassessed id with that id gone and the ids the call assessed kept, a
   URL holding a comma kept whole, a `url` value holding two local URLs
-  blanked whole when the second names a hidden bug and kept whole when
-  each may be named, an envelope holding an extra id serving only the
-  assessed entry, and a `cf_*` change judged by the kinds the write
-  learned with no bug id in any type-lookup URL; and identity
+  blanked to the empty map when the second names a hidden bug and kept
+  whole when each may be named, an envelope holding an extra id serving
+  only the assessed entry with its scrubbed change asserted, and a `cf_*`
+  change judged by the kinds the write learned with the type lookup
+  parsed to its keys and values carrying no bug id; and identity
   end to end —
   issue #33's exact scenario (a my-own-reports restrict rule above a
   group_restricted deny: with whoami answering the caller, a
