@@ -783,16 +783,27 @@ impl Guard {
             .join(", ")
     }
 
-    /// Keep a custom field's history value, which holds one bug id at most
-    /// and is never split on commas. Empty and `0` (how a cleared Bug ID
-    /// field reads) are kept; an id is kept only if disclosable; anything
-    /// else is blanked under `strict` and left alone otherwise.
-    fn keep_custom_scalar(value: &str, strict: bool, disclosable: &BTreeSet<u64>) -> String {
+    /// A cleared Bug ID reading: empty, or zeros with one `#` at
+    /// most. Kept verbatim wherever a scalar would be.
+    fn is_clear_marker(value: &str) -> bool {
         let trimmed = value.trim();
-        if trimmed.is_empty() || trimmed == "0" {
+        if trimmed.is_empty() {
+            return true;
+        }
+        let digits = trimmed.strip_prefix('#').unwrap_or(trimmed);
+        !digits.is_empty() && digits.bytes().all(|b| b == b'0')
+    }
+
+    /// Keep a custom field's history value, which holds one bug id at
+    /// most and is never split on commas. Empty and all-zero
+    /// spellings (how a cleared Bug ID field reads) are kept; an id
+    /// is kept only if disclosable; anything else is blanked under
+    /// `strict` and left alone otherwise.
+    fn keep_custom_scalar(value: &str, strict: bool, disclosable: &BTreeSet<u64>) -> String {
+        if Self::is_clear_marker(value) {
             return value.to_string();
         }
-        match Self::scalar_bug_id(trimmed) {
+        match Self::scalar_bug_id(value.trim()) {
             Some(id) if disclosable.contains(&id) => value.to_string(),
             Some(_) => String::new(),
             None if strict => String::new(),
@@ -844,40 +855,108 @@ impl Guard {
                 })
                 .collect(),
             HistoryLinks::CustomScalar { .. } => Self::scalar_bug_id(value).into_iter().collect(),
-            HistoryLinks::UrlScalar => Self::see_also_local_id(value, base_url)
-                .into_iter()
-                .collect(),
+            HistoryLinks::UrlScalar => Self::embedded_local_ids(value, base_url),
         }
     }
 
-    /// Keep a `url` value whole: only a URL pointing at this instance
-    /// names a bug, and then only when that bug may be named. A comma
-    /// inside a URL is data, never a separator.
+    /// Every local bug id a `url` value names, wherever each URL
+    /// sits in the text. The whole-value match alone misses a
+    /// second URL, so each local marker is scanned for.
+    fn embedded_local_ids(value: &str, base_url: &str) -> BTreeSet<u64> {
+        let strip = |u: &str| {
+            u.trim()
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .to_ascii_lowercase()
+        };
+        let base = strip(base_url);
+        let base = base.trim_end_matches('/');
+        if base.is_empty() {
+            return BTreeSet::new();
+        }
+        let hay = value.to_ascii_lowercase();
+        let mut out = BTreeSet::new();
+        for marker in ["/show_bug.cgi?id=", "/rest/bug/"] {
+            let needle = format!("{base}{marker}");
+            let mut at = 0;
+            while at <= hay.len() {
+                let Some(found) = hay[at..].find(needle.as_str()) else {
+                    break;
+                };
+                let start = at + found + needle.len();
+                let digits: String = hay[start..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(id) = digits.parse::<u64>() {
+                    out.insert(id);
+                }
+                at = start;
+                if at >= hay.len() {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Keep a `url` value whole: only a URL pointing at this
+    /// instance names a bug, and then only when that bug may be
+    /// named. A comma inside a URL is data, never a separator.
+    /// Any embedded local URL counts: one hidden id blanks all.
     fn keep_url_scalar(value: &str, base_url: &str, nameable: &BTreeSet<u64>) -> String {
-        match Self::see_also_local_id(value, base_url) {
-            Some(id) if nameable.contains(&id) => value.to_string(),
-            Some(_) => String::new(),
-            None => value.to_string(),
+        let embedded = Self::embedded_local_ids(value, base_url);
+        if embedded.is_empty() {
+            return value.to_string();
+        }
+        if embedded.iter().all(|id| nameable.contains(id)) {
+            value.to_string()
+        } else {
+            String::new()
         }
     }
 
-    /// Remove ids outside `nameable` from a `Bug.update` response, whose
-    /// `bugs[].changes` map a field to `added`/`removed` strings encoded
-    /// as history encodes them. `kinds` is read as in the history scrub,
-    /// so a `cf_` change is judged by its kind without a further lookup,
-    /// except that an unknown kind is split like a list: with no verdict
-    /// behind the assessed set, the lenient scalar reading would keep a
-    /// comma list verbatim.
+    /// Remove ids outside `nameable` from a `Bug.update`
+    /// response, whose `bugs[]` entries carry an `id` and a
+    /// `changes` map of field to `added`/`removed` strings encoded
+    /// as history encodes them. `kinds` is read as in the history
+    /// scrub, so a `cf_` change is judged by its kind without a
+    /// further lookup, except that an unknown kind is split like a
+    /// list: with no verdict behind the assessed set, the lenient
+    /// scalar reading would keep a comma list verbatim, while a
+    /// cleared reading stays verbatim.
     ///
-    /// An id-bearing change keeps only its scrubbed `added` and `removed`,
-    /// and is dropped once neither names anything; a value that is not a
-    /// string is blanked, and a `changes` that is not an object is dropped.
+    /// Only entries whose `id` is in `nameable` are kept; one with
+    /// no numeric `id` is dropped. A `bugs` key that is present
+    /// but not an array is removed; a missing one is left alone.
+    /// An id-bearing change keeps only its scrubbed `added` and
+    /// `removed`, and is dropped once neither names anything; a
+    /// value that is not a string is blanked, and a `changes`
+    /// that is not an object is dropped.
     pub fn scrub_update_changes(
         result: &mut Value,
         base_url: &str,
         nameable: &BTreeSet<u64>,
         kinds: &BTreeMap<String, CustomFieldKind>,
     ) {
+        let has_bugs = result.as_object().is_some_and(|m| m.contains_key("bugs"));
+        if !has_bugs {
+            return;
+        }
+        if result.get("bugs").and_then(Value::as_array).is_none() {
+            // Present but malformed: drop it rather than serve it.
+            if let Some(obj) = result.as_object_mut() {
+                obj.remove("bugs");
+            }
+            return;
+        }
+        if let Some(bugs) = result.get_mut("bugs").and_then(Value::as_array_mut) {
+            bugs.retain(|bug| {
+                bug.get("id")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|id| nameable.contains(&id))
+            });
+        }
         let Some(bugs) = result.get_mut("bugs").and_then(Value::as_array_mut) else {
             return;
         };
@@ -909,8 +988,13 @@ impl Guard {
                             // Unknown is the most restrictive split:
                             // history keeps free text verbatim, but a
                             // write must not keep a comma list whole.
+                            // A cleared reading stays verbatim.
                             HistoryLinks::CustomScalar { strict: false } => {
-                                Self::keep_disclosable_ids(value, base_url, nameable)
+                                if Self::is_clear_marker(value) {
+                                    value.to_string()
+                                } else {
+                                    Self::keep_disclosable_ids(value, base_url, nameable)
+                                }
                             }
                             HistoryLinks::CustomScalar { strict: true } => {
                                 Self::keep_custom_scalar(value, true, nameable)
@@ -1770,7 +1854,7 @@ mod tests {
         }]);
         let ids = Guard::history_bug_ids(&history, BASE, &kinds);
         assert_eq!(ids.into_iter().collect::<Vec<_>>(), vec![8, 666]);
-        let allowed: BTreeSet<u64> = [8].into_iter().collect();
+        let allowed: BTreeSet<u64> = [7, 8].into_iter().collect();
         let out = Guard::scrub_history(history, BASE, &allowed, &kinds);
         assert_eq!(out[0]["changes"][0]["added"], json!(shown));
         assert_eq!(out[0]["changes"][0]["removed"], json!(""));
@@ -1828,7 +1912,7 @@ mod tests {
                 "url": { "removed": "", "added": plain },
             }
         }]});
-        Guard::scrub_update_changes(&mut text, BASE, &BTreeSet::new(), &kinds);
+        Guard::scrub_update_changes(&mut text, BASE, &nameable, &kinds);
         assert_eq!(
             text["bugs"][0]["changes"]["url"],
             json!({ "removed": "", "added": plain }),
@@ -1985,13 +2069,163 @@ mod tests {
             "id": 7,
             "changes": "666",
         }]});
-        Guard::scrub_update_changes(&mut result, BASE, &BTreeSet::new(), &BTreeMap::new());
+        let nameable: BTreeSet<u64> = [7].into_iter().collect();
+        Guard::scrub_update_changes(&mut result, BASE, &nameable, &BTreeMap::new());
         assert!(
             result["bugs"][0]
                 .get("changes")
                 .is_none_or(|c| !c.is_string()),
             "a string `changes` must not survive: {result}"
         );
+    }
+
+    #[test]
+    fn url_with_two_local_targets_needs_both_named() {
+        // One value may hold two local URLs. The whole value is
+        // kept only when each named bug may be named; one hidden
+        // id blanks all, so the second URL cannot carry it out.
+        let shown = "https://bugzilla.example.com/show_bug.cgi?id=8";
+        let hidden = "https://bugzilla.example.com/rest/bug/666";
+        let joined = format!("{shown}, {hidden}");
+        let kinds = BTreeMap::new();
+        let nameable: BTreeSet<u64> = [7, 8].into_iter().collect();
+        let mut result = json!({ "bugs": [{
+            "id": 7,
+            "changes": { "url": { "added": joined.clone(),
+                                  "removed": "" } }
+        }]});
+        Guard::scrub_update_changes(&mut result, BASE, &nameable, &kinds);
+        assert!(
+            result["bugs"][0]
+                .get("changes")
+                .is_none_or(|c| c.as_object().is_none_or(|m| !m.contains_key("url"))),
+            "one hidden id blanks the joined value: {result}"
+        );
+
+        let wide: BTreeSet<u64> = [7, 8, 666].into_iter().collect();
+        let mut kept = json!({ "bugs": [{
+            "id": 7,
+            "changes": { "url": { "added": joined.clone(),
+                                  "removed": "" } }
+        }]});
+        Guard::scrub_update_changes(&mut kept, BASE, &wide, &kinds);
+        assert_eq!(
+            kept["bugs"][0]["changes"]["url"],
+            json!({ "added": joined, "removed": "" }),
+            "each named bug may be named, so the value stays"
+        );
+
+        // A URL inside free text counts the same way.
+        let text = format!("see {shown} and {hidden} for details");
+        let mut embedded = json!({ "bugs": [{
+            "id": 7,
+            "changes": { "url": { "added": text.clone(),
+                                  "removed": "" } }
+        }]});
+        Guard::scrub_update_changes(&mut embedded, BASE, &nameable, &kinds);
+        assert!(
+            embedded["bugs"][0]
+                .get("changes")
+                .is_none_or(|c| c.as_object().is_none_or(|m| !m.contains_key("url"))),
+            "free text cannot carry a hidden id out: {embedded}"
+        );
+
+        // Both ids are collected for assessment.
+        let history = json!([{
+            "changes": [{ "field_name": "url", "added": joined,
+                          "removed": "" }]
+        }]);
+        let ids = Guard::history_bug_ids(&history, BASE, &kinds);
+        assert_eq!(
+            ids.into_iter().collect::<Vec<_>>(),
+            vec![8, 666],
+            "each embedded URL is collected"
+        );
+    }
+
+    #[test]
+    fn cleared_bug_id_spellings_are_kept() {
+        // A cleared reading stays verbatim; only an id is judged.
+        let empty: BTreeSet<u64> = BTreeSet::new();
+        for marker in ["", "0", "00", "#0", "#00", "  0  ", "  #0  "] {
+            assert_eq!(
+                Guard::keep_custom_scalar(marker, true, &empty),
+                marker.to_string(),
+                "a cleared spelling stays: {marker:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_kind_keeps_a_cleared_reading() {
+        // An unknown `cf_` change is split like a list, but a
+        // cleared reading stays verbatim instead of blanking to
+        // nothing.
+        let kinds = BTreeMap::new();
+        let nameable: BTreeSet<u64> = [7, 8].into_iter().collect();
+        for marker in ["0", "#0", "00", "#00"] {
+            let mut result = json!({ "bugs": [{
+                "id": 7,
+                "changes": { "cf_unknown": { "added": marker,
+                                             "removed": marker } }
+            }]});
+            Guard::scrub_update_changes(&mut result, BASE, &nameable, &kinds);
+            assert_eq!(
+                result["bugs"][0]["changes"]["cf_unknown"],
+                json!({ "added": marker, "removed": marker }),
+                "a cleared reading stays: {marker:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_bugs_shapes_are_dropped_or_left_alone() {
+        // A `bugs` key that is present but not an array is
+        // removed; a missing one is left alone, as some
+        // envelopes carry no `bugs` key at all.
+        let nameable: BTreeSet<u64> = [7].into_iter().collect();
+        let mut text = json!({ "bugs": "oops" });
+        Guard::scrub_update_changes(&mut text, BASE, &nameable, &BTreeMap::new());
+        assert!(
+            text.get("bugs").is_none(),
+            "a string `bugs` must not survive: {text}"
+        );
+
+        let mut mapped = json!({ "bugs": { "id": 7 } });
+        Guard::scrub_update_changes(&mut mapped, BASE, &nameable, &BTreeMap::new());
+        assert!(
+            mapped.get("bugs").is_none(),
+            "an object `bugs` must not survive: {mapped}"
+        );
+
+        let mut bare = json!({ "id": 42 });
+        Guard::scrub_update_changes(&mut bare, BASE, &nameable, &BTreeMap::new());
+        assert_eq!(bare, json!({ "id": 42 }), "no key, nothing to do");
+    }
+
+    #[test]
+    fn bugs_entries_keep_only_nameable_ids() {
+        // The envelope's own `bugs[].id` is judged like any other
+        // id: only assessed entries are served, and one with no
+        // numeric id is dropped.
+        let kinds = BTreeMap::new();
+        let nameable: BTreeSet<u64> = [7, 8].into_iter().collect();
+        let mut result = json!({ "bugs": [
+            { "id": 7, "changes": {} },
+            { "id": 8, "changes": {} },
+            { "id": 900001, "changes": {} },
+            { "changes": {} },
+            { "id": "8", "changes": {} },
+            { "id": 7 },
+        ]});
+        Guard::scrub_update_changes(&mut result, BASE, &nameable, &kinds);
+        let ids: Vec<u64> = result["bugs"]
+            .as_array()
+            .expect("array stays")
+            .iter()
+            .map(|b| b["id"].as_u64().expect("numeric id stays"))
+            .collect();
+        assert_eq!(ids, vec![7, 8, 7], "only assessed entries stay");
     }
 
     #[test]

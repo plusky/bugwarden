@@ -128,18 +128,26 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
    update_bug_dependencies, add_cc_to_bug and mark_as_duplicate — serve
    Bugzilla's update envelope scrubbed (`Guard::scrub_update_changes`,
    over the history scrub's field set and the call's custom-field kinds):
-   a change keeps only ids THIS call assessed and allowed — the bug itself
-   (at its tool's capability) and the targets that passed at `summary` —
-   and every other id is blanked with no request and no policy lookup, so
-   the bytes are the same whether that bug is hidden or visible (issue
-   #351). A `cf_` change of unknown kind is split like a list here, the
-   most restrictive reading, unlike history's lenient scalar. Not the read
+   only `bugs[]` entries whose `id` the call assessed are served — one
+   with no numeric `id` is dropped — and a `bugs` key that is present
+   but not an array is removed, while a missing one is left alone, as
+   some envelopes carry none; a change keeps only ids THIS call
+   assessed and allowed — the bug itself (at its tool's capability)
+   and the targets that passed at `summary` — and every other id is
+   blanked with no request and no policy lookup, so the bytes are the
+   same whether that bug is hidden or visible (issue #351). A `cf_`
+   change of unknown kind is split like a list here, the most
+   restrictive reading, unlike history's lenient scalar, while a
+   cleared reading stays verbatim there too — empty or zeros with one
+   `#` at most — as it does under the strict scalar. Not the read
    paths' batched `disclosable`: that adds a request to every write and
    makes the answer follow a verdict on a bug the client never named, for
    an old value bug_info serves, under the ordinary scrub, until the write
    clears it.
-   The `url` change is judged as one scalar against the same assessed set;
-   its `added` half is the client's own input echoed, but it is still
+   The `url` change is judged as one scalar against the same assessed
+   set, scanning for every embedded local URL: one hidden id blanks
+   the whole value, and the history collector gathers each one; its
+   `added` half is the client's own input echoed, but it is still
    blanked unless assessed — Bugzilla never resolves `bug_file_loc`
    (`_check_bug_file_loc` only trims), so echoing would be safe, but one
    rule for both halves keeps the blanking decision a function of request
@@ -3739,22 +3747,27 @@ wired, `server.rs` and `main.rs` are the reference.
   dropped from a list and string items stay, a digit string is untouched,
   and `linked_bug_ids` collects the numbers only); and history kinds
   (`history_cf_changes_follow_kinds`) — a Bug ID field is strict (a hidden
-  id scrubbed, a visible one kept, `""` and `0` kept, `see 7` and `7, 8`
-  blanked: a custom value is never comma-split), an Other field is left
-  alone whatever digits it holds, an unknown field is lenient (`8` scrubbed,
-  `fixed in 7, 8` kept verbatim), a Bug List field is split like the core
-  lists, `history_bug_ids` collects from exactly the kinds that may link,
-  and `history_custom_fields` collects the distinct `cf_` names a history
-  changes and nothing else; `url` is one opaque scalar, never split — a
-  comma inside a URL is kept verbatim, a URL pointing at this instance is
-  blanked unless its bug may be named and kept whole when it may, a URL
-  pointing elsewhere is left alone, and `history_bug_ids` collects at most
-  the one id; and a `Bug.update` response keeps an id-bearing change only
-  as its scrubbed `added`/`removed` (any other key dropped, and any value
-  that is not a string blanked (and the change dropped once neither half
-  names anything)), keeps a foreign tracker's entry while dropping a local
-  hidden one, and judges `url` and `cf_` changes by the same kinds as
-  history except that an unknown `cf_` kind is split like a list.
+  id scrubbed, a visible one kept, `""` and all-zero spellings kept,
+  `see 7` and `7, 8` blanked: a custom value is never comma-split), an
+  Other field is left alone whatever digits it holds, an unknown field
+  is lenient (`8` scrubbed, `fixed in 7, 8` kept verbatim), a Bug List
+  field is split like the core lists, `history_bug_ids` collects from
+  exactly the kinds that may link, and `history_custom_fields` collects
+  the distinct `cf_` names a history changes and nothing else; `url` is
+  one opaque scalar, never split — a comma inside a URL is kept
+  verbatim, a value naming a local bug is blanked unless each named bug
+  may be named and kept whole when each may, a URL pointing elsewhere
+  is left alone, and `history_bug_ids` gathers each embedded id; and a
+  `Bug.update` response serves only `bugs[]` entries whose `id` was
+  assessed (one with no numeric `id` dropped), drops a `bugs` key that
+  is present but not an array while leaving a missing one alone, keeps
+  an id-bearing change only as its scrubbed `added`/`removed` (any other
+  key dropped, and any value that is not a string blanked (and the
+  change dropped once neither half names anything)), keeps a foreign
+  tracker's entry while dropping a local hidden one, and judges `url`
+  and `cf_` changes by the same kinds as history except that an unknown
+  `cf_` kind is split like a list while a cleared reading stays
+  verbatim.
 - Unit tests (#[cfg(test)] in crates/bugwarden-core/src/client.rs): a 400
   with code 114 is a `BugzillaError` whose code and status downcast and whose
   Display is the unchanged text; the code is read only inside an
@@ -4013,8 +4026,11 @@ wired, `server.rs` and `main.rs` are the reference.
   that id's lookup; re-marking keeps the assessed new target and blanks
   the old one; each `Bug.update` tool serves `changes` naming an
   unassessed id with that id gone and the ids the call assessed kept, a
-  URL holding a comma kept whole, and a `cf_*` change judged by the kinds
-  the write learned; and identity
+  URL holding a comma kept whole, a `url` value holding two local URLs
+  blanked whole when the second names a hidden bug and kept whole when
+  each may be named, an envelope holding an extra id serving only the
+  assessed entry, and a `cf_*` change judged by the kinds the write
+  learned with no bug id in any type-lookup URL; and identity
   end to end —
   issue #33's exact scenario (a my-own-reports restrict rule above a
   group_restricted deny: with whoami answering the caller, a
