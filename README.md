@@ -1155,7 +1155,11 @@ it); a `cf_*` custom field value that could be a bug id counts too, for
 bug (`mark_as_duplicate`, `update_bug_fields`, `update_bug_dependencies`, or
 `create_bug` through a Bug ID custom field) requires at least `summary` on
 that second bug, so an edit cannot confirm the existence of a bug the policy
-hides. And when Bugzilla refuses one of the seven bug-update tools
+hides. The changes an update tool reports back name only the bugs that
+call checked: any other bug Bugzilla reports, such as a reopened
+duplicate's former target, is blanked (and a change left empty is dropped)
+rather than risk naming a hidden bug. And when Bugzilla refuses one of the
+seven bug-update tools
 (`add_comment` through `mark_as_duplicate`), the reply is the tool's fixed
 failure line plus at most one short hint chosen by Bugzilla's error code —
 never Bugzilla's own message, which can say whether a bug exists or name the
