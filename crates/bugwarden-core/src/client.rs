@@ -555,13 +555,21 @@ impl BugzillaClient {
     /// them, so the GET would address the whole field list, another
     /// endpoint, or a field by a different name. An empty `name` is
     /// refused too, for a milder reason — it appends nothing but a
-    /// trailing slash, which stock Bugzilla routes nowhere. Otherwise it
-    /// fails as the other GETs here do.
+    /// trailing slash, which stock Bugzilla routes nowhere. A name of
+    /// all ASCII digits is refused as well: Bugzilla routes that path
+    /// form as a field id, so the GET would return an unasked field
+    /// under an unasked name. Otherwise it fails as the other GETs do.
     pub async fn bug_fields(&self, key: &str, name: Option<&str>) -> Result<Value> {
         match name {
             Some(n) => {
-                if matches!(n, "" | "." | "..") || n.contains(['\t', '\n', '\r']) {
-                    bail!("no such bug field: empty, `.` or `..`, or with a tab or line break");
+                if matches!(n, "" | "." | "..")
+                    || n.contains(['\t', '\n', '\r'])
+                    || (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                {
+                    bail!(
+                        "no such bug field: empty, all digits, `.` or `..`, \
+                         or with a tab or line break"
+                    );
                 }
                 let mut url = reqwest::Url::parse(&self.api_url)
                     .map_err(|e| anyhow!("bugzilla api_url is not a valid URL: {e}"))?;

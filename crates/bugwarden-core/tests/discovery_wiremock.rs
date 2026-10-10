@@ -3,7 +3,8 @@
 //! documented envelope shapes, a malformed envelope, that a field name
 //! travels as one percent-encoded path segment and that the names
 //! `Url::path_segments_mut` would rewrite instead are refused before any
-//! request, and that no error text contains the API key (I12).
+//! request, as is an all-digit name (Bugzilla routes that path form as
+//! a field id), and that no error text contains the API key (I12).
 
 use bugwarden_core::client::BugzillaClient;
 use serde_json::json;
@@ -204,6 +205,59 @@ async fn bug_fields_refuses_a_name_the_path_segment_would_rewrite() {
             "{name:?} must fail before any request, not reach {sent:?}: {result:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn bug_fields_refuses_all_digit_names_before_any_request() {
+    // Bugzilla routes GET /rest/field/bug/<digits> as a field id, so a
+    // digits-only "name" would return an unasked field under that name.
+    // The catch-all mock traps any request at all (`expect(0)`).
+    for name in ["0", "12", "007"] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "fields": [{ "name": "priority" }]
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let result = client(&server).bug_fields(KEY, Some(name)).await;
+        let sent: Vec<String> = server
+            .received_requests()
+            .await
+            .expect("request recording is on")
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert!(
+            result.is_err() && sent.is_empty(),
+            "{name:?} must fail before any request, not reach {sent:?}: {result:?}"
+        );
+        assert!(
+            result
+                .expect_err("refusal already asserted")
+                .to_string()
+                .contains("all digits"),
+            "{name:?} must draw the digits refusal"
+        );
+    }
+
+    // Control: a normal name still reaches its field endpoint.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug/priority"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "fields": [{ "name": "priority" }]
+        })))
+        .mount(&server)
+        .await;
+
+    let v = client(&server)
+        .bug_fields(KEY, Some("priority"))
+        .await
+        .expect("a normal name must still be fetched");
+    assert_eq!(v["fields"][0]["name"], json!("priority"));
 }
 
 #[tokio::test]
