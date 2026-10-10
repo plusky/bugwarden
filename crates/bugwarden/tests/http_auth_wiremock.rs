@@ -25,9 +25,12 @@
 //! - dropping any of the five startup refusals;
 //! - checking `--allowed-hosts` only where the http config is built, after
 //!   the preflight and the audit sink, or checking it for stdio too;
+//! - parsing the audit document at sink construction, after the preflight
+//!   and the OTLP probe, instead of ahead of them;
 //! - refusing a stdio start over a token in the environment.
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -942,6 +945,307 @@ async fn an_unparsable_allowed_host_refuses_before_bugzilla_and_the_audit_sink()
             .is_empty(),
         "a refused start must not have contacted Bugzilla: {stderr}"
     );
+}
+
+/// A server-held key file every audit-ordering case below shares: with
+/// it and the identity policy the preflight is a real `whoami`.
+fn ordering_key_file(dir: &Path) -> PathBuf {
+    let path = dir.join("api-key");
+    std::fs::write(&path, "test-key\n").expect("write the key file");
+    path
+}
+
+/// An identity-consulting policy: a start that reaches the preflight makes
+/// a real upstream request under it.
+fn ordering_identity_policy(dir: &Path) -> PathBuf {
+    let path = dir.join("policy.toml");
+    std::fs::write(
+        &path,
+        "[[rule]]\nname = \"mine\"\naction = \"allow\"\n\
+         [rule.match]\ncreated_by_me = true\n",
+    )
+    .expect("write the policy");
+    path
+}
+
+/// The `whoami` answer a preflight that runs would consume.
+async fn mount_ordering_whoami(mock: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/rest/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 1, "name": "svc@example.com", "real_name": "Service",
+        })))
+        .mount(mock)
+        .await;
+}
+
+/// A collector that would answer the startup probe, so a start reaching it
+/// delivers a record — the request each case then asserts never happened.
+async fn mount_healthy_collector(collector: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/logs"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(collector)
+        .await;
+}
+
+/// The files a case's tempdir holds when the refused start created nothing:
+/// exactly what the case itself wrote.
+fn assert_created_no_files(dir: &Path, written: &[&str], stderr: &str) {
+    let mut left: Vec<String> = std::fs::read_dir(dir)
+        .expect("tempdir must stay readable")
+        .map(|entry| {
+            entry
+                .expect("tempdir entries must be readable")
+                .file_name()
+                .to_str()
+                .expect("utf-8 names")
+                .to_owned()
+        })
+        .collect();
+    left.sort();
+    let mut expected: Vec<String> = written.iter().map(|name| name.to_string()).collect();
+    expected.sort();
+    assert_eq!(
+        left, expected,
+        "a refused start must create no file or directory: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_audit_config_refuses_before_bugzilla_and_the_collector() {
+    // `AuditConfig::load` is pure parsing — it reads and validates the
+    // TOML but creates no directory and no file — so `main` parses the
+    // document ahead of the identity preflight and the OTLP probe, and
+    // only OPENS the sink after them. A start whose audit document cannot
+    // be parsed must therefore refuse with no `whoami`, no collector
+    // delivery and no audit file, in every `--audit-config` mode: a file
+    // path alone, a file path beside an endpoint (where the probe would
+    // otherwise deliver a record first), `none` with no endpoint, and no
+    // file decision beside an endpoint (the two ambiguous spellings
+    // `select_sinks` already refused up front).
+    //
+    // A server-held key and an identity rule make the preflight a real
+    // request, and a healthy collector mock makes the probe one: either
+    // reaching the network fails the case.
+    //
+    // File alone: the document names the audit file but carries an
+    // unknown key, so parsing — not opening — refuses the start.
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit_dir = dir.path().join("audit");
+        let audit_path = audit_dir.join("audit.jsonl");
+        let config_path = dir.path().join("audit.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "path = {:?}\nbogus_key = true\n",
+                audit_path.to_str().expect("utf-8 path")
+            ),
+        )
+        .expect("write the audit config");
+        let key_path = ordering_key_file(dir.path());
+        let policy_path = ordering_identity_policy(dir.path());
+        let mock = MockServer::start().await;
+        mount_ordering_whoami(&mock).await;
+
+        let (code, stderr) = run_binary(
+            &[
+                "--bugzilla-server",
+                &mock.uri(),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "0",
+                "--api-key-file",
+                key_path.to_str().expect("utf-8 path"),
+                "--policy",
+                policy_path.to_str().expect("utf-8 path"),
+                "--audit-config",
+                config_path.to_str().expect("utf-8 path"),
+            ],
+            &[("BUGWARDEN_HTTP_TOKEN", WRITE_TOKEN)],
+        )
+        .await;
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(
+            stderr.contains("invalid audit configuration file"),
+            "a malformed audit document must refuse the start: {stderr}"
+        );
+        assert!(
+            !audit_dir.exists(),
+            "a refused start must not have opened the audit sink: {stderr}"
+        );
+        assert!(
+            mock.received_requests()
+                .await
+                .expect("recording")
+                .is_empty(),
+            "a refused start must not have contacted Bugzilla: {stderr}"
+        );
+    }
+    // File beside an endpoint: the same malformed document, but now the
+    // OTLP probe would deliver a record before a late parse refused.
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit_dir = dir.path().join("audit");
+        let audit_path = audit_dir.join("audit.jsonl");
+        let config_path = dir.path().join("audit.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "path = {:?}\nbogus_key = true\n",
+                audit_path.to_str().expect("utf-8 path")
+            ),
+        )
+        .expect("write the audit config");
+        let key_path = ordering_key_file(dir.path());
+        let policy_path = ordering_identity_policy(dir.path());
+        let mock = MockServer::start().await;
+        mount_ordering_whoami(&mock).await;
+        let collector = MockServer::start().await;
+        mount_healthy_collector(&collector).await;
+        let collector_uri = collector.uri();
+
+        let (code, stderr) = run_binary(
+            &[
+                "--bugzilla-server",
+                &mock.uri(),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "0",
+                "--api-key-file",
+                key_path.to_str().expect("utf-8 path"),
+                "--policy",
+                policy_path.to_str().expect("utf-8 path"),
+                "--audit-config",
+                config_path.to_str().expect("utf-8 path"),
+            ],
+            &[
+                ("BUGWARDEN_HTTP_TOKEN", WRITE_TOKEN),
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", collector_uri.as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(
+            stderr.contains("invalid audit configuration file"),
+            "a malformed audit document must refuse the start: {stderr}"
+        );
+        assert!(
+            !audit_dir.exists(),
+            "a refused start must not have opened the audit sink: {stderr}"
+        );
+        assert!(
+            mock.received_requests()
+                .await
+                .expect("recording")
+                .is_empty(),
+            "a refused start must not have contacted Bugzilla: {stderr}"
+        );
+        assert!(
+            collector
+                .received_requests()
+                .await
+                .expect("recording")
+                .is_empty(),
+            "a refused start must not have delivered to the collector: {stderr}"
+        );
+    }
+    // `none` with no endpoint: the ambiguous spelling `select_sinks`
+    // refuses up front — pinned here with the same no-request shape.
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = ordering_key_file(dir.path());
+        let policy_path = ordering_identity_policy(dir.path());
+        let mock = MockServer::start().await;
+        mount_ordering_whoami(&mock).await;
+
+        let (code, stderr) = run_binary(
+            &[
+                "--bugzilla-server",
+                &mock.uri(),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "0",
+                "--api-key-file",
+                key_path.to_str().expect("utf-8 path"),
+                "--policy",
+                policy_path.to_str().expect("utf-8 path"),
+                "--audit-config",
+                "none",
+            ],
+            &[("BUGWARDEN_HTTP_TOKEN", WRITE_TOKEN)],
+        )
+        .await;
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(
+            stderr.contains("is `none` but no OTLP"),
+            "the `none`-without-endpoint spelling must refuse the start: {stderr}"
+        );
+        assert!(
+            mock.received_requests()
+                .await
+                .expect("recording")
+                .is_empty(),
+            "a refused start must not have contacted Bugzilla: {stderr}"
+        );
+        assert_created_no_files(dir.path(), &["api-key", "policy.toml"], &stderr);
+    }
+    // No file decision beside an endpoint: the other ambiguous spelling.
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = ordering_key_file(dir.path());
+        let policy_path = ordering_identity_policy(dir.path());
+        let mock = MockServer::start().await;
+        mount_ordering_whoami(&mock).await;
+        let collector = MockServer::start().await;
+        mount_healthy_collector(&collector).await;
+        let collector_uri = collector.uri();
+
+        let (code, stderr) = run_binary(
+            &[
+                "--bugzilla-server",
+                &mock.uri(),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "0",
+                "--api-key-file",
+                key_path.to_str().expect("utf-8 path"),
+                "--policy",
+                policy_path.to_str().expect("utf-8 path"),
+            ],
+            &[
+                ("BUGWARDEN_HTTP_TOKEN", WRITE_TOKEN),
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", collector_uri.as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(
+            stderr.contains("but no audit file is configured"),
+            "an endpoint without a file decision must refuse the start: {stderr}"
+        );
+        assert!(
+            mock.received_requests()
+                .await
+                .expect("recording")
+                .is_empty(),
+            "a refused start must not have contacted Bugzilla: {stderr}"
+        );
+        assert!(
+            collector
+                .received_requests()
+                .await
+                .expect("recording")
+                .is_empty(),
+            "a refused start must not have delivered to the collector: {stderr}"
+        );
+        assert_created_no_files(dir.path(), &["api-key", "policy.toml"], &stderr);
+    }
 }
 
 #[tokio::test]

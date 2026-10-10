@@ -1675,7 +1675,11 @@ the OTLP probe and the audit sink, so this early call is what keeps an
 unparsable Host entry from probing Bugzilla or creating the audit file
 and its directory before it refuses; `select_sinks` (file path, `none`,
  OTLP endpoint) so the two ambiguous spellings refuse before any file or
- task exists; a fileless sink that reaches wiring with no exporter attached
+ task exists; the audit document itself (`AuditConfig::load`) is parsed
+ right after `select_sinks`, so a malformed file refuses before the
+ identity preflight and the OTLP probe — opening the sink, which creates
+ the directory and the file, stays where it is, after them (#329);
+ a fileless sink that reaches wiring with no exporter attached
  refuses as well (#341) — unreachable through `select_sinks` today, which
  pairs OTLP-only with an exporter, so this is defense against a future wiring
  change rather than a reachable configuration; and http with no sink at all (`NoAudit`) => tracing::warn
@@ -4677,7 +4681,11 @@ wired, `server.rs` and `main.rs` are the reference.
   to that ordering too: with a server-held key and a `created_by_me` rule,
   so the preflight is a real `whoami`, the refused http start leaves no
   audit file and made no request, and a stdio start with the same value
-  runs past startup.
+  runs past startup. A malformed `--audit-config` document is held to it
+  in every audit-config mode (#329): file alone, file beside an endpoint,
+  `none` without one, and no decision beside an endpoint — the refused
+  start names the configuration, made no Bugzilla or collector request,
+  and left no audit file.
   `WRITE_TOOLS` is additionally pinned against every tool's own
   `read_only_hint` annotation, so the read scope cannot drift from what
   clients are told.
