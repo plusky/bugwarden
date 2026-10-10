@@ -914,26 +914,74 @@ async fn stdio_an_over_cap_frame_after_initialize_exits_one() {
 
 #[tokio::test]
 async fn stdio_a_pre_initialize_tool_call_never_logs_the_frame() {
-    // The #261 reproduction. rmcp answers this frame -32602 (its `_meta`
-    // declares no handshake-free lifecycle) and then hands `main`
-    // `ExpectedInitializeRequest(Some(..))` holding the whole request, so
-    // both the `serving error` line and the runtime's `Error:` line grew
-    // with the query: 100 403 and 100 365 chars measured.
+    // rmcp 3.5.1 answers this frame in-band: one stdout -32602
+    // with a fixed `_meta` message, no client bytes, and the
+    // session keeps waiting for `initialize`. The handler never
+    // runs, stderr stays free of the frame, and the process only
+    // exits once stdin closes, with the hangup classification.
     let mut server = spawn_stdio();
     server.wait_for_stderr(STDIO_READY).await;
+    let stdout = server.child.stdout.take().expect("stdout is piped");
+    let mut stdout = BufReader::new(stdout).lines();
     let query = run_of('a', FILLER_CHARS);
     server
         .write_frame(&format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"bug_info","arguments":{{"query":"{query}"}}}}}}"#
         ))
         .await;
+    let reply = tokio::time::timeout(EXIT_TIMEOUT, stdout.next_line())
+        .await
+        .expect("the in-band refusal must arrive")
+        .expect("stdout must be readable")
+        .expect("the server must answer the frame");
+    let reply_json: serde_json::Value =
+        serde_json::from_str(&reply).expect("the reply must be JSON");
+    assert_eq!(
+        reply_json.get("id").and_then(|id| id.as_u64()),
+        Some(1),
+        "the reply must answer the frame sent: {reply}"
+    );
+    assert_eq!(
+        reply_json
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(|code| code.as_i64()),
+        Some(-32602),
+        "a pre-handshake frame is refused in-band: {reply}"
+    );
+    assert_eq!(
+        reply_json
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(|message| message.as_str()),
+        Some("request _meta is missing or has malformed required fields: io.modelcontextprotocol/protocolVersion, io.modelcontextprotocol/clientCapabilities"),
+        "the refusal message is fixed text: {reply}"
+    );
+    assert!(
+        !reply.contains(&run_of('a', FILLER_RUN)),
+        "no run of the query may reach stdout: {reply}"
+    );
+    assert!(
+        !server.log.contains(&run_of('a', FILLER_RUN)),
+        "no run of the query may reach stderr: {log}",
+        log = server.log
+    );
+    server.close_stdin();
     server
         .assert_bounded_handshake_failure(
             "stdio pre-handshake tools/call",
-            "the first frame was a request other than initialize",
+            "the stream ended before initialize",
             Some(&run_of('a', FILLER_RUN)),
         )
         .await;
+    let second = tokio::time::timeout(EXIT_TIMEOUT, stdout.next_line())
+        .await
+        .expect("stdout must close with the process")
+        .expect("stdout must be readable");
+    assert!(
+        second.is_none(),
+        "the frame draws exactly one reply: {reply}"
+    );
 }
 
 #[tokio::test]
