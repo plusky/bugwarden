@@ -3306,6 +3306,75 @@ async fn bug_info_include_fields_preserves_the_redacted_marker() {
     );
 }
 
+/// A BMO-shaped bug: the default body carries a `comment_count` tally
+/// counting every comment, private ones included.
+fn bmo_bug(id: u64) -> Value {
+    let mut bug = world_readable_bug(id);
+    bug["comment_count"] = json!(5);
+    bug
+}
+
+#[tokio::test]
+async fn bug_info_default_view_strips_comment_count() {
+    let mock = MockServer::start().await;
+    mount_bug_and_padding(&mock, bmo_bug(7)).await;
+    let client = client_for("", &mock).await;
+
+    let result = call(&client, "bug_info", json!({ "bug_ids": [7] })).await;
+    assert!(!is_error(&result), "{}", text_of(&result));
+    let envelope: Value = serde_json::from_str(&text_of(&result)).expect("bug_info returns JSON");
+    let served = &envelope["bugs"][0];
+    assert!(
+        served.get("comment_count").is_none(),
+        "the default view must not serve the tally: {served}"
+    );
+    assert_eq!(served["summary"], json!("a plain bug"));
+    assert_eq!(served["creation_time"], json!("2020-01-01T00:00:00Z"));
+}
+
+#[tokio::test]
+async fn bug_info_projection_drops_an_explicit_comment_count() {
+    let mock = MockServer::start().await;
+    mount_bug_and_padding(&mock, bmo_bug(7)).await;
+    let client = client_for("", &mock).await;
+
+    let result = call(
+        &client,
+        "bug_info",
+        json!({ "bug_ids": [7], "include_fields": "summary,creation_time,comment_count" }),
+    )
+    .await;
+    assert!(!is_error(&result), "{}", text_of(&result));
+    let envelope: Value = serde_json::from_str(&text_of(&result)).expect("bug_info returns JSON");
+    let served = &envelope["bugs"][0];
+    assert!(
+        served.get("comment_count").is_none(),
+        "naming the tally must not bring it back: {served}"
+    );
+    assert_eq!(served["summary"], json!("a plain bug"));
+    assert_eq!(served["creation_time"], json!("2020-01-01T00:00:00Z"));
+}
+
+#[tokio::test]
+async fn quicksearch_projection_drops_an_explicit_comment_count() {
+    let mock = MockServer::start().await;
+    mount_search(&mock, vec![bmo_bug(101)]).await;
+    let client = client_for("", &mock).await;
+
+    let envelope = quicksearch_json_args(
+        &client,
+        json!({ "query": "plain", "include_fields": "summary,creation_time,comment_count" }),
+    )
+    .await;
+    let served = &envelope["bugs"][0];
+    assert!(
+        served.get("comment_count").is_none(),
+        "naming the tally must not bring it back: {served}"
+    );
+    assert_eq!(served["summary"], json!("a plain bug"));
+    assert_eq!(served["creation_time"], json!("2020-01-01T00:00:00Z"));
+}
+
 #[tokio::test]
 async fn bug_info_include_fields_and_detail_are_mutually_exclusive() {
     let mock = MockServer::start().await;

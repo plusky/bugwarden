@@ -1526,12 +1526,23 @@ fn project_field_detail(f: &Value) -> Value {
     obj
 }
 
+/// Drop the BMO `comment_count` tally: it counts private ones too.
+fn strip_comment_count(bug: &mut Value) {
+    if let Some(obj) = bug.as_object_mut() {
+        obj.remove("comment_count");
+    }
+}
+
 /// Project a bug object to the requested field set, preserving the
-/// `_redacted` marker when present.
+/// `_redacted` marker when present. The BMO `comment_count` tally is
+/// always dropped: it counts private comments too.
 fn project_fields(bug: &Value, fields: &BTreeSet<String>) -> Value {
     let mut out = serde_json::Map::new();
     if let Some(obj) = bug.as_object() {
         for field in fields {
+            if field == "comment_count" {
+                continue;
+            }
             if let Some(v) = obj.get(field) {
                 out.insert(field.clone(), v.clone());
             }
@@ -3077,8 +3088,13 @@ impl BugWarden {
                         *bug = project_fields(bug, fields);
                     } else {
                         strip_detail_fields(bug);
+                        strip_comment_count(bug);
                     }
                 }
+            }
+        } else if let Some(bugs) = envelope.get_mut("bugs").and_then(Value::as_array_mut) {
+            for bug in bugs.iter_mut() {
+                strip_comment_count(bug);
             }
         }
         let base_url = self.bz.base_url();
@@ -5773,6 +5789,53 @@ mod tests {
     fn strip_detail_fields_leaves_non_objects_alone() {
         let mut not_an_object = json!("just a string");
         strip_detail_fields(&mut not_an_object);
+        assert_eq!(not_an_object, json!("just a string"));
+    }
+
+    #[test]
+    fn project_fields_always_drops_comment_count() {
+        // The tally counts private comments too, so even an
+        // explicit request must not bring it back.
+        let bug = json!({
+            "id": 7,
+            "summary": "a plain bug",
+            "creation_time": "2020-01-01T00:00:00Z",
+            "comment_count": 5,
+        });
+        let fields: BTreeSet<String> = ["id", "summary", "creation_time", "comment_count"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let out = project_fields(&bug, &fields);
+        let obj = out.as_object().expect("bug object");
+        assert!(obj.get("comment_count").is_none());
+        assert_eq!(obj.get("id"), Some(&json!(7)));
+        assert_eq!(obj.get("summary"), Some(&json!("a plain bug")));
+        assert_eq!(
+            obj.get("creation_time"),
+            Some(&json!("2020-01-01T00:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn strip_comment_count_drops_the_tally_and_keeps_neighbors() {
+        let mut bug = json!({
+            "id": 7,
+            "summary": "a plain bug",
+            "creation_time": "2020-01-01T00:00:00Z",
+            "comment_count": 5,
+        });
+        strip_comment_count(&mut bug);
+        let obj = bug.as_object().expect("bug object");
+        assert!(obj.get("comment_count").is_none());
+        assert_eq!(obj.get("id"), Some(&json!(7)));
+        assert_eq!(obj.get("summary"), Some(&json!("a plain bug")));
+        assert_eq!(
+            obj.get("creation_time"),
+            Some(&json!("2020-01-01T00:00:00Z"))
+        );
+        let mut not_an_object = json!("just a string");
+        strip_comment_count(&mut not_an_object);
         assert_eq!(not_an_object, json!("just a string"));
     }
 
