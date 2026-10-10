@@ -1549,6 +1549,180 @@ async fn quicksearch_group_by_does_not_soften_a_failing_search() {
     assert_eq!(text_of(&result), "Search failed");
 }
 
+// ---------- bugs_quicksearch predicate gate ----------
+
+/// Run `query` against two upstreams holding different rows and
+/// assert the refusal is byte-identical with zero upstream requests.
+/// A refusal that moved with hidden rows would be a verdict oracle.
+async fn assert_quicksearch_refused(query: &str, expected: &str) {
+    let policy = HIDE_SECRET_POLICY;
+    let plain = MockServer::start().await;
+    mount_search(&plain, vec![world_readable_bug(101)]).await;
+    let client = client_for(policy, &plain).await;
+    let first = call(&client, "bugs_quicksearch", json!({ "query": query })).await;
+    assert!(is_error(&first), "refused query must error: {query}");
+    assert_eq!(text_of(&first), expected, "query: {query}");
+    assert!(
+        plain
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "a refused query must cost zero requests: {query}"
+    );
+
+    let mut hidden = world_readable_bug(101);
+    hidden["product"] = json!("SecretSauce");
+    let hiding = MockServer::start().await;
+    mount_search(&hiding, vec![hidden]).await;
+    let client = client_for(policy, &hiding).await;
+    let second = call(&client, "bugs_quicksearch", json!({ "query": query })).await;
+    assert!(is_error(&second), "refused query must error: {query}");
+    assert_eq!(
+        text_of(&second),
+        text_of(&first),
+        "hidden rows must not move the refusal: {query}"
+    );
+    assert!(
+        hiding
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "a refused query must cost zero requests: {query}"
+    );
+}
+
+#[tokio::test]
+async fn quicksearch_gate_allows_bare_terms_and_quoted_phrases() {
+    let mock = MockServer::start().await;
+    mount_search(&mock, vec![world_readable_bug(101)]).await;
+    let client = client_for("", &mock).await;
+    for query in ["kernel crash", "\"kernel crash\"", "101, 102", "#101, 102"] {
+        let envelope = quicksearch_json(&client, query).await;
+        assert_eq!(
+            envelope["bugs"][0]["id"],
+            json!(101),
+            "control query must search: {query}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn quicksearch_gate_allows_servable_predicates() {
+    let mock = MockServer::start().await;
+    mount_search(&mock, vec![world_readable_bug(101)]).await;
+    let client = client_for("", &mock).await;
+    for query in [
+        "product:openSUSE",
+        "status:NEW",
+        "summary:plain",
+        "P1",
+        "product:openSUSE status:NEW",
+    ] {
+        let envelope = quicksearch_json(&client, query).await;
+        assert_eq!(
+            envelope["bugs"][0]["id"],
+            json!(101),
+            "servable predicate must search: {query}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn quicksearch_gate_refuses_link_predicates() {
+    for query in [
+        "dependson:123",
+        "blocked:123",
+        "dup_id:123",
+        "see_also:123",
+        "cf_foo:123",
+    ] {
+        assert_quicksearch_refused(
+            query,
+            "Quicksearch link predicates are not searchable through this server",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn quicksearch_gate_refuses_content_predicates() {
+    for query in ["longdesc:secret", "content:secret", "comment:secret"] {
+        assert_quicksearch_refused(
+            query,
+            "Quicksearch content predicates are not searchable through this server",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn quicksearch_gate_refuses_attachment_predicates() {
+    for query in ["attachdata:secret", "attachdesc:secret"] {
+        assert_quicksearch_refused(
+            query,
+            "Quicksearch attachment predicates are not searchable through this server",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn quicksearch_gate_refuses_visibility_predicates() {
+    for query in ["group:secret", "flag:review", "requestee:dev"] {
+        assert_quicksearch_refused(
+            query,
+            "Quicksearch visibility predicates are not searchable through this server",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn quicksearch_gate_refuses_shortcuts() {
+    for query in [":secret", "@dev", "#secret", "!regression", "review?:dev"] {
+        assert_quicksearch_refused(
+            query,
+            "Quicksearch shortcuts are not searchable through this server",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn quicksearch_gate_refuses_aliases() {
+    for query in ["assignee:dev", "owner:dev", "kw:regression"] {
+        assert_quicksearch_refused(
+            query,
+            "Quicksearch field aliases are not searchable through this server",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn quicksearch_gate_refuses_unknown_fields() {
+    for query in ["version:1.0", "prod:openSUSE", "assigned_to:dev"] {
+        assert_quicksearch_refused(
+            query,
+            "Quicksearch field predicates are not searchable through this server",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn quicksearch_gate_refuses_unbalanced_quotes() {
+    for query in ["product:\"unbalanced", "product:'unbalanced"] {
+        assert_quicksearch_refused(
+            query,
+            "Quicksearch query could not be parsed through this server",
+        )
+        .await;
+    }
+}
+
 // ---------- update_bug_fields: the widened field surface (issue #38) ----------
 
 /// Mount a successful `PUT /rest/bug/7` whose body must carry `body`,

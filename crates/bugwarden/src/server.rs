@@ -1628,6 +1628,504 @@ fn parse_group_by(spec: &str) -> Result<Vec<&'static str>, String> {
     Ok(keys)
 }
 
+/// Predicate fields a quicksearch query may name: the summary-redacted
+/// row already carries every one of them, so testing one probes only
+/// what the projection serves anyway. Anything else is refused
+/// before any upstream request. Hand-picked, like [`GROUP_BY_FIELDS`]:
+/// extending it is a decision, not a refactor.
+///
+/// Excluded on purpose: assignee-ish fields, keywords and whiteboard
+/// are stripped from summary rows, so a predicate over one would test
+/// data the caller is not shown. Timestamps and version-like fields
+/// stay out for the same reason: minimal beats clever here.
+const QUICKSEARCH_ALLOWED_FIELDS: &[&str] = &[
+    "component",
+    "priority",
+    "product",
+    "resolution",
+    "severity",
+    "short_desc",
+    "status",
+    "summary",
+];
+
+/// Direct link-field names the gate refuses as links. Any `cf_` name
+/// is a link too, judged by prefix without any type lookup.
+const QUICKSEARCH_LINK_FIELDS: &[&str] = &[
+    "blocked",
+    "blocks",
+    "dependson",
+    "depends_on",
+    "dupe",
+    "dupe_of",
+    "dup_id",
+    "duplicates",
+    "regressed_by",
+    "regressions",
+    "see_also",
+];
+
+/// Direct content-field names: comment text the projection never
+/// serves through this tool.
+const QUICKSEARCH_CONTENT_FIELDS: &[&str] = &["comment", "content", "description", "longdesc"];
+
+/// Direct attachment-field names: attachment data the projection
+/// never serves through this tool.
+const QUICKSEARCH_ATTACHMENT_FIELDS: &[&str] = &[
+    "attachdata",
+    "attachdesc",
+    "attachment",
+    "attachmentdata",
+    "attachmentdesc",
+    "attachmentmimetype",
+    "attachmimetype",
+];
+
+/// Direct visibility-field names: groups and flags decide access, so
+/// a predicate over one would test the policy itself.
+const QUICKSEARCH_VISIBILITY_FIELDS: &[&str] = &[
+    "bug_group",
+    "flag",
+    "flagtypes.name",
+    "group",
+    "requestee",
+    "requestees.login_name",
+    "setter",
+    "setters.login_name",
+];
+
+/// Mapping aliases for refused targets that no class above names.
+/// Aliases of allowed targets are allowed instead, by exact name.
+const QUICKSEARCH_ALIAS_FIELDS: &[&str] = &[
+    "assignee",
+    "kw",
+    "milestone",
+    "os",
+    "owner",
+    "platform",
+    "sw",
+    "url",
+    "whiteboard",
+];
+
+const QUICKSEARCH_LINK_REFUSAL: &str =
+    "Quicksearch link predicates are not searchable through this server";
+const QUICKSEARCH_CONTENT_REFUSAL: &str =
+    "Quicksearch content predicates are not searchable through this server";
+const QUICKSEARCH_ATTACHMENT_REFUSAL: &str =
+    "Quicksearch attachment predicates are not searchable through this server";
+const QUICKSEARCH_VISIBILITY_REFUSAL: &str =
+    "Quicksearch visibility predicates are not searchable through this server";
+const QUICKSEARCH_SHORTCUT_REFUSAL: &str =
+    "Quicksearch shortcuts are not searchable through this server";
+const QUICKSEARCH_ALIAS_REFUSAL: &str =
+    "Quicksearch field aliases are not searchable through this server";
+const QUICKSEARCH_FIELD_REFUSAL: &str =
+    "Quicksearch field predicates are not searchable through this server";
+const QUICKSEARCH_PARSE_REFUSAL: &str = "Quicksearch query could not be parsed through this server";
+
+fn qs_is_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// Whether a single quote after `prev` opens a quoted run. Mirrors
+/// the upstream grammar: only at the start or after whitespace or a
+/// separator, so a contraction stays a bare word.
+fn qs_is_start_ctx(prev: Option<u8>) -> bool {
+    match prev {
+        None => true,
+        Some(p) => {
+            qs_is_ws(p)
+                || matches!(
+                    p,
+                    b':' | b',' | b'|' | b'=' | b'!' | b'>' | b'<' | b'(' | b'?'
+                )
+        }
+    }
+}
+
+/// Whether a single quote before `next` closes a quoted run.
+fn qs_is_end_ctx(next: Option<u8>) -> bool {
+    match next {
+        None => true,
+        Some(n) => {
+            qs_is_ws(n)
+                || matches!(
+                    n,
+                    b',' | b'|' | b')' | b'?' | b'=' | b':' | b'!' | b'>' | b'<' | b'('
+                )
+        }
+    }
+}
+
+/// Quote mask for `s`: per-byte outside-quote flags plus whether the
+/// quotes balance. A backslash hides the next byte either way, so an
+/// escaped quote neither opens nor closes and an escaped delimiter
+/// never splits. Byte-indexed: every delimiter probed here is ASCII.
+fn qs_mask(s: &str) -> (bool, Vec<bool>) {
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    let mut outside = vec![true; n];
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut i = 0;
+    while i < n {
+        let b = bytes[i];
+        if b == b'\\' && i + 1 < n {
+            outside[i] = false;
+            outside[i + 1] = false;
+            i += 2;
+            continue;
+        }
+        if in_double {
+            outside[i] = false;
+            if b == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_single {
+            outside[i] = false;
+            if b == b'\'' {
+                let next = if i + 1 < n { Some(bytes[i + 1]) } else { None };
+                if qs_is_end_ctx(next) {
+                    in_single = false;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            outside[i] = false;
+            in_double = true;
+            i += 1;
+            continue;
+        }
+        if b == b'\'' {
+            let prev = if i > 0 { Some(bytes[i - 1]) } else { None };
+            if qs_is_start_ctx(prev) {
+                outside[i] = false;
+                in_single = true;
+            }
+            i += 1;
+            continue;
+        }
+        outside[i] = true;
+        i += 1;
+    }
+    (!(in_double || in_single), outside)
+}
+
+/// Byte ranges of `s` cut at delimiters seen outside quotes.
+fn qs_split_ranges(s: &str, mask: &[bool], is_delim: impl Fn(u8) -> bool) -> Vec<(usize, usize)> {
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < n {
+        if mask.get(i).is_some_and(|o| *o) && is_delim(bytes[i]) {
+            ranges.push((start, i));
+            start = i + 1;
+        }
+        i += 1;
+    }
+    ranges.push((start, n));
+    ranges
+}
+
+fn qs_slice(s: &str, start: usize, end: usize) -> Option<&str> {
+    s.get(start..end)
+}
+
+/// First operator outside quotes, two-byte forms winning ties.
+fn qs_find_operator(s: &str, mask: &[bool]) -> Option<(usize, usize)> {
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n {
+        if !mask.get(i).is_some_and(|o| *o) {
+            i += 1;
+            continue;
+        }
+        let b = bytes[i];
+        if i + 1 < n
+            && matches!(
+                (b, bytes[i + 1]),
+                (b'!', b'=') | (b'>', b'=') | (b'<', b'=')
+            )
+            && mask.get(i + 1).is_some_and(|o| *o)
+        {
+            return Some((i, 2));
+        }
+        if matches!(b, b':' | b'=' | b'>' | b'<') {
+            return Some((i, 1));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn qs_has_question(s: &str, mask: &[bool]) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if mask.get(i).is_some_and(|o| *o) && bytes[i] == b'?' {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// A whole operand wrapped in one pair of quotes is a phrase, never
+/// a predicate: the upstream parser does not look inside those.
+fn qs_is_quoted(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 2
+        && ((b[0] == b'"' && b[b.len() - 1] == b'"') || (b[0] == b'\'' && b[b.len() - 1] == b'\''))
+}
+
+/// Priority shorthand (`P1`, `P1-3`): the same data an allowed
+/// priority predicate would test.
+fn qs_is_priority_shorthand(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() < 2 || (b[0] != b'P' && b[0] != b'p') {
+        return false;
+    }
+    let mut i = 1;
+    let mut digits = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        digits += 1;
+        i += 1;
+    }
+    if digits == 0 {
+        return false;
+    }
+    if i == b.len() {
+        return true;
+    }
+    if b[i] != b'-' {
+        return false;
+    }
+    i += 1;
+    let mut tail = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        tail += 1;
+        i += 1;
+    }
+    tail > 0 && i == b.len()
+}
+
+/// Refusal for one lowercased field name, or `None` when allowed.
+/// Prefixes never pass: without the instance field list a prefix
+/// could name a custom link field, so only exact names are known.
+fn qs_field_refusal(lower: &str) -> Option<&'static str> {
+    if lower.starts_with("cf_") {
+        return Some(QUICKSEARCH_LINK_REFUSAL);
+    }
+    if QUICKSEARCH_LINK_FIELDS.contains(&lower) {
+        return Some(QUICKSEARCH_LINK_REFUSAL);
+    }
+    if QUICKSEARCH_CONTENT_FIELDS.contains(&lower) {
+        return Some(QUICKSEARCH_CONTENT_REFUSAL);
+    }
+    if QUICKSEARCH_ATTACHMENT_FIELDS.contains(&lower) {
+        return Some(QUICKSEARCH_ATTACHMENT_REFUSAL);
+    }
+    if QUICKSEARCH_VISIBILITY_FIELDS.contains(&lower) {
+        return Some(QUICKSEARCH_VISIBILITY_REFUSAL);
+    }
+    if QUICKSEARCH_ALIAS_FIELDS.contains(&lower) {
+        return Some(QUICKSEARCH_ALIAS_REFUSAL);
+    }
+    if QUICKSEARCH_ALLOWED_FIELDS.contains(&lower) {
+        return None;
+    }
+    Some(QUICKSEARCH_FIELD_REFUSAL)
+}
+
+/// A `#`-prefixed id (`#101`): the id-list shape the advisory
+/// steers to `bug_info`. Bare numbers already match as text, so this
+/// is no wider than any other bare term.
+fn qs_is_hash_id(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() > 1 && b[0] == b'#' && b[1..].iter().all(|c| c.is_ascii_digit())
+}
+
+/// Refusal for one `|`-separated operand, or `None` when it carries
+/// no refused predicate. Special leading characters are judged before
+/// operators, the order the upstream parser checks them in.
+fn qs_refuse_operand(operand: &str) -> Option<&'static str> {
+    let mut word = operand.trim();
+    if word.is_empty() {
+        return None;
+    }
+    if word.starts_with('-') {
+        word = word.get(1..)?.trim();
+        if word.is_empty() {
+            return None;
+        }
+    }
+    if word == "AND" || word == "OR" || word == "NOT" {
+        return None;
+    }
+    if qs_is_quoted(word) {
+        return None;
+    }
+    if qs_is_priority_shorthand(word) {
+        return None;
+    }
+    let (balanced, mask) = qs_mask(word);
+    if !balanced {
+        return Some(QUICKSEARCH_PARSE_REFUSAL);
+    }
+    if qs_has_question(word, &mask) {
+        return Some(QUICKSEARCH_SHORTCUT_REFUSAL);
+    }
+    // A `#` id list (`#101, 102`) stays a bare search; any other `#`
+    // word probes summary text, so it goes with the shortcuts.
+    if word.starts_with('#') {
+        let mut id_list = true;
+        for (start, end) in qs_split_ranges(word, &mask, |b| b == b',') {
+            let Some(piece) = qs_slice(word, start, end) else {
+                return Some(QUICKSEARCH_PARSE_REFUSAL);
+            };
+            let piece = piece.trim();
+            if piece.is_empty() {
+                continue;
+            }
+            if !qs_is_hash_id(piece) {
+                id_list = false;
+                break;
+            }
+        }
+        if id_list {
+            return None;
+        }
+        return Some(QUICKSEARCH_SHORTCUT_REFUSAL);
+    }
+    if let Some(first) = word.as_bytes().first() {
+        if matches!(first, b':' | b'@' | b'[' | b'!') {
+            return Some(QUICKSEARCH_SHORTCUT_REFUSAL);
+        }
+    }
+    if let Some((pos, len)) = qs_find_operator(word, &mask) {
+        let (field_part, _) = match (word.get(..pos), word.get(pos + len..)) {
+            (Some(f), Some(_)) => (f, pos),
+            _ => return Some(QUICKSEARCH_PARSE_REFUSAL),
+        };
+        if field_part.trim().is_empty() {
+            return Some(QUICKSEARCH_PARSE_REFUSAL);
+        }
+        if field_part.contains('"') || field_part.contains('\'') {
+            return Some(QUICKSEARCH_FIELD_REFUSAL);
+        }
+        let (_, field_mask) = qs_mask(field_part);
+        for (start, end) in qs_split_ranges(field_part, &field_mask, |b| b == b',') {
+            let Some(name) = qs_slice(field_part, start, end) else {
+                return Some(QUICKSEARCH_PARSE_REFUSAL);
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                return Some(QUICKSEARCH_PARSE_REFUSAL);
+            }
+            if let Some(refusal) = qs_field_refusal(&name.to_ascii_lowercase()) {
+                return Some(refusal);
+            }
+        }
+        return None;
+    }
+    // No predicate: comma-separated bare pieces (an id list, for
+    // instance). Each piece is judged alone; a shortcut in any one
+    // refuses the whole operand.
+    for (start, end) in qs_split_ranges(word, &mask, |b| b == b',') {
+        let Some(piece) = qs_slice(word, start, end) else {
+            return Some(QUICKSEARCH_PARSE_REFUSAL);
+        };
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        if piece == "AND" || piece == "OR" || piece == "NOT" {
+            continue;
+        }
+        if qs_is_quoted(piece) || qs_is_priority_shorthand(piece) {
+            continue;
+        }
+        if qs_is_hash_id(piece) {
+            continue;
+        }
+        if let Some(first) = piece.as_bytes().first() {
+            if matches!(first, b'#' | b':' | b'@' | b'[' | b'!') {
+                return Some(QUICKSEARCH_SHORTCUT_REFUSAL);
+            }
+        }
+    }
+    None
+}
+
+/// Refusal for one whitespace-separated token (`|` groups inside).
+fn qs_refuse_token(token: &str) -> Option<&'static str> {
+    if token == "AND" || token == "OR" || token == "NOT" {
+        return None;
+    }
+    let (_, mask) = qs_mask(token);
+    for (start, end) in qs_split_ranges(token, &mask, |b| b == b'|') {
+        let Some(part) = qs_slice(token, start, end) else {
+            return Some(QUICKSEARCH_PARSE_REFUSAL);
+        };
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(refusal) = qs_refuse_operand(part) {
+            return Some(refusal);
+        }
+    }
+    None
+}
+
+/// Refusal for a whole quicksearch expression, or `None` when every
+/// predicate it names is servable anyway. Pure request text: the
+/// answer never depends on verdicts or upstream state.
+fn qs_refuse_expr(expr: &str) -> Option<&'static str> {
+    if expr.trim().is_empty() {
+        return None;
+    }
+    let (balanced, mask) = qs_mask(expr);
+    if !balanced {
+        return Some(QUICKSEARCH_PARSE_REFUSAL);
+    }
+    for (start, end) in qs_split_ranges(expr, &mask, qs_is_ws) {
+        let Some(token) = qs_slice(expr, start, end) else {
+            return Some(QUICKSEARCH_PARSE_REFUSAL);
+        };
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(refusal) = qs_refuse_token(token) {
+            return Some(refusal);
+        }
+    }
+    None
+}
+
+/// Gate a quicksearch call (query plus status prefix) before any
+/// upstream request. Both strings are client text, so every refusal
+/// below names only a predicate class, never values.
+fn refuse_quicksearch_query(query: &str, status: &str) -> Option<&'static str> {
+    if let Some(refusal) = qs_refuse_expr(query) {
+        return Some(refusal);
+    }
+    if !status.trim().is_empty() {
+        if let Some(refusal) = qs_refuse_expr(status) {
+            return Some(refusal);
+        }
+    }
+    None
+}
+
 /// Bucket `rows` by their values for `keys`, hoisting those values out of
 /// every row into the group header — the whole point, one `"product": "P"`
 /// per group instead of one per bug.
@@ -3398,6 +3896,13 @@ impl BugWarden {
                 return Ok(err_text(msg));
             }
         };
+        // Predicate gate: a field predicate is evaluated upstream over
+        // data the projection may hide, so only predicates over served
+        // fields pass. Pure request text, fixed per class, zero requests.
+        if let Some(refusal) = refuse_quicksearch_query(&p.query, &p.status) {
+            note_refused(&ctx);
+            return Ok(err_text(refusal));
+        }
         let key = self.api_key(&ctx)?;
 
         // Requested projection; "id" is always part of it, and so is anything
@@ -5875,6 +6380,180 @@ mod tests {
         // Case-sensitive on purpose: the error lists the vocabulary, so a
         // wrong case self-corrects on the next call.
         assert!(parse_group_by("Product").is_err());
+    }
+
+    #[test]
+    fn quicksearch_gate_allowlist_is_summary_served() {
+        // Every allowed predicate probes data a summary-redacted row
+        // already carries. `short_desc` is the database spelling of the
+        // served `summary` field; the rest match by name.
+        assert_eq!(
+            QUICKSEARCH_ALLOWED_FIELDS,
+            [
+                "component",
+                "priority",
+                "product",
+                "resolution",
+                "severity",
+                "short_desc",
+                "status",
+                "summary"
+            ]
+        );
+        for f in QUICKSEARCH_ALLOWED_FIELDS {
+            let served = if *f == "short_desc" { "summary" } else { *f };
+            assert!(
+                bugwarden_core::guard::SUMMARY_FIELDS.contains(&served),
+                "{f} must be summary-served"
+            );
+        }
+    }
+
+    #[test]
+    fn quicksearch_gate_allows_bare_terms_and_phrases() {
+        for q in [
+            "kernel crash",
+            "\"kernel crash\"",
+            "'kernel crash'",
+            "101, 102",
+            "#101",
+            "#101, 102",
+            "don't",
+            "AND",
+            "kernel OR crash",
+            "NOT crash",
+            "-crash",
+            "-#101",
+            "",
+            "   ",
+        ] {
+            assert_eq!(qs_refuse_expr(q), None, "bare input must pass: {q:?}");
+        }
+        assert_eq!(qs_refuse_expr("\"kernel crash\""), None);
+        assert_eq!(qs_refuse_expr("don't"), None);
+    }
+
+    #[test]
+    fn quicksearch_gate_allows_servable_predicates() {
+        for q in [
+            "product:openSUSE",
+            "component:Kernel",
+            "status:NEW",
+            "resolution:FIXED",
+            "severity:normal",
+            "priority:P3",
+            "summary:crash",
+            "short_desc:crash",
+            "PRODUCT:openSUSE",
+            "Status:NEW",
+            "product=openSUSE",
+            "priority>=P2",
+            "status!=NEW",
+            "-product:openSUSE",
+            "product:openSUSE|status:NEW",
+            "product,component:Kernel",
+            "product:\"open SUSE\"",
+            "P1",
+            "p2",
+            "P1-3",
+            "NOT product:openSUSE",
+            "product:openSUSE AND status:NEW",
+        ] {
+            assert_eq!(
+                qs_refuse_expr(q),
+                None,
+                "servable predicate must pass: {q:?}"
+            );
+        }
+        assert_eq!(refuse_quicksearch_query("kernel", "ALL"), None);
+    }
+
+    #[test]
+    fn quicksearch_gate_refuses_each_hidden_class() {
+        let cases: &[(&str, &str)] = &[
+            ("dependson:123", QUICKSEARCH_LINK_REFUSAL),
+            ("blocked:123", QUICKSEARCH_LINK_REFUSAL),
+            ("dup_id:123", QUICKSEARCH_LINK_REFUSAL),
+            ("see_also:123", QUICKSEARCH_LINK_REFUSAL),
+            ("cf_foo:123", QUICKSEARCH_LINK_REFUSAL),
+            ("CF_FOO:123", QUICKSEARCH_LINK_REFUSAL),
+            ("longdesc:secret", QUICKSEARCH_CONTENT_REFUSAL),
+            ("content:secret", QUICKSEARCH_CONTENT_REFUSAL),
+            ("attachdata:secret", QUICKSEARCH_ATTACHMENT_REFUSAL),
+            ("attachdesc:secret", QUICKSEARCH_ATTACHMENT_REFUSAL),
+            ("group:secret", QUICKSEARCH_VISIBILITY_REFUSAL),
+            ("flag:review", QUICKSEARCH_VISIBILITY_REFUSAL),
+            ("requestee:dev", QUICKSEARCH_VISIBILITY_REFUSAL),
+            (":secret", QUICKSEARCH_SHORTCUT_REFUSAL),
+            ("@dev", QUICKSEARCH_SHORTCUT_REFUSAL),
+            ("#secret", QUICKSEARCH_SHORTCUT_REFUSAL),
+            ("!regression", QUICKSEARCH_SHORTCUT_REFUSAL),
+            ("[secret", QUICKSEARCH_SHORTCUT_REFUSAL),
+            ("review?:dev", QUICKSEARCH_SHORTCUT_REFUSAL),
+            ("assignee:dev", QUICKSEARCH_ALIAS_REFUSAL),
+            ("owner:dev", QUICKSEARCH_ALIAS_REFUSAL),
+            ("kw:regression", QUICKSEARCH_ALIAS_REFUSAL),
+            ("whiteboard:tag", QUICKSEARCH_ALIAS_REFUSAL),
+            ("version:1.0", QUICKSEARCH_FIELD_REFUSAL),
+            ("assigned_to:dev", QUICKSEARCH_FIELD_REFUSAL),
+            ("keywords:regression", QUICKSEARCH_FIELD_REFUSAL),
+            ("prod:openSUSE", QUICKSEARCH_FIELD_REFUSAL),
+            ("dep:123", QUICKSEARCH_FIELD_REFUSAL),
+            ("product:\"unbalanced", QUICKSEARCH_PARSE_REFUSAL),
+            ("product:'unbalanced", QUICKSEARCH_PARSE_REFUSAL),
+        ];
+        for (q, text) in cases {
+            assert_eq!(
+                qs_refuse_expr(q),
+                Some(*text),
+                "query {q:?} must refuse as its class"
+            );
+            for t in [
+                QUICKSEARCH_LINK_REFUSAL,
+                QUICKSEARCH_CONTENT_REFUSAL,
+                QUICKSEARCH_ATTACHMENT_REFUSAL,
+                QUICKSEARCH_VISIBILITY_REFUSAL,
+                QUICKSEARCH_SHORTCUT_REFUSAL,
+                QUICKSEARCH_ALIAS_REFUSAL,
+                QUICKSEARCH_FIELD_REFUSAL,
+                QUICKSEARCH_PARSE_REFUSAL,
+            ] {
+                assert!(
+                    !t.contains("123") && !t.contains("secret") && !t.contains("dev"),
+                    "refusal names the class, never values"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quicksearch_gate_quoted_predicates_are_phrases() {
+        // The upstream parser does not look inside a quoted operand,
+        // so a quoted predicate is a phrase search, not a probe.
+        assert_eq!(qs_refuse_expr("\"product:openSUSE\""), None);
+        assert_eq!(qs_refuse_expr("\"dependson:123\""), None);
+        assert_eq!(
+            qs_refuse_expr("product:\"foo:bar\""),
+            None,
+            "a colon inside a quoted value is data"
+        );
+        assert_eq!(
+            qs_refuse_expr("product:\"foo|bar\""),
+            None,
+            "a pipe inside a quoted value is data"
+        );
+    }
+
+    #[test]
+    fn quicksearch_gate_checks_the_status_prefix_too() {
+        assert_eq!(
+            refuse_quicksearch_query("kernel", "dependson:123"),
+            Some(QUICKSEARCH_LINK_REFUSAL)
+        );
+        assert_eq!(
+            refuse_quicksearch_query("dependson:123", "ALL"),
+            Some(QUICKSEARCH_LINK_REFUSAL)
+        );
     }
 
     #[test]
