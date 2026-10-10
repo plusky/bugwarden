@@ -1399,10 +1399,13 @@ impl AuditSink {
                     // The gap record did not make it out either. The
                     // caller's record was never attempted, so it is lost
                     // with the rest and joins the count.
-                    state.dropped = state.dropped.saturating_add(1);
-                    state.gap_reason = err.gap_reason();
+                    // Mirror before counting: a lock-free gate
+                    // between these lines must over-report,
+                    // never miss a fresh loss.
                     self.failing_flag
                         .store(true, std::sync::atomic::Ordering::SeqCst);
+                    state.dropped = state.dropped.saturating_add(1);
+                    state.gap_reason = err.gap_reason();
                     self.log_failure(&mut state, &err);
                     return Err(err);
                 }
@@ -1411,10 +1414,13 @@ impl AuditSink {
         match self.write_event(&mut state, kind, session) {
             Ok(seq) => Ok(seq),
             Err(err) => {
-                state.dropped = state.dropped.saturating_add(1);
-                state.gap_reason = err.gap_reason();
+                // Mirror before counting: a lock-free gate
+                // between these lines must over-report,
+                // never miss a fresh loss.
                 self.failing_flag
                     .store(true, std::sync::atomic::Ordering::SeqCst);
+                state.dropped = state.dropped.saturating_add(1);
+                state.gap_reason = err.gap_reason();
                 self.log_failure(&mut state, &err);
                 Err(err)
             }
@@ -3652,6 +3658,45 @@ mod tests {
         check_while_locked(&sink, true);
         sink.record(sample_initialize(), session_stdio()).unwrap();
         assert!(!sink.failing(), "absorbed losses must clear");
+    }
+
+    #[test]
+    fn failing_never_misses_a_loss_under_concurrent_writes() {
+        // Fail-closed hammer: once a loss exists and writes keep
+        // failing, concurrent gate asks must never read healthy.
+        // Over-reporting is allowed; a miss is not. This pins the
+        // steady state under contention, not the store/count order
+        // itself: that window sits inside the state lock and is too
+        // narrow for a hammer to hit, so the order is pinned by
+        // inspection plus the promptness test above.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path().join("audit.jsonl"));
+        let sink = Arc::new(AuditSink::open(cfg).unwrap());
+        sink.set_fail_writes(true);
+        sink.record(sample_initialize(), session_stdio())
+            .unwrap_err();
+        assert!(sink.failing(), "the first loss must read failing");
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let sink = Arc::clone(&sink);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let _ = sink.record(sample_initialize(), session_stdio());
+                }
+            })
+        };
+        for _ in 0..10_000 {
+            assert!(
+                sink.failing(),
+                "gate must not miss losses recorded concurrently"
+            );
+        }
+        stop.store(true, Ordering::SeqCst);
+        writer.join().expect("writer joins");
     }
 
     /// An exporter that proves the file write PRECEDES the hand-off: at
