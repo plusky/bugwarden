@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 
 use crate::client::{BugzillaClient, CLASSIFY_FIELDS};
@@ -84,6 +84,8 @@ pub struct SearchRequest<'a> {
     pub limit: u32,
     /// How many visible bugs to skip.
     pub offset: u32,
+    /// Only bugs changed since then; narrows upstream rows.
+    pub changed_since: Option<DateTime<Utc>>,
 }
 
 /// What one [`Guard::quicksearch_window`] scan produced: the window the
@@ -334,6 +336,7 @@ impl Guard {
             include_fields,
             limit,
             offset,
+            changed_since,
         } = *req;
         let needed = offset.saturating_add(limit).min(Self::MAX_SEARCH_WINDOW);
         if limit == 0 || needed == 0 {
@@ -368,7 +371,15 @@ impl Guard {
             // in guard_wiremock.rs.
             let chunk = Self::SEARCH_SCAN_CHUNK.min(Self::SEARCH_SCAN_MAX - scanned);
             let envelope = bz
-                .quicksearch(key, query, status, include_fields, chunk, scanned)
+                .quicksearch(
+                    key,
+                    query,
+                    status,
+                    include_fields,
+                    chunk,
+                    scanned,
+                    changed_since,
+                )
                 .await?;
             let rows: Vec<Value> = envelope
                 .get("bugs")

@@ -1253,6 +1253,156 @@ async fn quicksearch_advisory_wording_tracks_status_and_id_count() {
 }
 
 #[tokio::test]
+async fn quicksearch_changed_since_reaches_upstream_as_last_change_time() {
+    // A watch narrows upstream rows: the timestamp travels as
+    // Bugzilla `last_change_time`, and without it no such key
+    // is sent.
+    let mock = MockServer::start().await;
+    mount_search(&mock, vec![world_readable_bug(101)]).await;
+    let client = client_for("", &mock).await;
+
+    let result = call(
+        &client,
+        "bugs_quicksearch",
+        json!({ "query": "kernel", "changed_since": "2026-01-02T00:00:00Z" }),
+    )
+    .await;
+    assert!(!is_error(&result), "search failed: {}", text_of(&result));
+
+    let searches: Vec<_> = mock
+        .received_requests()
+        .await
+        .expect("the mock records requests")
+        .into_iter()
+        .filter(|r| r.url.query_pairs().any(|(k, _)| k == "quicksearch"))
+        .collect();
+    assert!(!searches.is_empty(), "the scan must reach upstream");
+    for r in &searches {
+        let sent = r
+            .url
+            .query_pairs()
+            .find(|(k, _)| k == "last_change_time")
+            .map(|(_, v)| v.into_owned());
+        assert_eq!(
+            sent.as_deref(),
+            Some("2026-01-02T00:00:00Z"),
+            "every scan request carries the watch timestamp"
+        );
+    }
+
+    let before = mock
+        .received_requests()
+        .await
+        .expect("the mock records requests")
+        .len();
+    let plain = call(&client, "bugs_quicksearch", json!({ "query": "kernel" })).await;
+    assert!(!is_error(&plain), "search failed: {}", text_of(&plain));
+    let fresh: Vec<_> = mock
+        .received_requests()
+        .await
+        .expect("the mock records requests")
+        .into_iter()
+        .skip(before)
+        .filter(|r| r.url.query_pairs().any(|(k, _)| k == "quicksearch"))
+        .collect();
+    assert!(!fresh.is_empty(), "the plain scan must reach upstream");
+    for r in &fresh {
+        assert!(
+            r.url.query_pairs().all(|(k, _)| k != "last_change_time"),
+            "without the param the scan sends no such key"
+        );
+    }
+}
+
+#[tokio::test]
+async fn quicksearch_changed_since_leaves_filtering_and_refusal_untouched() {
+    // The filter narrows what upstream returns; the guard still
+    // classifies every returned row the same way, so the served
+    // bytes do not move with the param. The predicate gate reads
+    // only query and status, so a refusal does not move either.
+    let rows = {
+        let mut hidden = world_readable_bug(102);
+        hidden["product"] = json!("SecretSauce");
+        vec![world_readable_bug(101), hidden]
+    };
+    let plain_mock = MockServer::start().await;
+    mount_search(&plain_mock, rows.clone()).await;
+    let plain_client = client_for(HIDE_SECRET_POLICY, &plain_mock).await;
+    let without = call(
+        &plain_client,
+        "bugs_quicksearch",
+        json!({ "query": "kernel" }),
+    )
+    .await;
+    assert!(!is_error(&without), "search failed: {}", text_of(&without));
+
+    let watch_mock = MockServer::start().await;
+    mount_search(&watch_mock, rows).await;
+    let watch_client = client_for(HIDE_SECRET_POLICY, &watch_mock).await;
+    let with = call(
+        &watch_client,
+        "bugs_quicksearch",
+        json!({ "query": "kernel", "changed_since": "2026-01-02T00:00:00Z" }),
+    )
+    .await;
+    assert!(!is_error(&with), "search failed: {}", text_of(&with));
+    assert_eq!(
+        serde_json::to_string(&with).unwrap(),
+        serde_json::to_string(&without).unwrap(),
+        "filtering serves byte-identical envelopes with or without the param"
+    );
+    let watch_searches: Vec<_> = watch_mock
+        .received_requests()
+        .await
+        .expect("the mock records requests")
+        .into_iter()
+        .filter(|r| r.url.query_pairs().any(|(k, _)| k == "quicksearch"))
+        .collect();
+    assert!(!watch_searches.is_empty(), "the watch must reach upstream");
+    for r in &watch_searches {
+        assert!(
+            r.url
+                .query_pairs()
+                .any(|(k, v)| k == "last_change_time" && v == "2026-01-02T00:00:00Z"),
+            "the param took effect upstream"
+        );
+    }
+
+    // The predicate gate refuses before any request, with or
+    // without the param: it reads only query and status.
+    let gate_mock = MockServer::start().await;
+    mount_search(&gate_mock, vec![world_readable_bug(101)]).await;
+    let gate_client = client_for(HIDE_SECRET_POLICY, &gate_mock).await;
+    let refused = call(
+        &gate_client,
+        "bugs_quicksearch",
+        json!({ "query": "longdesc:secret" }),
+    )
+    .await;
+    assert!(is_error(&refused));
+    assert_eq!(
+        text_of(&refused),
+        "Quicksearch content predicates are not searchable through this server"
+    );
+    let refused_watch = call(
+        &gate_client,
+        "bugs_quicksearch",
+        json!({ "query": "longdesc:secret", "changed_since": "2026-01-02T00:00:00Z" }),
+    )
+    .await;
+    assert!(is_error(&refused_watch));
+    assert_eq!(
+        text_of(&refused_watch),
+        text_of(&refused),
+        "the gate refusal is byte-identical with the param"
+    );
+    assert!(
+        gate_mock.received_requests().await.unwrap().is_empty(),
+        "a refused query costs zero requests either way"
+    );
+}
+
+#[tokio::test]
 async fn add_attachment_comment_travels_as_a_plain_string() {
     // Bug.add_attachment documents `comment` as a plain string — NOT the
     // `{"comment": {"body": ...}}` shape Bug.update uses. The body matcher

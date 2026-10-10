@@ -1831,6 +1831,74 @@ async fn quicksearch_response_is_byte_identical_whether_or_not_rows_were_dropped
 }
 
 #[tokio::test]
+async fn quicksearch_changed_since_empty_page_ends_the_scan_in_one_request() {
+    // An unchanged watch: the first upstream page is empty, so the
+    // scan stops after that one request and serves an empty list.
+    // The request carries the watch timestamp upstream, and the
+    // record carries the param by value.
+    let mock = MockServer::start().await;
+    mount_search_corpus(&mock, vec![]).await;
+    let audited = audited_client_for("", &mock, "test-key").await;
+
+    let before = upstream_hits(&mock).await;
+    let result = call(
+        &audited.client,
+        "bugs_quicksearch",
+        json!({ "query": "kernel", "changed_since": "2099-01-01T00:00:00Z" }),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "the watch is served");
+    let text: String = result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text())
+        .map(|t| t.text.as_str())
+        .collect();
+    let envelope: Value = serde_json::from_str(&text).expect("the watch returns JSON");
+    assert_eq!(
+        envelope,
+        json!({ "bugs": [] }),
+        "no change is an empty list"
+    );
+
+    let received = mock
+        .received_requests()
+        .await
+        .expect("the mock records requests");
+    let searches: Vec<_> = received[before..]
+        .iter()
+        .filter(|r| r.url.query_pairs().any(|(k, _)| k == "quicksearch"))
+        .collect();
+    assert_eq!(searches.len(), 1, "the scan ends on the first empty page");
+    assert!(
+        searches[0]
+            .url
+            .query_pairs()
+            .any(|(k, v)| k == "last_change_time" && v == "2099-01-01T00:00:00Z"),
+        "the one scan request carries the watch timestamp"
+    );
+
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    let hits = upstream_hits(&mock).await - before;
+    assert_eq!(
+        tc.upstream.map_or(0, |u| u.requests) as usize,
+        hits,
+        "the record counts every upstream request it made: {:?}",
+        tc.upstream
+    );
+    assert_eq!(
+        hits, 2,
+        "one scan page plus the link-disclosure padding fetch every search pays"
+    );
+    assert_eq!(
+        tc.request.params["changed_since"],
+        json!("2099-01-01T00:00:00Z"),
+        "an allowlisted param is recorded by value"
+    );
+}
+
+#[tokio::test]
 async fn quicksearch_group_by_reshapes_the_envelope_and_nothing_in_the_record() {
     // Issue #143: grouping runs after the audit block, so a grouped call and
     // a flat call over the same window must record the same guard info —

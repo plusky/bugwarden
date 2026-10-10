@@ -108,6 +108,7 @@ async fn profile_hot_paths() {
                 include_fields: "id,summary,product,component,status,groups,creation_time,blocks,depends_on,see_also",
                 limit: 50,
                 offset: 0,
+                changed_since: None,
             },
             None,
         )
@@ -185,6 +186,7 @@ async fn profile_hot_paths() {
                 include_fields: "id,summary,product,groups,creation_time",
                 limit: 50,
                 offset: 0,
+                changed_since: None,
             },
             None,
         )

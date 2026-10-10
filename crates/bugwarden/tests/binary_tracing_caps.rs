@@ -1268,7 +1268,7 @@ async fn a_client_field_can_neither_end_a_stderr_line_nor_open_one() {
 /// and its boundary is the writer's. Three assertions, because each
 /// alone can be met by accident: the whole of the client's text reads
 /// back as ONE field, the `status` past that field's closing quote is
-/// the server's own `ALL`, and the line's KEYS are the six the server
+/// the server's own `ALL`, and the line's KEYS are the seven the server
 /// named. The second probe carries a `"` and a trailing `\` so the
 /// rendered value ends in an escaped backslash immediately before its
 /// closing quote — the case a reader that only looks at the preceding
@@ -1306,6 +1306,7 @@ async fn a_client_field_cannot_forge_a_later_field_on_its_own_line() {
                 "include_fields",
                 "limit",
                 "offset",
+                "changed_since",
                 "group_by"
             ],
             "and the line's fields are the server's own, in its own order: {line}"

@@ -687,6 +687,7 @@ fn search(query: &str, limit: u32, offset: u32) -> SearchRequest<'_> {
         include_fields: "id",
         limit,
         offset,
+        changed_since: None,
     }
 }
 
