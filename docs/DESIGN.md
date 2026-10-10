@@ -3285,7 +3285,9 @@ wired, `server.rs` and `main.rs` are the reference.
 
   **Log levels — the rule.** ERROR is for what an operator must act on and
   a client cannot repeat at will; a per-request failure a client can cause
-  on demand is WARN. A panic is a server bug an operator must learn about,
+  on demand is WARN. A successful outcome that is the designed answer to
+  a client-triggerable request is INFO, however often a client can
+  repeat it (#320). A panic is a server bug an operator must learn about,
   once — so the hook's FIRST line in a process is ERROR and every later
   one is WARN, same text and same fields, an `AtomicBool::swap` deciding
   which. A deployment that pages on ERROR is therefore paged once for a
