@@ -104,6 +104,23 @@ async fn main() -> anyhow::Result<()> {
     // open after the preflight, below, exactly as before.
     let sinks = select_sinks(cli.audit_config.as_deref(), otel_config.is_some())?;
 
+    // The audit document itself, parsed here — still pure: reading and
+    // validating the TOML touches no directory and no audit file, so a
+    // malformed document refuses before the preflight and the OTLP probe
+    // below. Opening the sink stays where it is, after them.
+    let audit_cfg = match sinks {
+        SinkSelection::FileOnly | SinkSelection::Both => {
+            match cli.audit_config.as_deref() {
+                Some(path) => AuditConfig::load(path)?,
+                // Unreachable: `select_sinks` returns a file-bearing
+                // selection only for a real path. Refuse rather than
+                // panic, like the http bearer gate below.
+                None => anyhow::bail!("internal error: a file-bearing sink selection has no path"),
+            }
+        }
+        _ => AuditConfig::fileless(),
+    };
+
     // Guard policy comes ONLY from the TOML file given at startup (I1);
     // without one the built-in default policy applies.
     let mut policy = match &cli.policy {
@@ -163,20 +180,8 @@ async fn main() -> anyhow::Result<()> {
     let audit_sink = match sinks {
         SinkSelection::NoAudit => None,
         SinkSelection::FileOnly | SinkSelection::Both | SinkSelection::OtlpOnly => {
-            let audit_cfg = match sinks {
-                SinkSelection::FileOnly | SinkSelection::Both => {
-                    match cfg.audit_config.as_deref() {
-                        Some(path) => AuditConfig::load(path)?,
-                        // Unreachable: `select_sinks` returns a file-bearing
-                        // selection only for a real path. Refuse rather than
-                        // panic, like the http bearer gate below.
-                        None => anyhow::bail!(
-                            "internal error: a file-bearing sink selection has no path"
-                        ),
-                    }
-                }
-                _ => AuditConfig::fileless(),
-            };
+            // Parsed above, before the preflight and the OTLP probe;
+            // opening the sink is what creates the directory and file.
             let transport = match cfg.transport {
                 Transport::Stdio => TransportKind::Stdio,
                 Transport::Http => TransportKind::Http,
