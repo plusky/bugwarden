@@ -434,16 +434,47 @@ jobs:
           # The build digest is an index (provenance mode=max wraps the
           # image); a single-platform pull resolves to the child, which no
           # attestation covers yet. Resolve it for the ride-along below.
-          manifest="$(docker buildx imagetools inspect "ghcr.io/plusky/bugwarden@${{ steps.build.outputs.digest }}" --format '{{json .Manifest}}')"
-          arch="${{ matrix.platform }}"
-          arch="${arch##*/}"
-          digest="$(jq -r --arg arch "$arch" '(.manifests // []) | map(select(.platform.architecture == $arch)) | .[0].digest // empty' <<<"$manifest")"
-          if [ -z "$digest" ]; then
-            # Single-manifest push (no index): the digest is the image.
+          # Match os+arch+variant, skipping attestation manifests (no
+          # platform.arch). An empty spec variant matches any entry variant
+          # (ghcr.io records arm64 as v8).
+          platform="${{ matrix.platform }}"
+          os="${platform%%/*}"
+          arch_variant="${platform#*/}"
+          arch="${arch_variant%%/*}"
+          variant=""
+          if [[ "$arch_variant" == */* ]]; then
+            variant="${arch_variant#*/}"
+          fi
+          manifest=""
+          for attempt in 1 2 3; do
+            if manifest="$(docker buildx imagetools inspect "ghcr.io/plusky/bugwarden@${{ steps.build.outputs.digest }}" --format '{{json .Manifest}}')" && [ -n "$manifest" ]; then
+              break
+            fi
+            manifest=""
+            echo "::warning::inspect attempt ${attempt}/3 has no manifest yet"
+            case "$attempt" in 1) sleep 10;; 2) sleep 30;; esac
+          done
+          if [ -z "$manifest" ]; then
+            echo "::error::cannot inspect ${{ steps.build.outputs.digest }}"
+            exit 1
+          fi
+          digest="$(jq -r --arg os "$os" --arg arch "$arch" --arg variant "$variant" \
+            '(.manifests // []) | map(select((.platform // null) != null
+              and ((.annotations // {})["vnd.docker.reference.type"] // "") != "attestation-manifest"
+              and .platform.os == $os and .platform.architecture == $arch
+              and ($variant == "" or ((.platform.variant // "") == $variant)))) | .[0].digest // empty' <<<"$manifest")"
+          if jq -e 'has("manifests")' <<<"$manifest" >/dev/null; then
+            # Index shape: the child must have matched above, else fail.
+            if [ -z "$digest" ]; then
+              echo "::error::cannot resolve ${{ matrix.platform }} child of ${{ steps.build.outputs.digest }}"
+              exit 1
+            fi
+          else
+            # Single-manifest shape only: the digest is the image.
             digest="$(jq -r '.digest // empty' <<<"$manifest")"
           fi
-          if [ -z "$digest" ] || [ "$digest" = "null" ]; then
-            echo "::error::cannot resolve $arch child of ${{ steps.build.outputs.digest }}"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::cannot resolve ${{ matrix.platform }} child of ${{ steps.build.outputs.digest }}"
             exit 1
           fi
           echo "digest=$digest" >>"$GITHUB_OUTPUT"
@@ -456,6 +487,29 @@ jobs:
           subject-name: ghcr.io/plusky/bugwarden
           subject-digest: ${{ steps.platform.outputs.digest }}
           push-to-registry: true
+
+      - name: Verify the platform image attestation
+        # Digest-pinned gate before smoke: a missing attestation fails here
+        # instead of after burning runner minutes on an unverifiable image.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="${{ steps.platform.outputs.digest }}"
+          ok=0
+          for attempt in 1 2 3; do
+            if gh attestation verify "oci://ghcr.io/plusky/bugwarden@${digest}" --repo plusky/bugwarden; then
+              ok=1
+              break
+            fi
+            echo "::warning::platform attestation not visible yet (attempt ${attempt}/3)"
+            case "$attempt" in 1) sleep 10;; 2) sleep 30;; esac
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::error::no attestation for ghcr.io/plusky/bugwarden@${digest}"
+            exit 1
+          fi
 
       - name: Pull the pushed image by digest
         shell: bash
@@ -538,6 +592,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Create and push the multi-arch manifest
+        id: create
         working-directory: /tmp/digests
         shell: bash
         run: |
@@ -548,32 +603,70 @@ jobs:
           if [[ "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             tags+=(-t ghcr.io/plusky/bugwarden:latest)
           fi
+          # Attest the create result, never a re-resolved tag (TOCTOU). The
+          # file is the documented source (docker/buildx#2407/#3638: push
+          # mode prints no digest; progress goes to stderr); a stdout digest,
+          # if any, must match it, and inspect below only cross-checks.
+          meta="$(mktemp)"
           # shellcheck disable=SC2046  # splitting the digest list is intended
-          docker buildx imagetools create "${tags[@]}" \
-            $(printf 'ghcr.io/plusky/bugwarden@sha256:%s ' *)
+          out="$(docker buildx imagetools create --metadata-file "$meta" \
+            "${tags[@]}" $(printf 'ghcr.io/plusky/bugwarden@sha256:%s ' *))"
+          stdout_digest="$(grep -E -o -m1 'sha256:[0-9a-f]{64}' <<<"$out" || true)"
+          created="$(jq -r '.["containerimage.descriptor"].digest // empty' "$meta")"
+          rm -f "$meta"
+          if [[ ! "$created" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::imagetools create reported no digest"
+            exit 1
+          fi
+          if [ -n "$stdout_digest" ] && [ "$stdout_digest" != "$created" ]; then
+            echo "::error::stdout digest $stdout_digest != metadata digest $created"
+            exit 1
+          fi
+          echo "digest=$created" >>"$GITHUB_OUTPUT"
       - name: Inspect the published manifest
         shell: bash
         run: |
           set -euo pipefail
-          docker buildx imagetools inspect "ghcr.io/plusky/bugwarden:$GITHUB_REF_NAME"
-      - name: Resolve the tag digest
+          for attempt in 1 2 3; do
+            if docker buildx imagetools inspect "ghcr.io/plusky/bugwarden:$GITHUB_REF_NAME"; then
+              exit 0
+            fi
+            echo "::warning::inspect attempt ${attempt}/3 failed"
+            case "$attempt" in 1) sleep 10;; 2) sleep 30;; esac
+          done
+          echo "::error::cannot inspect ghcr.io/plusky/bugwarden:$GITHUB_REF_NAME"
+          exit 1
+      - name: Resolve and cross-check the tag digest
         id: tag
         shell: bash
         run: |
           set -euo pipefail
-          digest="$(docker buildx imagetools inspect "ghcr.io/plusky/bugwarden:$GITHUB_REF_NAME" --format '{{json .Manifest}}' | jq -r .digest)"
-          if [ -z "$digest" ] || [ "$digest" = "null" ]; then
-            echo "::error::cannot resolve tag digest"
+          # Equality cross-check only: the attested digest comes from the
+          # create step, never from this re-resolution.
+          created="${{ steps.create.outputs.digest }}"
+          current=""
+          for attempt in 1 2 3; do
+            current="$(docker buildx imagetools inspect "ghcr.io/plusky/bugwarden:$GITHUB_REF_NAME" --format '{{json .Manifest}}' | jq -r '.digest // empty' || true)"
+            if [[ "$current" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              break
+            fi
+            current=""
+            echo "::warning::inspect attempt ${attempt}/3 has no digest yet"
+            case "$attempt" in 1) sleep 10;; 2) sleep 30;; esac
+          done
+          if [ "$current" != "$created" ]; then
+            echo "::error::tag digest moved: created $created but tag now ${current:-<none>}"
             exit 1
           fi
-          echo "digest=$digest" >>"$GITHUB_OUTPUT"
+          echo "digest=$current" >>"$GITHUB_OUTPUT"
       - name: Attest the tag digest
-        # The tag exists briefly before its provenance here; the verify step
-        # below fails the job when the attestation never lands.
+        # Attests the create result: the cross-check above asserted it still
+        # equals the tag. The tag exists briefly before its provenance here;
+        # the verify step below fails the job when the attestation lands late.
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
           subject-name: ghcr.io/plusky/bugwarden
-          subject-digest: ${{ steps.tag.outputs.digest }}
+          subject-digest: ${{ steps.create.outputs.digest }}
           push-to-registry: true
       - name: Verify the tag attestation
         env:
@@ -581,15 +674,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          attested="${{ steps.tag.outputs.digest }}"
-          current="$(docker buildx imagetools inspect "ghcr.io/plusky/bugwarden:$GITHUB_REF_NAME" --format '{{json .Manifest}}' | jq -r .digest)"
-          if [ "$current" != "$attested" ]; then
-            echo "::error::tag digest moved: attested $attested but tag now $current"
+          digest="${{ steps.tag.outputs.digest }}"
+          ok=0
+          for attempt in 1 2 3; do
+            if gh attestation verify "oci://ghcr.io/plusky/bugwarden@${digest}" --repo plusky/bugwarden; then
+              ok=1
+              break
+            fi
+            echo "::warning::tag attestation not visible yet (attempt ${attempt}/3)"
+            case "$attempt" in 1) sleep 10;; 2) sleep 30;; esac
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::error::no attestation for ghcr.io/plusky/bugwarden@${digest}"
             exit 1
           fi
-          gh attestation verify "oci://ghcr.io/plusky/bugwarden:$GITHUB_REF_NAME" --repo plusky/bugwarden
+          # Informational only: tag lookups resolve to the same digest.
+          gh attestation verify "oci://ghcr.io/plusky/bugwarden:$GITHUB_REF_NAME" --repo plusky/bugwarden \
+            || echo "::warning::tag lookup missed; digest-pinned verify above is the gate"
           if [[ "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            gh attestation verify oci://ghcr.io/plusky/bugwarden:latest --repo plusky/bugwarden
+            gh attestation verify oci://ghcr.io/plusky/bugwarden:latest --repo plusky/bugwarden \
+              || echo "::warning::latest lookup missed; digest-pinned verify above is the gate"
           fi
 
   publish:
