@@ -803,3 +803,227 @@ async fn without_an_endpoint_nothing_is_exported() {
         "with export off the collector must never be contacted"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Byte-bound batching
+// ---------------------------------------------------------------------------
+
+use bugwarden::audit::AuditExport;
+
+/// Session for pipeline-direct tests, with a stable id.
+fn direct_session() -> bugwarden::audit::SessionInfo {
+    bugwarden::audit::SessionInfo {
+        id: Some("sess-direct".to_owned()),
+        transport: bugwarden::audit::TransportKind::Http,
+        remote: Some("192.0.2.7:52611".to_owned()),
+    }
+}
+
+/// One tool-call kind for pipeline-direct tests.
+fn direct_tool_call() -> bugwarden::audit::AuditEventKind {
+    bugwarden::audit::AuditEventKind::ToolCall(Box::new(bugwarden::audit::ToolCallEvent {
+        client: bugwarden::audit::ClientInfo {
+            name: Some("agent".to_owned()),
+            version: None,
+            principal: None,
+            work_context: None,
+        },
+        trace: None,
+        request: bugwarden::audit::RequestInfo {
+            tool: "bug_info".to_owned(),
+            id: Some("3".to_owned()),
+            params: BTreeMap::new(),
+        },
+        guard: Some(bugwarden::audit::GuardInfo {
+            verdict: bugwarden::audit::Verdict::Denied,
+            rule: Some("embargo".to_owned()),
+            policy_hash: None,
+            suppressed_ids_count: 1,
+            suppressed_other_count: 0,
+            suppressed_ids: vec![7],
+            redacted_fields: Vec::new(),
+            scan: None,
+        }),
+        upstream: None,
+        outcome: bugwarden::audit::OutcomeInfo {
+            class: bugwarden::audit::OutcomeClass::Ok,
+            duration_ms: 3,
+            response_bytes: Some(87),
+        },
+    }))
+}
+
+/// One audit event for pipeline-direct tests.
+fn direct_event(seq: u64) -> bugwarden::audit::AuditEvent {
+    bugwarden::audit::AuditEvent {
+        v: bugwarden::audit::SCHEMA_VERSION,
+        ts: "2026-08-18T00:00:00.000Z".to_owned(),
+        seq,
+        session: direct_session(),
+        kind: direct_tool_call(),
+    }
+}
+
+/// Wait until the collector holds `want` records in total.
+async fn wait_for_records(collector: &MockServer, want: usize) -> Vec<Record> {
+    for _ in 0..100 {
+        let requests = collector
+            .received_requests()
+            .await
+            .expect("request recording is on");
+        let records: Vec<Record> = requests
+            .iter()
+            .flat_map(|r| decode_records(&r.body))
+            .collect();
+        if records.len() >= want {
+            return records;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("collector did not receive {want} records in time");
+}
+
+#[tokio::test]
+async fn byte_bound_splits_many_small_records_into_multiple_posts() {
+    // Many small records that together exceed the byte bound
+    // must arrive as several posts, even though the count is
+    // far below the 512 limit.
+    let collector = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/logs"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&collector)
+        .await;
+    let cfg = bugwarden::otel::resolve(&OtelEnv {
+        endpoint: Some(collector.uri()),
+        ..OtelEnv::default()
+    })
+    .expect("endpoint resolves")
+    .expect("export is on");
+    let pipeline = Arc::new(Pipeline::start(cfg).expect("pipeline starts"));
+    let total: usize = 40;
+    let line_size: usize = 128 * 1024;
+    for seq in 0..(total as u64) {
+        let event = direct_event(seq);
+        let line = vec![b'x'; line_size];
+        pipeline
+            .accept(&event, &line)
+            .expect("open queue takes custody");
+    }
+    let records = wait_for_records(&collector, total).await;
+    assert_eq!(
+        records.len(),
+        total,
+        "every accepted record must be delivered"
+    );
+    let requests = collector
+        .received_requests()
+        .await
+        .expect("request recording is on");
+    assert!(
+        requests.len() >= 2,
+        "byte bound must split below the count limit: got {} posts",
+        requests.len()
+    );
+    for request in &requests {
+        assert!(
+            request.body.len() <= 4 * 1024 * 1024,
+            "each post must respect the byte bound: got {} bytes",
+            request.body.len()
+        );
+    }
+    assert_eq!(pipeline.take_lost(), 0, "split batches are not lost");
+    assert!(!pipeline.delivery_failing(), "split delivery stays healthy");
+    pipeline.shutdown().await;
+}
+
+#[tokio::test]
+async fn oversized_single_record_posts_alone() {
+    // One record larger than the byte bound must post by
+    // itself, so a refusal can only lose what caused it.
+    let collector = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/logs"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&collector)
+        .await;
+    let cfg = bugwarden::otel::resolve(&OtelEnv {
+        endpoint: Some(collector.uri()),
+        ..OtelEnv::default()
+    })
+    .expect("endpoint resolves")
+    .expect("export is on");
+    let pipeline = Arc::new(Pipeline::start(cfg).expect("pipeline starts"));
+    let small = vec![b's'; 1024];
+    let large = vec![b'L'; 5 * 1024 * 1024];
+    pipeline
+        .accept(&direct_event(1), &small)
+        .expect("open queue takes custody");
+    pipeline
+        .accept(&direct_event(2), &small)
+        .expect("open queue takes custody");
+    pipeline
+        .accept(&direct_event(3), &large)
+        .expect("open queue takes custody");
+    let records = wait_for_records(&collector, 3).await;
+    assert_eq!(records.len(), 3, "every record must be delivered");
+    let requests = collector
+        .received_requests()
+        .await
+        .expect("request recording is on");
+    assert_eq!(
+        requests.len(),
+        2,
+        "oversized record must post alone, small together: got {}",
+        requests.len()
+    );
+    let mut sizes: Vec<usize> = requests
+        .iter()
+        .map(|r| decode_records(&r.body).len())
+        .collect();
+    sizes.sort_unstable();
+    assert_eq!(sizes, vec![1, 2], "one lone post and one pair");
+    let large_alone = requests.iter().any(|r| {
+        let recs = decode_records(&r.body);
+        recs.len() == 1 && recs[0].body.len() == large.len()
+    });
+    assert!(large_alone, "large record must arrive alone");
+    assert_eq!(pipeline.take_lost(), 0, "no loss on split posts");
+    pipeline.shutdown().await;
+}
+
+#[tokio::test]
+async fn collector_413_counts_as_delivered_without_gap() {
+    // A collector answering 413 refuses one body rather than
+    // failing delivery: no loss, no gap, gate stays open.
+    let mock = MockServer::start().await;
+    mount_bugzilla(&mock).await;
+    let collector = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/logs"))
+        .respond_with(ResponseTemplate::new(413))
+        .mount(&collector)
+        .await;
+    let served = exporting_server(&mock, Some(&collector.uri())).await;
+    let first = call(&served.client, "bug_info", json!({ "bug_ids": [7] }), None).await;
+    assert_ne!(first.is_error, Some(true), "open mode keeps serving");
+    let second = call(&served.client, "bug_info", json!({ "bug_ids": [7] }), None).await;
+    assert_ne!(second.is_error, Some(true), "open mode keeps serving");
+    exported(&collector).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let pipeline = served.pipeline.clone().expect("export is on");
+    assert_eq!(pipeline.take_lost(), 0, "a 413 batch is not lost");
+    assert!(!pipeline.delivery_failing(), "a 413 answer is not outage");
+    assert!(!served.audit.sink.failing(), "sink stays healthy on 413");
+    let lines = audit_lines(served.file());
+    assert!(
+        lines.iter().any(|l| l.contains("\"event\":\"tool_call\"")),
+        "records still reach the file: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("\"event\":\"audit_gap\"")),
+        "a 413 batch must not produce a gap: {lines:?}"
+    );
+    assert_eq!(pipeline.dropped(), 0, "audit never rides drop counter");
+    pipeline.shutdown().await;
+}
