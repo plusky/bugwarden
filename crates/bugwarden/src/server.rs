@@ -605,6 +605,7 @@ const PARAM_ALLOWLIST: &[&str] = &[
     "limit",
     "max_chars",
     "max_comment_chars",
+    "changed_since",
     "new_since",
     "offset",
     "on_bug_entry_only",
@@ -2582,12 +2583,21 @@ pub struct QuicksearchParams {
     /// Comma-separated list of fields to return for each bug.
     #[serde(default = "default_include_fields")]
     pub include_fields: String,
-    /// Maximum number of bugs to return.
+    /// Maximum number of bugs to return. Honoured up to
+    /// MAX_SEARCH_WINDOW (1000) and silently clamped above;
+    /// a page short of limit is not the end of results.
+    /// Prefer a lean include_fields over paging.
     #[serde(default = "default_limit")]
     pub limit: u32,
-    /// Offset into the result list (for pagination).
+    /// Offset into the result list (for pagination). Prefer one
+    /// call with a large limit over an offset walk: the walk
+    /// re-scans from row zero, so it costs one turn per page.
+    /// A page short of limit is not the end of results.
     #[serde(default)]
     pub offset: u32,
+    /// Only return bugs changed since this date.
+    #[serde(default)]
+    pub changed_since: Option<DateTime<Utc>>,
     /// Optional comma-separated list of fields to group the results by:
     /// product, component, status, resolution, severity, priority. Omit it
     /// (or send an empty string) for a flat `{"bugs": [...]}` response.
@@ -3915,7 +3925,7 @@ impl BugWarden {
     }
 
     #[tool(
-        description = "Search bugs by CONTENT using bugzilla's quicksearch syntax (full-text matching over bug summaries and text). The status filter is prefixed to the query expression, and under any non-empty status (the default is ALL) a number in the query is matched as text like any other word — it returns bugs that merely MENTION that number, not an id lookup. The one exception: an empty status sends the query to bugzilla bare, and bugzilla treats a bare query of nothing but numbers as an exact id lookup. Either way, for an exact set of known bug ids call bug_info with its bug_ids array instead: every requested id comes back either as a bug or under 'restricted', so an inaccessible id is reported rather than silently missing from a search.\n\nTo reduce the token limit & response time, only returns a subset of fields for each bug. The user can query full details of each bug using the bug_info tool. Returns the top-level bug data envelope containing the matched bugs.\n\nSet group_by to a comma-separated list of product, component, status, resolution, severity or priority to get {'groups': [{'bugs': [...], <field>: <value>, ...}]} instead of a flat bug list: each grouped field is then reported once per group rather than once per bug. Worth doing only when the results share few distinct values for those fields — grouping a heterogeneous result set by several fields at once makes the response LARGER, since a group holding one bug costs more than the fields it saved. Omit group_by for the flat response.",
+        description = "Search bugs by CONTENT using bugzilla's quicksearch syntax (full-text matching over bug summaries and text). The status filter is prefixed to the query expression, and under any non-empty status (the default is ALL) a number in the query is matched as text like any other word — it returns bugs that merely MENTION that number, not an id lookup. The one exception: an empty status sends the query to bugzilla bare, and bugzilla treats a bare query of nothing but numbers as an exact id lookup. Either way, for an exact set of known bug ids call bug_info with its bug_ids array instead: every requested id comes back either as a bug or under 'restricted', so an inaccessible id is reported rather than silently missing from a search.\n\nTo reduce the token limit & response time, only returns a subset of fields for each bug. The user can query full details of each bug using the bug_info tool. Returns the top-level bug data envelope containing the matched bugs.\n\nPass changed_since with the previous poll's timestamp to watch for changes: an unchanged watch costs one upstream search request and returns an empty bug list.\n\nPaging: limit is honoured up to MAX_SEARCH_WINDOW (1000) and silently clamped above — prefer one call with a large limit and a lean include_fields over an offset walk, which costs one turn instead of N+1; a page short of limit is not the end of results, only an empty page is.\n\nSet group_by to a comma-separated list of product, component, status, resolution, severity or priority to get {'groups': [{'bugs': [...], <field>: <value>, ...}]} instead of a flat bug list: each grouped field is then reported once per group rather than once per bug. Worth doing only when the results share few distinct values for those fields — grouping a heterogeneous result set by several fields at once makes the response LARGER, since a group holding one bug costs more than the fields it saved. Omit group_by for the flat response.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn bugs_quicksearch(
@@ -3929,6 +3939,7 @@ impl BugWarden {
             include_fields = ?Capped(&p.include_fields),
             limit = p.limit,
             offset = p.offset,
+            changed_since = ?p.changed_since,
             group_by = ?Capped(p.group_by.as_deref().unwrap_or("")),
             "tool: bugs_quicksearch"
         );
@@ -3990,6 +4001,7 @@ impl BugWarden {
                     include_fields: &fetch_fields,
                     limit: p.limit,
                     offset: p.offset,
+                    changed_since: p.changed_since,
                 },
                 caller.as_deref(),
             )
@@ -5849,7 +5861,13 @@ impl ServerHandler for BugWarden {
                  view (marked with '_redacted'), and some operations may be \
                  refused. A reply that a bug 'is not accessible through this \
                  server' is final; it does not indicate whether the bug \
-                 exists, and retrying will not help."
+                 exists, and retrying will not help. Every call completes in \
+                 its one reply and there is nothing to poll: a failure reply \
+                 gives no cause by design and the same call gets the same \
+                 answer unless Bugzilla itself changed, so do not retry in a \
+                 loop; a write tool's failure reply, or a call the client \
+                 timed out, does not mean the write did not happen — read \
+                 the bug back before re-issuing."
                     .to_string(),
             )
     }
@@ -7513,10 +7531,32 @@ mod tests {
     }
 
     #[test]
+    fn quicksearch_changed_since_is_a_plain_date_time() {
+        let (cfg, guard, bz) = parts("[global]\nallow_discovery = true\n");
+        let server = BugWarden::new(cfg, guard, bz).expect("server builds");
+        let tool = server
+            .get_tool("bugs_quicksearch")
+            .expect("bugs_quicksearch is routed");
+        let changed_since = tool.input_schema["properties"]["changed_since"].clone();
+        assert_eq!(
+            changed_since,
+            json!({
+                "description": "Only return bugs changed since this date.",
+                "format": "date-time",
+                "type": "string",
+            }),
+            "changed_since must be a plain nullable-free date-time string"
+        );
+    }
+
+    #[test]
     fn optional_params_still_accept_an_explicit_null() {
         // The advertised schema got stricter; what serde accepts did not.
         let value = json!({"id": 1, "new_since": null});
         serde_json::from_value::<BugCommentsParams>(value)
+            .expect("an explicit null for an Option field must still deserialize");
+        let value = json!({"query": "q", "changed_since": null});
+        serde_json::from_value::<QuicksearchParams>(value)
             .expect("an explicit null for an Option field must still deserialize");
     }
 
@@ -10944,6 +10984,21 @@ mod tests {
                  retrying will not help."
             ),
             "the model must be told a denial is final: {instructions}"
+        );
+        assert!(
+            instructions.contains(
+                "Every call completes in its one reply and there is \
+                 nothing to poll"
+            ),
+            "the model must be told there is nothing to poll: {instructions}"
+        );
+        assert!(
+            instructions.contains("do not retry in a loop"),
+            "the model must be told not to retry in a loop: {instructions}"
+        );
+        assert!(
+            instructions.contains("read the bug back before re-issuing"),
+            "the model must read back before re-issuing: {instructions}"
         );
     }
 

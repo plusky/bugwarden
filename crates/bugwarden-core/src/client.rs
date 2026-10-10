@@ -410,6 +410,10 @@ impl BugzillaClient {
     ///
     /// The quicksearch expression is `"{status} {query}"` when `status` is
     /// non-empty, otherwise just `query`; results are ordered by relevance.
+    /// A set `changed_since` adds `last_change_time`, narrowing upstream
+    /// rows to bugs changed since then.
+    // One param per Bugzilla query key; a struct would hide that.
+    #[allow(clippy::too_many_arguments)]
     pub async fn quicksearch(
         &self,
         key: &str,
@@ -418,19 +422,23 @@ impl BugzillaClient {
         include_fields: &str,
         limit: u32,
         offset: u32,
+        changed_since: Option<DateTime<Utc>>,
     ) -> Result<Value> {
         let quicksearch = if status.is_empty() {
             query.to_string()
         } else {
             format!("{status} {query}")
         };
-        let params: Vec<(&str, String)> = vec![
+        let mut params: Vec<(&str, String)> = vec![
             ("quicksearch", quicksearch),
             ("include_fields", include_fields.to_string()),
             ("limit", limit.to_string()),
             ("offset", offset.to_string()),
             ("order", "relevance".to_string()),
         ];
+        if let Some(ts) = changed_since {
+            params.push(("last_change_time", ts.format(TIMESTAMP_FORMAT).to_string()));
+        }
         self.get_json(key, "/bug", &params).await
     }
 
