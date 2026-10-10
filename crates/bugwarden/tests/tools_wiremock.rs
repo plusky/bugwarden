@@ -1563,11 +1563,7 @@ async fn assert_quicksearch_refused(query: &str, expected: &str) {
     assert!(is_error(&first), "refused query must error: {query}");
     assert_eq!(text_of(&first), expected, "query: {query}");
     assert!(
-        plain
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .is_empty(),
+        plain.received_requests().await.unwrap().is_empty(),
         "a refused query must cost zero requests: {query}"
     );
 
@@ -1584,11 +1580,7 @@ async fn assert_quicksearch_refused(query: &str, expected: &str) {
         "hidden rows must not move the refusal: {query}"
     );
     assert!(
-        hiding
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .is_empty(),
+        hiding.received_requests().await.unwrap().is_empty(),
         "a refused query must cost zero requests: {query}"
     );
 }
@@ -1598,7 +1590,14 @@ async fn quicksearch_gate_allows_bare_terms_and_quoted_phrases() {
     let mock = MockServer::start().await;
     mount_search(&mock, vec![world_readable_bug(101)]).await;
     let client = client_for("", &mock).await;
-    for query in ["kernel crash", "\"kernel crash\"", "101, 102", "#101, 102"] {
+    for query in [
+        "kernel crash",
+        "\"kernel crash\"",
+        "101, 102",
+        "#101, 102",
+        "#101,102",
+        "101,#102",
+    ] {
         let envelope = quicksearch_json(&client, query).await;
         assert_eq!(
             envelope["bugs"][0]["id"],
@@ -1619,6 +1618,7 @@ async fn quicksearch_gate_allows_servable_predicates() {
         "summary:plain",
         "P1",
         "product:openSUSE status:NEW",
+        "(product:foo)",
     ] {
         let envelope = quicksearch_json(&client, query).await;
         assert_eq!(
@@ -1637,6 +1637,7 @@ async fn quicksearch_gate_refuses_link_predicates() {
         "dup_id:123",
         "see_also:123",
         "cf_foo:123",
+        "product:openSUSE dependson:123",
     ] {
         assert_quicksearch_refused(
             query,
@@ -1721,6 +1722,66 @@ async fn quicksearch_gate_refuses_unbalanced_quotes() {
         )
         .await;
     }
+}
+
+#[tokio::test]
+async fn quicksearch_gate_refuses_pseudo_quoted_predicate() {
+    // Only the ends are quoted; the predicate between them still
+    // runs, so it must refuse with zero upstream requests.
+    assert_quicksearch_refused(
+        "\"x\"blocked:123\"y\"",
+        "Quicksearch field predicates are not searchable through this server",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn quicksearch_gate_refuses_a_split_hidden_predicate() {
+    // A form feed splits upstream like any Perl whitespace, so
+    // the half after it must refuse too, with zero requests.
+    assert_quicksearch_refused(
+        "product:foo\x0Cblocked:123",
+        "Quicksearch link predicates are not searchable through this server",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn quicksearch_gate_refuses_a_negated_comma_shortcut() {
+    // Negation lives on the comma piece; stripping it must still
+    // show the shortcut, with zero upstream requests.
+    assert_quicksearch_refused(
+        "foo,-@dev",
+        "Quicksearch shortcuts are not searchable through this server",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn quicksearch_gate_refuses_a_status_prefix_predicate() {
+    // The status filter is prefixed upstream, so it goes through
+    // the same gate; ALL is the control that still searches.
+    let mock = MockServer::start().await;
+    mount_search(&mock, vec![world_readable_bug(101)]).await;
+    let client = client_for("", &mock).await;
+    let refused = call(
+        &client,
+        "bugs_quicksearch",
+        json!({ "query": "kernel", "status": "dependson:123" }),
+    )
+    .await;
+    assert!(is_error(&refused));
+    assert_eq!(
+        text_of(&refused),
+        "Quicksearch link predicates are not searchable through this server"
+    );
+    assert!(
+        mock.received_requests().await.unwrap().is_empty(),
+        "a refused status must cost zero requests"
+    );
+    let envelope =
+        quicksearch_json_args(&client, json!({ "query": "kernel", "status": "ALL" })).await;
+    assert_eq!(envelope["bugs"][0]["id"], json!(101));
 }
 
 // ---------- update_bug_fields: the widened field surface (issue #38) ----------

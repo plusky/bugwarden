@@ -1725,7 +1725,7 @@ const QUICKSEARCH_FIELD_REFUSAL: &str =
 const QUICKSEARCH_PARSE_REFUSAL: &str = "Quicksearch query could not be parsed through this server";
 
 fn qs_is_ws(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0B' | b'\x0C')
 }
 
 /// Whether a single quote after `prev` opens a quoted run. Mirrors
@@ -1963,15 +1963,15 @@ fn qs_refuse_operand(operand: &str) -> Option<&'static str> {
         return None;
     }
     if word.starts_with('-') {
-        word = word.get(1..)?.trim();
+        let Some(rest) = word.get(1..) else {
+            return Some(QUICKSEARCH_PARSE_REFUSAL);
+        };
+        word = rest.trim();
         if word.is_empty() {
             return None;
         }
     }
     if word == "AND" || word == "OR" || word == "NOT" {
-        return None;
-    }
-    if qs_is_quoted(word) {
         return None;
     }
     if qs_is_priority_shorthand(word) {
@@ -1984,8 +1984,9 @@ fn qs_refuse_operand(operand: &str) -> Option<&'static str> {
     if qs_has_question(word, &mask) {
         return Some(QUICKSEARCH_SHORTCUT_REFUSAL);
     }
-    // A `#` id list (`#101, 102`) stays a bare search; any other `#`
-    // word probes summary text, so it goes with the shortcuts.
+    // A `#` id list (`#101, 102`, `#101,102`) stays a bare search;
+    // any other `#` word probes summary text, so it goes with the
+    // shortcuts. Each comma piece may carry its own `#` or not.
     if word.starts_with('#') {
         let mut id_list = true;
         for (start, end) in qs_split_ranges(word, &mask, |b| b == b',') {
@@ -1996,7 +1997,8 @@ fn qs_refuse_operand(operand: &str) -> Option<&'static str> {
             if piece.is_empty() {
                 continue;
             }
-            if !qs_is_hash_id(piece) {
+            let digits = piece.strip_prefix('#').unwrap_or(piece);
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
                 id_list = false;
                 break;
             }
@@ -2027,7 +2029,10 @@ fn qs_refuse_operand(operand: &str) -> Option<&'static str> {
             let Some(name) = qs_slice(field_part, start, end) else {
                 return Some(QUICKSEARCH_PARSE_REFUSAL);
             };
+            // Parens group, they never name a field: `(product:foo)`
+            // judges `product`, not `(product`.
             let name = name.trim();
+            let name = name.trim_matches(|c| c == '(' || c == ')').trim();
             if name.is_empty() {
                 return Some(QUICKSEARCH_PARSE_REFUSAL);
             }
@@ -2057,7 +2062,26 @@ fn qs_refuse_operand(operand: &str) -> Option<&'static str> {
         if qs_is_hash_id(piece) {
             continue;
         }
-        if let Some(first) = piece.as_bytes().first() {
+        // A leading `-` negates the piece, as at the operand level;
+        // judge what it negates, so `foo,-@dev` refuses like `-@dev`.
+        let mut core = piece;
+        if let Some(rest) = core.strip_prefix('-') {
+            core = rest.trim();
+            if core.is_empty() {
+                continue;
+            }
+            if core == "AND" || core == "OR" || core == "NOT" {
+                continue;
+            }
+            if qs_is_quoted(core) || qs_is_priority_shorthand(core) {
+                continue;
+            }
+            let digits = core.strip_prefix('#').unwrap_or(core);
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+        }
+        if let Some(first) = core.as_bytes().first() {
             if matches!(first, b'#' | b':' | b'@' | b'[' | b'!') {
                 return Some(QUICKSEARCH_SHORTCUT_REFUSAL);
             }
@@ -2118,7 +2142,7 @@ fn refuse_quicksearch_query(query: &str, status: &str) -> Option<&'static str> {
     if let Some(refusal) = qs_refuse_expr(query) {
         return Some(refusal);
     }
-    if !status.trim().is_empty() {
+    if !status.is_empty() {
         if let Some(refusal) = qs_refuse_expr(status) {
             return Some(refusal);
         }
@@ -6418,6 +6442,8 @@ mod tests {
             "101, 102",
             "#101",
             "#101, 102",
+            "#101,102",
+            "101,#102",
             "don't",
             "AND",
             "kernel OR crash",
@@ -6453,6 +6479,7 @@ mod tests {
             "product:openSUSE|status:NEW",
             "product,component:Kernel",
             "product:\"open SUSE\"",
+            "(product:foo)",
             "P1",
             "p2",
             "P1-3",
@@ -6542,6 +6569,42 @@ mod tests {
             None,
             "a pipe inside a quoted value is data"
         );
+    }
+
+    #[test]
+    fn quicksearch_gate_refuses_a_pseudo_quoted_predicate() {
+        // Only the endpoints are quoted; the predicate between
+        // them still runs, so the mask must still see it.
+        assert_eq!(
+            qs_refuse_expr("\"x\"blocked:123\"y\""),
+            Some(QUICKSEARCH_FIELD_REFUSAL)
+        );
+    }
+
+    #[test]
+    fn quicksearch_gate_splits_on_vertical_tab_and_form_feed() {
+        // The upstream grammar splits on every Perl whitespace
+        // byte, so the gate must too; otherwise the second half
+        // of the split runs upstream unchecked.
+        assert_eq!(
+            qs_refuse_expr("product:foo\x0Bblocked:123"),
+            Some(QUICKSEARCH_LINK_REFUSAL)
+        );
+        assert_eq!(
+            qs_refuse_expr("product:foo\x0Cblocked:123"),
+            Some(QUICKSEARCH_LINK_REFUSAL)
+        );
+    }
+
+    #[test]
+    fn quicksearch_gate_refuses_a_negated_comma_shortcut() {
+        // Negation lives on the piece, not the operand, so each
+        // comma piece strips one `-` before the shortcut check.
+        assert_eq!(
+            qs_refuse_expr("foo,-@dev"),
+            Some(QUICKSEARCH_SHORTCUT_REFUSAL)
+        );
+        assert_eq!(qs_refuse_expr("-@dev"), Some(QUICKSEARCH_SHORTCUT_REFUSAL));
     }
 
     #[test]
