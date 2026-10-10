@@ -1701,10 +1701,18 @@ Decisions, all deliberate:
   whatever verdict and upstream legs it had managed, `class: error`
   (its definition already covers abandonment, so no schema change),
   and no `response_bytes`. A drop guard in `call_tool` writes the
-  record when the dispatch future is dropped before its own record
+  record when the dispatch future is dropped before its own persist
   runs, and the signal path flushes the in-flight calls before
-  exiting, since exiting never runs drops. The claim between the
-  three is atomic, so they can never write twice. File-best-effort,
+  exiting, since exiting never runs drops. The slot moves armed to
+  writing to done on the normal path, or armed to flushed on an
+  abandonment write; only the claim holder ever writes, so the
+  three can never write twice. A flush that catches writing waits
+  up to 2 s for done and then skips; past the deadline it writes
+  nothing and counts one failure, surfaced by the shutdown warning
+  — the normal persist (or its detached blocking write, which runs
+  to completion after a drop mid-persist) still owns that record,
+  and a steal that cannot unwrite would double it. A second flush
+  finds nothing owed and writes nothing. File-best-effort,
   OTLP-lossy: guard and flush write synchronously to the file, while
   the export hand-off only queues into a collector already going
   away.

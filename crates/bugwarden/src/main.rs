@@ -365,7 +365,13 @@ async fn main() -> anyhow::Result<()> {
                     () = shutdown => {
                         tracing::info!("received shutdown signal");
                         cancel.cancel();
-                        abandoned.flush();
+                        let failed = abandoned.flush().await;
+                        if failed > 0 {
+                            tracing::warn!(
+                                "shutdown flush failed to record \
+                                 {failed} abandoned call(s)"
+                            );
+                        }
                         flush_otel_and_exit(otel_on_signal.as_deref()).await;
                     }
                 }
