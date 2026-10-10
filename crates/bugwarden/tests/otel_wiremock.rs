@@ -1027,3 +1027,98 @@ async fn collector_413_counts_as_delivered_without_gap() {
     assert_eq!(pipeline.dropped(), 0, "audit never rides drop counter");
     pipeline.shutdown().await;
 }
+
+#[tokio::test]
+async fn count_full_batch_of_large_records_splits_on_bytes() {
+    // 512 records just over the byte bound together but
+    // under it at 511 must arrive as several posts each
+    // within the bound.
+    let collector = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/logs"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&collector)
+        .await;
+    let cfg = bugwarden::otel::resolve(&OtelEnv {
+        endpoint: Some(collector.uri()),
+        ..OtelEnv::default()
+    })
+    .expect("endpoint resolves")
+    .expect("export is on");
+    let pipeline = Arc::new(Pipeline::start(cfg).expect("pipeline starts"));
+    let total: usize = 512;
+    let line_size: usize = 7890;
+    for seq in 0..(total as u64) {
+        let event = direct_event(seq);
+        let line = vec![b'x'; line_size];
+        pipeline
+            .accept(&event, &line)
+            .expect("open queue takes custody");
+    }
+    let records = wait_for_records(&collector, total).await;
+    assert_eq!(records.len(), total, "every record must be delivered");
+    let requests = collector
+        .received_requests()
+        .await
+        .expect("request recording is on");
+    assert!(
+        requests.len() >= 2,
+        "a count-full batch over the byte bound must split: got {} post(s)",
+        requests.len()
+    );
+    for request in &requests {
+        assert!(
+            request.body.len() <= 4 * 1024 * 1024,
+            "each post must respect the byte bound: got {} bytes",
+            request.body.len()
+        );
+    }
+    assert_eq!(pipeline.take_lost(), 0, "split batches are not lost");
+    assert!(!pipeline.delivery_failing(), "split delivery stays healthy");
+    pipeline.shutdown().await;
+}
+
+#[tokio::test]
+async fn probe_fails_fast_when_collector_limit_is_below_one_record() {
+    // An always-413 collector refuses even the tiny probe,
+    // so startup must refuse with the limit message
+    // without retrying through the backoff.
+    let collector = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/logs"))
+        .respond_with(ResponseTemplate::new(413))
+        .mount(&collector)
+        .await;
+    let cfg = bugwarden::otel::resolve(&OtelEnv {
+        endpoint: Some(collector.uri()),
+        ..OtelEnv::default()
+    })
+    .expect("endpoint resolves")
+    .expect("export is on");
+    let pipeline = Arc::new(Pipeline::start(cfg).expect("pipeline starts"));
+    let started = std::time::Instant::now();
+    let err = pipeline
+        .probe()
+        .await
+        .expect_err("a limit below one record must refuse startup");
+    let message = format!("{err}");
+    assert!(
+        message.contains("413") && message.contains("max_request_body_size"),
+        "the refusal must name the collector limit: {message}"
+    );
+    let attempts = collector
+        .received_requests()
+        .await
+        .expect("request recording is on")
+        .len();
+    assert_eq!(
+        attempts, 1,
+        "a deterministic limit must not be retried: got {attempts} attempt(s)"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "fail-fast must skip the retry backoff: took {:?}",
+        started.elapsed()
+    );
+    pipeline.shutdown().await;
+}
