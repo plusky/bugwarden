@@ -1646,9 +1646,12 @@ gate — `http_server_config` repeats it only after the identity preflight,
 the OTLP probe and the audit sink, so this early call is what keeps an
 unparsable Host entry from probing Bugzilla or creating the audit file
 and its directory before it refuses; `select_sinks` (file path, `none`,
-OTLP endpoint) so the two ambiguous spellings refuse before any file or
-task exists; and http with no sink at all (`NoAudit`) => tracing::warn
-(remote tool calls leave no audit record).
+ OTLP endpoint) so the two ambiguous spellings refuse before any file or
+ task exists; a fileless sink that reaches wiring with no exporter attached
+ refuses as well (#341) — unreachable through `select_sinks` today, which
+ pairs OTLP-only with an exporter, so this is defense against a future wiring
+ change rather than a reachable configuration; and http with no sink at all (`NoAudit`) => tracing::warn
+ (remote tool calls leave no audit record).
 
 ## Audit stream (crates/bugwarden/src/audit.rs + the server.rs wrapper)
 
@@ -4744,9 +4747,11 @@ wired, `server.rs` and `main.rs` are the reference.
   the four deployments resolve, the two ambiguous spellings refuse naming
   both ways out, and `none` is exact bytes (`None` and `./none` are
   files). Exporter-as-sink: a fileless sink records through the exporter
-  alone; a refused hand-off fails the record while the file still keeps
-  it; delivery failure alone puts the sink in failure; undelivered losses
-  surface as an `audit_gap`; and the file write precedes the hand-off.
+ alone; a refused hand-off fails the record while the file still keeps
+ it; delivery failure alone puts the sink in failure; undelivered losses
+ surface as an `audit_gap`; the file write precedes the hand-off; and a
+ fileless sink with no exporter refuses startup while the exporter-attached
+ and file-bearing shapes pass beside it.
 - Integration tests (crates/bugwarden/tests/otel_wiremock.rs, a wiremock
   OTLP collector beside the wiremock Bugzilla): a real tool call over a
   real MCP session arrives at `POST /v1/logs` as

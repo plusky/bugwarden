@@ -1314,6 +1314,17 @@ impl AuditSink {
         self
     }
 
+    /// Refuse a sink that would drop every record.
+    ///
+    /// A fileless sink keeps nothing itself, so without an exporter
+    /// each record vanishes; startup refuses instead.
+    pub fn require_export_for_fileless(&self) -> anyhow::Result<()> {
+        if self.cfg.path.is_none() && self.export.is_none() {
+            anyhow::bail!("internal error: a fileless audit sink has no exporter");
+        }
+        Ok(())
+    }
+
     /// Persist one record; returns its assigned `seq`.
     ///
     /// Blocks until the record is written (and synced, under `fsync`). If
@@ -3394,6 +3405,35 @@ mod tests {
             .collect();
         assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
         assert!(!sink.failing());
+    }
+
+    #[test]
+    fn a_fileless_sink_without_an_exporter_refuses_to_start() {
+        // A fileless sink keeps nothing itself: without an exporter
+        // every record would vanish, so the combination refuses.
+        let err = format!(
+            "{}",
+            AuditSink::open(AuditConfig::fileless())
+                .unwrap()
+                .require_export_for_fileless()
+                .unwrap_err()
+        );
+        assert!(
+            err.contains("no exporter"),
+            "the refusal must name the missing exporter: {err}"
+        );
+        // Either half of the pairing suffices: an exporter beside a
+        // fileless sink, or a file with no exporter at all.
+        AuditSink::open(AuditConfig::fileless())
+            .unwrap()
+            .with_export(std::sync::Arc::new(StubExport::default()))
+            .require_export_for_fileless()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        AuditSink::open(test_cfg(dir.path().join("audit.jsonl")))
+            .unwrap()
+            .require_export_for_fileless()
+            .unwrap();
     }
 
     #[test]
