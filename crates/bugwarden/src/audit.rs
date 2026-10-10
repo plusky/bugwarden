@@ -1161,6 +1161,12 @@ pub trait AuditExport: Send + Sync + std::fmt::Debug {
     /// delivered. The sink folds it into its own loss accounting, so the
     /// `audit_gap` a reader sees covers both sinks.
     fn take_lost(&self) -> u64;
+
+    /// Non-destructive peek at the undelivered count.
+    /// Lets the lock-free gate see losses not yet folded
+    /// in without moving them. Agrees with the next take
+    /// absent concurrent delivery.
+    fn peek_lost(&self) -> u64;
 }
 
 /// Why [`AuditExport::accept`] refused custody.
@@ -1214,6 +1220,13 @@ pub struct AuditSink {
     /// Load-bearing exporter attached by [`AuditSink::with_export`].
     /// See [`AuditExport`].
     export: Option<std::sync::Arc<dyn AuditExport>>,
+    /// Lock-free mirror of whether losses are pending.
+    /// Set under the state lock when losses are added,
+    /// cleared when the gap is written. Lets the gate
+    /// ask without taking the lock. The guarded count
+    /// stays authoritative for gap reporting; this only
+    /// mirrors its emptiness.
+    failing_flag: std::sync::atomic::AtomicBool,
     /// Test-only fault injection: when set, the write step fails without
     /// touching the file. Lets the gap-marker path be exercised without
     /// weakening the production API.
@@ -1299,6 +1312,7 @@ impl AuditSink {
                 torn: false,
                 last_failure_log: None,
             }),
+            failing_flag: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_writes: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -1376,13 +1390,19 @@ impl AuditSink {
                 reason: state.gap_reason,
             });
             match self.write_event(&mut state, gap, session.clone()) {
-                Ok(_) => state.dropped = 0,
+                Ok(_) => {
+                    state.dropped = 0;
+                    self.failing_flag
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                }
                 Err(err) => {
                     // The gap record did not make it out either. The
                     // caller's record was never attempted, so it is lost
                     // with the rest and joins the count.
                     state.dropped = state.dropped.saturating_add(1);
                     state.gap_reason = err.gap_reason();
+                    self.failing_flag
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                     self.log_failure(&mut state, &err);
                     return Err(err);
                 }
@@ -1393,6 +1413,8 @@ impl AuditSink {
             Err(err) => {
                 state.dropped = state.dropped.saturating_add(1);
                 state.gap_reason = err.gap_reason();
+                self.failing_flag
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 self.log_failure(&mut state, &err);
                 Err(err)
             }
@@ -1590,20 +1612,22 @@ impl AuditSink {
     /// batch for the whole outage. Delivery health does not clear until a
     /// request actually succeeds.
     pub fn failing(&self) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Also here, not only in `record`: the pre-dispatch gate asks this
-        // question far more often than it writes, and an outage that only
-        // became visible between two records must close the gate at the
-        // first ask.
-        self.absorb_export_losses(&mut state);
-        state.dropped > 0
-            || self
-                .export
-                .as_ref()
-                .is_some_and(|export| export.delivery_failing())
+        // Lock-free: peek before the mirror, mirror before
+        // delivery. The writer sets the mirror before
+        // draining, so this order cannot miss a loss moved
+        // under us. The guarded count stays authoritative;
+        // this only decides the gate.
+        if let Some(export) = &self.export {
+            if export.peek_lost() > 0 {
+                return true;
+            }
+        }
+        if self.failing_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            return true;
+        }
+        self.export
+            .as_ref()
+            .is_some_and(|export| export.delivery_failing())
     }
 
     /// Move any undelivered-record count out of the exporter and into this
@@ -1612,10 +1636,20 @@ impl AuditSink {
         let Some(export) = &self.export else {
             return;
         };
+        // Mirror before draining, paired with the peek-first
+        // order in the gate. Without this a loss drained here
+        // but not yet mirrored would be invisible to a
+        // concurrent gate. Over-reporting is safe.
+        if export.peek_lost() > 0 {
+            self.failing_flag
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         let lost = export.take_lost();
         if lost > 0 {
             state.dropped = state.dropped.saturating_add(lost);
             state.gap_reason = GapReason::WriteError;
+            self.failing_flag
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -3391,7 +3425,7 @@ mod tests {
 
     impl AuditExport for StubExport {
         fn accept(&self, _event: &AuditEvent, line: &[u8]) -> Result<(), ExportRefused> {
-            if self.refuse.load(std::sync::atomic::Ordering::Relaxed) {
+            if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(ExportRefused);
             }
             self.accepted.lock().expect("stub lock").push(line.to_vec());
@@ -3399,11 +3433,15 @@ mod tests {
         }
 
         fn delivery_failing(&self) -> bool {
-            self.failing.load(std::sync::atomic::Ordering::Relaxed)
+            self.failing.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn take_lost(&self) -> u64 {
-            self.lost.swap(0, std::sync::atomic::Ordering::Relaxed)
+            self.lost.swap(0, std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn peek_lost(&self) -> u64 {
+            self.lost.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -3469,7 +3507,7 @@ mod tests {
             .with_export(export.clone());
         export
             .refuse
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let err = sink
             .record(sample_initialize(), session_stdio())
             .unwrap_err();
@@ -3487,7 +3525,7 @@ mod tests {
         // Recovery: the next record is preceded by the gap accounting it.
         export
             .refuse
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
             sink.record(sample_initialize(), session_stdio()).unwrap(),
             3
@@ -3515,14 +3553,14 @@ mod tests {
         assert!(!sink.failing());
         export
             .failing
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(
             sink.failing(),
             "failing delivery must gate even with nothing dropped"
         );
         export
             .failing
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         assert!(!sink.failing(), "recovered delivery must clear the gate");
     }
 
@@ -3535,7 +3573,7 @@ mod tests {
             .unwrap()
             .with_export(export.clone());
         // Three records accepted earlier were never delivered.
-        export.lost.store(3, std::sync::atomic::Ordering::Relaxed);
+        export.lost.store(3, std::sync::atomic::Ordering::SeqCst);
         assert!(sink.failing(), "known losses put the sink in failure");
         assert_eq!(
             sink.record(sample_initialize(), session_stdio()).unwrap(),
@@ -3554,6 +3592,66 @@ mod tests {
         // own outage accounted in the stream it lost records from.
         let accepted = export.accepted.lock().expect("stub lock").clone();
         assert_eq!(accepted.len(), 2, "gap and record both reach the exporter");
+    }
+
+    #[test]
+    fn failing_returns_promptly_while_a_record_holds_the_lock() {
+        // Lock-free gate: a writer holding the state lock
+        // must not park a concurrent gate ask. Checked
+        // before any loss, after a file loss, and after
+        // an exporter loss is pending.
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        fn check_while_locked(sink: &Arc<AuditSink>, want: bool) {
+            // Hold the mutex on another thread, then ask.
+            // The holder signals once it owns the lock.
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let holder = {
+                let sink = Arc::clone(sink);
+                std::thread::spawn(move || {
+                    let _guard = sink.state.lock().expect("holder takes the lock");
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv();
+                })
+            };
+            entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("holder must take the lock");
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            {
+                let sink = Arc::clone(sink);
+                std::thread::spawn(move || {
+                    let _ = result_tx.send(sink.failing());
+                });
+            }
+            let got = result_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("gate must answer while lock is held");
+            assert_eq!(got, want, "gate value while lock is held");
+            let _ = release_tx.send(());
+            holder.join().expect("holder joins");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path().join("audit.jsonl"));
+        let export = std::sync::Arc::new(StubExport::default());
+        let sink = Arc::new(AuditSink::open(cfg).unwrap().with_export(export.clone()));
+        check_while_locked(&sink, false);
+        sink.set_fail_writes(true);
+        sink.record(sample_initialize(), session_stdio())
+            .unwrap_err();
+        sink.set_fail_writes(false);
+        assert!(sink.failing(), "file loss must read failing");
+        check_while_locked(&sink, true);
+        sink.record(sample_initialize(), session_stdio()).unwrap();
+        assert!(!sink.failing(), "gap must clear the gate");
+        export.lost.store(3, std::sync::atomic::Ordering::SeqCst);
+        assert!(sink.failing(), "pending losses must read failing");
+        check_while_locked(&sink, true);
+        sink.record(sample_initialize(), session_stdio()).unwrap();
+        assert!(!sink.failing(), "absorbed losses must clear");
     }
 
     /// An exporter that proves the file write PRECEDES the hand-off: at
@@ -3583,6 +3681,10 @@ mod tests {
         fn take_lost(&self) -> u64 {
             0
         }
+
+        fn peek_lost(&self) -> u64 {
+            0
+        }
     }
 
     #[test]
@@ -3599,7 +3701,7 @@ mod tests {
         sink.record(sample_initialize(), session_stdio()).unwrap();
         sink.record(sample_tool_call(), session_http()).unwrap();
         assert_eq!(
-            export.checked.load(std::sync::atomic::Ordering::Relaxed),
+            export.checked.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "the ordering assertion must actually have run"
         );

@@ -799,7 +799,7 @@ impl fmt::Debug for Pipeline {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Pipeline")
             .field("dropped", &self.dropped.load(Ordering::Relaxed))
-            .field("healthy", &self.healthy.load(Ordering::Relaxed))
+            .field("healthy", &self.healthy.load(Ordering::SeqCst))
             .finish_non_exhaustive()
     }
 }
@@ -902,11 +902,11 @@ impl Pipeline {
             // retrying a bound that cannot pass.
             match post_batch(&self.client, &self.cfg, batch).await {
                 Ok(PostOutcome::Delivered) => {
-                    self.healthy.store(true, Ordering::Relaxed);
+                    self.healthy.store(true, Ordering::SeqCst);
                     return Ok(());
                 }
                 Ok(PostOutcome::TooLarge) => {
-                    self.healthy.store(false, Ordering::Relaxed);
+                    self.healthy.store(false, Ordering::SeqCst);
                     anyhow::bail!(
                         "the OTLP collector answered 413 to the startup record; its \
                          max_request_body_size sits below one small record — raise \
@@ -916,7 +916,7 @@ impl Pipeline {
                 Err(_) => {}
             }
             if attempt >= PROBE_ATTEMPTS {
-                self.healthy.store(false, Ordering::Relaxed);
+                self.healthy.store(false, Ordering::SeqCst);
                 anyhow::bail!(
                     "the OTLP collector did not accept the startup record after \
                      {PROBE_ATTEMPTS} attempts; audit records are exported to it and \
@@ -944,7 +944,7 @@ impl Pipeline {
     /// request until one succeeds.
     #[must_use]
     pub fn healthy(&self) -> bool {
-        self.healthy.load(Ordering::Relaxed)
+        self.healthy.load(Ordering::SeqCst)
     }
 
     /// This pipeline as one of the audit sink's destinations.
@@ -998,18 +998,22 @@ impl AuditExport for Pipeline {
                 // marking delivery unhealthy keeps the gate shut until a
                 // request actually succeeds, rather than reopening it the
                 // moment one queue slot frees up.
-                self.healthy.store(false, Ordering::Relaxed);
+                self.healthy.store(false, Ordering::SeqCst);
                 Err(ExportRefused)
             }
         }
     }
 
     fn delivery_failing(&self) -> bool {
-        !self.healthy.load(Ordering::Relaxed)
+        !self.healthy.load(Ordering::SeqCst)
     }
 
     fn take_lost(&self) -> u64 {
-        self.lost.swap(0, Ordering::Relaxed)
+        self.lost.swap(0, Ordering::SeqCst)
+    }
+
+    fn peek_lost(&self) -> u64 {
+        self.lost.load(Ordering::SeqCst)
     }
 }
 
@@ -1104,7 +1108,7 @@ async fn post_batch(
 /// recovery, never one per batch. Audit success opens the latch; either
 /// stream's failure closes it; a successful diagnostics flush is ignored.
 fn note_delivery(healthy: &AtomicBool, ok: bool) {
-    let was = healthy.swap(ok, Ordering::Relaxed);
+    let was = healthy.swap(ok, Ordering::SeqCst);
     if was && !ok {
         tracing::warn!(
             "otlp delivery is failing; the audit fail mode now gates tool calls \
@@ -1303,7 +1307,7 @@ impl ExportTask {
                 note_delivery(&self.healthy, true);
             }
             Err(_) => {
-                self.lost.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                self.lost.fetch_add(batch.len() as u64, Ordering::SeqCst);
                 note_delivery(&self.healthy, false);
             }
         }
@@ -2707,7 +2711,7 @@ mod tests {
             "repeated failures log once: {}",
             logs.as_str()
         );
-        assert!(!healthy.load(Ordering::Relaxed));
+        assert!(!healthy.load(Ordering::SeqCst));
         let (_, logs) = capture_logs(|| {
             note_delivery(&healthy, true);
             note_delivery(&healthy, true);
@@ -2718,7 +2722,7 @@ mod tests {
             "repeated successes log once: {}",
             logs.as_str()
         );
-        assert!(healthy.load(Ordering::Relaxed));
+        assert!(healthy.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

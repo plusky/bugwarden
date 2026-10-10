@@ -5636,8 +5636,8 @@ impl ServerHandler for BugWarden {
         // unrouted below, identically under every fail mode.
         if reachable
             && self.tool_router.has_route(&tool)
-            && audit.sink.failing()
             && gate_applies(audit.fail_mode, &tool)
+            && audit.sink.failing()
         {
             let event = audit::AuditEventKind::ToolCall(Box::new(audit::ToolCallEvent {
                 client,
@@ -8753,6 +8753,50 @@ mod tests {
         // On disk: only the healthy-phase records made it.
         let events = read_audit_events(&audit_path);
         assert_eq!(events.len(), 2, "initialize + the served call");
+    }
+
+    #[tokio::test]
+    async fn predispatch_gate_skips_unrouted_names_while_failing() {
+        // Unrouted names stay unrouted while the sink is down.
+        // The gate only answers names the router would serve,
+        // so health never changes which refusal comes back.
+        let mock = MockServer::start().await;
+        mount_bug7(&mock).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, _path) = audit_state(dir.path(), FailMode::ClosedAll);
+        let client = mcp_client("", &mock.uri(), Some(Arc::clone(&audit))).await;
+        let served = call(&client, "bug_history", json!({ "id": 7 })).await;
+        assert!(!is_error(&served), "healthy sink must serve");
+        audit.sink.set_fail_writes(true);
+        let discovered = call(&client, "bug_history", json!({ "id": 7 })).await;
+        assert!(is_error(&discovered));
+        assert_eq!(text_of(&discovered), "Failed to fetch bug history");
+        let before = mock.received_requests().await.unwrap().len();
+        let unrouted = bounded(
+            "the unknown call",
+            client.call_tool(CallToolRequestParams::new("no_such_tool_xyz".to_string())),
+        )
+        .await
+        .expect_err("unknown names stay protocol errors");
+        assert!(
+            unrouted.to_string().contains("tool not found"),
+            "unrouted refusal must not become a gate refusal: {unrouted}"
+        );
+        assert_eq!(
+            mock.received_requests().await.unwrap().len(),
+            before,
+            "unrouted names must not contact upstream"
+        );
+        // A routed name under the same outage is gated instead,
+        // with the same zero-upstream shape.
+        let gated = call(&client, "bug_history", json!({ "id": 7 })).await;
+        assert!(is_error(&gated));
+        assert_eq!(text_of(&gated), "Failed to fetch bug history");
+        assert_eq!(
+            mock.received_requests().await.unwrap().len(),
+            before,
+            "gated calls must not contact upstream"
+        );
     }
 
     #[tokio::test]

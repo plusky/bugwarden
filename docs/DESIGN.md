@@ -2019,6 +2019,7 @@ pinned by the in-crate capture test under "Testing". create_bug's single `warn` 
   user), http → `closed_all` (accountability for a fleet). A sink
   already in failure also gates matching calls BEFORE dispatch, so an
   outage cannot be farmed for unaudited upstream work.
+- **Gate liveness (#327).** The pre-dispatch gate reads a lock-free atomic mirror of loss state plus a peek at pending export losses; the mutex-guarded count stays authoritative for gap reporting.
 - **Refusals are not a fingerprint.** A fail-closed refusal reuses the
   tool's existing uniform failure text, chosen by tool name alone; a
   protocol error from the router stands unchanged (swapping it would
