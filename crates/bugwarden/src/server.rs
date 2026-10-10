@@ -1192,6 +1192,145 @@ async fn record_event(
     }
 }
 
+/// Writes the call's record when the dispatch future is dropped first.
+///
+/// Built before the dispatch await and disarmed where the normal record
+/// is written. If the future is dropped in between, the serve loop gave
+/// up waiting and the normal record never runs; the guard then writes
+/// one record from the cell state instead, keeping whatever verdict and
+/// upstream legs were noted so far, with the error outcome and no
+/// response size. The write is synchronous on the file sink, which is
+/// safe from `Drop`; the export hand-off only queues, so a collector
+/// already shutting down may still lose this record while the file
+/// keeps it.
+///
+/// Shared with the shutdown path through [`AbandonedRegistry`]: a
+/// signal flush writes the same record before the process exits, and
+/// the atomic handoff keeps the two from ever writing twice.
+struct AbandonedSlot {
+    audit: Arc<AuditState>,
+    cell: Arc<AuditCell>,
+    stats: Arc<UpstreamStats>,
+    client: audit::ClientInfo,
+    trace: Option<audit::TraceContext>,
+    tool: String,
+    request_id: Option<String>,
+    params: BTreeMap<String, Value>,
+    session: audit::SessionInfo,
+    started: Instant,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl AbandonedSlot {
+    /// Claim the one record write. Exactly one claimant per call ever
+    /// sees true: the normal path, the drop guard, or the signal flush.
+    fn take_armed(&self) -> bool {
+        self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Build the abandonment record from the cell state. Partial by
+    /// design: whatever verdict and upstream legs exist are kept.
+    fn record_abandoned(&self) {
+        if self.stats.requests() > 0 {
+            self.cell.note_upstream(audit::UpstreamInfo {
+                requests: self.stats.requests(),
+                status: self.stats.status(),
+                latency_ms: self.stats.latency_ms(),
+                bugzilla_code: self.cell.take_bugzilla_code(),
+            });
+        }
+        let upstream = self.cell.take_upstream();
+        let guard = self.cell.into_guard_info(
+            self.audit.policy_hash.as_deref(),
+            self.audit.sink.suppressed_ids(),
+        );
+        let event = audit::AuditEventKind::ToolCall(Box::new(audit::ToolCallEvent {
+            client: self.client.clone(),
+            trace: self.trace.clone(),
+            request: audit::RequestInfo {
+                tool: capped(&self.tool),
+                id: self.request_id.clone(),
+                params: self.params.clone(),
+            },
+            guard,
+            upstream,
+            outcome: audit::OutcomeInfo {
+                class: audit::OutcomeClass::Error,
+                duration_ms: elapsed_ms(self.started),
+                response_bytes: None,
+            },
+        }));
+        let _ = self.audit.sink.record(event, self.session.clone());
+    }
+
+    /// Write the record unless someone already claimed it. Never
+    /// panics: the record build runs inside a panic boundary, and the
+    /// locks it takes tolerate poison.
+    fn write_if_armed(&self) {
+        if self.take_armed() {
+            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                self.record_abandoned();
+            }));
+        }
+    }
+}
+
+/// Holds a call's abandonment slot; writes on drop when still armed.
+struct AbandonedGuard {
+    slot: Arc<AbandonedSlot>,
+}
+
+impl Drop for AbandonedGuard {
+    /// Never panics: [`AbandonedSlot::write_if_armed`] cannot panic,
+    /// and a panicking `Drop` during unwinding aborts.
+    fn drop(&mut self) {
+        self.slot.write_if_armed();
+    }
+}
+
+/// The calls currently in flight, for the shutdown path to flush.
+///
+/// Every audited `call_tool` registers its slot before dispatch; the
+/// normal path disarms it where the normal record runs. A signal
+/// arriving mid-dispatch flushes what is still armed and then exits,
+/// which never runs drops — so without this the flushed record would
+/// have no writer. Entries are weak: a finished call drops its slot
+/// and the next insert prunes it.
+#[derive(Debug, Default)]
+pub struct AbandonedRegistry {
+    slots: std::sync::Mutex<Vec<std::sync::Weak<AbandonedSlot>>>,
+}
+
+impl AbandonedRegistry {
+    /// Register one call's slot, pruning slots no call holds.
+    fn insert(&self, slot: &Arc<AbandonedSlot>) {
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slots.retain(|weak| weak.upgrade().is_some());
+        slots.push(Arc::downgrade(slot));
+    }
+
+    /// Write the abandonment record for every call still owed one.
+    /// Synchronous, one file write per armed slot, export lossy like
+    /// the drop path. Never panics.
+    pub fn flush(&self) {
+        let weaks = {
+            let slots = self
+                .slots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slots.clone()
+        };
+        for weak in weaks {
+            if let Some(slot) = weak.upgrade() {
+                slot.write_if_armed();
+            }
+        }
+    }
+}
+
 /// Assemble the `bug_info` envelope, re-classifying every body before it is
 /// served.
 ///
@@ -2970,6 +3109,9 @@ pub struct BugWarden {
     /// Custom field kinds learned from Bugzilla by name, on first use and
     /// never at construction; shared by every per-session clone.
     fields: Arc<FieldTypeCache>,
+    /// Calls currently in flight, for the shutdown path to flush before
+    /// exiting. Shared by every clone, like the audit state itself.
+    abandoned: Arc<AbandonedRegistry>,
 }
 
 impl BugWarden {
@@ -3073,6 +3215,7 @@ impl BugWarden {
             audit: None,
             enforce_scopes: false,
             fields: Arc::default(),
+            abandoned: Arc::new(AbandonedRegistry::default()),
         })
     }
 
@@ -3096,6 +3239,13 @@ impl BugWarden {
     pub fn with_scope_enforcement(mut self, enforce: bool) -> Self {
         self.enforce_scopes = enforce;
         self
+    }
+
+    /// The in-flight abandonment registry, for the shutdown path to
+    /// flush before exiting. Shares the server's registry, so a flush
+    /// through any clone reaches every call.
+    pub fn abandoned(&self) -> Arc<AbandonedRegistry> {
+        Arc::clone(&self.abandoned)
     }
 
     /// The streamable-HTTP transport configuration this server is served
@@ -5694,6 +5844,28 @@ impl ServerHandler for BugWarden {
         // scan, or create_bug's padding classify, so only the client's own
         // choke point counts them all.
         let stats = Arc::new(UpstreamStats::default());
+        // Abandonment record: if this future is dropped before the
+        // normal record below, the guard writes one error record from
+        // the cell state, and a signal flush before exiting writes the
+        // same record. The atomic claim keeps the three from ever
+        // writing twice.
+        let slot = Arc::new(AbandonedSlot {
+            audit: Arc::clone(&audit),
+            cell: Arc::clone(&cell),
+            stats: Arc::clone(&stats),
+            client: client.clone(),
+            trace: trace.clone(),
+            tool: tool.clone(),
+            request_id: request_id.clone(),
+            params: params.clone(),
+            session: session.clone(),
+            started,
+            armed: std::sync::atomic::AtomicBool::new(true),
+        });
+        self.abandoned.insert(&slot);
+        let _guard = AbandonedGuard {
+            slot: Arc::clone(&slot),
+        };
         // Recorded like any other call, refused or not: exactly one record,
         // with no guard verdict and no upstream leg, the same shape an
         // unknown tool name produces.
@@ -5706,6 +5878,13 @@ impl ServerHandler for BugWarden {
         } else {
             Err(tool_not_found())
         };
+
+        // Claim the one record write. A signal flush that claimed it
+        // first already wrote the abandonment record; returning the
+        // result unrecorded keeps exactly one record standing.
+        if !slot.take_armed() {
+            return result;
+        }
 
         // Exactly one record per call, whatever `result` is — including
         // an unknown tool or another protocol error from the router.

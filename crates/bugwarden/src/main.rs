@@ -282,6 +282,10 @@ async fn main() -> anyhow::Result<()> {
                 // up closes the stream inside `initialize`'s wait, where
                 // rmcp reports `ConnectionClosed` rather than a clean end.
                 let probed = transport.answered();
+                // In-flight calls for the signal arm to flush: exiting
+                // never runs drops, so the abandonment records are
+                // written there, before the OTLP flush and the exit.
+                let abandoned = server.abandoned();
                 tracing::info!("Starting Bugzilla MCP server on stdio");
                 let service = tokio::select! {
                     result = server.serve(transport) => match result {
@@ -361,6 +365,7 @@ async fn main() -> anyhow::Result<()> {
                     () = shutdown => {
                         tracing::info!("received shutdown signal");
                         cancel.cancel();
+                        abandoned.flush();
                         flush_otel_and_exit(otel_on_signal.as_deref()).await;
                     }
                 }
