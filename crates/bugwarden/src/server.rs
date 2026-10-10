@@ -229,6 +229,18 @@ fn note_refused(ctx: &RequestContext<RoleServer>) {
     }
 }
 
+/// Note Bugzilla's numeric code for a failed upstream leg. Last
+/// failure wins; a code-less failure clears, so the record omits
+/// the field rather than carrying null.
+fn note_code(ctx: &RequestContext<RoleServer>, e: &anyhow::Error) {
+    let code = e
+        .downcast_ref::<bugwarden_core::client::BugzillaError>()
+        .and_then(|bz| bz.code());
+    if let Some(cell) = audit_cell(ctx) {
+        cell.note_bugzilla_code(code);
+    }
+}
+
 /// Whether the pre-dispatch audit gate holds `tool` back while the sink is
 /// already failing: `Open` never gates, `ClosedWritesDenials` gates the
 /// write tools only, `ClosedAll` gates everything.
@@ -504,11 +516,15 @@ fn payload_reach(payload: &serde_json::Map<String, Value>) -> UpstreamReach {
 /// message. The write-side split ([`upstream_refusal`]) without the hint:
 /// the text is the tool's fixed line ([`refusal_line`]), the same for
 /// every status and code. A transport error has neither status nor code.
-fn read_refusal(tool: &'static str, e: &anyhow::Error) -> CallToolResult {
+fn read_refusal(tool: &'static str, e: &anyhow::Error, cell: Option<&AuditCell>) -> CallToolResult {
     let bz = e.downcast_ref::<bugwarden_core::client::BugzillaError>();
+    let code = bz.and_then(|bz| bz.code());
+    if let Some(cell) = cell {
+        cell.note_bugzilla_code(code);
+    }
     tracing::warn!(
         http_status = bz.map(|bz| bz.http_status()),
-        bugzilla_code = bz.and_then(|bz| bz.code()),
+        bugzilla_code = code,
         "{tool}: upstream request failed"
     );
     tracing::debug!(error = ?QuotedError(e), "{tool}: upstream failure text");
@@ -524,9 +540,13 @@ fn upstream_refusal(
     bug_id: u64,
     reach: UpstreamReach,
     e: &anyhow::Error,
+    cell: Option<&AuditCell>,
 ) -> CallToolResult {
     let bz = e.downcast_ref::<bugwarden_core::client::BugzillaError>();
     let code = bz.and_then(|bz| bz.code());
+    if let Some(cell) = cell {
+        cell.note_bugzilla_code(code);
+    }
     tracing::warn!(
         bug_id,
         http_status = bz.map(|bz| bz.http_status()),
@@ -3795,6 +3815,7 @@ impl BugWarden {
                 })))
             }
             Err(e) => {
+                note_code(&ctx, &e);
                 tracing::warn!(id = p.id, error = ?QuotedError(&e), "bug_history: fetch failed");
                 Ok(err_text("Failed to fetch bug history"))
             }
@@ -3886,6 +3907,7 @@ impl BugWarden {
                 })))
             }
             Err(e) => {
+                note_code(&ctx, &e);
                 tracing::warn!(id = p.id, error = ?QuotedError(&e), "bug_comments: fetch failed");
                 Ok(err_text("Failed to fetch bug comments"))
             }
@@ -3976,6 +3998,7 @@ impl BugWarden {
             Ok(window) => window,
             // Uniform: a failing search never says which bug or why (I2).
             Err(e) => {
+                note_code(&ctx, &e);
                 tracing::warn!(error = ?QuotedError(&e), "bugs_quicksearch: upstream search failed");
                 return Ok(err_text("Search failed"));
             }
@@ -4178,6 +4201,7 @@ impl BugWarden {
                 // Uniform with the policy refusal above (see that comment);
                 // Bugzilla's message is logged server-side only — it can say
                 // whether a product or component exists.
+                note_code(&ctx, &e);
                 tracing::warn!(error = ?QuotedError(&e), "create_bug: upstream refused");
                 Ok(err_text(Guard::create_denial()))
             }
@@ -4238,6 +4262,7 @@ impl BugWarden {
         match self.bz.add_attachment(&key, p.bug_id, payload).await {
             Ok(v) => Ok(ok_json(v)),
             Err(e) => {
+                note_code(&ctx, &e);
                 tracing::warn!(bug_id = p.bug_id, error = ?QuotedError(&e), "add_attachment: upstream refused");
                 Ok(err_text("Failed to add attachment"))
             }
@@ -4288,6 +4313,7 @@ impl BugWarden {
                 p.bug_id,
                 UpstreamReach::Assessed,
                 &e,
+                audit_cell(&ctx).as_deref(),
             )),
         }
     }
@@ -4340,7 +4366,13 @@ impl BugWarden {
                 &[p.bug_id],
                 &BTreeMap::new(),
             )),
-            Err(e) => Ok(upstream_refusal("update_bug_status", p.bug_id, reach, &e)),
+            Err(e) => Ok(upstream_refusal(
+                "update_bug_status",
+                p.bug_id,
+                reach,
+                &e,
+                audit_cell(&ctx).as_deref(),
+            )),
         }
     }
 
@@ -4386,7 +4418,13 @@ impl BugWarden {
                 &[p.bug_id],
                 &BTreeMap::new(),
             )),
-            Err(e) => Ok(upstream_refusal("assign_bug", p.bug_id, reach, &e)),
+            Err(e) => Ok(upstream_refusal(
+                "assign_bug",
+                p.bug_id,
+                reach,
+                &e,
+                audit_cell(&ctx).as_deref(),
+            )),
         }
     }
 
@@ -4567,7 +4605,13 @@ impl BugWarden {
             .await
         {
             Ok(result) => Ok(update_response(result, self.bz.base_url(), &ids, &kinds)),
-            Err(e) => Ok(upstream_refusal("update_bug_fields", p.bug_id, reach, &e)),
+            Err(e) => Ok(upstream_refusal(
+                "update_bug_fields",
+                p.bug_id,
+                reach,
+                &e,
+                audit_cell(&ctx).as_deref(),
+            )),
         }
     }
 
@@ -4709,6 +4753,7 @@ impl BugWarden {
                 p.bug_id,
                 UpstreamReach::Unassessed,
                 &e,
+                audit_cell(&ctx).as_deref(),
             )),
         }
     }
@@ -4754,7 +4799,13 @@ impl BugWarden {
                 &[p.bug_id],
                 &BTreeMap::new(),
             )),
-            Err(e) => Ok(upstream_refusal("add_cc_to_bug", p.bug_id, reach, &e)),
+            Err(e) => Ok(upstream_refusal(
+                "add_cc_to_bug",
+                p.bug_id,
+                reach,
+                &e,
+                audit_cell(&ctx).as_deref(),
+            )),
         }
     }
 
@@ -4847,6 +4898,7 @@ impl BugWarden {
                 p.bug_id,
                 UpstreamReach::Unassessed,
                 &e,
+                audit_cell(&ctx).as_deref(),
             )),
         }
     }
@@ -4899,7 +4951,11 @@ impl BugWarden {
                 }
                 Ok(ok_json(Value::Array(filtered)))
             }
-            Err(e) => Ok(read_refusal("list_attachments", &e)),
+            Err(e) => Ok(read_refusal(
+                "list_attachments",
+                &e,
+                audit_cell(&ctx).as_deref(),
+            )),
         }
     }
 
@@ -5149,7 +5205,10 @@ impl BugWarden {
             Ok(info) => Ok(ok_json(info)),
             // The failed legs already logged themselves inside the
             // client; this names only the fixed line.
-            Err(_) => Ok(err_text(refusal_line("bugzilla_server_info"))),
+            Err(e) => {
+                note_code(&ctx, &e);
+                Ok(err_text(refusal_line("bugzilla_server_info")))
+            }
         }
     }
 
@@ -5173,7 +5232,13 @@ impl BugWarden {
         if p.products.is_empty() {
             let ids = match self.bz.enterable_product_ids(&key).await {
                 Ok(ids) => ids,
-                Err(e) => return Ok(read_refusal("bugzilla_products", &e)),
+                Err(e) => {
+                    return Ok(read_refusal(
+                        "bugzilla_products",
+                        &e,
+                        audit_cell(&ctx).as_deref(),
+                    ))
+                }
             };
             if ids.is_empty() {
                 return Ok(ok_json(json!({ "products": [] })));
@@ -5184,13 +5249,21 @@ impl BugWarden {
                 .await
             {
                 Ok(v) => Ok(ok_json(json!({ "products": project_product_catalog(&v) }))),
-                Err(e) => Ok(read_refusal("bugzilla_products", &e)),
+                Err(e) => Ok(read_refusal(
+                    "bugzilla_products",
+                    &e,
+                    audit_cell(&ctx).as_deref(),
+                )),
             }
         } else {
             let names: Vec<&str> = p.products.iter().map(String::as_str).collect();
             match self.bz.products(&key, &[], &names, None).await {
                 Ok(v) => Ok(ok_json(json!({ "products": project_product_detail(&v) }))),
-                Err(e) => Ok(read_refusal("bugzilla_products", &e)),
+                Err(e) => Ok(read_refusal(
+                    "bugzilla_products",
+                    &e,
+                    audit_cell(&ctx).as_deref(),
+                )),
             }
         }
     }
@@ -5221,14 +5294,16 @@ impl BugWarden {
                 Ok(v) => Ok(ok_json(json!({
                     "fields": project_field_catalog(&v, p.on_bug_entry_only)
                 }))),
-                Err(e) => Ok(read_refusal("bug_fields", &e)),
+                Err(e) => Ok(read_refusal("bug_fields", &e, audit_cell(&ctx).as_deref())),
             }
         } else {
             let mut fields = Vec::with_capacity(p.field_names.len());
             for name in &p.field_names {
                 let v = match self.bz.bug_fields(&key, Some(name)).await {
                     Ok(v) => v,
-                    Err(e) => return Ok(read_refusal("bug_fields", &e)),
+                    Err(e) => {
+                        return Ok(read_refusal("bug_fields", &e, audit_cell(&ctx).as_deref()))
+                    }
                 };
                 match v
                     .get("fields")
@@ -5251,11 +5326,18 @@ impl BugWarden {
         description = "Access the documentation of the bugzilla quicksearch syntax. LLM can learn using this tool. Response is in HTML. Note: through this server's bugs_quicksearch the status filter is prefixed to the query, so under any non-empty status (the default is ALL) a number in the query is content-matched as text; the syntax page's jump-to-bug-number shortcut applies only when status is empty and the query is nothing but numbers. Look up known bug ids with the bug_info tool.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
-    async fn quicksearch_syntax(&self) -> Result<CallToolResult, McpError> {
+    async fn quicksearch_syntax(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         tracing::info!("tool: quicksearch_syntax");
         match self.bz.quicksearch_syntax_html().await {
             Ok(html) => Ok(CallToolResult::success(vec![ContentBlock::text(html)])),
-            Err(e) => Ok(read_refusal("quicksearch_syntax", &e)),
+            Err(e) => Ok(read_refusal(
+                "quicksearch_syntax",
+                &e,
+                audit_cell(&ctx).as_deref(),
+            )),
         }
     }
 
@@ -5310,7 +5392,13 @@ impl BugWarden {
         }
         let comments = match self.bz.bug_comments(&key, p.id, None).await {
             Ok(comments) => comments,
-            Err(e) => return Ok(read_refusal("summarize_bug", &e)),
+            Err(e) => {
+                return Ok(read_refusal(
+                    "summarize_bug",
+                    &e,
+                    audit_cell(&ctx).as_deref(),
+                ))
+            }
         };
         let total = comments.len();
         let comments = self.guard.filter_comments(comments, false);
@@ -5616,6 +5704,7 @@ impl ServerHandler for BugWarden {
                 requests: stats.requests(),
                 status: stats.status(),
                 latency_ms: stats.latency_ms(),
+                bugzilla_code: cell.take_bugzilla_code(),
             });
         }
         let upstream = cell.take_upstream();
@@ -5631,7 +5720,14 @@ impl ServerHandler for BugWarden {
             Ok(CallToolResponse::Complete(r))
                 if r.is_error == Some(true) && guard_verdict != Some(Verdict::Denied) =>
             {
-                audit::OutcomeClass::Refused
+                // An error result after upstream contact is a
+                // Bugzilla failure. A Refused verdict with contact
+                // is a padded client refusal, so it stays refused.
+                if upstream.is_some() && guard_verdict != Some(Verdict::Refused) {
+                    audit::OutcomeClass::Error
+                } else {
+                    audit::OutcomeClass::Refused
+                }
             }
             Ok(_) => audit::OutcomeClass::Ok,
             Err(_) => audit::OutcomeClass::Error,
@@ -7834,7 +7930,7 @@ mod tests {
     fn a_transport_error_gives_the_bare_line() {
         // No BugzillaError to downcast to, so no code and no hint.
         let e = anyhow::anyhow!("error sending request");
-        let result = upstream_refusal("add_comment", 7, UpstreamReach::Assessed, &e);
+        let result = upstream_refusal("add_comment", 7, UpstreamReach::Assessed, &e, None);
         assert_eq!(result.is_error, Some(true));
         assert_eq!(text_of(&result), "Failed to create a comment");
     }
@@ -8030,7 +8126,8 @@ mod tests {
             )
         });
         for e in [&coded, &bare] {
-            let (result, logs) = crate::testlog::capture_logs(|| read_refusal("bug_fields", e));
+            let (result, logs) =
+                crate::testlog::capture_logs(|| read_refusal("bug_fields", e, None));
             assert_eq!(result.is_error, Some(true));
             assert_eq!(text_of(&result), "Failed to fetch bug fields");
             let captured = logs.as_str();
@@ -8052,7 +8149,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("the debug line must be logged: {captured}"));
             assert!(debug.contains("DEBUG"), "the text rides debug: {debug}");
         }
-        let (_, logs) = crate::testlog::capture_logs(|| read_refusal("bug_fields", &coded));
+        let (_, logs) = crate::testlog::capture_logs(|| read_refusal("bug_fields", &coded, None));
         let captured = logs.as_str();
         assert!(
             captured.contains("http_status=500") && captured.contains("bugzilla_code=32000"),

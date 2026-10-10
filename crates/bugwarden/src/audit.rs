@@ -980,8 +980,9 @@ pub enum Verdict {
 /// `resolve_caller`'s whoami, the search window's chunk scan,
 /// `create_bug`'s padding classify.
 ///
-/// Three integers by construction: nothing here can carry a URL, a
-/// header, a body, an error text, or the API key (I12).
+/// Three integers plus an optional code by construction: nothing
+/// here can carry a URL, a header, a body, an error text, or the
+/// API key (I12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamInfo {
@@ -1002,6 +1003,11 @@ pub struct UpstreamInfo {
     /// read, summed. Reading the body is time spent waiting on Bugzilla,
     /// so it counts.
     pub latency_ms: u64,
+    /// Bugzilla's numeric error code from the last failure noted on
+    /// the call, never its message text. Absent when that failure
+    /// carried no code, or when no failure was noted at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bugzilla_code: Option<i64>,
 }
 
 /// How a tool call ended, from the client's point of view.
@@ -1039,10 +1045,12 @@ pub struct OutcomeInfo {
 pub enum OutcomeClass {
     /// A well-formed result was returned.
     Ok,
-    /// The call was refused (invalid arguments, disabled tool, audit
-    /// outage under a closed fail mode).
+    /// Client-side refusal without an upstream failure: invalid
+    /// arguments, disabled or unrouted tool, gate or policy refusal.
+    /// Includes refusals padded with successful upstream reads.
     Refused,
-    /// The call failed (upstream or internal error).
+    /// Bugzilla or internal failure after contact, plus protocol
+    /// and panic errors that never reached a tool.
     Error,
 }
 
@@ -1784,6 +1792,7 @@ struct CellState {
     /// Search-window scan accounting ([`AuditCell::note_scan`]).
     scan: Option<ScanInfo>,
     upstream: Option<UpstreamInfo>,
+    bugzilla_code: Option<i64>,
 }
 
 /// Per-request enrichment cell for one tool call's audit record.
@@ -1943,6 +1952,18 @@ impl AuditCell {
         self.lock().upstream.take()
     }
 
+    /// Note Bugzilla's numeric code for a failed upstream leg.
+    /// Overwrites; `None` clears. Last failure wins, as with
+    /// status: a later leg replaces an earlier note.
+    pub fn note_bugzilla_code(&self, code: Option<i64>) {
+        self.lock().bugzilla_code = code;
+    }
+
+    /// Take the noted Bugzilla code, if any.
+    pub fn take_bugzilla_code(&self) -> Option<i64> {
+        self.lock().bugzilla_code.take()
+    }
+
     /// Drain the cell into the record's [`GuardInfo`]. `None` when no
     /// verdict was ever noted — the tool performed no guard assessment.
     /// When `suppressed_ids_cfg` is `false` the ids are dropped and only
@@ -2047,6 +2068,7 @@ mod tests {
                 requests: 1,
                 status: Some(200),
                 latency_ms: 48,
+                bugzilla_code: None,
             }),
             outcome: OutcomeInfo {
                 class: OutcomeClass::Ok,
@@ -3123,6 +3145,7 @@ mod tests {
             requests: 1,
             status: Some(200),
             latency_ms: 3,
+            bugzilla_code: None,
         });
         assert!(cell.take_upstream().is_some());
         assert_eq!(cell.into_guard_info(None, true), None);

@@ -1508,7 +1508,7 @@ reaches it moved to that side. The fork the deployment runs was not read;
  a self-dependency add and a self-duplicate are refused before the PUT
  with a fixed request-derived text (issue #339); a required comment and a
  resolution on an open bug stay bare. Hinted failures
- are still recorded as `refused` (#325).
+ are still recorded as `error` (#325).
 
 **Logging.** A refusal is two lines: `warn!` with `bug_id`, `http_status`
 and `bugzilla_code` and no text, and `debug!` with
@@ -2123,7 +2123,7 @@ pinned by the in-crate capture test under "Testing". create_bug's single `warn` 
   `bugwarden.response_bytes` beside the verdict, absent when unmeasured,
   so a collector aggregates size per tool without parsing every body.
 - **Upstream accounting (issue #118).** `upstream = {requests, status,
-  latency_ms}` is populated from `BugzillaClient::send`, the single point
+  latency_ms, bugzilla_code?}` is populated from `BugzillaClient::send`, the single point
   every request the client makes passes through, collected into a
   `bugwarden_core::client::UpstreamStats` that `call_tool` scopes around
   the whole dispatch (`with_upstream_stats`) and drains into the cell just
@@ -2153,9 +2153,9 @@ pinned by the in-crate capture test under "Testing". create_bug's single `warn` 
   wrong count. Detached upstream work is a review rule, not a tested one.
   `requests` counts client dispatches, not wire requests: nothing
   overrides reqwest's default redirect policy, so up to ten hops inside
-  one `send` are one request here. Three integers and nothing else, so no
-  URL, header, body, error text or API key can reach a record through
-  this path (I12). Absent, never zero, when the call contacted Bugzilla
+  one `send` are one request here. Three integers plus an optional code
+  and nothing else, so no URL, header, body, error text or API key can
+  reach a record through this path (I12). Absent, never zero, when the call contacted Bugzilla
   not at all — a local tool like `bug_url`, an unrouted name, a refusal
   answered from the request alone, the pre-dispatch gate. Absence is a
   measurement here (zero requests), the opposite side from
@@ -2165,6 +2165,12 @@ pinned by the in-crate capture test under "Testing". create_bug's single `warn` 
   than reporting an earlier request's status as the outcome; `latency_ms`
   sums each request from hand-off to the transport until its body has
   been read, because reading the body is time spent waiting on Bugzilla.
+  `bugzilla_code` (issue #325) is Bugzilla's numeric error code from the
+  last failure noted on the call, never its message text — absent when
+  that failure carried no code, or when no failure was noted at all;
+  absent, never null. Handlers note it on the audit cell as the failure
+  happens (last failure wins); the wrapper drains it into the block only
+  when the call contacted Bugzilla at all.
   Optional and absent-when-unset, so the schema stayed v1 and no golden
   shape moved when the block arrived — a backward promise revoked at v2
   with the other two ("Schema v2", below): a v1 `tool_call` line carrying
@@ -2176,6 +2182,14 @@ pinned by the in-crate capture test under "Testing". create_bug's single `warn` 
   tracks a mounted response delay rather than any constant, while the
   server suite measures every routed tool's count against wiremock's own
   request log.
+- **Outcome classes (issue #325).** `Refused` is a client-side refusal
+  without an upstream failure: invalid arguments, a disabled or unrouted
+  tool, the audit gate, or a guard/policy refusal — including refusals
+  padded with successful upstream reads (the create pad, an unassessable
+  custom field, an oversized attachment). `Error` is a Bugzilla or
+  internal failure after contact, plus the protocol and panic errors that
+  never reached a tool. A guard denial stays `ok`. Alert on `refused`
+  for policy and client behavior, on `error` for upstream health.
 - **Search-window drop accounting (issue #29).** A `bugs_quicksearch`
   record carries `guard.scan = {scanned, dropped}`: how many upstream rows
   the window scan examined and how many it dropped by verdict — without
@@ -4516,7 +4530,12 @@ wired, `server.rs` and `main.rs` are the reference.
   and keep the block absent). The refusal suite pins the denial side, where
   a denied `bug_info` costs two — the classify plus `disclosable`'s I2
   padding — against a refusal decided from the request alone, which
-  costs zero. `latency_ms` needs a mounted response delay to be pinned
+  costs zero. Outcome classes (issue #325) pin three shapes: an upstream
+  500 on a read and on a write records `error` with the status and the
+  numeric code; a request-alone refusal records `refused` with no upstream
+  block and no code key on the raw line; and a code-less upstream 500
+  records `error` with the status but still no code key — absent, never
+  null. `latency_ms` needs a mounted response delay to be pinned
   at all, which is why it is asserted in the core suite and not off
   ambient timing: a threshold over a localhost round trip is either
   flaky or so loose a constant passes it, so the assertion is that a
