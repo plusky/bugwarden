@@ -115,6 +115,14 @@ receivers:
         # Point OTEL_EXPORTER_OTLP_ENDPOINT at the collector's base URL —
         # http://otel-collector:4318 in compose, http://127.0.0.1:4318 on
         # the host. bugwarden appends /v1/logs itself.
+        # bugwarden closes an export batch at 4 MiB of encoded bytes,
+        # well under this receiver's default `max_request_body_size`
+        # of 20 MiB. Keep that setting above 4 MiB: a lower limit
+        # answers 413 to batches bugwarden already bounded, and a
+        # 413 counts as delivered rather than retried, so records
+        # would be lost without a gap. A single audit record larger
+        # than the receiver limit still posts alone and draws 413
+        # by itself.
 
   filelog/bugwarden-audit:
     include:

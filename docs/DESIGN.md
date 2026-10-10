@@ -2559,10 +2559,22 @@ names an endpoint.
   outage, and a log line getting through is not proof the audit sink
   works. Two queues keep the streams apart (2048 each): a log storm must
   not fill the audit queue and take the server down, and a dropped
-  diagnostic must not stop the guard. The batch is bounded (512 records,
-  500 ms, a 10 s request timeout); a failed AUDIT batch is lost rather
-  than retried (a retry queue is a second unbounded buffer in front of a
-  collector that is already not answering) but never silently. Diagnostic
+  diagnostic must not stop the guard. The batch is bounded by count and
+  by encoded bytes (512 records or 4 MiB of `encode_request` output,
+  whichever closes first, 500 ms, a 10 s request timeout); the byte
+  bound is measured on the exact POST body, envelope and all, so a
+  busy window of large records becomes several small posts and a
+  single record larger than the bound still posts alone, losing at
+  most what caused it (#326). A 413 for a batch counts as delivered:
+  the collector answered and refused this body, which is permanent
+  for the body rather than an outage, so there is no `audit_gap`,
+  no retry, and no health flip -- only a `debug!` line naming the
+  count, never the body. A failed AUDIT batch is otherwise lost
+  rather than retried (a retry queue is a second unbounded buffer
+  in front of a collector that is already not answering) but never
+  silently. The 4 MiB bound sits well under the collector default
+  of 20 MiB, leaving 16 MiB of headroom; the example keeps the
+  collector above it. Diagnostic
   drops are counted and the counter is logged when the total crosses a
   power of two — the diagnostic has to survive an outage that lasts, and
   one line per lost record would be its own denial of service. On a
@@ -4870,7 +4882,10 @@ wired, `server.rs` and `main.rs` are the reference.
   uniform failure text and recovery reopens the gate; an OTLP-only server
   serves, exports initialize and the tool call, and touches no
   filesystem; the startup probe retries through 503s until a racing
-  collector answers; and with no endpoint configured `resolve` yields
+  collector answers; byte-bound batching splits many small records
+  into several posts below the count limit, posts a lone oversized
+  record alone, and counts a 413 as delivered with no gap and no
+  loss (#326); and with no endpoint configured `resolve` yields
   nothing, no exporter is attached, the file still gets the record and a
   listening collector is never contacted. `otel_diagnostics.rs` is one
   test in a binary of its own

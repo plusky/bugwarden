@@ -139,6 +139,14 @@ const QUEUE_CAPACITY: usize = 2048;
 /// what the queue holds.
 const MAX_BATCH: usize = 512;
 
+/// Most encoded bytes in one export request, measured as the
+/// `encode_request` output for the batch. The drain task closes
+/// a batch on this as well as on the count, so a busy window of
+/// large records becomes several small posts rather than one the
+/// collector refuses. A single record larger than this still
+/// posts alone, so a refusal can only lose what caused it.
+const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
 /// How long the exporter waits for a batch to fill before sending what it
 /// has.
 const BATCH_INTERVAL: Duration = Duration::from_millis(500);
@@ -888,7 +896,14 @@ impl Pipeline {
         let batch = std::slice::from_ref(&entry);
         let mut attempt = 1;
         loop {
-            if post_batch(&self.client, &self.cfg, batch).await.is_ok() {
+            // A 413 for the tiny probe means the collector limit
+            // sits below even one small record, so startup still
+            // refuses: treating it as delivered would hide a limit
+            // that every later batch would hit as well.
+            if matches!(
+                post_batch(&self.client, &self.cfg, batch).await,
+                Ok(PostOutcome::Delivered)
+            ) {
                 self.healthy.store(true, Ordering::Relaxed);
                 return Ok(());
             }
@@ -1023,6 +1038,26 @@ fn note_drops(dropped: &AtomicU64, threshold: &AtomicU64, count: u64, reason: &'
     }
 }
 
+/// What one export request did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostOutcome {
+    /// The collector took the batch.
+    Delivered,
+    /// The collector answered 413. The body was too large for
+    /// its limit, which is permanent for this body rather than
+    /// an outage of the collector itself.
+    TooLarge,
+}
+
+/// Encoded size of the request `batch` would post.
+///
+/// Measured by encoding, not estimated, so the byte bound rests
+/// on the exact bytes the collector would receive, envelope and
+/// all.
+fn batch_encoded_len(service_name: &str, batch: &[LogEntry]) -> usize {
+    encode_request(service_name, batch).len()
+}
+
 /// Post one batch of entries: the one request path, shared by the drain
 /// task and the startup probe so the probe proves exactly what delivery
 /// uses — the client, the URL, the headers and the encoding.
@@ -1037,7 +1072,7 @@ async fn post_batch(
     client: &reqwest::Client,
     cfg: &ExportConfig,
     batch: &[LogEntry],
-) -> Result<(), &'static str> {
+) -> Result<PostOutcome, &'static str> {
     let body = encode_request(&cfg.service_name, batch);
     let mut request = client
         .post(&cfg.logs_url)
@@ -1047,7 +1082,10 @@ async fn post_batch(
         request = request.header(name.as_str(), value.as_str());
     }
     match request.send().await {
-        Ok(response) if response.status().is_success() => Ok(()),
+        Ok(response) if response.status().is_success() => Ok(PostOutcome::Delivered),
+        Ok(response) if response.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE => {
+            Ok(PostOutcome::TooLarge)
+        }
         Ok(_) => Err(REASON_HTTP_STATUS),
         Err(_) => Err(REASON_NETWORK),
     }
@@ -1109,6 +1147,31 @@ impl ExportTask {
                             if audit_batch.len() >= MAX_BATCH {
                                 break;
                             }
+                            // Byte bound, measured as the exact
+                            // request size. A full batch flushes
+                            // without the newcomer; a lone huge
+                            // record flushes alone on the break.
+                            if batch_encoded_len(
+                                &self.cfg.service_name,
+                                &audit_batch,
+                            ) > MAX_BATCH_BYTES
+                            {
+                                if audit_batch.len() <= 1 {
+                                    break;
+                                }
+                                if let Some(last) = audit_batch.pop() {
+                                    self.flush_audit(&mut audit_batch)
+                                        .await;
+                                    audit_batch.push(last);
+                                    if batch_encoded_len(
+                                        &self.cfg.service_name,
+                                        &audit_batch,
+                                    ) > MAX_BATCH_BYTES
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
                         }
                         None => { stopping = true; break; }
                     },
@@ -1117,6 +1180,30 @@ impl ExportTask {
                             diag_batch.push(entry);
                             if diag_batch.len() >= MAX_BATCH {
                                 break;
+                            }
+                            // Same byte bound as audit: split on
+                            // encoded size, post a lone huge
+                            // record alone.
+                            if batch_encoded_len(
+                                &self.cfg.service_name,
+                                &diag_batch,
+                            ) > MAX_BATCH_BYTES
+                            {
+                                if diag_batch.len() <= 1 {
+                                    break;
+                                }
+                                if let Some(last) = diag_batch.pop() {
+                                    self.flush_diag(&mut diag_batch)
+                                        .await;
+                                    diag_batch.push(last);
+                                    if batch_encoded_len(
+                                        &self.cfg.service_name,
+                                        &diag_batch,
+                                    ) > MAX_BATCH_BYTES
+                                    {
+                                        break;
+                                    }
+                                }
                             }
                         }
                         None => { stopping = true; break; }
@@ -1141,12 +1228,40 @@ impl ExportTask {
                     audit_batch.push(entry);
                     if audit_batch.len() >= MAX_BATCH {
                         self.flush_audit(&mut audit_batch).await;
+                    } else if batch_encoded_len(&self.cfg.service_name, &audit_batch)
+                        > MAX_BATCH_BYTES
+                    {
+                        if audit_batch.len() <= 1 {
+                            self.flush_audit(&mut audit_batch).await;
+                        } else if let Some(last) = audit_batch.pop() {
+                            self.flush_audit(&mut audit_batch).await;
+                            audit_batch.push(last);
+                            if batch_encoded_len(&self.cfg.service_name, &audit_batch)
+                                > MAX_BATCH_BYTES
+                            {
+                                self.flush_audit(&mut audit_batch).await;
+                            }
+                        }
                     }
                 }
                 while let Ok(entry) = self.diag_rx.try_recv() {
                     diag_batch.push(entry);
                     if diag_batch.len() >= MAX_BATCH {
                         self.flush_diag(&mut diag_batch).await;
+                    } else if batch_encoded_len(&self.cfg.service_name, &diag_batch)
+                        > MAX_BATCH_BYTES
+                    {
+                        if diag_batch.len() <= 1 {
+                            self.flush_diag(&mut diag_batch).await;
+                        } else if let Some(last) = diag_batch.pop() {
+                            self.flush_diag(&mut diag_batch).await;
+                            diag_batch.push(last);
+                            if batch_encoded_len(&self.cfg.service_name, &diag_batch)
+                                > MAX_BATCH_BYTES
+                            {
+                                self.flush_diag(&mut diag_batch).await;
+                            }
+                        }
                     }
                 }
                 self.flush_audit(&mut audit_batch).await;
@@ -1162,13 +1277,27 @@ impl ExportTask {
     /// that is already not answering) — but never silently: the count
     /// reaches the sink's `audit_gap` accounting via `lost`, and the
     /// failure flips the health flag that holds the fail-mode gate
-    /// closed until a delivery succeeds.
+    /// closed until a delivery succeeds. A 413 counts as delivered:
+    /// the collector answered and refused this body, which is
+    /// permanent for the body rather than an outage, so there is
+    /// no gap to account and nothing to retry.
     async fn flush_audit(&self, batch: &mut Vec<LogEntry>) {
         if batch.is_empty() {
             return;
         }
         match post_batch(&self.client, &self.cfg, batch).await {
-            Ok(()) => note_delivery(&self.healthy, true),
+            Ok(PostOutcome::Delivered) => {
+                note_delivery(&self.healthy, true);
+            }
+            Ok(PostOutcome::TooLarge) => {
+                // Count only, never the body: the body is audit
+                // content and must not reach a log line.
+                tracing::debug!(
+                    records = batch.len(),
+                    "otlp batch drew 413; counting as delivered"
+                );
+                note_delivery(&self.healthy, true);
+            }
             Err(_) => {
                 self.lost.fetch_add(batch.len() as u64, Ordering::Relaxed);
                 note_delivery(&self.healthy, false);
@@ -1181,13 +1310,23 @@ impl ExportTask {
     /// counted warning — best-effort. A failure still marks delivery
     /// unhealthy (the same collector will refuse audit records too); a
     /// success does not clear the latch. Only a successful AUDIT flush
-    /// proves the load-bearing sink works again.
+    /// proves the load-bearing sink works again. A 413 counts the
+    /// same as a success: the collector answered, so there is no
+    /// outage to mark and nothing to count.
     async fn flush_diag(&self, batch: &mut Vec<LogEntry>) {
         if batch.is_empty() {
             return;
         }
         match post_batch(&self.client, &self.cfg, batch).await {
-            Ok(()) => {}
+            Ok(PostOutcome::Delivered) => {}
+            Ok(PostOutcome::TooLarge) => {
+                // Count only, never the body, for the same reason
+                // the audit path names no content.
+                tracing::debug!(
+                    records = batch.len(),
+                    "otlp diagnostics batch drew 413; delivered"
+                );
+            }
             Err(reason) => {
                 note_drops(
                     &self.dropped,
