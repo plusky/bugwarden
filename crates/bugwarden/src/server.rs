@@ -5467,7 +5467,7 @@ impl ServerHandler for BugWarden {
         {
             info.protocol_version = request.protocol_version.clone();
         } else {
-            tracing::warn!(
+            tracing::info!(
                 client_requested = ?Capped(request.protocol_version.as_str()),
                 server_fallback = %info.protocol_version,
                 "client requested unsupported protocol version; falling back to server default"
