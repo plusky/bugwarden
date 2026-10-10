@@ -205,13 +205,20 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let audit = audit_sink.map(|(sink, fail_mode, policy_hash)| {
-        let sink = match &otel {
-            Some(pipeline) => sink.with_export(pipeline.audit_exporter()),
-            None => sink,
-        };
-        Arc::new(AuditState::new(sink, fail_mode, policy_hash))
-    });
+    let audit = match audit_sink {
+        Some((sink, fail_mode, policy_hash)) => {
+            let sink = match &otel {
+                Some(pipeline) => sink.with_export(pipeline.audit_exporter()),
+                None => sink,
+            };
+            // A fileless sink keeps nothing itself, so without an
+            // exporter every record would vanish; refuse rather than
+            // serve unaudited.
+            sink.require_export_for_fileless()?;
+            Some(Arc::new(AuditState::new(sink, fail_mode, policy_hash)))
+        }
+        None => None,
+    };
     if audit.is_none() && cfg.transport == Transport::Http {
         tracing::warn!(
             "auditing is OFF: remote tool calls over http will leave no audit \
