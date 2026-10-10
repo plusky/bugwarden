@@ -613,7 +613,7 @@ impl Guard {
         }
         if let Some(Value::Array(entries)) = obj.get_mut("see_also") {
             entries.retain(|e| {
-                e.as_str().is_none_or(|entry| {
+                e.as_str().is_some_and(|entry| {
                     Self::see_also_local_id(entry, base_url)
                         .is_none_or(|id| disclosable.contains(&id))
                 })
@@ -1621,6 +1621,28 @@ mod tests {
             "local hidden bug dropped, foreign tracker kept"
         );
         assert_eq!(bug["id"], json!(1), "the bug's own id is untouched");
+    }
+
+    #[test]
+    fn see_also_drops_non_string_entries() {
+        // A non-string entry names nothing assessable, so it goes.
+        let mut bug = json!({
+            "id": 1,
+            "see_also": [
+                "https://bugzilla.example.com/show_bug.cgi?id=7",
+                "https://bugzilla.example.com/show_bug.cgi?id=8",
+                9,
+                { "url": "https://bugzilla.example.com/show_bug.cgi?id=8" },
+                null,
+            ],
+        });
+        let allowed: BTreeSet<u64> = [8].into_iter().collect();
+        Guard::scrub_bug_links(&mut bug, BASE, &allowed);
+        assert_eq!(
+            bug["see_also"],
+            json!(["https://bugzilla.example.com/show_bug.cgi?id=8"]),
+            "hidden dropped, nameable kept, non-strings dropped"
+        );
     }
 
     #[test]

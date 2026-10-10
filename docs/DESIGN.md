@@ -3752,7 +3752,9 @@ wired, `server.rs` and `main.rs` are the reference.
   a string is not (`any_json_number_in_a_cf_field_is_a_link`: a hidden
   scalar becomes null, a disclosable one is kept, hidden number items are
   dropped from a list and string items stay, a digit string is untouched,
-  and `linked_bug_ids` collects the numbers only); and history kinds
+    and `linked_bug_ids` collects the numbers only); a non-string
+    `see_also` entry is dropped, a hidden local URL with it and a
+    nameable one kept (`see_also_drops_non_string_entries`); and history kinds
   (`history_cf_changes_follow_kinds`) — a Bug ID field is strict (a hidden
   id scrubbed, a visible one kept, `""` and all-zero spellings kept,
   `see 7` and `7, 8` blanked: a custom value is never comma-split), an
