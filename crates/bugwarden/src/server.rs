@@ -4112,20 +4112,17 @@ impl BugWarden {
                 return Ok(err_text(Guard::denial(id)));
             }
         }
-        // A bug listed in its own dependency change is refused
+        // A bug adding itself as a dependency is refused
         // here, after the denials and before the PUT: the loop
         // codes can name a hidden bug, so they carry no hint,
         // while this text is read off the request alone.
-        let self_linked = [
-            &p.blocks_add,
-            &p.blocks_remove,
-            &p.depends_on_add,
-            &p.depends_on_remove,
-        ]
-        .into_iter()
-        .flatten()
-        .flatten()
-        .any(|id| *id == p.bug_id);
+        // A remove naming itself only clears a link, so it
+        // passes through to the PUT.
+        let self_linked = [&p.blocks_add, &p.depends_on_add]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|id| *id == p.bug_id);
         if self_linked {
             note_refused(&ctx);
             return Ok(err_text(format!(
