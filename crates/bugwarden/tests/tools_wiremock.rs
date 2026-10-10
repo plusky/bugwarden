@@ -1951,15 +1951,14 @@ async fn mount_put_trap(mock: &MockServer) {
 
 #[tokio::test]
 async fn update_bug_dependencies_refuses_a_self_reference_before_the_put() {
-    // A bug naming itself in any of the four lists is refused with a
+    // A bug adding itself in either add list is refused with a
     // fixed text read off the request alone — the loop codes can name
     // a hidden bug, so they carry no hint. The guard still assesses
-    // first (one classify), but nothing is PUT.
+    // first (one classify), but nothing is PUT. A remove naming
+    // itself only clears a link, so it is served (next test).
     for args in [
         json!({ "bug_id": 7, "blocks_add": [7] }),
-        json!({ "bug_id": 7, "blocks_remove": [7] }),
         json!({ "bug_id": 7, "depends_on_add": [7] }),
-        json!({ "bug_id": 7, "depends_on_remove": [7] }),
     ] {
         let mock = MockServer::start().await;
         mount_classify(&mock, world_readable_bug(7)).await;
@@ -1976,6 +1975,35 @@ async fn update_bug_dependencies_refuses_a_self_reference_before_the_put() {
             mock.received_requests().await.unwrap().len(),
             1,
             "the classify alone reaches Bugzilla: {args}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_bug_dependencies_allows_removing_a_self_reference() {
+    // A remove naming the bug itself only clears a link, so it
+    // passes through to the PUT. Each remove reaches Bugzilla:
+    // one classify plus one PUT.
+    for (args, body) in [
+        (
+            json!({ "bug_id": 7, "blocks_remove": [7] }),
+            json!({ "blocks": { "remove": [7] } }),
+        ),
+        (
+            json!({ "bug_id": 7, "depends_on_remove": [7] }),
+            json!({ "depends_on": { "remove": [7] } }),
+        ),
+    ] {
+        let mock = MockServer::start().await;
+        mount_classify(&mock, world_readable_bug(7)).await;
+        mount_update_put(&mock, body.clone()).await;
+        let client = client_for("", &mock).await;
+        let result = call(&client, "update_bug_dependencies", args.clone()).await;
+        assert!(!is_error(&result), "self remove must be served: {args}");
+        assert_eq!(
+            sole_put_body(&mock).await,
+            body,
+            "the remove reaches the PUT: {args}"
         );
     }
 }
