@@ -4,6 +4,11 @@
 
 # bugwarden
 
+![Build Status](https://github.com/plusky/bugwarden/actions/workflows/ci.yml/badge.svg?branch=main)
+[![Crates.io](https://img.shields.io/crates/v/bugwarden)](https://crates.io/crates/bugwarden)
+[![Docs](https://docs.rs/bugwarden/badge.svg)](https://docs.rs/bugwarden)
+[![License](https://img.shields.io/crates/l/bugwarden)](https://github.com/plusky/bugwarden/blob/main/LICENSE)
+
 **bugwarden** is a Model Context Protocol (MCP) server, written in Rust, with
 operator-controlled security guards. It exposes a Bugzilla instance to LLM
 clients — querying bugs,
