@@ -896,16 +896,24 @@ impl Pipeline {
         let batch = std::slice::from_ref(&entry);
         let mut attempt = 1;
         loop {
-            // A 413 for the tiny probe means the collector limit
-            // sits below even one small record, so startup still
-            // refuses: treating it as delivered would hide a limit
-            // that every later batch would hit as well.
-            if matches!(
-                post_batch(&self.client, &self.cfg, batch).await,
-                Ok(PostOutcome::Delivered)
-            ) {
-                self.healthy.store(true, Ordering::Relaxed);
-                return Ok(());
+            // A 413 for the tiny probe is deterministic: the
+            // collector limit sits below even one small record,
+            // so fail fast with the limit message instead of
+            // retrying a bound that cannot pass.
+            match post_batch(&self.client, &self.cfg, batch).await {
+                Ok(PostOutcome::Delivered) => {
+                    self.healthy.store(true, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Ok(PostOutcome::TooLarge) => {
+                    self.healthy.store(false, Ordering::Relaxed);
+                    anyhow::bail!(
+                        "the OTLP collector answered 413 to the startup record; its \
+                         max_request_body_size sits below one small record — raise \
+                         the collector limit above the 4 MiB batch bound"
+                    );
+                }
+                Err(_) => {}
             }
             if attempt >= PROBE_ATTEMPTS {
                 self.healthy.store(false, Ordering::Relaxed);
@@ -1144,13 +1152,8 @@ impl ExportTask {
                     entry = self.audit_rx.recv() => match entry {
                         Some(entry) => {
                             audit_batch.push(entry);
-                            if audit_batch.len() >= MAX_BATCH {
-                                break;
-                            }
-                            // Byte bound, measured as the exact
-                            // request size. A full batch flushes
-                            // without the newcomer; a lone huge
-                            // record flushes alone on the break.
+                            // Byte bound first, so a count-full batch
+                            // splits on size the same way.
                             if batch_encoded_len(
                                 &self.cfg.service_name,
                                 &audit_batch,
@@ -1163,14 +1166,13 @@ impl ExportTask {
                                     self.flush_audit(&mut audit_batch)
                                         .await;
                                     audit_batch.push(last);
-                                    if batch_encoded_len(
-                                        &self.cfg.service_name,
-                                        &audit_batch,
-                                    ) > MAX_BATCH_BYTES
-                                    {
-                                        break;
-                                    }
+                                    // One window stays bounded; the
+                                    // outer flush gets its turn next.
+                                    break;
                                 }
+                            }
+                            if audit_batch.len() >= MAX_BATCH {
+                                break;
                             }
                         }
                         None => { stopping = true; break; }
@@ -1178,12 +1180,9 @@ impl ExportTask {
                     entry = self.diag_rx.recv() => match entry {
                         Some(entry) => {
                             diag_batch.push(entry);
-                            if diag_batch.len() >= MAX_BATCH {
-                                break;
-                            }
-                            // Same byte bound as audit: split on
-                            // encoded size, post a lone huge
-                            // record alone.
+                            // Byte bound first, as for audit. A split
+                            // flushes pending audit first, so export
+                            // order stays audit first.
                             if batch_encoded_len(
                                 &self.cfg.service_name,
                                 &diag_batch,
@@ -1193,17 +1192,17 @@ impl ExportTask {
                                     break;
                                 }
                                 if let Some(last) = diag_batch.pop() {
+                                    self.flush_audit(&mut audit_batch)
+                                        .await;
                                     self.flush_diag(&mut diag_batch)
                                         .await;
                                     diag_batch.push(last);
-                                    if batch_encoded_len(
-                                        &self.cfg.service_name,
-                                        &diag_batch,
-                                    ) > MAX_BATCH_BYTES
-                                    {
-                                        break;
-                                    }
+                                    // Bounded window, as for audit.
+                                    break;
                                 }
+                            }
+                            if diag_batch.len() >= MAX_BATCH {
+                                break;
                             }
                         }
                         None => { stopping = true; break; }
@@ -1226,11 +1225,9 @@ impl ExportTask {
                 self.diag_rx.close();
                 while let Ok(entry) = self.audit_rx.try_recv() {
                     audit_batch.push(entry);
-                    if audit_batch.len() >= MAX_BATCH {
-                        self.flush_audit(&mut audit_batch).await;
-                    } else if batch_encoded_len(&self.cfg.service_name, &audit_batch)
-                        > MAX_BATCH_BYTES
-                    {
+                    // Byte bound first, so a count-full tail
+                    // splits on size the same way.
+                    if batch_encoded_len(&self.cfg.service_name, &audit_batch) > MAX_BATCH_BYTES {
                         if audit_batch.len() <= 1 {
                             self.flush_audit(&mut audit_batch).await;
                         } else if let Some(last) = audit_batch.pop() {
@@ -1242,26 +1239,33 @@ impl ExportTask {
                                 self.flush_audit(&mut audit_batch).await;
                             }
                         }
+                    } else if audit_batch.len() >= MAX_BATCH {
+                        self.flush_audit(&mut audit_batch).await;
                     }
                 }
                 while let Ok(entry) = self.diag_rx.try_recv() {
                     diag_batch.push(entry);
-                    if diag_batch.len() >= MAX_BATCH {
-                        self.flush_diag(&mut diag_batch).await;
-                    } else if batch_encoded_len(&self.cfg.service_name, &diag_batch)
-                        > MAX_BATCH_BYTES
-                    {
+                    // Byte bound first, as for audit. Each diag
+                    // flush drains pending audit first, so the
+                    // tail keeps audit first.
+                    if batch_encoded_len(&self.cfg.service_name, &diag_batch) > MAX_BATCH_BYTES {
                         if diag_batch.len() <= 1 {
+                            self.flush_audit(&mut audit_batch).await;
                             self.flush_diag(&mut diag_batch).await;
                         } else if let Some(last) = diag_batch.pop() {
+                            self.flush_audit(&mut audit_batch).await;
                             self.flush_diag(&mut diag_batch).await;
                             diag_batch.push(last);
                             if batch_encoded_len(&self.cfg.service_name, &diag_batch)
                                 > MAX_BATCH_BYTES
                             {
+                                self.flush_audit(&mut audit_batch).await;
                                 self.flush_diag(&mut diag_batch).await;
                             }
                         }
+                    } else if diag_batch.len() >= MAX_BATCH {
+                        self.flush_audit(&mut audit_batch).await;
+                        self.flush_diag(&mut diag_batch).await;
                     }
                 }
                 self.flush_audit(&mut audit_batch).await;
@@ -2821,5 +2825,94 @@ mod tests {
                 "Pipeline's Debug must not carry {forbidden}: {rendered}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn diag_byte_split_keeps_audit_first() {
+        // Audit collected before the diag trip must export
+        // before the diagnostics.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let collector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/logs"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&collector)
+            .await;
+        let cfg = resolve(&env(&collector.uri()))
+            .expect("resolves")
+            .expect("export is on");
+        let pipeline = Arc::new(Pipeline::start(cfg).expect("starts"));
+        for _ in 0..5 {
+            pipeline
+                .accept(&event(tool_call(None)), b"{\"seq\":1}")
+                .expect("queue takes audit");
+        }
+        for _ in 0..40 {
+            pipeline.emit(LogEntry {
+                time_unix_nano: now_unix_nano(),
+                severity: Severity::Info,
+                body: "x".repeat(128 * 1024),
+                attrs: vec![("bugwarden.stream", AttrValue::Str("diagnostics".to_owned()))],
+                trace: None,
+            });
+        }
+        let want = 45;
+        for _ in 0..100 {
+            let requests = collector
+                .received_requests()
+                .await
+                .expect("recording is on");
+            let mut total = 0;
+            for request in &requests {
+                let decoded = decode_request(&request.body);
+                for resource in &decoded.resource_logs {
+                    for scope in &resource.scope_logs {
+                        total += scope.log_records.len();
+                    }
+                }
+            }
+            if total >= want {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let requests = collector
+            .received_requests()
+            .await
+            .expect("recording is on");
+        let mut first_audit: Option<usize> = None;
+        let mut first_diag: Option<usize> = None;
+        for (index, request) in requests.iter().enumerate() {
+            let decoded = decode_request(&request.body);
+            for resource in &decoded.resource_logs {
+                for scope in &resource.scope_logs {
+                    for record in &scope.log_records {
+                        let stream = record
+                            .attributes
+                            .iter()
+                            .find(|kv| kv.key == "bugwarden.stream")
+                            .and_then(|kv| any(&kv.value));
+                        match stream {
+                            Some(otlp::AnyValueKind::StringValue(s)) if s == "audit" => {
+                                first_audit.get_or_insert(index);
+                            }
+                            Some(otlp::AnyValueKind::StringValue(s)) if s == "diagnostics" => {
+                                first_diag.get_or_insert(index);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        let first_audit = first_audit.expect("audit must have been exported");
+        let first_diag = first_diag.expect("diagnostics must have been exported");
+        assert!(
+            first_audit < first_diag,
+            "audit collected first must export first: audit at \
+             request {first_audit}, diagnostics at {first_diag}"
+        );
+        pipeline.shutdown().await;
     }
 }

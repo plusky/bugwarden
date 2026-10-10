@@ -2562,10 +2562,16 @@ names an endpoint.
   diagnostic must not stop the guard. The batch is bounded by count and
   by encoded bytes (512 records or 4 MiB of `encode_request` output,
   whichever closes first, 500 ms, a 10 s request timeout); the byte
-  bound is measured on the exact POST body, envelope and all, so a
-  busy window of large records becomes several small posts and a
-  single record larger than the bound still posts alone, losing at
-  most what caused it (#326). A 413 for a batch counts as delivered:
+  bound is checked first and the count-full batch splits by bytes the
+  same way, in the live loops and in both shutdown tails, so a
+  count-full batch averaging over 8KB still posts as several small
+  posts; the byte bound is measured on the exact POST body, envelope
+  and all, so a busy window of large records becomes several small
+  posts and a single record larger than the bound still posts alone,
+  losing at most what caused it (#326). A diagnostics byte split
+  flushes pending audit first, keeping audit first, and an inner byte
+  split breaks to the outer flush so one window stays bounded. A 413
+  for a batch counts as delivered:
   the collector answered and refused this body, which is permanent
   for the body rather than an outage, so there is no `audit_gap`,
   no retry, and no health flip -- only a `debug!` line naming the
@@ -2711,7 +2717,9 @@ names an endpoint.
   without leaving a file behind (five attempts, `n × 500 ms` backoff,
   posting one real diagnostics record — not an empty request some
   collectors accept blindly, and not a fake audit event the schema does
-  not have). The diagnostics layer is installed at subscriber time but
+  not have; a 413 to that probe fails fast on the first attempt with a
+  limit message, since the limit sits below one small record). The
+  diagnostics layer is installed at subscriber time but
   reads an empty slot until the pipeline starts, so events emitted during
   startup reach stderr and not the collector. At shutdown the queue is
   flushed best-effort under a 5 s bound; over http that runs after
@@ -4883,9 +4891,12 @@ wired, `server.rs` and `main.rs` are the reference.
   serves, exports initialize and the tool call, and touches no
   filesystem; the startup probe retries through 503s until a racing
   collector answers; byte-bound batching splits many small records
-  into several posts below the count limit, posts a lone oversized
-  record alone, and counts a 413 as delivered with no gap and no
-  loss (#326); and with no endpoint configured `resolve` yields
+  into several posts below the count limit, splits a count-full batch
+  of large records by bytes, posts a lone oversized record alone, keeps
+  audit first across a diagnostics byte split, and counts a 413 as
+  delivered with no gap and no loss (#326); an always-413 collector
+  refuses the probe fast with the limit message on one attempt; and
+  with no endpoint configured `resolve` yields
   nothing, no exporter is attached, the file still gets the record and a
   listening collector is never contacted. `otel_diagnostics.rs` is one
   test in a binary of its own
