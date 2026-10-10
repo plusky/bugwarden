@@ -1696,8 +1696,18 @@ Decisions, all deliberate:
   extensions (verdict worst-wins merged, suppressed ids unioned). An
   unknown tool, a protocol error, or a missed enrichment that reaches
   the handler still yields exactly one record — a poorer record is
-  possible, an audit gap is not (except a stdio call still running when
-  the session ends, #319).
+  possible, an audit gap is not. Since #319 that holds for a stdio call
+  still running when the session ends as well: it is recorded with
+  whatever verdict and upstream legs it had managed, `class: error`
+  (its definition already covers abandonment, so no schema change),
+  and no `response_bytes`. A drop guard in `call_tool` writes the
+  record when the dispatch future is dropped before its own record
+  runs, and the signal path flushes the in-flight calls before
+  exiting, since exiting never runs drops. The claim between the
+  three is atomic, so they can never write twice. File-best-effort,
+  OTLP-lossy: guard and flush write synchronously to the file, while
+  the export hand-off only queues into a collector already going
+  away.
   A handler that PANICS is no exception since #253, and used to be one: the
   unwind is caught at the dispatch boundary, the request is answered with a
   JSON-RPC internal error carrying a fixed, content-free text, and the

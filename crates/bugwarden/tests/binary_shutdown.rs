@@ -84,6 +84,8 @@ use tokio::io::BufReader;
 use tokio::process::Child;
 use tokio::process::ChildStdin;
 use tokio::process::Command;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/deadline.rs"]
 mod deadline;
@@ -1104,4 +1106,224 @@ async fn stdio_a_refused_initialize_is_classified_not_echoed() {
             None,
         )
         .await;
+}
+
+/// How long an abandoned-call row waits for the child to exit.
+///
+/// Past the serve loop drain window for a closed stdin, so a child
+/// that only exits once its slow upstream answers still exits here.
+const ABANDON_EXIT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A mock Bugzilla that classifies at once but holds the comment
+/// write past the serve loop drain window, so the call is still in
+/// flight when the test ends the session.
+async fn slow_comment_bugzilla() -> MockServer {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "bugs": [{
+                "id": 7,
+                "summary": "a plain bug",
+                "product": "openSUSE",
+                "component": "Kernel",
+                "status": "NEW",
+                "severity": "normal",
+                "priority": "P3",
+                "keywords": [],
+                "groups": [],
+                "whiteboard": "",
+                "creation_time": "2020-01-01T00:00:00Z",
+            }] })),
+        )
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/rest/bug/7/comment"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(10))
+                .set_body_json(serde_json::json!({ "id": 11 })),
+        )
+        .mount(&mock)
+        .await;
+    mock
+}
+
+/// Spawn stdio against `bugzilla` with a file audit sink under `dir`.
+/// Returns the server and the audit file path.
+fn spawn_stdio_audited(bugzilla: &str, dir: &tempfile::TempDir) -> (Server, std::path::PathBuf) {
+    let audit_path = dir.path().join("audit.jsonl");
+    let config_path = dir.path().join("audit.toml");
+    std::fs::write(
+        &config_path,
+        format!("path = {:?}\n", audit_path.to_str().expect("utf-8")),
+    )
+    .expect("the audit config must be writable");
+    let config_str = config_path.to_str().expect("a utf-8 temp path").to_owned();
+    let server = Server::spawn(&[
+        "--transport",
+        "stdio",
+        "--bugzilla-server",
+        bugzilla,
+        "--api-key",
+        "test-key",
+        "--audit-config",
+        config_str.as_str(),
+    ]);
+    (server, audit_path)
+}
+
+/// Handshake the child, then fire one comment write and leave it in
+/// flight. Returns the stdout drain task, as the shared helper does.
+async fn handshake_and_fire_add_comment(server: &mut Server) -> tokio::task::JoinHandle<()> {
+    let stdin = server.stdin.as_mut().expect("stdin is piped");
+    let stdout = server.child.stdout.take().expect("stdout is piped");
+    let mut lines = BufReader::new(stdout).lines();
+    stdin
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"binary-shutdown-test","version":"0"}}}
+"#,
+        )
+        .await
+        .expect("the child must accept the handshake");
+    let reply = tokio::time::timeout(ABANDON_EXIT_TIMEOUT, lines.next_line())
+        .await
+        .expect("the handshake must not hang")
+        .expect("stdout must be readable")
+        .expect("the server must answer initialize");
+    assert!(
+        reply.contains("bugwarden"),
+        "initialize must complete before the test acts: {reply}"
+    );
+    stdin
+        .write_all(
+            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}
+"#,
+        )
+        .await
+        .expect("the child must accept the notification");
+    stdin
+        .write_all(br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add_comment","arguments":{"bug_id":7,"comment":"hello"}}}
+"#)
+        .await
+        .expect("the child must accept the call");
+    tokio::spawn(async move { while lines.next_line().await.ok().flatten().is_some() {} })
+}
+
+/// Wait until the mock has served the comment write, proving dispatch
+/// reached upstream and the call is in flight.
+async fn wait_for_comment_post(mock: &MockServer) {
+    tokio::time::timeout(ABANDON_EXIT_TIMEOUT, async {
+        loop {
+            let seen = mock
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|r| r.method.as_str() == "POST" && r.url.path() == "/rest/bug/7/comment");
+            if seen {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the call must reach upstream before the session ends");
+}
+
+/// Wait for the child to exit 0 and drain its stderr, then return the
+/// log. A longer budget than the shared graceful wait, covering the
+/// serve loop drain window the abandoned call outlives.
+async fn wait_for_exit_and_drain(mut server: Server, what: &str) -> String {
+    let status = tokio::time::timeout(ABANDON_EXIT_TIMEOUT, server.child.wait())
+        .await
+        .unwrap_or_else(|_| panic!("{what}: the process must exit within {ABANDON_EXIT_TIMEOUT:?}"))
+        .expect("the child must be waitable");
+    let _ = tokio::time::timeout(ABANDON_EXIT_TIMEOUT, async {
+        while server.next_stderr_line().await.is_some() {}
+    })
+    .await;
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "{what}: ending the session mid-call must stay a clean exit 0: \
+         status={status:?} stderr={log}",
+        log = server.log
+    );
+    server.log
+}
+
+/// The `tool_call` records in the audit file, in file order.
+fn tool_call_records(path: &std::path::Path) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(path).expect("audit file must be readable");
+    text.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("every audit line must parse"))
+        .filter(|v: &serde_json::Value| {
+            v.get("event").and_then(|e| e.as_str()) == Some("tool_call")
+        })
+        .collect()
+}
+
+/// One abandoned call is exactly one record, and it reports the
+/// failure: the call never answered, so its class is error.
+fn assert_one_error_record(path: &std::path::Path, what: &str) {
+    let records = tool_call_records(path);
+    assert_eq!(
+        records.len(),
+        1,
+        "{what}: an abandoned call must leave exactly one tool_call \
+         record: found {} in {}",
+        records.len(),
+        path.display()
+    );
+    assert_eq!(
+        records[0]
+            .pointer("/outcome/class")
+            .and_then(|v| v.as_str()),
+        Some("error"),
+        "{what}: the abandoned record reports the failure: {}",
+        records[0]
+    );
+    assert_eq!(
+        records[0].pointer("/request/tool").and_then(|v| v.as_str()),
+        Some("add_comment"),
+        "{what}: the abandoned record names the call: {}",
+        records[0]
+    );
+}
+
+#[tokio::test]
+async fn stdio_closing_stdin_mid_call_still_records_the_call() {
+    let mock = slow_comment_bugzilla().await;
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (mut server, audit_path) = spawn_stdio_audited(&mock.uri(), &dir);
+    server.wait_for_stderr(STDIO_READY).await;
+    let _drain = handshake_and_fire_add_comment(&mut server).await;
+    wait_for_comment_post(&mock).await;
+    server.close_stdin();
+    let log = wait_for_exit_and_drain(server, "stdio close-stdin mid-call").await;
+    assert!(
+        !log.contains("received shutdown signal"),
+        "a hangup is not a signal shutdown: {log}"
+    );
+    assert_one_error_record(&audit_path, "stdio close-stdin mid-call");
+}
+
+#[tokio::test]
+async fn stdio_sigterm_mid_call_still_records_the_call() {
+    let mock = slow_comment_bugzilla().await;
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (mut server, audit_path) = spawn_stdio_audited(&mock.uri(), &dir);
+    server.wait_for_stderr(STDIO_READY).await;
+    let _drain = handshake_and_fire_add_comment(&mut server).await;
+    wait_for_comment_post(&mock).await;
+    server.signal("TERM");
+    let log = wait_for_exit_and_drain(server, "stdio SIGTERM mid-call").await;
+    assert!(
+        log.contains("received shutdown signal"),
+        "the shutdown path must log that it ran: {log}"
+    );
+    assert_one_error_record(&audit_path, "stdio SIGTERM mid-call");
 }
