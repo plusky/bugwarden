@@ -25,6 +25,9 @@
 //!   field instead of failing the call;
 //! - forwarding Bugzilla's message from any of the seven bug-update tools'
 //!   failure arms, or dropping the hint a listed code selects;
+//! - forwarding Bugzilla's message from any read tool's failure arm —
+//!   including a `server_info` `unavailable` entry — or answering two
+//!   statuses with different bytes;
 //! - keying the hint lookup on the HTTP status, or ignoring the tool or
 //!   the request's reach when looking one up;
 //! - dropping the `cf_` arm from `linked_bug_ids` (a visible Bug ID custom
@@ -3162,10 +3165,10 @@ async fn bug_fields_a_dot_segment_name_fails_the_call_without_a_request() {
     let client = client_for(DISCOVERY_POLICY, &mock).await;
     let result = call(&client, "bug_fields", json!({ "field_names": [".."] })).await;
     assert!(is_error(&result), "{}", text_of(&result));
-    assert!(
-        text_of(&result).starts_with("Failed to fetch bug fields\n"),
-        "the generic call-level failure: {}",
-        text_of(&result)
+    assert_eq!(
+        text_of(&result),
+        "Failed to fetch bug fields",
+        "the generic call-level failure, with no client-input echo"
     );
     assert!(
         mock.received_requests().await.unwrap().is_empty(),
@@ -4092,6 +4095,295 @@ async fn an_unassessed_request_gets_no_hint_but_the_product_one() {
     )
     .await;
     assert_eq!(text, "Failed to mark as duplicate");
+}
+
+// ---------- upstream failures of the read tools ----------
+
+/// The fixed line every read tool answers an upstream failure with, and
+/// never Bugzilla's text, status or code. `UPSTREAM_MESSAGE` names a bug
+/// and forges a logfmt pair, so either reaching the result fails the row.
+fn assert_read_refusal(result: &CallToolResult, tool: &str, line: &str) {
+    assert!(is_error(result), "{tool} must fail: {}", text_of(result));
+    let text = text_of(result);
+    assert_eq!(text, line, "{tool} must answer its fixed line alone");
+    for needle in ["424242", "HACKED", "bugzilla error"] {
+        assert!(
+            !text.contains(needle),
+            "{tool} leaked Bugzilla's text into the result: {text}"
+        );
+    }
+}
+
+/// A Bugzilla error envelope carrying [`UPSTREAM_MESSAGE`].
+fn upstream_500() -> ResponseTemplate {
+    ResponseTemplate::new(500).set_body_json(json!({
+        "error": true, "code": 32000, "message": UPSTREAM_MESSAGE,
+    }))
+}
+
+#[tokio::test]
+async fn read_tools_answer_a_refusal_with_their_fixed_line_never_bugzillas_text() {
+    // Every failing endpoint on one mock; each tool below answers its
+    // own path, so no row can mask another.
+    let mock = MockServer::start().await;
+    // Both bug tools classify bug 7, so this mock answers any number of
+    // classification fetches (`mount_classify` expects exactly one).
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "bugs": [world_readable_bug(7)] })),
+        )
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/7/attachment"))
+        .respond_with(upstream_500())
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/7/comment"))
+        .respond_with(upstream_500())
+        .mount(&mock)
+        .await;
+    for endpoint in [
+        "/rest/version",
+        "/rest/extensions",
+        "/rest/time",
+        "/rest/parameters",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(upstream_500())
+            .mount(&mock)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/rest/product_enterable"))
+        .respond_with(upstream_500())
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(upstream_500())
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/page.cgi"))
+        .respond_with(upstream_500())
+        .mount(&mock)
+        .await;
+    let client = client_for("", &mock).await;
+    let discovery = client_for(DISCOVERY_POLICY, &mock).await;
+
+    for (client, tool, args, line) in [
+        (
+            &client,
+            "list_attachments",
+            json!({ "bug_id": 7 }),
+            "Failed to fetch bug attachments",
+        ),
+        (
+            &client,
+            "summarize_bug",
+            json!({ "id": 7 }),
+            "Summarize Comments Failed",
+        ),
+        (
+            &client,
+            "bugzilla_server_info",
+            json!({}),
+            "Failed to fetch bugzilla server info",
+        ),
+        (
+            &client,
+            "quicksearch_syntax",
+            json!({}),
+            "Failed to fetch quicksearch documentation",
+        ),
+        (
+            &discovery,
+            "bugzilla_products",
+            json!({}),
+            "Failed to fetch products",
+        ),
+        (
+            &discovery,
+            "bug_fields",
+            json!({}),
+            "Failed to fetch bug fields",
+        ),
+    ] {
+        let result = call(client, tool, args).await;
+        assert_read_refusal(&result, tool, line);
+    }
+}
+
+#[tokio::test]
+async fn read_tools_refuse_their_secondary_endpoints_with_the_same_line() {
+    // The failure arms behind the first request of each discovery tool:
+    // a catalog whose product list fails, a named-products fetch, and a
+    // named-field fetch.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/product_enterable"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ids": [1] })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/product"))
+        .respond_with(upstream_500())
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug/priority"))
+        .respond_with(upstream_500())
+        .mount(&mock)
+        .await;
+    let discovery = client_for(DISCOVERY_POLICY, &mock).await;
+
+    let result = call(&discovery, "bugzilla_products", json!({})).await;
+    assert_read_refusal(&result, "bugzilla_products", "Failed to fetch products");
+    let result = call(
+        &discovery,
+        "bugzilla_products",
+        json!({ "products": ["TestProduct"] }),
+    )
+    .await;
+    assert_read_refusal(&result, "bugzilla_products", "Failed to fetch products");
+    let result = call(
+        &discovery,
+        "bug_fields",
+        json!({ "field_names": ["priority"] }),
+    )
+    .await;
+    assert_read_refusal(&result, "bug_fields", "Failed to fetch bug fields");
+}
+
+#[tokio::test]
+async fn read_tool_refusals_are_identical_across_statuses() {
+    // The fixed line must not vary with the underlying error: the
+    // existence oracle's 401/404, a code-less 500 and an HTML 502 all
+    // answer byte-identically.
+    for (status, code) in [(401, Some(102)), (404, Some(101)), (404, None), (500, None)] {
+        let mock = MockServer::start().await;
+        let mut body = json!({ "error": true, "message": UPSTREAM_MESSAGE });
+        if let Some(code) = code {
+            body["code"] = json!(code);
+        }
+        Mock::given(method("GET"))
+            .and(path("/rest/field/bug"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(&mock)
+            .await;
+        let discovery = client_for(DISCOVERY_POLICY, &mock).await;
+        let result = call(&discovery, "bug_fields", json!({})).await;
+        assert_read_refusal(&result, "bug_fields", "Failed to fetch bug fields");
+    }
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/field/bug"))
+        .respond_with(ResponseTemplate::new(502).set_body_string("<html>gateway</html>"))
+        .mount(&mock)
+        .await;
+    let discovery = client_for(DISCOVERY_POLICY, &mock).await;
+    let result = call(&discovery, "bug_fields", json!({})).await;
+    assert_read_refusal(&result, "bug_fields", "Failed to fetch bug fields");
+}
+
+#[tokio::test]
+async fn server_info_unavailable_entries_carry_fixed_text_only() {
+    // One endpoint down: the call still succeeds, and `unavailable` names
+    // the endpoint without Bugzilla's text.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/version"))
+        .respond_with(upstream_500())
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/extensions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "extensions": {} })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/time"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "tz_name": "UTC", "web_time": "2026-01-01T00:00:00Z" })),
+        )
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/parameters"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "parameters": {} })))
+        .mount(&mock)
+        .await;
+    let client = client_for("", &mock).await;
+
+    let result = call(&client, "bugzilla_server_info", json!({})).await;
+    assert!(
+        !is_error(&result),
+        "one failed endpoint must not fail the call"
+    );
+    let text = text_of(&result);
+    for needle in ["424242", "HACKED", "bugzilla error"] {
+        assert!(
+            !text.contains(needle),
+            "unavailable entries leaked Bugzilla's text: {text}"
+        );
+    }
+    let info: Value = serde_json::from_str(&text).expect("server_info returns JSON");
+    assert_eq!(info["unavailable"], json!(["/version: unavailable"]));
+    assert_eq!(info["version"], Value::Null);
+}
+
+#[tokio::test]
+async fn read_tool_transport_errors_answer_the_fixed_line() {
+    // A refused connection is neither a status nor a code — the shape a
+    // timeout takes — and still answers the fixed line, with no key
+    // material anywhere near the result.
+    let base = refused::refused_base_url();
+    let cfg: Arc<Cli> = Arc::new(pinned(&[
+        "bugwarden",
+        "--bugzilla-server",
+        &base,
+        "--transport",
+        "stdio",
+        "--api-key",
+        "SUPERSECRETKEY123",
+    ]));
+    let guard = Arc::new(Guard {
+        policy: Policy::from_toml_str(DISCOVERY_POLICY).expect("test policy must parse"),
+    });
+    let bz = Arc::new(BugzillaClient::new(&base, false, USER_AGENT).expect("client must build"));
+    let server = BugWarden::new(cfg, guard, bz).expect("server must build");
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+    let client: RunningService<RoleClient, ()> = bounded("the MCP handshake", ().serve(client_io))
+        .await
+        .expect("MCP handshake must succeed");
+
+    let result = tokio::time::timeout(
+        common::REFUSED_CONNECT_BUDGET,
+        call(&client, "quicksearch_syntax", json!({})),
+    )
+    .await
+    .expect("connect to the refused privileged port must not hang");
+    assert_read_refusal(
+        &result,
+        "quicksearch_syntax",
+        "Failed to fetch quicksearch documentation",
+    );
+    let text = serde_json::to_string(&result).unwrap();
+    assert!(
+        !text.contains("SUPERSECRETKEY123"),
+        "API key leaked into a client-visible result: {text}"
+    );
 }
 
 // ---------- Bug ID custom fields (I14 on bodies) ----------

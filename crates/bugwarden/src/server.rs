@@ -499,6 +499,22 @@ fn payload_reach(payload: &serde_json::Map<String, Value>) -> UpstreamReach {
     }
 }
 
+/// A read tool's result for an upstream failure, logged on two lines:
+/// `warn` with the status and code and no text, `debug` with Bugzilla's
+/// message. The write-side split ([`upstream_refusal`]) without the hint:
+/// the text is the tool's fixed line ([`refusal_line`]), the same for
+/// every status and code. A transport error has neither status nor code.
+fn read_refusal(tool: &'static str, e: &anyhow::Error) -> CallToolResult {
+    let bz = e.downcast_ref::<bugwarden_core::client::BugzillaError>();
+    tracing::warn!(
+        http_status = bz.map(|bz| bz.http_status()),
+        bugzilla_code = bz.and_then(|bz| bz.code()),
+        "{tool}: upstream request failed"
+    );
+    tracing::debug!(error = ?QuotedError(e), "{tool}: upstream failure text");
+    err_text(refusal_line(tool))
+}
+
 /// A write tool's result for an upstream failure, logged on two lines:
 /// `warn` with the status and code and no text, `debug` with Bugzilla's
 /// message, which can echo the content the tool-entry trace keeps out of
@@ -4354,9 +4370,7 @@ impl BugWarden {
                 }
                 Ok(ok_json(Value::Array(filtered)))
             }
-            Err(e) => Ok(err_text(format!(
-                "Failed to fetch bug attachments\nReason: {e}"
-            ))),
+            Err(e) => Ok(read_refusal("list_attachments", &e)),
         }
     }
 
@@ -4604,9 +4618,9 @@ impl BugWarden {
         let key = self.api_key(&ctx)?;
         match self.bz.server_info(&key).await {
             Ok(info) => Ok(ok_json(info)),
-            Err(e) => Ok(err_text(format!(
-                "Failed to fetch bugzilla server info\nReason: {e}"
-            ))),
+            // The failed legs already logged themselves inside the
+            // client; this names only the fixed line.
+            Err(_) => Ok(err_text(refusal_line("bugzilla_server_info"))),
         }
     }
 
@@ -4630,7 +4644,7 @@ impl BugWarden {
         if p.products.is_empty() {
             let ids = match self.bz.enterable_product_ids(&key).await {
                 Ok(ids) => ids,
-                Err(e) => return Ok(err_text(format!("Failed to fetch products\nReason: {e}"))),
+                Err(e) => return Ok(read_refusal("bugzilla_products", &e)),
             };
             if ids.is_empty() {
                 return Ok(ok_json(json!({ "products": [] })));
@@ -4641,13 +4655,13 @@ impl BugWarden {
                 .await
             {
                 Ok(v) => Ok(ok_json(json!({ "products": project_product_catalog(&v) }))),
-                Err(e) => Ok(err_text(format!("Failed to fetch products\nReason: {e}"))),
+                Err(e) => Ok(read_refusal("bugzilla_products", &e)),
             }
         } else {
             let names: Vec<&str> = p.products.iter().map(String::as_str).collect();
             match self.bz.products(&key, &[], &names, None).await {
                 Ok(v) => Ok(ok_json(json!({ "products": project_product_detail(&v) }))),
-                Err(e) => Ok(err_text(format!("Failed to fetch products\nReason: {e}"))),
+                Err(e) => Ok(read_refusal("bugzilla_products", &e)),
             }
         }
     }
@@ -4678,16 +4692,14 @@ impl BugWarden {
                 Ok(v) => Ok(ok_json(json!({
                     "fields": project_field_catalog(&v, p.on_bug_entry_only)
                 }))),
-                Err(e) => Ok(err_text(format!("Failed to fetch bug fields\nReason: {e}"))),
+                Err(e) => Ok(read_refusal("bug_fields", &e)),
             }
         } else {
             let mut fields = Vec::with_capacity(p.field_names.len());
             for name in &p.field_names {
                 let v = match self.bz.bug_fields(&key, Some(name)).await {
                     Ok(v) => v,
-                    Err(e) => {
-                        return Ok(err_text(format!("Failed to fetch bug fields\nReason: {e}")))
-                    }
+                    Err(e) => return Ok(read_refusal("bug_fields", &e)),
                 };
                 match v
                     .get("fields")
@@ -4714,9 +4726,7 @@ impl BugWarden {
         tracing::info!("tool: quicksearch_syntax");
         match self.bz.quicksearch_syntax_html().await {
             Ok(html) => Ok(CallToolResult::success(vec![ContentBlock::text(html)])),
-            Err(e) => Ok(err_text(format!(
-                "Failed to fetch quicksearch documentation: {e}"
-            ))),
+            Err(e) => Ok(read_refusal("quicksearch_syntax", &e)),
         }
     }
 
@@ -4771,9 +4781,7 @@ impl BugWarden {
         }
         let comments = match self.bz.bug_comments(&key, p.id, None).await {
             Ok(comments) => comments,
-            Err(e) => {
-                return Ok(err_text(format!("Summarize Comments Failed\nReason: {e}")));
-            }
+            Err(e) => return Ok(read_refusal("summarize_bug", &e)),
         };
         let total = comments.len();
         let comments = self.guard.filter_comments(comments, false);
@@ -7087,6 +7095,233 @@ mod tests {
         let result = upstream_refusal("add_comment", 7, UpstreamReach::Assessed, &e);
         assert_eq!(result.is_error, Some(true));
         assert_eq!(text_of(&result), "Failed to create a comment");
+    }
+
+    #[test]
+    fn read_tool_failures_log_status_and_code_with_text_on_debug_only() {
+        // Every read arm's wiring to the split: the result is the fixed
+        // line, the warn line carries the status and code but no text,
+        // and the text rides a debug line of its own. A current-thread
+        // runtime, whose `block_on` runs inside the capture: the duplex
+        // server task then emits on the capturing thread.
+        const MESSAGE: &str = "Bug 424242 does not exist. status=HACKED";
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime");
+        let (texts, logs) = crate::testlog::capture_logs(|| {
+            rt.block_on(async {
+                let mock = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path("/rest/bug"))
+                    .and(query_param("id", "7"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "bugs": [{
+                            "id": 7,
+                            "summary": "a plain bug",
+                            "product": "openSUSE",
+                            "component": "Kernel",
+                            "status": "NEW",
+                            "severity": "normal",
+                            "priority": "P3",
+                            "keywords": [],
+                            "groups": [],
+                            "whiteboard": "",
+                            "creation_time": "2020-01-01T00:00:00Z",
+                        }]
+                    })))
+                    .mount(&mock)
+                    .await;
+                let refused = ResponseTemplate::new(500).set_body_json(json!({
+                    "error": true, "code": 32000, "message": MESSAGE,
+                }));
+                for endpoint in [
+                    "/rest/bug/7/attachment",
+                    "/rest/bug/7/comment",
+                    "/rest/version",
+                    "/rest/extensions",
+                    "/rest/time",
+                    "/rest/parameters",
+                    "/rest/product_enterable",
+                    "/rest/field/bug",
+                    "/page.cgi",
+                ] {
+                    Mock::given(method("GET"))
+                        .and(path(endpoint))
+                        .respond_with(refused.clone())
+                        .mount(&mock)
+                        .await;
+                }
+                let client = mcp_client("", &mock.uri(), None).await;
+                let discovery =
+                    mcp_client("[global]\nallow_discovery = true\n", &mock.uri(), None).await;
+                let mut texts = Vec::new();
+                for (client, tool, args) in [
+                    (&client, "list_attachments", json!({ "bug_id": 7 })),
+                    (&client, "summarize_bug", json!({ "id": 7 })),
+                    (&client, "bugzilla_server_info", json!({})),
+                    (&client, "quicksearch_syntax", json!({})),
+                    (&discovery, "bugzilla_products", json!({})),
+                    (&discovery, "bug_fields", json!({})),
+                ] {
+                    let result = call(client, tool, args).await;
+                    assert!(is_error(&result), "{tool} must fail");
+                    texts.push((tool, text_of(&result)));
+                }
+                texts
+            })
+        });
+        let expected = [
+            ("list_attachments", "Failed to fetch bug attachments"),
+            ("summarize_bug", "Summarize Comments Failed"),
+            (
+                "bugzilla_server_info",
+                "Failed to fetch bugzilla server info",
+            ),
+            (
+                "quicksearch_syntax",
+                "Failed to fetch quicksearch documentation",
+            ),
+            ("bugzilla_products", "Failed to fetch products"),
+            ("bug_fields", "Failed to fetch bug fields"),
+        ];
+        for (i, (want_tool, want_line)) in expected.into_iter().enumerate() {
+            let (tool, text) = &texts[i];
+            assert_eq!(*tool, want_tool);
+            assert_eq!(
+                text.as_str(),
+                want_line,
+                "{tool} must answer its fixed line"
+            );
+            assert!(
+                !text.contains("424242") && !text.contains("HACKED"),
+                "{tool} leaked Bugzilla's text: {text}"
+            );
+        }
+        let captured = logs.as_str();
+        for (tool, _) in expected {
+            if tool == "bugzilla_server_info" {
+                continue;
+            }
+            let warn = captured
+                .lines()
+                .find(|line| line.contains(&format!("{tool}: upstream request failed")))
+                .unwrap_or_else(|| panic!("{tool} must log its warn line: {captured}"));
+            assert!(warn.contains("WARN"), "the refusal rides warn: {warn}");
+            assert!(
+                warn.contains("http_status=500"),
+                "the warn line carries the status: {warn}"
+            );
+            assert!(
+                !warn.contains("424242") && !warn.contains("HACKED"),
+                "the warn line carries no Bugzilla text: {warn}"
+            );
+            let debug = captured
+                .lines()
+                .find(|line| line.contains(&format!("{tool}: upstream failure text")))
+                .unwrap_or_else(|| panic!("{tool} must log its debug line: {captured}"));
+            assert!(debug.contains("DEBUG"), "the text rides debug: {debug}");
+            assert!(
+                debug.contains("424242"),
+                "the debug line carries the refused text: {debug}"
+            );
+        }
+        for endpoint in ["/version", "/extensions", "/time", "/parameters"] {
+            let warn = captured
+                .lines()
+                .find(|line| {
+                    line.contains("server-info endpoint failed")
+                        && line.contains(&format!("path=\"{endpoint}\""))
+                })
+                .unwrap_or_else(|| panic!("{endpoint} must log its warn line: {captured}"));
+            assert!(warn.contains("WARN"), "the leg refusal rides warn: {warn}");
+            assert!(
+                warn.contains("http_status=500"),
+                "the leg warn line carries the status: {warn}"
+            );
+            assert!(
+                !warn.contains("424242"),
+                "the leg warn line carries no Bugzilla text: {warn}"
+            );
+        }
+        assert!(
+            captured
+                .lines()
+                .filter(|line| line.contains("server-info endpoint failure text"))
+                .any(|line| line.contains("424242")),
+            "a leg debug line carries the refused text: {captured}"
+        );
+    }
+
+    /// A typed upstream refusal built over the loopback mock, so the
+    /// split below is pinned against the error the client really wraps.
+    async fn upstream_error() -> anyhow::Error {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/version"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "error": true, "code": 32000, "message": "Bug 424242 does not exist.",
+            })))
+            .mount(&mock)
+            .await;
+        let bz = BugzillaClient::new(&mock.uri(), false, USER_AGENT).expect("client must build");
+        bz.version("test-key")
+            .await
+            .expect_err("a 500 must be an error")
+    }
+
+    #[test]
+    fn a_read_refusal_is_the_fixed_line_whatever_the_error() {
+        // The read-side split without the hint: a refusal carrying a
+        // status and code answers byte-identically to a transport error,
+        // which has neither. A current-thread runtime, whose `block_on`
+        // runs inside the capture: `capture_logs` is thread-local, so a
+        // multi-thread runtime could emit the lines on another thread.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime");
+        let (coded, bare) = rt.block_on(async {
+            (
+                upstream_error().await,
+                anyhow::anyhow!("error sending request"),
+            )
+        });
+        for e in [&coded, &bare] {
+            let (result, logs) = crate::testlog::capture_logs(|| read_refusal("bug_fields", e));
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(text_of(&result), "Failed to fetch bug fields");
+            let captured = logs.as_str();
+            let warn = captured
+                .lines()
+                .find(|line| line.contains("upstream request failed"))
+                .unwrap_or_else(|| panic!("the warn line must be logged: {captured}"));
+            assert!(
+                warn.contains("WARN"),
+                "the split logs the refusal at warn: {warn}"
+            );
+            assert!(
+                !warn.contains("424242"),
+                "the warn line carries no Bugzilla text: {warn}"
+            );
+            let debug = captured
+                .lines()
+                .find(|line| line.contains("upstream failure text"))
+                .unwrap_or_else(|| panic!("the debug line must be logged: {captured}"));
+            assert!(debug.contains("DEBUG"), "the text rides debug: {debug}");
+        }
+        let (_, logs) = crate::testlog::capture_logs(|| read_refusal("bug_fields", &coded));
+        let captured = logs.as_str();
+        assert!(
+            captured.contains("http_status=500") && captured.contains("bugzilla_code=32000"),
+            "a coded refusal logs its status and code: {captured}"
+        );
+        assert!(
+            captured
+                .lines()
+                .any(|line| line.contains("upstream failure text") && line.contains("424242")),
+            "the coded refusal's text reaches the debug line: {captured}"
+        );
     }
 
     #[test]

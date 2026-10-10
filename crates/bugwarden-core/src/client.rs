@@ -240,9 +240,9 @@ impl BugzillaClient {
     ///
     /// The endpoints are fetched one at a time — some Bugzilla deployments
     /// drop connections when a single client opens several at once — and a
-    /// failing endpoint degrades only its own fields, with the sanitized
-    /// reason collected under `"unavailable"`. The call errors only when
-    /// every endpoint fails.
+    /// failing endpoint degrades only its own fields, with a fixed
+    /// per-endpoint marker collected under `"unavailable"`. The call
+    /// errors only when every endpoint fails.
     pub async fn server_info(&self, key: &str) -> Result<Value> {
         let mut unavailable: Vec<String> = Vec::new();
         let version = self.info_endpoint(key, "/version", &mut unavailable).await;
@@ -294,7 +294,10 @@ impl BugzillaClient {
     }
 
     /// GET one server-info endpoint, degrading a failure into `None` and
-    /// recording the sanitized reason.
+    /// recording a fixed per-endpoint marker. The marker names only the
+    /// endpoint, never Bugzilla's text, so the success payload's
+    /// `"unavailable"` entries cannot carry it; the text itself is
+    /// debug-logged (quoted) beside a warn line with the status and code.
     async fn info_endpoint(
         &self,
         key: &str,
@@ -304,7 +307,19 @@ impl BugzillaClient {
         match self.get_json(key, path, &[]).await {
             Ok(v) => Some(v),
             Err(e) => {
-                unavailable.push(format!("{path}: {e:#}"));
+                let bz = e.downcast_ref::<BugzillaError>();
+                tracing::warn!(
+                    path,
+                    http_status = bz.map(BugzillaError::http_status),
+                    bugzilla_code = bz.and_then(BugzillaError::code),
+                    "server-info endpoint failed"
+                );
+                tracing::debug!(
+                    path,
+                    error = ?crate::quoted::QuotedError(&e),
+                    "server-info endpoint failure text"
+                );
+                unavailable.push(format!("{path}: unavailable"));
                 None
             }
         }

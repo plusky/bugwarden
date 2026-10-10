@@ -38,9 +38,10 @@ Dependency direction: `bugwarden -> bugwarden-core`, never the reverse.
   `bug_access_denied` (102), and a dependency loop message names the bugs
   on the loop, hidden ones included (a duplicate loop is reported at all
   only because of a chain that may run through one) — see "Upstream
-  failures of the write tools". Six read tools still forward it —
+  failures of the write tools". The six read tools with an upstream leg —
   list_attachments, summarize_bug, quicksearch_syntax, bugzilla_server_info,
-  bugzilla_products and bug_fields (#338).
+  bugzilla_products and bug_fields — answer their fixed line alone, no
+  hint — see "Upstream failures of the read tools" (issue #338).
 - **I3** Search filtering is silent: counts of dropped/filtered results are
   never returned to the client (server-side debug logging is fine).
 - **I4** Fail closed: classification-fetch failure, bug absent from the
@@ -1340,15 +1341,15 @@ constraints the model must know.
 | update_bug_dependencies | bug_id, blocks_add?/blocks_remove?/depends_on_add?/depends_on_remove?: Vec<u64>, comment = "" | deps (write) | at least one change required; payload uses `{"blocks": {"add": [..], "remove": [..]}}` shape; a bug naming itself in `blocks_add`/`depends_on_add` is refused before the PUT with the fixed text `A bug cannot depend on itself: remove {bug_id} from the dependency lists` — after the denials, so a hidden bug_id or target still takes the uniform denial, and identical for a visible bug (issue #339); a remove naming the bug itself only clears a link and passes through to the PUT; an upstream refusal is the fixed line, plus the 109 hint alone — see "Upstream failures of the write tools". Success serves Bugzilla's update envelope with id-bearing `changes` scrubbed to the bug plus the assessed dependency targets (I14) |
 | add_cc_to_bug | bug_id, cc_email | cc (write) | payload `{"cc": {"add": [email]}}`; an upstream refusal is the fixed line plus at most one code-selected hint — see "Upstream failures of the write tools". Success serves Bugzilla's update envelope with id-bearing `changes` scrubbed to the assessed bug (I14); CC logins name no bug and pass through |
 | mark_as_duplicate | bug_id, duplicate_of, comment = "" | status on bug_id + summary on duplicate_of (I11) | default comment "Marking as duplicate of bug {duplicate_of}"; payload carries only `dupe_of` (+ comment) — Bugzilla's `set_dup_id` applies the instance's `duplicate_or_move_bug_status` and resolution DUPLICATE itself, so the resulting status is instance-defined, not necessarily CLOSED; bug_id == duplicate_of is refused before the PUT with the fixed text `A bug cannot be a duplicate of itself` — after the denials, so a hidden bug still takes the uniform denial, and identical for a visible bug (issue #339); an upstream refusal is the fixed line, plus the 109 hint alone — see "Upstream failures of the write tools". Success serves Bugzilla's update envelope with id-bearing `changes` scrubbed to the bug plus the assessed duplicate target (I14) |
-| list_attachments | bug_id | attachments | metadata only (`exclude_fields=data`) |
+| list_attachments | bug_id | attachments | metadata only (`exclude_fields=data`); an upstream failure is the fixed line alone — see "Upstream failures of the read tools" |
 | download_attachment | attachment_id, include_private: bool = false, head_lines?/tail_lines?/max_chars?: u32 | attachments (on the owning bug) | metadata fetched FIRST (no blob) for guard assessment + attachment_gate; unknown id, metadata OR blob fetch failure, denied owning bug, missing bug_id, and private-without-opt-in all yield the uniform attachment denial. Constant upstream request count on every path (a metadata miss still runs one classify call against bug id 0) so call latency is not an existence oracle. The gate AND the bug-id check re-run on the blob response (TOCTOU), then the actual base64 size is re-checked against the cap (a lying `size` cannot bypass it). Raster image types from a strict allowlist => ContentBlock::image; everything else (incl. image/svg+xml) => BlobResourceContents whose uri carries only the attachment id (uploader-chosen file_name never enters the uri). Optional head_lines/tail_lines/max_chars window TEXT-ish payloads only (text/* plus a fixed application/* allowlist, svg deliberately excluded): applied LAST, on the lossy-UTF-8 decode of a payload that passed both gates and the size re-check — head/tail select lines of the whole text, then a char cap that is the MIN of the caller's max_chars and `MAX_WINDOW_CHARS` (200k). That ceiling is unconditional — it binds with no max_chars and with no operator byte cap — because `max_attachment_bytes` bounds DECODED BYTES while the windowed serve is JSON text: JSON escapes every C0 byte to `\u00XX` (6 chars) and lossy UTF-8 maps every invalid byte to U+FFFD, and `content_type` is uploader-chosen, so 2 MiB of `0x01` labelled text/plain is ONE `lines()` line, takes the serve-whole branch on `head_lines: 1`, and would otherwise emit ~12 MiB — six times the cap it passed, and unbounded at `max_attachment_bytes = 0`. The windowed text rides as a plain text block and the summary gains a truncation object (total_lines/shown_lines/truncated_chars); `shown_lines` counts the lines of the SERVED text, recounted AFTER the char cap (a cap-shortened line still counts), so `total_lines - shown_lines` is never 0 over a mostly-dropped payload. Params on a non-text payload are ignored (summary: `windowing_ignored`), never an error, and so is a payload whose base64 will not decode (distinct reason string) — the whole blob then ships, and the caller is told why its window vanished. A window that cut content is audited as redacted_fields [attachment_window], one that cut nothing stays silent; either way the granting rule stays in the record, since the cut is the client's choice and not a guard decision (see "The `guard.rule` encoding"). The cap still measures the FULL payload, and every denial path is byte-identical with or without the params (I2). Two deliberate decisions: (a) windowing moves attacker-controlled attachment bytes into the model's TEXT channel instead of an opaque blob resource — the text-channel analogue of the image/svg+xml decision above, accepted because it is opt-in per call, bounded by MAX_WINDOW_CHARS, and never reached on a denial path; (b) the cut branch is `str::lines()` + `join("\n")`, which normalises CRLF to LF and drops a trailing newline, so a windowed text/x-patch is line-ending-normalised while the serve-whole branch stays byte-exact — windowing is a reading aid, not a fetch of the artifact |
 | bug_url | bug_id | none (I8 exception) | `{base_url}/show_bug.cgi?id={id}` |
-| bugzilla_server_info | — | none | client.server_info |
-| bugzilla_products | products?: Vec<String> (max 5) | none — present only when `global.allow_discovery = true` (I16) | no `products` named: `enterable_product_ids` then `products(ids, [], [id,name])`, projected to `{id, name}` catalog entries; `products` named: `products([], names, None)`, projected to `{name, description, is_active, default_milestone, has_unconfirmed, components[{name,description,is_active}], versions[{name,is_active}], milestones[{name,is_active}]}` — `default_assigned_to`/`default_qa_contact` are never selected. Over-cap (>5 names) refuses with a fixed text and makes ZERO upstream requests, since the refusal is a pure function of the request's own shape |
-| bug_fields | field_names?: Vec<String> (max 5), on_bug_entry_only: bool = false | none — present only when `global.allow_discovery = true` (I16) | no `field_names`: `bug_fields(None)`, projected per field to `{name, display_name, type, is_custom, is_mandatory, is_on_bug_entry, visibility_field, visibility_values, has_values}` — NEVER `values` — optionally filtered to `is_on_bug_entry` fields; `field_names` named: one `bug_fields(Some(name))` call per name (sequential, one `/rest/field/bug/{name}` path request per name; the `names=` query form `bug_field_types` uses would batch them, but discovery keeps the per-field path form), same projection plus `values` as `[{name, is_open?, can_change_to?}]` — `is_open` and `can_change_to: [{name, comment_required}]` present exactly when the upstream value carries them (only `bug_status` does today), omitted rather than `null` on every other field, reported exactly as Bugzilla gave it (I16). Over-cap (>5 names) refuses with a fixed text and makes ZERO upstream requests. A named field Bugzilla does not recognise is a call-level failure (the generic `Failed to fetch bug fields` text), not a partial result; so is a name that cannot survive being resolved into a path segment (`.`, `..`, or holding a tab, CR or LF), and the empty name with them; a name of all ASCII digits is refused the same way, because Bugzilla routes that path form as a field id rather than a name — see `bug_fields` under the client's endpoint mapping — all refused by the client before any request for that name |
-| quicksearch_syntax | — | none | HTML doc page |
+| bugzilla_server_info | — | none | client.server_info; an upstream failure is the fixed line alone, and a degraded endpoint leaves a fixed per-endpoint `unavailable` marker — see "Upstream failures of the read tools" |
+| bugzilla_products | products?: Vec<String> (max 5) | none — present only when `global.allow_discovery = true` (I16) | no `products` named: `enterable_product_ids` then `products(ids, [], [id,name])`, projected to `{id, name}` catalog entries; `products` named: `products([], names, None)`, projected to `{name, description, is_active, default_milestone, has_unconfirmed, components[{name,description,is_active}], versions[{name,is_active}], milestones[{name,is_active}]}` — `default_assigned_to`/`default_qa_contact` are never selected. Over-cap (>5 names) refuses with a fixed text and makes ZERO upstream requests, since the refusal is a pure function of the request's own shape; an upstream failure is the fixed line alone — see "Upstream failures of the read tools" |
+| bug_fields | field_names?: Vec<String> (max 5), on_bug_entry_only: bool = false | none — present only when `global.allow_discovery = true` (I16) | no `field_names`: `bug_fields(None)`, projected per field to `{name, display_name, type, is_custom, is_mandatory, is_on_bug_entry, visibility_field, visibility_values, has_values}` — NEVER `values` — optionally filtered to `is_on_bug_entry` fields; `field_names` named: one `bug_fields(Some(name))` call per name (sequential, one `/rest/field/bug/{name}` path request per name; the `names=` query form `bug_field_types` uses would batch them, but discovery keeps the per-field path form), same projection plus `values` as `[{name, is_open?, can_change_to?}]` — `is_open` and `can_change_to: [{name, comment_required}]` present exactly when the upstream value carries them (only `bug_status` does today), omitted rather than `null` on every other field, reported exactly as Bugzilla gave it (I16). Over-cap (>5 names) refuses with a fixed text and makes ZERO upstream requests. A named field Bugzilla does not recognise is a call-level failure (the generic `Failed to fetch bug fields` text), not a partial result; so is a name that cannot survive being resolved into a path segment (`.`, `..`, or holding a tab, CR or LF), and the empty name with them; a name of all ASCII digits is refused the same way, because Bugzilla routes that path form as a field id rather than a name — see `bug_fields` under the client's endpoint mapping — all refused by the client before any request for that name; an upstream failure is the fixed line alone — see "Upstream failures of the read tools" |
+| quicksearch_syntax | — | none | HTML doc page; an upstream failure is the fixed line alone — see "Upstream failures of the read tools" |
 | mcp_server_info | — | none | name (CARGO_PKG_NAME) and version (CARGO_PKG_VERSION), the same two the handshake sends; bugzilla server url, transport, and policy summary per I1 |
-| summarize_bug | id | comments | fetches comments (private filtered with include_private=false), returns the summarization prompt text (fixed prompt template) |
+| summarize_bug | id | comments | fetches comments (private filtered with include_private=false), returns the summarization prompt text (fixed prompt template); an upstream failure is the fixed line alone — see "Upstream failures of the read tools" |
 
 ### Upstream failures of the write tools (issue #323)
 
@@ -1529,6 +1530,28 @@ line under `closed_writes_denials` and `closed_all` (the swap test under
 "Testing"). Hints depend on (tool, code, reach) alone, never on audit
 state, so responses stay byte-identical with auditing off, on, or failing
 open (I15).
+
+### Upstream failures of the read tools (issue #338)
+
+**The rule.** When Bugzilla fails one of the six read tools with an
+upstream leg (list_attachments, summarize_bug, quicksearch_syntax,
+bugzilla_server_info, bugzilla_products, bug_fields), the result is the
+tool's fixed line — the text `audit_refusal_text` maps it to — and
+nothing else: no hint, no code, no status. Bugzilla's own `message`
+never reaches the client; on the two bug tools it tells "does not
+exist" from "not authorized", the race the guard just assessed. The
+line is identical for a 401, a 404, a 500 and a transport failure.
+`bugzilla_server_info`'s `unavailable` entries are fixed per-endpoint
+markers (`/version: unavailable`), never the failure's text.
+
+**Logging.** The write-side split (`read_refusal` in server.rs):
+`warn!` with `http_status` and `bugzilla_code` and no text
+(`<tool>: upstream request failed`), `debug!` with
+`error = ?QuotedError(&e)` carrying the message
+(`<tool>: upstream failure text`). The `server_info` legs log the same
+split per endpoint inside the client (`server-info endpoint failed` /
+`server-info endpoint failure text`, with the endpoint as `path`), so
+the tool's all-failed arm logs nothing further.
 
 ### Update-field surface (issue #38)
 
@@ -1917,16 +1940,20 @@ Decisions, all deliberate:
   same `Capped` budget, quoted, so a reader that honours quotes finds
   the end the writer marked. Readers that do not honour quotes are no
   better off than before: `grep 'status=HACKED'` still matches the line.
-  The seven bug-update tools write that field on a `debug` line of their
-  own (`<tool>: upstream refusal text`), beside a `warn` line
-  (`<tool>: upstream refused`) whose fields are exactly `bug_id`,
-  `http_status` and `bugzilla_code` and which carries no text at all, so
-  the default filter reports the refusal without the content
-  `update_bug_fields` keeps out of the log (#323; `binary_tracing_caps`
-  pins both lines — the key set of the `warn` one, with the whole
-  default-filter stderr carrying neither the text nor the `debug` line,
-  and the `debug` one's quoted `error=` equal to the Display with no
-  `status` key beside it). create_bug's single `warn` line is unchanged.
+The seven bug-update tools write that field on a `debug` line of their
+own (`<tool>: upstream refusal text`), beside a `warn` line
+(`<tool>: upstream refused`) whose fields are exactly `bug_id`,
+`http_status` and `bugzilla_code` and which carries no text at all, so
+the default filter reports the refusal without the content
+`update_bug_fields` keeps out of the log (#323; `binary_tracing_caps`
+pins both lines — the key set of the `warn` one, with the whole
+default-filter stderr carrying neither the text nor the `debug` line,
+and the `debug` one's quoted `error=` equal to the Display with no
+`status` key beside it). The six read tools split the same way without
+the hint (`read_refusal`: `<tool>: upstream request failed` at `warn`
+with `http_status` and `bugzilla_code`, `<tool>: upstream failure text`
+at `debug`; the `server_info` legs log per endpoint inside the client),
+pinned by the in-crate capture test under "Testing". create_bug's single `warn` line is unchanged.
 
   The two lines a failed stdio handshake writes are bounded by a
   different means, because the cut above is the wrong instrument for
@@ -3820,10 +3847,14 @@ wired, `server.rs` and `main.rs` are the reference.
   `payload_reach` per key (see_also is Unhintable whatever else is sent;
   resolution, a `cf_*` key, dupe_of, blocks and an unknown key are
   Unassessed; status plus comment, and priority alone, Assessed); and a
-  plain transport-like error gives line 1; and the `comment_count` drop
-  (#340) — `project_fields` omits the tally even when requested and
-  the full-body strip keeps neighboring fields, both with neighbors
-  asserted surviving.
+  plain transport-like error gives line 1; the read tools' refusal split
+  (issue #338) — a coded and a transport-like error each answer the fixed
+  line, the `warn` line carries the status and code but no text and the
+  text rides a `debug` line, and a duplex drive of all six tools shows
+  each arm wired to it, the `server_info` legs logging per endpoint; and
+  the `comment_count` drop (#340) — `project_fields` omits the tally even
+  when requested and the full-body strip keeps neighboring fields, both
+  with neighbors asserted surviving.
 - Unit tests (#[cfg(test)] in crates/bugwarden/src/config.rs): the key
   custody table — the mutual-exclusion error names both flags (each pinned
   with its env var, since `--api-key` is a substring of `--api-key-file`);
@@ -3938,10 +3969,12 @@ wired, `server.rs` and `main.rs` are the reference.
   wiremock): the discovery endpoints answer their documented envelopes, a
   field name travels as one percent-encoded path segment, the names
   `path_segments_mut` would rewrite (`""`, `.`, `..`, tab/CR/LF) are
-  refused before any request, an all-digit name is refused the same way
-  (Bugzilla routes that path form as a field id, issue #341) with
-  `expect(0)` requests while a normal name still fetches, and no error
-  text carries the API key (I12).
+   refused before any request, an all-digit name is refused the same way
+   (Bugzilla routes that path form as a field id, issue #341) with
+   `expect(0)` requests while a normal name still fetches, a degraded
+   `server_info` endpoint leaves the fixed `unavailable` marker carrying
+   no upstream text (and the all-failed error neither), and no error
+   text carries the API key (I12).
 - Integration tests (crates/bugwarden/tests/tools_wiremock.rs, wiremock +
   rmcp client over an in-memory duplex transport): the tools are CALLED
   through a real MCP session, so a tool that stops calling its guard fails
@@ -3958,9 +3991,17 @@ wired, `server.rs` and `main.rs` are the reference.
   request gets no hint (dependencies with 114 or 115, a status with a
   resolution and 123, fields with see_also, a `cf_*` key or a resolution
   and 107) while the same request without that key, with
-  `resolution: ""`, or carrying a `cf_*` key with 109, is hinted, and a
-  see_also link with 109 is exactly line 1; create_bug policy
-  refusal and upstream refusal are byte-identical and each cost exactly one
+   `resolution: ""`, or carrying a `cf_*` key with 109, is hinted, and a
+   see_also link with 109 is exactly line 1; the read tools' upstream
+   failures (issue #338), against the same 424242/`status=HACKED`
+   message — one row per read tool returns exactly its fixed line and
+   never the id, the forged pair or `bugzilla error`, the discovery
+   tools' secondary endpoints refuse with the same line, 401/404/500, a
+   code-less failure and an HTML 502 answer byte-identically, a
+   single failed `server_info` endpoint degrades to the fixed
+   `unavailable` marker, and a refused connection answers the fixed
+   line with no key material; create_bug policy
+   refusal and upstream refusal are byte-identical and each cost exactly one
   upstream request (nothing POSTed on the refused path, which instead burns
   a classify call against bug id 0); a claimed `groups` list never defeats
   a group deny rule and a group_restricted policy refuses all creation;

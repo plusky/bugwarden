@@ -1,10 +1,13 @@
 //! HTTP-level integration tests for the discovery client endpoints
-//! (wiremock): `enterable_product_ids`, `products`, `bug_fields`. Covers the
+//! (wiremock): `enterable_product_ids`, `products`, `bug_fields`,
+//! `server_info`. Covers the
 //! documented envelope shapes, a malformed envelope, that a field name
 //! travels as one percent-encoded path segment and that the names
 //! `Url::path_segments_mut` would rewrite instead are refused before any
 //! request, as is an all-digit name (Bugzilla routes that path form as
-//! a field id), and that no error text contains the API key (I12).
+//! a field id), that a degraded `server_info` endpoint leaves a fixed
+//! `unavailable` marker carrying no upstream text, and that no error text
+//! contains the API key (I12).
 
 use bugwarden_core::client::BugzillaClient;
 use serde_json::json;
@@ -258,6 +261,81 @@ async fn bug_fields_refuses_all_digit_names_before_any_request() {
         .await
         .expect("a normal name must still be fetched");
     assert_eq!(v["fields"][0]["name"], json!("priority"));
+}
+
+#[tokio::test]
+async fn server_info_unavailable_entries_carry_no_upstream_text() {
+    // One endpoint refused with a distinctive message: the call still
+    // succeeds, and `unavailable` holds the endpoint's fixed marker —
+    // never Bugzilla's text.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/version"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "error": true, "code": 32000, "message": "Bug 424242 does not exist.",
+        })))
+        .mount(&server)
+        .await;
+    for (endpoint, body) in [
+        ("/rest/extensions", json!({ "extensions": {} })),
+        (
+            "/rest/time",
+            json!({ "tz_name": "UTC", "web_time": "2026-01-01T00:00:00Z" }),
+        ),
+        ("/rest/parameters", json!({ "parameters": {} })),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+    }
+
+    let info = client(&server)
+        .server_info(KEY)
+        .await
+        .expect("one failed endpoint must not fail the call");
+    assert_eq!(info["unavailable"], json!(["/version: unavailable"]));
+    let text = serde_json::to_string(&info).expect("info serializes");
+    for needle in ["424242", "does not exist", "bugzilla error"] {
+        assert!(
+            !text.contains(needle),
+            "unavailable entries leaked Bugzilla's text: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn server_info_all_failed_error_carries_no_upstream_text() {
+    // Every endpoint down: the error names only the fixed markers, so a
+    // caller mapping it to a fixed line forwards nothing upstream said.
+    let server = MockServer::start().await;
+    for endpoint in [
+        "/rest/version",
+        "/rest/extensions",
+        "/rest/time",
+        "/rest/parameters",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "error": true, "code": 32000, "message": "Bug 424242 does not exist.",
+            })))
+            .mount(&server)
+            .await;
+    }
+
+    let err = client(&server)
+        .server_info(KEY)
+        .await
+        .expect_err("all endpoints down must be an error");
+    let text = format!("{err:#}");
+    for needle in ["424242", "does not exist", "bugzilla error", KEY] {
+        assert!(
+            !text.contains(needle),
+            "the aggregate error leaked upstream text or the key: {text}"
+        );
+    }
 }
 
 #[tokio::test]
