@@ -1218,7 +1218,11 @@ impl Guard {
     /// ASCII-only product names are no protection either, and Bugzilla's
     /// code looks up component, keyword, severity and priority names the
     /// same way. This gate does not close that; issue #330 tracks it, open
-    /// and deferred. And with `letsubmitterchoosepriority` off Bugzilla
+    /// and deferred. What narrows it is an allowlist-shaped create grant
+    /// (a create-scoped grant on exact product names ahead of a default
+    /// deny): an equivalent spelling can then only be refused, never
+    /// admitted, while a denylist create rule stays bypassable by one.
+    /// And with `letsubmitterchoosepriority` off Bugzilla
     /// replaces the requested priority with `defaultpriority`, so a
     /// `priorities` criterion judges a priority the bug may not get.
     ///
@@ -3707,6 +3711,25 @@ products = ["NoView*"]
         let mut req = create_request("openSUSE");
         req["summary"] = json!("fails to boot\u{180E}\n");
         assert!(!g.may_create(&mut req), "the judged summary keeps U+180E");
+    }
+
+    #[test]
+    fn may_create_zwsp_spelling_pins_the_collation_known_limit() {
+        // The database can equate two spellings a glob tells apart,
+        // so a zero-width-space-padded product walks past a deny rule
+        // and is filed verbatim. Pins the known limit beside
+        // `may_create`: a future change that resolves names upstream
+        // must flip this test deliberately.
+        let g = Guard {
+            policy: policy(concat!(
+                "[[rule]]\nname = \"hide-security\"\naction = \"deny\"\n",
+                "[rule.match]\nproducts = [\"Security*\"]\n",
+            )),
+        };
+        assert!(!g.may_create(&mut create_request("Security Response")));
+        let mut req = create_request("\u{200B}Security Response");
+        assert!(g.may_create(&mut req));
+        assert_eq!(req["product"], "\u{200B}Security Response");
     }
 
     #[test]
