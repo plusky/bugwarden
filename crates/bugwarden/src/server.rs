@@ -4112,6 +4112,27 @@ impl BugWarden {
                 return Ok(err_text(Guard::denial(id)));
             }
         }
+        // A bug listed in its own dependency change is refused
+        // here, after the denials and before the PUT: the loop
+        // codes can name a hidden bug, so they carry no hint,
+        // while this text is read off the request alone.
+        let self_linked = [
+            &p.blocks_add,
+            &p.blocks_remove,
+            &p.depends_on_add,
+            &p.depends_on_remove,
+        ]
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|id| *id == p.bug_id);
+        if self_linked {
+            note_refused(&ctx);
+            return Ok(err_text(format!(
+                "A bug cannot depend on itself: remove {} from the dependency lists",
+                p.bug_id
+            )));
+        }
         note(p.bug_id, Verdict::Served);
 
         match self
@@ -4230,6 +4251,14 @@ impl BugWarden {
         if !duplicate_ok {
             note(p.duplicate_of, Verdict::Denied);
             return Ok(err_text(Guard::denial(p.duplicate_of)));
+        }
+        // A bug marked as its own duplicate is refused here,
+        // after the denials and before the PUT, for the same
+        // reason as a self-dependency: the duplicate loop code
+        // can name a hidden bug and so carries no hint.
+        if p.bug_id == p.duplicate_of {
+            note_refused(&ctx);
+            return Ok(err_text("A bug cannot be a duplicate of itself"));
         }
         note(p.bug_id, Verdict::Served);
 

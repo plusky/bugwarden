@@ -1939,6 +1939,138 @@ async fn mark_as_duplicate_sends_only_dupe_of_and_comment() {
     );
 }
 
+/// A PUT that must never be reached: the mock fails the test if one is.
+async fn mount_put_trap(mock: &MockServer) {
+    Mock::given(method("PUT"))
+        .and(path("/rest/bug/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [{ "id": 7 }] })))
+        .expect(0)
+        .mount(mock)
+        .await;
+}
+
+#[tokio::test]
+async fn update_bug_dependencies_refuses_a_self_reference_before_the_put() {
+    // A bug naming itself in any of the four lists is refused with a
+    // fixed text read off the request alone — the loop codes can name
+    // a hidden bug, so they carry no hint. The guard still assesses
+    // first (one classify), but nothing is PUT.
+    for args in [
+        json!({ "bug_id": 7, "blocks_add": [7] }),
+        json!({ "bug_id": 7, "blocks_remove": [7] }),
+        json!({ "bug_id": 7, "depends_on_add": [7] }),
+        json!({ "bug_id": 7, "depends_on_remove": [7] }),
+    ] {
+        let mock = MockServer::start().await;
+        mount_classify(&mock, world_readable_bug(7)).await;
+        mount_put_trap(&mock).await;
+        let client = client_for("", &mock).await;
+        let result = call(&client, "update_bug_dependencies", args.clone()).await;
+        assert!(is_error(&result), "self link must be refused: {args}");
+        assert_eq!(
+            text_of(&result),
+            "A bug cannot depend on itself: remove 7 from the dependency lists",
+            "fixed text, identical whatever the bug's visibility: {args}"
+        );
+        assert_eq!(
+            mock.received_requests().await.unwrap().len(),
+            1,
+            "the classify alone reaches Bugzilla: {args}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_bug_dependencies_denial_stays_first_for_hidden_bugs() {
+    // A hidden bug_id still takes the uniform denial, never the
+    // self-reference text — and so does a hidden target named beside
+    // the self link. Nothing is PUT on either path.
+    let mock = MockServer::start().await;
+    let mut secret = world_readable_bug(7);
+    secret["product"] = json!("SecretSauce");
+    mount_classify(&mock, secret).await;
+    mount_put_trap(&mock).await;
+    let client = client_for(HIDE_SECRET_POLICY, &mock).await;
+    let result = call(
+        &client,
+        "update_bug_dependencies",
+        json!({ "bug_id": 7, "blocks_add": [7] }),
+    )
+    .await;
+    assert!(is_error(&result));
+    assert_eq!(
+        text_of(&result),
+        "Bug 7 is not accessible through this server"
+    );
+
+    let mock = MockServer::start().await;
+    mount_classify(&mock, world_readable_bug(7)).await;
+    let mut secret = world_readable_bug(999);
+    secret["product"] = json!("SecretSauce");
+    mount_classify(&mock, secret).await;
+    mount_put_trap(&mock).await;
+    let client = client_for(HIDE_SECRET_POLICY, &mock).await;
+    let result = call(
+        &client,
+        "update_bug_dependencies",
+        json!({ "bug_id": 7, "blocks_add": [7, 999] }),
+    )
+    .await;
+    assert!(is_error(&result));
+    assert_eq!(
+        text_of(&result),
+        "Bug 999 is not accessible through this server",
+        "a hidden target denies before the self check runs"
+    );
+}
+
+#[tokio::test]
+async fn mark_as_duplicate_refuses_itself_before_the_put() {
+    // bug_id == duplicate_of is refused with a fixed text read off
+    // the request alone, same reasoning as the self-dependency
+    // refusal above. One classify, no PUT.
+    let mock = MockServer::start().await;
+    mount_classify(&mock, world_readable_bug(7)).await;
+    mount_put_trap(&mock).await;
+    let client = client_for("", &mock).await;
+    let result = call(
+        &client,
+        "mark_as_duplicate",
+        json!({ "bug_id": 7, "duplicate_of": 7 }),
+    )
+    .await;
+    assert!(is_error(&result));
+    assert_eq!(text_of(&result), "A bug cannot be a duplicate of itself");
+    assert_eq!(
+        mock.received_requests().await.unwrap().len(),
+        1,
+        "the classify alone reaches Bugzilla"
+    );
+}
+
+#[tokio::test]
+async fn mark_as_duplicate_denial_stays_first_for_a_hidden_bug() {
+    // A hidden bug_id still takes the uniform denial, never the
+    // self-duplicate text. Nothing is PUT.
+    let mock = MockServer::start().await;
+    let mut secret = world_readable_bug(7);
+    secret["product"] = json!("SecretSauce");
+    mount_classify(&mock, secret).await;
+    mount_put_trap(&mock).await;
+    let client = client_for(HIDE_SECRET_POLICY, &mock).await;
+    let result = call(
+        &client,
+        "mark_as_duplicate",
+        json!({ "bug_id": 7, "duplicate_of": 7 }),
+    )
+    .await;
+    assert!(is_error(&result));
+    assert_eq!(
+        text_of(&result),
+        "Bug 7 is not accessible through this server"
+    );
+}
+
 /// Tool names a client sees when it lists the server's tools — a real
 /// `tools/list` request over the wire, so the handler's own listing path
 /// is what answers.
