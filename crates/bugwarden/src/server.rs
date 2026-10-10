@@ -13,7 +13,7 @@ use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose, Engine as _};
 use bugwarden_core::client::{with_upstream_stats, BugzillaClient, UpstreamStats, CLASSIFY_FIELDS};
@@ -1193,19 +1193,31 @@ async fn record_event(
 
 /// Writes the call's record when the dispatch future is dropped first.
 ///
-/// Built before the dispatch await and disarmed where the normal record
-/// is written. If the future is dropped in between, the serve loop gave
-/// up waiting and the normal record never runs; the guard then writes
-/// one record from the cell state instead, keeping whatever verdict and
-/// upstream legs were noted so far, with the error outcome and no
-/// response size. The write is synchronous on the file sink, which is
-/// safe from `Drop`; the export hand-off only queues, so a collector
-/// already shutting down may still lose this record while the file
-/// keeps it.
+/// Built before the dispatch await; the normal path moves the claim
+/// to writing before its own persist runs. If the future is dropped
+/// in between, the serve loop gave up waiting and the normal record
+/// never runs; the guard then writes one record from the cell state
+/// instead, keeping whatever verdict and upstream legs were noted so
+/// far, with the error outcome and no response size. The write is
+/// synchronous on the file sink, which is safe from `Drop`; the
+/// export hand-off only queues, so a collector already shutting down
+/// may still lose this record while the file keeps it.
 ///
 /// Shared with the shutdown path through [`AbandonedRegistry`]: a
 /// signal flush writes the same record before the process exits, and
 /// the atomic handoff keeps the two from ever writing twice.
+const SLOT_ARMED: u8 = 0;
+const SLOT_WRITING: u8 = 1;
+const SLOT_DONE: u8 = 2;
+const SLOT_FLUSHED: u8 = 3;
+
+/// How often the shutdown flush polls a writing slot for done.
+const FLUSH_POLL: Duration = Duration::from_millis(10);
+
+/// How long the shutdown flush waits for a writing slot before it
+/// gives up waiting and counts one failure without writing.
+const FLUSH_DEADLINE: Duration = Duration::from_secs(2);
+
 struct AbandonedSlot {
     audit: Arc<AuditState>,
     cell: Arc<AuditCell>,
@@ -1217,60 +1229,101 @@ struct AbandonedSlot {
     params: BTreeMap<String, Value>,
     session: audit::SessionInfo,
     started: Instant,
-    armed: std::sync::atomic::AtomicBool,
+    state: std::sync::atomic::AtomicU8,
 }
 
 impl AbandonedSlot {
-    /// Claim the one record write. Exactly one claimant per call ever
-    /// sees true: the normal path, the drop guard, or the signal flush.
-    fn take_armed(&self) -> bool {
-        self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+    /// Claim the slot for the normal persist. True moves armed to
+    /// writing; a flush that won first leaves flushed, so the normal
+    /// path returns its result unrecorded and keeps exactly one.
+    fn claim_for_persist(&self) -> bool {
+        self.state
+            .compare_exchange(
+                SLOT_ARMED,
+                SLOT_WRITING,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
     }
 
-    /// Build the abandonment record from the cell state. Partial by
-    /// design: whatever verdict and upstream legs exist are kept.
-    fn record_abandoned(&self) {
-        if self.stats.requests() > 0 {
-            self.cell.note_upstream(audit::UpstreamInfo {
-                requests: self.stats.requests(),
-                status: self.stats.status(),
-                latency_ms: self.stats.latency_ms(),
-                bugzilla_code: self.cell.take_bugzilla_code(),
-            });
-        }
-        let upstream = self.cell.take_upstream();
-        let guard = self.cell.into_guard_info(
-            self.audit.policy_hash.as_deref(),
-            self.audit.sink.suppressed_ids(),
-        );
-        let event = audit::AuditEventKind::ToolCall(Box::new(audit::ToolCallEvent {
-            client: self.client.clone(),
-            trace: self.trace.clone(),
-            request: audit::RequestInfo {
-                tool: capped(&self.tool),
-                id: self.request_id.clone(),
-                params: self.params.clone(),
-            },
-            guard,
-            upstream,
-            outcome: audit::OutcomeInfo {
-                class: audit::OutcomeClass::Error,
-                duration_ms: elapsed_ms(self.started),
-                response_bytes: None,
-            },
-        }));
-        let _ = self.audit.sink.record(event, self.session.clone());
+    /// Mark the normal persist finished. Runs after the record await,
+    /// so a flush waiting on writing sees it and skips. Only this
+    /// path ever leaves writing, so the claim cannot fail; the
+    /// compare keeps that single-writer shape if it ever does.
+    fn mark_done(&self) {
+        let claimed = self
+            .state
+            .compare_exchange(
+                SLOT_WRITING,
+                SLOT_DONE,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok();
+        debug_assert!(claimed, "only the persist holder leaves writing");
     }
 
-    /// Write the record unless someone already claimed it. Never
-    /// panics: the record build runs inside a panic boundary, and the
-    /// locks it takes tolerate poison.
-    fn write_if_armed(&self) {
-        if self.take_armed() {
-            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                self.record_abandoned();
+    /// Claim the slot for an abandonment write. True moves armed to
+    /// flushed; writing, done and flushed all refuse, each for its
+    /// own reason documented at the call sites.
+    fn claim_for_abandon(&self) -> bool {
+        self.state
+            .compare_exchange(
+                SLOT_ARMED,
+                SLOT_FLUSHED,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    fn load_state(&self) -> u8 {
+        self.state.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Build the abandonment record from the cell state and write it.
+    /// Partial by design: whatever verdict and upstream legs exist
+    /// are kept. Returns whether the sink kept the record. Never
+    /// panics: the build runs inside a panic boundary, and the locks
+    /// it takes tolerate poison.
+    fn drain_cell(&self) -> bool {
+        let wrote = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let requests = self.stats.requests();
+            let status = self.stats.status();
+            let latency_ms = self.stats.latency_ms();
+            if requests > 0 {
+                self.cell.note_upstream(audit::UpstreamInfo {
+                    requests,
+                    status,
+                    latency_ms,
+                    bugzilla_code: self.cell.take_bugzilla_code(),
+                });
+            }
+            let upstream = self.cell.take_upstream();
+            let guard = self.cell.into_guard_info(
+                self.audit.policy_hash.as_deref(),
+                self.audit.sink.suppressed_ids(),
+            );
+            let event = audit::AuditEventKind::ToolCall(Box::new(audit::ToolCallEvent {
+                client: self.client.clone(),
+                trace: self.trace.clone(),
+                request: audit::RequestInfo {
+                    tool: capped(&self.tool),
+                    id: self.request_id.clone(),
+                    params: self.params.clone(),
+                },
+                guard,
+                upstream,
+                outcome: audit::OutcomeInfo {
+                    class: audit::OutcomeClass::Error,
+                    duration_ms: elapsed_ms(self.started),
+                    response_bytes: None,
+                },
             }));
-        }
+            self.audit.sink.record(event, self.session.clone()).is_ok()
+        }));
+        matches!(wrote, Ok(true))
     }
 }
 
@@ -1280,41 +1333,66 @@ struct AbandonedGuard {
 }
 
 impl Drop for AbandonedGuard {
-    /// Never panics: [`AbandonedSlot::write_if_armed`] cannot panic,
-    /// and a panicking `Drop` during unwinding aborts.
+    /// Never panics: [`AbandonedSlot::drain_cell`] cannot panic, and
+    /// a panicking `Drop` during unwinding aborts.
     fn drop(&mut self) {
-        self.slot.write_if_armed();
+        // Armed to flushed covers drops before dispatch or before
+        // the normal persist starts. Writing is left alone: the
+        // detached blocking persist runs to completion and writes
+        // the normal record, so a second write here would double
+        // it. Done and flushed need nothing.
+        //
+        // Per-call clones and this synchronous file write stay:
+        // abandonment is rare, one write per dropped call, and a
+        // scoped blocking wait would panic outside a runtime.
+        if self.slot.claim_for_abandon() {
+            self.slot.drain_cell();
+        }
     }
 }
 
 /// The calls currently in flight, for the shutdown path to flush.
 ///
 /// Every audited `call_tool` registers its slot before dispatch; the
-/// normal path disarms it where the normal record runs. A signal
-/// arriving mid-dispatch flushes what is still armed and then exits,
-/// which never runs drops — so without this the flushed record would
-/// have no writer. Entries are weak: a finished call drops its slot
-/// and the next insert prunes it.
+/// normal path moves it to writing and then done. A signal arriving
+/// mid-dispatch flushes what is still owed and then exits, which
+/// never runs drops — so without this the flushed record would have
+/// no writer. Entries are weak: a finished call drops its slot and
+/// the registry prunes it on a later insert.
 #[derive(Debug, Default)]
 pub struct AbandonedRegistry {
     slots: std::sync::Mutex<Vec<std::sync::Weak<AbandonedSlot>>>,
 }
 
 impl AbandonedRegistry {
-    /// Register one call's slot, pruning slots no call holds.
+    /// Register one call's slot, pruning dead slots amortized: only
+    /// when the list grows past 64 entries.
     fn insert(&self, slot: &Arc<AbandonedSlot>) {
         let mut slots = self
             .slots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        slots.retain(|weak| weak.upgrade().is_some());
+        if slots.len() > 64 {
+            slots.retain(|weak| weak.upgrade().is_some());
+        }
         slots.push(Arc::downgrade(slot));
     }
 
-    /// Write the abandonment record for every call still owed one.
-    /// Synchronous, one file write per armed slot, export lossy like
-    /// the drop path. Never panics.
-    pub fn flush(&self) {
+    /// Write the abandonment record for every call still owed one,
+    /// and return how many of those writes failed. Consumes the
+    /// claims it writes: a normal completion that lands later sees
+    /// flushed and returns its result unrecorded, keeping exactly
+    /// one record. Run once, before process exit; a second run
+    /// finds nothing owed and writes nothing.
+    ///
+    /// Synchronous file writes, one per owed slot, export lossy
+    /// like the drop path. A slot caught writing is waited on up
+    /// to the deadline: done means the normal path recorded, so it
+    /// is skipped; past the deadline the flush writes nothing and
+    /// counts one failure. Only the claim holder ever writes, so
+    /// expiry silence preserves exactly-once while the count keeps
+    /// the unresolved call visible. Never panics.
+    pub async fn flush(&self) -> usize {
         let weaks = {
             let slots = self
                 .slots
@@ -1322,11 +1400,40 @@ impl AbandonedRegistry {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             slots.clone()
         };
+        let mut failures = 0;
         for weak in weaks {
-            if let Some(slot) = weak.upgrade() {
-                slot.write_if_armed();
+            let Some(slot) = weak.upgrade() else {
+                continue;
+            };
+            if slot.claim_for_abandon() {
+                if !slot.drain_cell() {
+                    failures += 1;
+                }
+                continue;
             }
+            if slot.load_state() != SLOT_WRITING {
+                continue;
+            }
+            let start = Instant::now();
+            let mut done = false;
+            while start.elapsed() < FLUSH_DEADLINE {
+                if slot.load_state() == SLOT_DONE {
+                    done = true;
+                    break;
+                }
+                tokio::time::sleep(FLUSH_POLL).await;
+            }
+            if done {
+                continue;
+            }
+            // Only the claim holder ever writes: the normal persist
+            // claimed armed to writing, and neither drop nor flush
+            // leaves writing. A post-write steal cannot unwrite, so
+            // expiry stays silent to preserve exactly-once; the count
+            // keeps the unresolved call visible through the warning.
+            failures += 1;
         }
+        failures
     }
 }
 
@@ -5848,7 +5955,7 @@ impl ServerHandler for BugWarden {
             params: params.clone(),
             session: session.clone(),
             started,
-            armed: std::sync::atomic::AtomicBool::new(true),
+            state: std::sync::atomic::AtomicU8::new(SLOT_ARMED),
         });
         self.abandoned.insert(&slot);
         let _guard = AbandonedGuard {
@@ -5867,10 +5974,13 @@ impl ServerHandler for BugWarden {
             Err(tool_not_found())
         };
 
-        // Claim the one record write. A signal flush that claimed it
-        // first already wrote the abandonment record; returning the
-        // result unrecorded keeps exactly one record standing.
-        if !slot.take_armed() {
+        // Claim the persist before it runs: armed to writing. A
+        // signal flush that claimed it first left flushed, so the
+        // result returns unrecorded and exactly one record stands.
+        // Claiming first also keeps a cancellation during the await
+        // below from leaving zero records: the drop guard sees
+        // writing and leaves the detached persist to finish it.
+        if !slot.claim_for_persist() {
             return result;
         }
 
@@ -5933,7 +6043,12 @@ impl ServerHandler for BugWarden {
                 response_bytes: response_bytes(&result),
             },
         }));
-        match record_event(&audit, event, session).await {
+        let persisted = record_event(&audit, event, session).await;
+        // Done on either outcome: the normal path attempted its one
+        // record, so a concurrent flush skips. A failed persist stays
+        // with the fail-mode arms below, not with a second write.
+        slot.mark_done();
+        match persisted {
             // Persisted before the response is returned.
             Ok(_) => result,
             Err(()) => match (audit.fail_mode, &result) {
@@ -11481,5 +11596,100 @@ mod tests {
         assert!(msg.contains('*'), "the error must name the entry: {msg}");
         // Refusal is before the info line, so the capture may be empty;
         // asserting a negative on it would be the #97 vacuous form.
+    }
+
+    fn abandoned_slot(audit: &Arc<AuditState>, state: u8) -> Arc<AbandonedSlot> {
+        Arc::new(AbandonedSlot {
+            audit: Arc::clone(audit),
+            cell: Arc::new(AuditCell::default()),
+            stats: Arc::new(UpstreamStats::default()),
+            client: audit::ClientInfo {
+                name: None,
+                version: None,
+                principal: None,
+                work_context: None,
+            },
+            trace: None,
+            tool: "add_comment".to_owned(),
+            request_id: None,
+            params: BTreeMap::new(),
+            session: audit::SessionInfo {
+                id: None,
+                transport: TransportKind::Stdio,
+                remote: None,
+            },
+            started: Instant::now(),
+            state: std::sync::atomic::AtomicU8::new(state),
+        })
+    }
+
+    #[test]
+    fn abandoned_drop_on_writing_writes_nothing() {
+        // Drop during the normal persist must not double it: the
+        // detached blocking write finishes the record on its own.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, path) = audit_state(dir.path(), FailMode::Open);
+        let slot = abandoned_slot(&audit, SLOT_WRITING);
+        drop(AbandonedGuard { slot });
+        let events = read_audit_events(&path);
+        assert!(
+            events.is_empty(),
+            "drop on writing must write nothing: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_drop_then_flush_writes_once() {
+        // The drop claims armed to flushed; the flush then finds
+        // flushed and skips, leaving exactly one error record.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, path) = audit_state(dir.path(), FailMode::Open);
+        let registry = AbandonedRegistry::default();
+        let slot = abandoned_slot(&audit, SLOT_ARMED);
+        registry.insert(&slot);
+        drop(AbandonedGuard { slot });
+        let failures = registry.flush().await;
+        assert_eq!(failures, 0, "the one write must succeed");
+        let events = read_audit_events(&path);
+        assert_eq!(events.len(), 1, "drop plus flush is one: {events:?}");
+    }
+
+    #[tokio::test]
+    async fn abandoned_flush_waits_for_writing_then_skips() {
+        // A slot caught writing that reaches done while the flush
+        // waits is the normal path recording: skip, no failure.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, path) = audit_state(dir.path(), FailMode::Open);
+        let registry = AbandonedRegistry::default();
+        let slot = abandoned_slot(&audit, SLOT_WRITING);
+        registry.insert(&slot);
+        let marker = Arc::clone(&slot);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            marker.mark_done();
+        });
+        let failures = registry.flush().await;
+        assert_eq!(failures, 0, "a recorded call is not a failure");
+        let events = read_audit_events(&path);
+        assert!(
+            events.is_empty(),
+            "flush after done must write nothing: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_flush_expiry_counts_failure_without_writing() {
+        // A slot stuck writing past the deadline keeps its claim:
+        // the flush writes nothing, preserving exactly-once, and
+        // counts one failure to keep it visible. Full deadline.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, path) = audit_state(dir.path(), FailMode::Open);
+        let registry = AbandonedRegistry::default();
+        let slot = abandoned_slot(&audit, SLOT_WRITING);
+        registry.insert(&slot);
+        let failures = registry.flush().await;
+        assert_eq!(failures, 1, "expiry counts one failure");
+        let events = read_audit_events(&path);
+        assert!(events.is_empty(), "expiry must write nothing: {events:?}");
     }
 }
