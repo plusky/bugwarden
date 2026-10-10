@@ -2684,3 +2684,126 @@ async fn bug_history_counts_the_field_type_lookup_in_upstream_requests() {
     let tc = last_tool_call(&events);
     assert_eq!(tc.upstream.map_or(0, |u| u.requests) as usize, hits);
 }
+
+#[tokio::test]
+async fn upstream_failure_records_error_with_bugzilla_code() {
+    // A Bugzilla failure after contact is an error, carrying the
+    // numeric code and the status. Both a read and a write leg
+    // are pinned so the two refusal helpers stay in agreement.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [world_bug(7)] })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/7/history"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_json(json!({"error": true, "code": 32000, "message": "boom"})),
+        )
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/rest/bug/7/comment"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_json(json!({"error": true, "code": 109, "message": "denied"})),
+        )
+        .mount(&mock)
+        .await;
+    let audited = audited_client_for("", &mock, "test-key").await;
+
+    let failed = call(&audited.client, "bug_history", json!({ "id": 7 })).await;
+    assert_eq!(failed.is_error, Some(true));
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.outcome.class, OutcomeClass::Error);
+    let upstream = tc.upstream.expect("contacted Bugzilla");
+    assert_eq!(upstream.status, Some(500));
+    assert_eq!(upstream.bugzilla_code, Some(32000));
+
+    let failed = call(
+        &audited.client,
+        "add_comment",
+        json!({ "bug_id": 7, "comment": "hello" }),
+    )
+    .await;
+    assert_eq!(failed.is_error, Some(true));
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.outcome.class, OutcomeClass::Error);
+    let upstream = tc.upstream.expect("contacted Bugzilla");
+    assert_eq!(upstream.status, Some(500));
+    assert_eq!(upstream.bugzilla_code, Some(109));
+}
+
+#[tokio::test]
+async fn refusal_without_upstream_contact_records_refused_without_code() {
+    // A refusal answered from the request alone never contacted
+    // Bugzilla: refused class, no upstream block, and no code key
+    // on the raw line.
+    let mock = MockServer::start().await;
+    let audited = audited_client_for("", &mock, "test-key").await;
+
+    let ids: Vec<u64> = (1..=26).collect();
+    let refused = call(&audited.client, "bug_info", json!({ "bug_ids": ids })).await;
+    assert_eq!(refused.is_error, Some(true));
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.outcome.class, OutcomeClass::Refused);
+    assert!(
+        tc.upstream.is_none(),
+        "no request was made: {:?}",
+        tc.upstream
+    );
+    let raw = std::fs::read_to_string(&audited.audit_path).expect("audit file must be readable");
+    let last = raw
+        .lines()
+        .rev()
+        .find(|l| !l.is_empty())
+        .expect("at least one line");
+    assert!(
+        !last.contains("bugzilla_code"),
+        "the key is absent without contact: {last}"
+    );
+}
+
+#[tokio::test]
+async fn upstream_failure_without_code_records_error_without_code_field() {
+    // A Bugzilla failure carrying no numeric code is still an error,
+    // with a status but no code key on the raw line: absent, never null.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [world_bug(7)] })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/7/attachment"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("oops"))
+        .mount(&mock)
+        .await;
+    let audited = audited_client_for("", &mock, "test-key").await;
+
+    let failed = call(&audited.client, "list_attachments", json!({ "bug_id": 7 })).await;
+    assert_eq!(failed.is_error, Some(true));
+    let events = read_events(&audited.audit_path);
+    let tc = last_tool_call(&events);
+    assert_eq!(tc.outcome.class, OutcomeClass::Error);
+    let upstream = tc.upstream.expect("contacted Bugzilla");
+    assert_eq!(upstream.status, Some(500));
+    assert_eq!(upstream.bugzilla_code, None);
+    let raw = std::fs::read_to_string(&audited.audit_path).expect("audit file must be readable");
+    let last = raw
+        .lines()
+        .rev()
+        .find(|l| !l.is_empty())
+        .expect("at least one line");
+    assert!(
+        !last.contains("bugzilla_code"),
+        "absent, never null: {last}"
+    );
+}
