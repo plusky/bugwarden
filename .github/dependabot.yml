@@ -16,7 +16,7 @@ updates:
           - "patch"
 
   # GitHub Actions used by the workflows. Keeps the SHA-pinned actions in
-  # ci.yml / release.yml current so they cannot silently rot.
+  # every workflow current so they cannot silently rot.
   #
   # Pin every action to a commit a version tag points at, and name that
   # release in the trailing `# vX.Y.Z` comment. This file cannot enforce it:
