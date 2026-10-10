@@ -426,6 +426,37 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
+      - name: Resolve the platform image digest
+        id: platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The build digest is an index (provenance mode=max wraps the
+          # image); a single-platform pull resolves to the child, which no
+          # attestation covers yet. Resolve it for the ride-along below.
+          manifest="$(docker buildx imagetools inspect "ghcr.io/plusky/bugwarden@${{ steps.build.outputs.digest }}" --format '{{json .Manifest}}')"
+          arch="${{ matrix.platform }}"
+          arch="${arch##*/}"
+          digest="$(jq -r --arg arch "$arch" '(.manifests // []) | map(select(.platform.architecture == $arch)) | .[0].digest // empty' <<<"$manifest")"
+          if [ -z "$digest" ]; then
+            # Single-manifest push (no index): the digest is the image.
+            digest="$(jq -r '.digest // empty' <<<"$manifest")"
+          fi
+          if [ -z "$digest" ] || [ "$digest" = "null" ]; then
+            echo "::error::cannot resolve $arch child of ${{ steps.build.outputs.digest }}"
+            exit 1
+          fi
+          echo "digest=$digest" >>"$GITHUB_OUTPUT"
+
+      - name: Attest the platform image digest
+        # Ride-along so a single-platform pull verifies too; the tag's index
+        # attestation in container-manifest covers the multi-arch reference.
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-name: ghcr.io/plusky/bugwarden
+          subject-digest: ${{ steps.platform.outputs.digest }}
+          push-to-registry: true
+
       - name: Pull the pushed image by digest
         shell: bash
         run: |
@@ -491,6 +522,10 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # Mint the OIDC token for the Sigstore cert and store the tag-level
+      # bundle (option 1 in #328).
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
@@ -521,6 +556,41 @@ jobs:
         run: |
           set -euo pipefail
           docker buildx imagetools inspect "ghcr.io/plusky/bugwarden:$GITHUB_REF_NAME"
+      - name: Resolve the tag digest
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect "ghcr.io/plusky/bugwarden:$GITHUB_REF_NAME" --format '{{json .Manifest}}' | jq -r .digest)"
+          if [ -z "$digest" ] || [ "$digest" = "null" ]; then
+            echo "::error::cannot resolve tag digest"
+            exit 1
+          fi
+          echo "digest=$digest" >>"$GITHUB_OUTPUT"
+      - name: Attest the tag digest
+        # The tag exists briefly before its provenance here; the verify step
+        # below fails the job when the attestation never lands.
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-name: ghcr.io/plusky/bugwarden
+          subject-digest: ${{ steps.tag.outputs.digest }}
+          push-to-registry: true
+      - name: Verify the tag attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          attested="${{ steps.tag.outputs.digest }}"
+          current="$(docker buildx imagetools inspect "ghcr.io/plusky/bugwarden:$GITHUB_REF_NAME" --format '{{json .Manifest}}' | jq -r .digest)"
+          if [ "$current" != "$attested" ]; then
+            echo "::error::tag digest moved: attested $attested but tag now $current"
+            exit 1
+          fi
+          gh attestation verify "oci://ghcr.io/plusky/bugwarden:$GITHUB_REF_NAME" --repo plusky/bugwarden
+          if [[ "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            gh attestation verify oci://ghcr.io/plusky/bugwarden:latest --repo plusky/bugwarden
+          fi
 
   publish:
     # crates.io last: a version can be yanked but never replaced, so it only

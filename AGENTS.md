@@ -221,6 +221,12 @@ A release is one push of an annotated tag; nothing is released by hand.
   `container` job after push-by-digest and before smoke, so a provenance
   failure cannot publish `:$VERSION` / `:latest`; verify with
   `gh attestation verify oci://ghcr.io/plusky/bugwarden@<digest>
+  --repo plusky/bugwarden`. The platform image child is attested alongside
+  it so a single-platform pull verifies, and the published tag's index
+  digest is attested in `container-manifest` after `imagetools create`,
+  with the job verifying `oci://ghcr.io/plusky/bugwarden:$VERSION` (plus
+  `:latest` unless a pre-release) before finishing; verify with
+  `gh attestation verify oci://ghcr.io/plusky/bugwarden:<tag>
   --repo plusky/bugwarden`.
 - The same tag also ships the multi-arch container image
   `ghcr.io/plusky/bugwarden` (jobs `container`, `container-manifest`).
