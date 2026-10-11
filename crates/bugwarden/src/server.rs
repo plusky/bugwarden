@@ -7093,6 +7093,14 @@ mod tests {
     fn quicksearch_gate_escaped_colon_is_data() {
         // An escaped colon names no field, so the operand is bare text.
         assert_eq!(qs_refuse_expr(r"product\:foo"), None);
+        // A quote past the escape still opens: skipping it (`i *= 2`
+        // leaps over the opener) unbalances the query, so the refusal
+        // must name the parse failure, not a bare pass.
+        assert_eq!(
+            qs_refuse_expr("abc\\:\"de"),
+            Some(QUICKSEARCH_PARSE_REFUSAL),
+            "an opener past an escape still opens"
+        );
     }
 
     #[test]

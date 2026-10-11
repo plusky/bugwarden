@@ -4256,7 +4256,11 @@ wired, `server.rs` and `main.rs` are the reference.
   draws its fixed text with `expect(0)` upstream requests, byte-identical
   over hidden vs visible rows, the stripped-gate mutant failing the refusal
   tests; unit tests pin the allowlist against SUMMARY_FIELDS and the
-  tokenizer edges (quoting, escapes, prefixes, status prefix); and the
+  tokenizer edges (quoting, escapes, prefixes, status prefix); gate-level
+  rows pin what the edge table misses — hash and dash-hash shortcuts
+  after a comma, unbalanced and stray quotes, bare operator values,
+  escaped colons and operators, and a quote past an escape (the advance
+  must not leap over the opener); and the
   `comment_count` drop (#340) — a BMO-shaped fixture carrying the tally
   is stripped on the bug_info default, bug_info projected, and
   quicksearch projected paths alike, with neighbors asserted surviving.
