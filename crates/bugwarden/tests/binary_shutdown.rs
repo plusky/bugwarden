@@ -84,7 +84,7 @@ use tokio::io::BufReader;
 use tokio::process::Child;
 use tokio::process::ChildStdin;
 use tokio::process::Command;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/deadline.rs"]
@@ -1357,6 +1357,161 @@ async fn stdio_closing_stdin_mid_call_still_records_the_call() {
         "a hangup is not a signal shutdown: {log}"
     );
     assert_one_error_record(&audit_path, "stdio close-stdin mid-call");
+}
+
+/// The classify fetch asks for `CLASSIFY_FIELDS`, the body fetch does
+/// not: that is what tells the two `GET /rest/bug?id=7` legs apart.
+/// Spelled out rather than read from the library the binary embeds, the
+/// way `expected_agent` spells the user agent: agreement with whatever
+/// the constant says, including a wrong one, would prove nothing.
+const ASSESS_FIELDS: &str = "id,summary,product,component,status,resolution,severity,priority,keywords,groups,whiteboard,creation_time,last_change_time,creator";
+
+/// Mount one leg of a bug_info call whose assessment and body disagree:
+/// the classify fetch sees `groups`, the body fetch sees `body_groups.
+/// Mounted assess-first: equal priorities match in mount order, so the
+/// field-bearing request meets the assess mock and the bare one falls
+/// through to the body mock.
+async fn mount_flip_shapes(mock: &MockServer, groups: &[&str], body_groups: &[&str]) {
+    let bug = |groups: &[&str]| {
+        serde_json::json!({ "bugs": [{
+            "id": 7, "summary": "a plain bug", "product": "P", "component": "C",
+            "status": "NEW", "severity": "normal", "priority": "P3",
+            "keywords": [], "groups": groups, "whiteboard": "",
+            "creation_time": "2020-01-01T00:00:00Z",
+        }] })
+    };
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .and(query_param("include_fields", ASSESS_FIELDS))
+        .respond_with(ResponseTemplate::new(200).set_body_json(bug(groups)))
+        .expect(1)
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(bug(body_groups)))
+        .expect(1)
+        .mount(mock)
+        .await;
+    // Link disclosure always costs one request, even with no links to
+    // check (bug id 0 never exists): the padding that keeps "no links"
+    // and "links, all hidden" indistinguishable by the clock (I2).
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "bugs": [] })))
+        .expect(1)
+        .mount(mock)
+        .await;
+}
+
+/// Drive one `bug_info` call for bug 7 through the shipped binary and
+/// return its reply envelope plus the process's whole stderr at exit.
+async fn flipped_call_log(
+    mock_uri: &str,
+    policy_path: &std::path::Path,
+) -> (serde_json::Value, String) {
+    let mut server = Server::spawn(&[
+        "--transport",
+        "stdio",
+        "--bugzilla-server",
+        mock_uri,
+        "--api-key",
+        "test-key",
+        "--policy",
+        policy_path.to_str().expect("a utf-8 temp path"),
+    ]);
+    server.wait_for_stderr(STDIO_READY).await;
+    let stdin = server.stdin.as_mut().expect("stdin is piped");
+    let stdout = server.child.stdout.take().expect("stdout is piped");
+    let mut lines = BufReader::new(stdout).lines();
+    stdin
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"binary-shutdown-test","version":"0"}}}
+"#,
+        )
+        .await
+        .expect("the child must accept the handshake");
+    let reply = tokio::time::timeout(EXIT_TIMEOUT, lines.next_line())
+        .await
+        .expect("the handshake must not hang")
+        .expect("stdout must be readable")
+        .expect("the server must answer initialize");
+    assert!(
+        reply.contains("bugwarden"),
+        "initialize must complete before the test acts: {reply}"
+    );
+    stdin
+        .write_all(br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bug_info","arguments":{"bug_ids":[7]}}}
+"#)
+        .await
+        .expect("the child must accept the call");
+    let reply = tokio::time::timeout(EXIT_TIMEOUT, lines.next_line())
+        .await
+        .expect("the call must not hang")
+        .expect("stdout must be readable")
+        .expect("the server must answer the call");
+    let reply_json: serde_json::Value =
+        serde_json::from_str(&reply).expect("the reply must be JSON");
+    let text = reply_json["result"]["content"][0]["text"]
+        .as_str()
+        .expect("a served call carries a text envelope");
+    let envelope: serde_json::Value =
+        serde_json::from_str(text).expect("the envelope must be JSON");
+    server.close_stdin();
+    let log = wait_for_exit_and_drain(server, "stdio bug_info embargo flip").await;
+    (envelope, log)
+}
+
+#[tokio::test]
+async fn stdio_bug_info_embargo_flip_logs_the_anomaly() {
+    // The re-check's anomaly line is operator-facing: classification
+    // granted Read, but the fetched body arrived embargoed meanwhile.
+    // cargo-mutants reaches this hole by deleting the `!` (logging the
+    // clean path instead), which no unit assertion distinguished — and a
+    // `testlog` capture goes blind on this path, so the pin lives at the
+    // stderr the operators actually read.
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let policy_path = dir.path().join("policy.toml");
+    std::fs::write(
+        &policy_path,
+        "[[rule]]\nname = \"embargo\"\naction = \"deny\"\n[rule.match]\ngroups = [\"embargo*\"]\n",
+    )
+    .expect("the policy file must be writable");
+    let mock = MockServer::start().await;
+    mount_flip_shapes(&mock, &[], &["embargo-security"]).await;
+    let (envelope, log) = flipped_call_log(&mock.uri(), &policy_path).await;
+    assert!(
+        envelope["bugs"].as_array().unwrap().is_empty(),
+        "a body that no longer passes must not be served"
+    );
+    assert_eq!(envelope["restricted"][0]["id"], serde_json::json!(7));
+    assert!(
+        log.contains("no longer passes the guard"),
+        "the flip must name itself on stderr: {log}"
+    );
+    assert_eq!(
+        mock.received_requests().await.unwrap().len(),
+        3,
+        "assess plus body plus the link-disclosure padding, nothing else"
+    );
+
+    // The clean path logs no anomaly: same shapes, no embargo anywhere.
+    // The log is non-empty (startup lines), so the absence is evidence.
+    let mock = MockServer::start().await;
+    mount_flip_shapes(&mock, &[], &[]).await;
+    let (envelope, log) = flipped_call_log(&mock.uri(), &policy_path).await;
+    assert_eq!(envelope["bugs"].as_array().unwrap().len(), 1);
+    assert!(
+        !log.is_empty(),
+        "an empty log would make the absence vacuous"
+    );
+    assert!(
+        !log.contains("no longer passes the guard"),
+        "a body that still passes logs no anomaly: {log}"
+    );
 }
 
 #[tokio::test]

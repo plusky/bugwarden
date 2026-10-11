@@ -7139,6 +7139,13 @@ mod tests {
         ];
         assert!(!cap_comment_text(&mut comments, 100));
         assert!(comments[0].get("text_truncated").is_none());
+        // Exactly at the cap stays whole and unmarked: the bound is
+        // exclusive. cargo-mutants reaches this hole by flipping `>` to
+        // `>=`, which truncates nothing but still marks.
+        let mut comments = vec![json!({ "id": 1, "text": "x".repeat(100) })];
+        assert!(!cap_comment_text(&mut comments, 100));
+        assert_eq!(comments[0]["text"].as_str().unwrap().chars().count(), 100);
+        assert!(comments[0].get("text_truncated").is_none());
     }
 
     /// `n` list items, told apart by a sequence number.
@@ -7982,6 +7989,14 @@ mod tests {
         // A cap beyond the text cuts nothing and stays silent.
         let w = window_text(full, None, None, Some(1000));
         assert_eq!(w.text, full);
+        assert!(!w.cut_anything());
+        // Exactly at the cap is whole, not truncated: the bound is
+        // exclusive. cargo-mutants reaches this hole by flipping `>` to
+        // `>=`, which marks the same text truncated.
+        let len = full.chars().count();
+        let w = window_text(full, None, None, Some(len as u32));
+        assert_eq!(w.text, full);
+        assert!(!w.truncated_chars, "an exact-cap text is not truncated");
         assert!(!w.cut_anything());
     }
 
