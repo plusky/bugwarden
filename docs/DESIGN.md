@@ -4260,7 +4260,10 @@ wired, `server.rs` and `main.rs` are the reference.
   rows pin what the edge table misses — hash and dash-hash shortcuts
   after a comma, unbalanced and stray quotes, bare operator values,
   escaped colons and operators, and a quote past an escape (the advance
-  must not leap over the opener); and the
+  must not leap over the opener); helper-shape tables pin the quoted,
+  priority-shorthand and hash predicates row by row, and the keyword-skip
+  redundancy and quoted-field refusal are pinned as defense-in-depth; and
+  the
   `comment_count` drop (#340) — a BMO-shaped fixture carrying the tally
   is stripped on the bug_info default, bug_info projected, and
   quicksearch projected paths alike, with neighbors asserted surviving.
