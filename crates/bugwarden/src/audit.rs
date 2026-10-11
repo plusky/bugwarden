@@ -2827,6 +2827,83 @@ mod tests {
     }
 
     #[test]
+    fn write_event_at_exactly_the_cap_writes_without_rotating() {
+        // The rotate bound is exclusive: size + len == max still fits.
+        // cargo-mutants reaches this hole by flipping `>` to `>=`,
+        // which rotates a file that is exactly full.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_cfg(dir.path().join("audit.jsonl"));
+        cfg.rotate_max_bytes = 100;
+        cfg.rotate_keep = 3;
+        let sink = AuditSink::open(cfg.clone()).unwrap();
+        sink.record(sample_initialize(), session_stdio()).unwrap();
+        let first = std::fs::metadata(live_path(&cfg)).unwrap().len();
+        // Reopen counting those bytes, with the cap at exactly twice:
+        // the second record then lands precisely on the limit.
+        cfg.rotate_max_bytes = 2 * first;
+        let sink = AuditSink::open(cfg.clone()).unwrap();
+        sink.record(sample_initialize(), session_stdio()).unwrap();
+        assert_eq!(
+            std::fs::metadata(live_path(&cfg)).unwrap().len(),
+            2 * first,
+            "both records share one length and neither rotated"
+        );
+        assert!(
+            !rotated_path(live_path(&cfg), 1).exists(),
+            "an exactly-full file is not rotated"
+        );
+        assert_eq!(read_events(live_path(&cfg)).len(), 2);
+    }
+
+    #[test]
+    fn rotation_recovers_a_missing_live_file() {
+        // Recovery from a previous partial rotation: the live file was
+        // renamed away but never recreated. The NotFound arm recreates
+        // it instead of failing the rotation. cargo-mutants reaches this
+        // hole by forcing the guard false and by flipping `==` to `!=`,
+        // both of which fail a rotation that must succeed.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_cfg(dir.path().join("audit.jsonl"));
+        cfg.rotate_max_bytes = 100;
+        cfg.rotate_keep = 3;
+        let sink = AuditSink::open(cfg.clone()).unwrap();
+        sink.record(sample_initialize(), session_stdio()).unwrap();
+        // Simulate the crash between rename and recreate.
+        std::fs::rename(live_path(&cfg), rotated_path(live_path(&cfg), 1)).unwrap();
+        sink.record(sample_initialize(), session_stdio()).unwrap();
+        assert!(live_path(&cfg).exists(), "the live file is recreated");
+        let live = read_events(live_path(&cfg));
+        assert_eq!(live.len(), 1, "live holds only the new record");
+        assert_eq!(live[0].seq, 2);
+    }
+
+    #[test]
+    fn rotation_reports_a_real_remove_error() {
+        // The NotFound arms skip missing slots, never real failures: a
+        // slot path that cannot even be removed fails the rotation.
+        // cargo-mutants reaches this hole by forcing the oldest-slot
+        // guard true, which swallows every removal error into success.
+        // A non-empty directory fails removal with EISDIR/EPERM, never
+        // NotFound, on every platform this suite runs on.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_cfg(dir.path().join("audit.jsonl"));
+        cfg.rotate_max_bytes = 100;
+        cfg.rotate_keep = 3;
+        let sink = AuditSink::open(cfg.clone()).unwrap();
+        sink.record(sample_initialize(), session_stdio()).unwrap();
+        let obstacle = rotated_path(live_path(&cfg), 3);
+        std::fs::create_dir(&obstacle).unwrap();
+        std::fs::write(obstacle.join("pinned"), b"x").unwrap();
+        let err = sink
+            .record(sample_initialize(), session_stdio())
+            .unwrap_err();
+        assert!(
+            matches!(err, AuditError::Rotation(_)),
+            "an undeletable slot fails the rotation, not the write: {err:?}"
+        );
+    }
+
+    #[test]
     fn reopened_sink_counts_existing_bytes_toward_rotation() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = test_cfg(dir.path().join("audit.jsonl"));
@@ -2979,6 +3056,17 @@ mod tests {
             !raw.ends_with('\n'),
             "the partial write must have left a torn, unterminated line"
         );
+        // The fault hook writes roughly half the line: a stub writing a
+        // byte or two would tear nothing worth healing, and the recovery
+        // below would prove nothing. cargo-mutants reaches this hole by
+        // turning the halving division into a remainder.
+        let torn = raw.rsplit('\n').next().unwrap_or_default();
+        assert!(
+            torn.len() > 2,
+            "the torn prefix must be substantial, not a stub: {} bytes of {}",
+            torn.len(),
+            raw.len()
+        );
         // Recovery: the healing newline terminates the torn line; the
         // gap record and the caller's record follow, both parsable.
         assert_eq!(
@@ -3004,6 +3092,38 @@ mod tests {
             }
             other => panic!("expected audit_gap, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sink_failure_logs_exactly_one_rate_limited_line() {
+        // The rate-limited error line is the operator's only signal of a
+        // dying sink. cargo-mutants reaches this hole two ways: deleting
+        // the log call (no line at all) and inverting the rate check
+        // (a line per failure instead of one per interval). Both rapid
+        // failures go in one capture so the count is exact: one line.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(dir.path().join("audit.jsonl"));
+        let sink = AuditSink::open(cfg).unwrap();
+        sink.set_fail_writes(true);
+        let (_, logs) = crate::testlog::capture_logs(|| {
+            let first = sink.record(sample_initialize(), session_stdio());
+            assert!(
+                matches!(first, Err(AuditError::Write(_))),
+                "the record itself still fails: {first:?}"
+            );
+            let second = sink.record(sample_initialize(), session_stdio());
+            assert!(
+                matches!(second, Err(AuditError::Write(_))),
+                "the record itself still fails: {second:?}"
+            );
+        });
+        crate::testlog::assert_logged(&logs, "could not be persisted");
+        assert_eq!(
+            logs.as_str().matches("could not be persisted").count(),
+            1,
+            "the rate limit allows one line per interval, not per failure: {}",
+            logs.as_str()
+        );
     }
 
     #[test]

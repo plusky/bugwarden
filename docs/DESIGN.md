@@ -4403,7 +4403,13 @@ wired, `server.rs` and `main.rs` are the reference.
   under every `cargo run`.
 - Audit tests (crates/bugwarden/tests/audit_wiremock.rs + #[cfg(test)] in
   server.rs and audit.rs): one record per call for EVERY routed tool,
-  refusal paths and protocol errors included; a handler that PANICS is
+  refusal paths and protocol errors included; rotation — an exactly-full
+  file is not rotated (the bound is exclusive), a missing live file is
+  recreated instead of failing (partial-rotation recovery), and a real
+  removal error fails the rotation rather than being swallowed; a dying
+  sink logs exactly one rate-limited error line no matter how many
+  records fail inside the interval; the partial-write fault hook tears a
+  substantial prefix, not a stub; a handler that PANICS is
   answered `-32603` with the fixed text and no `data`, recorded once as
   `class: error` with no `response_bytes`, and followed by a served next
   call on the same session — audited and unaudited alike, with the panic
