@@ -62,7 +62,7 @@ jobs:
       matrix:
         # 0-based, per cargo-mutants' k/n. The denominator is read back from
         # strategy.job-total, so this list is the only place to change it.
-        # Twelve shards for ~900 mutants: at the measured ~80 s per mutant
+        # Twelve shards for ~1060 mutants: at the measured ~80 s per mutant
         # on a 4-core runner each shard stays near two hours, inside the
         # timeout below even with a timeout-floor mutant or two per shard.
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
@@ -78,10 +78,11 @@ jobs:
       # main.rs's five survivors came out of a hand run (#269);
       # this job saw none of them, because until now its scope was guard.rs
       # alone. server.rs (685 mutants at last --list) joined once the
-      # triage campaign had closed every one of its survivors. Space-separated,
+      # triage campaign had closed every one of its survivors, and
+      # audit.rs (155) once its own triage landed. Space-separated,
       # one --file each below. Grow this by adding shards, not by dropping
       # the filter. Live counts: the Mutate summary.
-      MUTANTS_SCOPE: crates/bugwarden-core/src/guard.rs crates/bugwarden/src/main.rs crates/bugwarden/src/server.rs
+      MUTANTS_SCOPE: crates/bugwarden-core/src/guard.rs crates/bugwarden/src/main.rs crates/bugwarden/src/server.rs crates/bugwarden/src/audit.rs
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
