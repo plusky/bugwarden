@@ -2043,6 +2043,14 @@ mod tests {
                 "https://bugzilla.example.com/search?x=id=666".to_string(),
                 vec![],
             ),
+            // The query ENDS at whitespace, a quote or a bracket: an
+            // `id=` pair in the text after it is not part of the URL, so
+            // mining it would blank an id the URL itself never named.
+            // cargo-mutants reaches this hole by flipping the boundary
+            // predicate's `||` to `&&` (never cuts, then reads on).
+            (format!("{BASE}/show_bug.cgi?id=666 and &id=777"), vec![666]),
+            (format!("{BASE}/rest/bug?id=666 notes &id=777"), vec![666]),
+            (format!("{BASE}/show_bug.cgi?id=666\"&id=777"), vec![666]),
         ];
         for (url, want) in cases {
             let history = json!([{ "changes":
@@ -2128,6 +2136,34 @@ mod tests {
                 "a zero id stays whole: {url}"
             );
         }
+    }
+
+    #[test]
+    fn scalar_bug_ids_guard_condition_stays_a_disjunction() {
+        // The guard rejects an empty value OR a non-digit one, but
+        // `digits.parse().ok().filter(|id| *id != 0)` below it yields
+        // None for both, so flipping the `||` to `&&` changes no
+        // observable behaviour and no behavioural test can kill it
+        // (cargo-mutants found exactly this survivor). The early return
+        // is the intent — name the two rejections rather than lean on
+        // the parse's backstop — so the condition itself is the pin.
+        let src = include_str!("guard.rs");
+        let after = src
+            .split("fn scalar_bug_id(value: &str) -> Option<u64> {")
+            .nth(1)
+            .expect("scalar_bug_id must stay in this file");
+        let end = after
+            .find("\n    }")
+            .expect("scalar_bug_id must close at its own indentation");
+        let body: String = after[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit())"),
+            "the early return must reject empty OR non-digit, never AND: {body}"
+        );
     }
 
     #[test]

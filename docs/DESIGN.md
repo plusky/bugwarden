@@ -3878,8 +3878,13 @@ wired, `server.rs` and `main.rs` are the reference.
   is left alone, and `history_bug_ids` gathers each embedded id,
   including `show_bug.cgi` with the `id` param after others and
   `rest/bug` by query id, while a `q` param, a non-link path holding
-  `id=`, a host merely ending in ours, and id 0 name nothing; and a
-  `Bug.update` response serves only `bugs[]` entries whose `id` was
+   `id=`, a host merely ending in ours, and id 0 name nothing; the
+   embedded scan's query part ends at whitespace, a quote or a bracket,
+   so an `id=` pair in the text after a URL is not mined (flipping that
+   boundary predicate's `||` to `&&` survived a run until pinned); and
+   `scalar_bug_id`'s early return stays a disjunction pinned by source,
+   because the parse below it makes the flip behaviourally invisible; and
+   a `Bug.update` response serves only `bugs[]` entries whose `id` was
   assessed (one with no numeric `id` dropped), drops a `bugs` key that
   is present but not an array while leaving a missing one alone, keeps
   an id-bearing change only as its scrubbed `added`/`removed` (any other
