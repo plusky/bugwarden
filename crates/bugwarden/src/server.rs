@@ -11762,4 +11762,129 @@ mod tests {
         let events = read_audit_events(&path);
         assert!(events.is_empty(), "expiry must write nothing: {events:?}");
     }
+
+    #[test]
+    fn abandoned_drain_cell_omits_upstream_without_requests() {
+        // drain_cell's `requests > 0` gate: an abandonment with no
+        // upstream legs records no upstream block at all ("absent means
+        // zero requests, never not measured"). cargo-mutants reaches
+        // this hole two ways — `>` to `==` and to `>=` — both of which
+        // note a zero-request block.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
+        let slot = abandoned_slot(&audit, SLOT_ARMED);
+        drop(AbandonedGuard { slot });
+        let text = std::fs::read_to_string(&audit_path).expect("audit file must be readable");
+        let events: Vec<Value> = text
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).expect("every audit line must parse"))
+            .collect();
+        assert_eq!(events.len(), 1, "one abandonment record: {text}");
+        assert!(
+            events[0].get("upstream").is_none(),
+            "zero requests means no upstream block: {}",
+            events[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_drain_cell_records_upstream_after_requests() {
+        // The other half of the gate: after real requests the block is
+        // present with their count. Pins the positive intent the zero
+        // case cannot distinguish, and kills the `==` flip from the
+        // other side.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, audit_path) = audit_state(dir.path(), FailMode::Open);
+        let slot = abandoned_slot(&audit, SLOT_ARMED);
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "version": "5.0" })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let bz = BugzillaClient::new(&mock.uri(), false, USER_AGENT).expect("client must build");
+        with_upstream_stats(Arc::clone(&slot.stats), bz.version("test-key"))
+            .await
+            .expect("one request must complete");
+        drop(AbandonedGuard { slot });
+        let text = std::fs::read_to_string(&audit_path).expect("audit file must be readable");
+        let events: Vec<Value> = text
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).expect("every audit line must parse"))
+            .collect();
+        assert_eq!(events.len(), 1, "one abandonment record: {text}");
+        assert_eq!(
+            events[0]
+                .pointer("/upstream/requests")
+                .and_then(Value::as_u64),
+            Some(1),
+            "one completed request is recorded: {}",
+            events[0]
+        );
+    }
+
+    #[test]
+    fn abandoned_registry_prunes_dead_slots_past_sixty_four() {
+        // insert's amortized prune: dead slots are reaped only once the
+        // list grows past 64 entries. cargo-mutants reaches this hole by
+        // flipping `>` to `<` (prunes nearly every insert) and to `>=`
+        // (prunes one insert early) — both change what the list holds.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, _path) = audit_state(dir.path(), FailMode::Open);
+        let registry = AbandonedRegistry::default();
+        let mut live = Vec::new();
+        for _ in 0..63 {
+            let slot = abandoned_slot(&audit, SLOT_ARMED);
+            registry.insert(&slot);
+            live.push(slot);
+        }
+        let dead = abandoned_slot(&audit, SLOT_ARMED);
+        registry.insert(&dead);
+        drop(dead);
+        let len = || registry.slots.lock().unwrap().len();
+        let dead_count = || {
+            registry
+                .slots
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|weak| weak.upgrade().is_none())
+                .count()
+        };
+        assert_eq!(len(), 64, "no prune at or under the boundary");
+        assert_eq!(dead_count(), 1, "the dead slot is still listed");
+        // The 65th insert still does not prune: the trigger is past 64,
+        // not at it.
+        let extra = abandoned_slot(&audit, SLOT_ARMED);
+        registry.insert(&extra);
+        live.push(extra);
+        assert_eq!(len(), 65, "no prune at exactly 64 entries");
+        assert_eq!(dead_count(), 1, "the dead slot survives to the trigger");
+        // Past the trigger the dead slot is reaped and the live stay.
+        let extra = abandoned_slot(&audit, SLOT_ARMED);
+        registry.insert(&extra);
+        live.push(extra);
+        assert_eq!(len(), 65, "one reaped, one added");
+        assert_eq!(dead_count(), 0, "the trigger reaps the dead");
+        let _ = live;
+    }
+
+    #[tokio::test]
+    async fn abandoned_flush_counts_a_failed_drain_as_failure() {
+        // flush counts failures, not successes: a drain that cannot
+        // write (here the sink refuses every write) counts one.
+        // cargo-mutants reaches this hole by deleting the `!`, which
+        // counts a success and forgives a failure.
+        let dir = tempfile::tempdir().unwrap();
+        let (audit, _path) = audit_state(dir.path(), FailMode::Open);
+        audit.sink.set_fail_writes(true);
+        let registry = AbandonedRegistry::default();
+        let slot = abandoned_slot(&audit, SLOT_ARMED);
+        registry.insert(&slot);
+        let failures = registry.flush().await;
+        assert_eq!(failures, 1, "a drain that cannot write counts one failure");
+    }
 }

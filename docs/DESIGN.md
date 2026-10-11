@@ -3935,7 +3935,10 @@ wired, `server.rs` and `main.rs` are the reference.
   each arm wired to it, the `server_info` legs logging per endpoint; and
   the `comment_count` drop (#340) — `project_fields` omits the tally even
   when requested and the full-body strip keeps neighboring fields, both
-  with neighbors asserted surviving.
+  with neighbors asserted surviving; and the abandonment machinery — a
+  zero-request drain records no upstream block while a post-request one
+  records its count, dead slots are reaped only past 64 entries, and a
+  drain that cannot write counts one failure.
 - Unit tests (#[cfg(test)] in crates/bugwarden/src/config.rs): the key
   custody table — the mutual-exclusion error names both flags (each pinned
   with its env var, since `--api-key` is a substring of `--api-key-file`);
