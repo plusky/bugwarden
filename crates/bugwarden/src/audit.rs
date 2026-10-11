@@ -122,6 +122,7 @@
 //! [`select_sinks`]: crate::audit::select_sinks
 
 use std::collections::BTreeMap;
+use std::error::Error as _;
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -129,6 +130,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use bugwarden_core::quoted::QuotedError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -1594,8 +1596,14 @@ impl AuditSink {
             .is_none_or(|last| last.elapsed() >= FAILURE_LOG_INTERVAL);
         if due {
             state.last_failure_log = Some(Instant::now());
+            // `QuotedError` renders Display, and `AuditError`'s messages name
+            // the operation without its source, so the OS reason (ENOSPC vs
+            // EACCES) needs a field of its own — quoted like the error,
+            // because it is a string this server does not control.
+            let cause = err.source().map(|s| s.to_string());
             tracing::error!(
-                error = ?err,
+                error = ?QuotedError(err),
+                cause = ?cause.as_deref().map(QuotedError),
                 dropped = state.dropped,
                 path = self.cfg.path.as_ref().map(|p| p.display().to_string()),
                 "audit record could not be persisted; records are being dropped"
