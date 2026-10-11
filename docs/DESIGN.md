@@ -2555,7 +2555,11 @@ names an endpoint.
   field when the client sent a valid `traceparent`, so a guard decision
   joins the client trace that caused it; they are the same unauthenticated
   client claims the audit schema documents, correlation hints and never
-  evidence.
+  evidence. A DIAGNOSTICS body may carry client text the audit record's
+  own allowlist (`RequestInfo::params`, see the audit schema) would have
+  redacted — that allowlist is a property of the RECORD, not of the stream
+  — so the collector is audit-sensitive and gets the handling the file
+  gets, not the handling of an indifferent log sink.
 - **Byte equality (I12).** `AuditSink::write_event` hands the exporter the
   exact slice it wrote (or would have written), after the file write and
   `sync_data` (when a file is configured) and while the sink lock is still
