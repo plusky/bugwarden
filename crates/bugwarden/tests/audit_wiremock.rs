@@ -549,6 +549,16 @@ async fn refusal_paths_write_exactly_one_record_each() {
     assert_eq!(refused.is_error, Some(true));
     // The padded create refusal: no POST, but one classify against bug 0.
     check(read_events(&audited.audit_path), Verdict::Refused, None, 1);
+    // A Refused verdict WITH contact stays refused, never error: the
+    // padding request must not reclassify a client refusal as a Bugzilla
+    // failure. cargo-mutants reaches this hole by flipping the match's
+    // `&&` to `||`.
+    let events = read_events(&audited.audit_path);
+    assert_eq!(
+        last_tool_call(&events).outcome.class,
+        OutcomeClass::Refused,
+        "a padded client refusal records refused"
+    );
 
     // A DENIED bug_info: the classify that produced the verdict ran and the
     // link-disclosure padding after it did, but no body fetch — the exact

@@ -871,6 +871,95 @@ async fn download_attachment_denial_is_byte_identical_with_windowing_params() {
 }
 
 #[tokio::test]
+async fn download_attachment_denied_owner_stays_uniformly_denied() {
+    // I2: a PUBLIC attachment on a DENIED bug must get the uniform
+    // attachment denial, never the blob. cargo-mutants reaches this hole
+    // by flipping the metadata gate's `allowed && assess_id != 0` to `||`,
+    // which lets a denied-but-nonzero assessment through to the fetch.
+    use base64::{engine::general_purpose, Engine as _};
+    let mock = MockServer::start().await;
+    mount_classify(&mock, world_readable_bug(7)).await;
+    let data = general_purpose::STANDARD.encode("alpha\nbeta\ngamma\n");
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/attachment/55"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "attachments": { "55": {
+                "id": 55,
+                "bug_id": 7,
+                "is_private": false,
+                "size": 128,
+                "file_name": "log.txt",
+                "content_type": "text/plain",
+                "data": data,
+            } }
+        })))
+        // Metadata only: the gate stops the blob fetch, so a second hit
+        // is the mutant serving.
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let client = client_for(
+        concat!(
+            "[[rule]]\nname = \"hide-opensuse\"\naction = \"deny\"\n",
+            "[rule.match]\nproducts = [\"openSUSE\"]\n",
+        ),
+        &mock,
+    )
+    .await;
+    let result = call(
+        &client,
+        "download_attachment",
+        json!({ "attachment_id": 55 }),
+    )
+    .await;
+    assert!(is_error(&result), "a denied owning bug stays denied");
+    assert_eq!(
+        text_of(&result),
+        "Attachment 55 is not accessible through this server"
+    );
+}
+
+#[tokio::test]
+async fn bug_url_serves_the_canonical_local_url() {
+    // I8 exception: the URL is computed locally and contacts nothing.
+    // cargo-mutants reaches this hole by replacing the whole body with
+    // a default, which no test distinguished — nothing pinned the shape.
+    let mock = MockServer::start().await;
+    let client = client_for("", &mock).await;
+    let result = call(&client, "bug_url", json!({ "bug_id": 7 })).await;
+    assert!(!is_error(&result), "{}", text_of(&result));
+    assert_eq!(
+        text_of(&result),
+        serde_json::to_string(&json!({ "url": format!("{}/show_bug.cgi?id=7", mock.uri()) }))
+            .expect("JSON"),
+        "the canonical local URL, byte for byte"
+    );
+    assert!(
+        mock.received_requests().await.unwrap().is_empty(),
+        "the URL computation must make zero upstream requests"
+    );
+}
+
+#[tokio::test]
+async fn mcp_server_info_reports_the_configured_default_action() {
+    // The policy summary names the default action's VALUE, not just its
+    // presence: cargo-mutants blanked `action_name` to `""` and nothing
+    // noticed.
+    let mock = MockServer::start().await;
+    for (policy, want) in [("default_action = \"deny\"\n", "deny"), ("", "allow")] {
+        let client = client_for(policy, &mock).await;
+        let result = call(&client, "mcp_server_info", json!({})).await;
+        assert!(!is_error(&result), "{}", text_of(&result));
+        let body: Value = serde_json::from_str(&text_of(&result)).expect("server info is JSON");
+        assert_eq!(
+            body["policy"]["default_action"],
+            json!(want),
+            "the reported default action tracks the policy"
+        );
+    }
+}
+
+#[tokio::test]
 async fn download_attachment_windowing_cannot_serve_an_over_cap_attachment() {
     // Asking for one line of a payload the operator's cap forbids must
     // refuse, not serve one line of it. The metadata `size` lies (8 under a
@@ -3362,6 +3451,33 @@ async fn bugzilla_products_over_cap_makes_no_upstream_request() {
 }
 
 #[tokio::test]
+async fn bugzilla_products_at_exactly_the_cap_still_fetches() {
+    // The cap is exclusive: exactly five names run the fetch.
+    // cargo-mutants reaches this hole by flipping `>` to `>=`.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/product"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "products": [{ "id": 1, "name": "TestProduct" }]
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let client = client_for(DISCOVERY_POLICY, &mock).await;
+    let result = call(
+        &client,
+        "bugzilla_products",
+        json!({ "products": ["a", "b", "c", "d", "e"] }),
+    )
+    .await;
+    assert!(
+        !is_error(&result),
+        "five names are served: {}",
+        text_of(&result)
+    );
+}
+
+#[tokio::test]
 async fn bug_fields_catalog_carries_no_values() {
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
@@ -3532,6 +3648,37 @@ async fn bug_fields_over_cap_makes_no_upstream_request() {
     assert!(
         mock.received_requests().await.unwrap().is_empty(),
         "the cap refusal must make zero upstream requests"
+    );
+}
+
+#[tokio::test]
+async fn bug_fields_at_exactly_the_cap_still_fetches() {
+    // The cap is exclusive: exactly five names run the lookup.
+    // cargo-mutants reaches this hole by flipping `>` to `>=`.
+    // Named fields fetch per name (`/rest/field/bug/{name}`), so five
+    // names cost five requests.
+    let mock = MockServer::start().await;
+    for name in ["a", "b", "c", "d", "e"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/rest/field/bug/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "fields": [{ "id": 13, "name": name, "type": 2 }]
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+    }
+    let client = client_for(DISCOVERY_POLICY, &mock).await;
+    let result = call(
+        &client,
+        "bug_fields",
+        json!({ "field_names": ["a", "b", "c", "d", "e"] }),
+    )
+    .await;
+    assert!(
+        !is_error(&result),
+        "five names are served: {}",
+        text_of(&result)
     );
 }
 
