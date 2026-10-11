@@ -7028,6 +7028,121 @@ mod tests {
     }
 
     #[test]
+    fn quicksearch_gate_refuses_a_hash_shortcut_after_a_comma() {
+        // A `#` piece with no digits is a text shortcut, not an id:
+        // the hash-id shape needs `#` plus digits only.
+        assert_eq!(
+            qs_refuse_expr("foo,#abc"),
+            Some(QUICKSEARCH_SHORTCUT_REFUSAL)
+        );
+        assert_eq!(qs_refuse_expr("foo,#"), Some(QUICKSEARCH_SHORTCUT_REFUSAL));
+    }
+
+    #[test]
+    fn quicksearch_gate_refuses_an_unbalanced_value_quote() {
+        // The value quote never closes, so the whole expression
+        // stays inside a quote and cannot parse.
+        assert_eq!(
+            qs_refuse_expr("product:'a'foo"),
+            Some(QUICKSEARCH_PARSE_REFUSAL)
+        );
+    }
+
+    #[test]
+    fn quicksearch_gate_refuses_comma_shortcut_with_stray_quote() {
+        // The trailing quote does not pair with anything, so the
+        // `@` piece stays a shortcut instead of a quoted phrase.
+        assert_eq!(
+            qs_refuse_expr("foo,@dev'"),
+            Some(QUICKSEARCH_SHORTCUT_REFUSAL)
+        );
+    }
+
+    #[test]
+    fn quicksearch_gate_unbalanced_single_quote_is_parse_refusal() {
+        // The opening quote never closes (`b` is no end context),
+        // so the expression is unbalanced.
+        assert_eq!(qs_refuse_expr("'a'b"), Some(QUICKSEARCH_PARSE_REFUSAL));
+    }
+
+    #[test]
+    fn quicksearch_gate_refuses_a_dash_hash_shortcut() {
+        // A negated `#` with no digits negates nothing, so the bare
+        // `#` shortcut still refuses the operand.
+        assert_eq!(qs_refuse_expr("foo,-#"), Some(QUICKSEARCH_SHORTCUT_REFUSAL));
+    }
+
+    #[test]
+    fn quicksearch_gate_refuses_a_link_after_a_quoted_prefix() {
+        // The leading phrase is data, but the predicate after it
+        // still names a link field.
+        assert_eq!(
+            qs_refuse_expr("'a' blocked:123'"),
+            Some(QUICKSEARCH_LINK_REFUSAL)
+        );
+    }
+
+    #[test]
+    fn quicksearch_gate_single_quote_needs_both_contexts() {
+        // A quote opens only after start context and closes only
+        // before end context; `'foo'` is a phrase, `bar` is bare.
+        assert_eq!(qs_refuse_expr("'foo' bar"), None);
+    }
+
+    #[test]
+    fn quicksearch_gate_escaped_colon_is_data() {
+        // An escaped colon names no field, so the operand is bare text.
+        assert_eq!(qs_refuse_expr(r"product\:foo"), None);
+    }
+
+    #[test]
+    fn quicksearch_gate_refuses_bare_operator_value() {
+        // An operator with no field names nothing, so it cannot parse.
+        for q in ["=foo", ">foo", "<foo"] {
+            assert_eq!(
+                qs_refuse_expr(q),
+                Some(QUICKSEARCH_PARSE_REFUSAL),
+                "bare operator must not parse: {q:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quicksearch_gate_escaped_operator_second_byte_is_data() {
+        // The `=` is escaped, so `!` never forms `!=` and the operand
+        // is bare text.
+        assert_eq!(qs_refuse_expr(r"dependson!\=123"), None);
+    }
+
+    #[test]
+    fn quicksearch_gate_escaped_question_is_data() {
+        // An escaped `?` is text, not the single-char-wildcard shortcut.
+        assert_eq!(qs_refuse_expr(r"foo\?bar"), None);
+    }
+
+    #[test]
+    fn quicksearch_gate_refuses_operators_without_a_field() {
+        // `!=` leads with `!`, which the shortcut check judges before
+        // any operator split; `>=` and `<=` reach the operator with an
+        // empty field, so they cannot parse.
+        assert_eq!(qs_refuse_expr("!=NEW"), Some(QUICKSEARCH_SHORTCUT_REFUSAL));
+        for q in [">=NEW", "<=NEW"] {
+            assert_eq!(
+                qs_refuse_expr(q),
+                Some(QUICKSEARCH_PARSE_REFUSAL),
+                "operator with no field must not parse: {q:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quicksearch_gate_trailing_backslash_is_data() {
+        // A backslash with no next byte escapes nothing, so the
+        // operand stays bare text.
+        assert_eq!(qs_refuse_expr(r"foo\"), None);
+    }
+
+    #[test]
     fn group_by_vocabulary_is_fetched_and_survives_redaction() {
         // A change detector first: the two memberships below hold for the
         // whole CLASSIFY ∩ SUMMARY intersection, `summary` and `id`
