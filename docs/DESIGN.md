@@ -4262,8 +4262,12 @@ wired, `server.rs` and `main.rs` are the reference.
   escaped colons and operators, and a quote past an escape (the advance
   must not leap over the opener); helper-shape tables pin the quoted,
   priority-shorthand and hash predicates row by row, and the keyword-skip
-  redundancy and quoted-field refusal are pinned as defense-in-depth; and
-  the
+  redundancy and quoted-field refusal are pinned as defense-in-depth;
+  timing-only mutants stay documented, not tested — loop-bound `<=`
+  pairs with no observable difference, wall-clock durations no
+  deterministic assertion can pin, deadline-razor waits whose only
+  divergence is a measure-zero timing window, and operator pairs provable
+  from their guards; and the
   `comment_count` drop (#340) — a BMO-shaped fixture carrying the tally
   is stripped on the bug_info default, bug_info projected, and
   quicksearch projected paths alike, with neighbors asserted surviving.
