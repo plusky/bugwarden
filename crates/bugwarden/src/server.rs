@@ -7116,6 +7116,51 @@ mod tests {
     }
 
     #[test]
+    fn quicksearch_quoted_shapes() {
+        // A whole operand in one matched pair is a phrase; anything else is not.
+        assert!(qs_is_quoted("\"a\"")); // kills 2153:13 (>=→<): true becomes false
+        assert!(qs_is_quoted("'a'")); // kills 2154:63 (first ' ==→!=): true becomes false
+        assert!(!qs_is_quoted("\"a'")); // kills 2154:27 (first &&→||): false becomes true
+        assert!(!qs_is_quoted("'a\"")); // kills 2154:27 (first &&→||): false becomes true
+        assert!(!qs_is_quoted("\"abc")); // kills 2154:27 (first &&→||): false becomes true
+        assert!(!qs_is_quoted("\"a\"b")); // kills 2154:45 (last " ==→!=): false becomes true
+        assert!(!qs_is_quoted("'ab")); // kills 2154:72 (second &&→||): false becomes true
+        assert!(!qs_is_quoted("")); // kills 2153:13 (>=→<): false panics on indexing
+    }
+
+    #[test]
+    fn quicksearch_priority_shorthand_shapes() {
+        assert!(qs_is_priority_shorthand("P1")); // kills 2161:37 (&&→|| always-false): true becomes false
+        assert!(qs_is_priority_shorthand("p2")); // kills 2161:45 (second !=→==): true becomes false
+        assert!(qs_is_priority_shorthand("P1-3")); // kills 2176:13 (!=→== dash) + tail 2181:13/2182:14/2183:11/2185:10: true becomes false
+        assert!(!qs_is_priority_shorthand("P")); // kills 2160:5 (fn→true): false becomes true
+        assert!(!qs_is_priority_shorthand("P-")); // kills 2160:5 (fn→true): false becomes true
+        assert!(!qs_is_priority_shorthand("P1-")); // kills 2185:14 (&&→||): false becomes true
+        assert!(!qs_is_priority_shorthand("P1-x")); // kills 2160:5 (fn→true): false becomes true
+        assert!(!qs_is_priority_shorthand("P1-3x")); // kills 2185:19 (==→!= end): false becomes true
+        assert!(!qs_is_priority_shorthand("X1")); // kills 2161:20 (||→&&): false becomes true
+        assert!(!qs_is_priority_shorthand("")); // kills 2160:5 (fn→true): false becomes true
+    }
+
+    #[test]
+    fn quicksearch_hash_shapes() {
+        assert!(qs_is_hash_id("#101")); // kills 2221:25 (==→!= #): true becomes false
+        assert!(!qs_is_hash_id("#")); // kills 2221:33 (second &&→|| empty-all): false becomes true
+        assert!(!qs_is_hash_id("#abc")); // kills 2221:17 (first &&→||): false becomes true
+    }
+
+    #[test]
+    fn quicksearch_gate_keyword_skips_are_redundant() {
+        // Defense in depth: each keyword skip is redundant with the bare-word
+        // fallthrough, so these pass on the original AND on every skip mutant
+        // (2241:22, 2241:38, 2323:27, 2323:44, 2340:30, 2340:46, 2362:23,
+        // 2362:40) by construction.
+        for q in ["AND", "OR", "NOT", "foo|AND", "foo,OR", "foo,-NOT", "-AND"] {
+            assert_eq!(qs_refuse_expr(q), None, "keyword must pass: {q:?}");
+        }
+    }
+
+    #[test]
     fn quicksearch_gate_escaped_operator_second_byte_is_data() {
         // The `=` is escaped, so `!` never forms `!=` and the operand
         // is bare text.
@@ -7148,6 +7193,20 @@ mod tests {
         // A backslash with no next byte escapes nothing, so the
         // operand stays bare text.
         assert_eq!(qs_refuse_expr(r"foo\"), None);
+    }
+
+    #[test]
+    fn quicksearch_gate_quoted_field_is_field_refusal() {
+        // Defense in depth: a quote inside the field half refuses as FIELD on
+        // the quote check, and as FIELD again via the unknown-field fallback
+        // when 2291:37 (||→&&) removes the quote check — passes on both.
+        // Single-quoted mid-word: a `'` after a word byte never opens, so the
+        // word stays balanced and reaches the field check (a `"` there would
+        // unbalance into PARSE instead).
+        assert_eq!(
+            qs_refuse_expr("pro'duct:foo"),
+            Some(QUICKSEARCH_FIELD_REFUSAL)
+        );
     }
 
     #[test]
