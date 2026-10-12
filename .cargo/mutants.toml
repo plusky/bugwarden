@@ -55,8 +55,62 @@ minimum_test_timeout = 720
 # and the scheduled job emails a false gap. Reachable arms stay in scope
 # (Some(frame), ConnectionClosed, InitializeFailed, TransportError). Drop
 # these if rmcp starts constructing the variants.
+#
+# Proven-equivalent mutants, 2026-10-11 campaign: each entry below was found
+# by a scheduled run, hand-proved behaviorally identical, and pinned by an
+# anchor test (or documented where no test can reach it). They are excluded
+# so the Saturday summary stays a list of real gaps, not a standing roster.
+# Unlike the unreachable arms above, these are LIVE code: re-examine an
+# entry when touching its function. Entries are LINE-ANCHORED on purpose:
+# a bare function+operator pattern also hides mutants the suite DOES kill
+# (verified: it swept 2268:34, 2302:55, 2120:14/18, 2168/2179/2182/2183,
+# 1662:17 along with the intended ones). Line drift fails safe — the
+# mutant reappears and gets re-triaged — while a broad pattern would fail
+# silent. The two exceptions are single-instance function shapes with no
+# killed POL siblings (elapsed_ms, flush razor).
 exclude_re = [
     "ExpectedInitializeRequest\\(None\\)",
     "UnexpectedInitializeResponse",
     "Failure::Cancelled",
+    # Keyword-skip conjunctions in qs_refuse_operand/token: first-byte
+    # disjointness plus the bare-word fallthrough make each one
+    # unreachable-in-effect; the redundancy doc-anchor passes on both by
+    # construction. One entry per proven site.
+    "server\\.rs:2241:22:.*\\|\\| with &&",
+    "server\\.rs:2241:38:.*\\|\\| with &&",
+    "server\\.rs:2291:37:.*\\|\\| with &&",
+    "server\\.rs:2323:27:.*\\|\\| with &&",
+    "server\\.rs:2323:44:.*\\|\\| with &&",
+    "server\\.rs:2340:30:.*\\|\\| with &&",
+    "server\\.rs:2340:46:.*\\|\\| with &&",
+    "server\\.rs:2362:23:.*\\|\\| with &&",
+    "server\\.rs:2362:40:.*\\|\\| with &&",
+    "server\\.rs:2326:32:.*\\|\\| with &&",
+    "server\\.rs:2343:35:.*\\|\\| with &&",
+    # Loop-bound <= pairs with no observable difference: the extra
+    # iteration short-circuits on None.
+    "server\\.rs:2094:13:.*< with <=",
+    "server\\.rs:2114:13:.*< with <=",
+    "server\\.rs:2140:13:.*< with <=",
+    # mask.get(i+1) reads mask[i]: the loop-top guard already proved it,
+    # so the pair can only differ where it cannot happen.
+    "server\\.rs:2125:27:.*\\+ with \\*",
+    # The shorthand digit counter feeds only an ==0 check, so a stuck
+    # counter is indistinguishable.
+    "server\\.rs:2167:16:.*\\+= with -=",
+    # Wall-clock durations no deterministic assertion can pin.
+    "server\\.rs:1121:5:.*elapsed_ms",
+    # The flush deadline razor: the only divergence is a measure-zero
+    # timing window.
+    "server\\.rs:1420:35:.*< with <=",
+    # Line-anchored: the reverse-order shifting construction makes static
+    # traps impossible here, and permission failures converge downstream,
+    # so forcing these two guards true changes no observable outcome.
+    "audit\\.rs:1565:.*match guard.*with true",
+    "audit\\.rs:1573:.*match guard.*with true",
+    # The export-loss mirror is redundant single-threaded: peek>0 implies
+    # the take below returns the same count and stores the same flag, so
+    # the peek branch cannot diverge. Kept for the nanosecond race it
+    # narrows; untestable by design.
+    "audit\\.rs:1657:.*> with <",
 ]
