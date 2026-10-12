@@ -219,6 +219,7 @@ name = "bugwarden"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64 0.23.1",
  "bugwarden-core",

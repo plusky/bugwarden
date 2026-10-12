@@ -153,6 +153,9 @@ mod tests {
         ClientNotification, ClientRequest, ClientResult, ErrorData, InitializedNotification,
         JsonRpcMessage, PingRequest, RequestId,
     };
+    use rmcp::transport::streamable_http_server::session::store::{
+        EventId, EventStoreError, EventStream,
+    };
 
     fn session() -> SessionId {
         SessionId::from("sess-180")
@@ -218,5 +221,89 @@ mod tests {
         stamp(&mut error, &session());
         assert!(matches!(error, ClientJsonRpcMessage::Error(_)));
         assert_eq!(json(&error), before);
+    }
+
+    #[tokio::test]
+    async fn unknown_sessions_stay_unknown() {
+        // `has_session` answers from the inner map: a forged id must read
+        // absent, or the session branch serves a stranger.
+        let manager = AuditedSessionManager::default();
+        let unknown = SessionId::from("no-such-session");
+        assert!(
+            !manager
+                .has_session(&unknown)
+                .await
+                .expect("has_session answers"),
+            "an unknown session must not exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_removes_the_session_it_closed() {
+        // Present after create, absent after close: a close that skipped the
+        // inner call would leave the id valid.
+        let manager = AuditedSessionManager::default();
+        let (id, _transport) = manager.create_session().await.expect("create");
+        assert!(
+            manager.has_session(&id).await.expect("has_session answers"),
+            "a created session must exist"
+        );
+        manager.close_session(&id).await.expect("close");
+        assert!(
+            !manager.has_session(&id).await.expect("has_session answers"),
+            "a closed session must not exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_for_unknown_sessions_are_rejected() {
+        // `accept_message` delegates: an id the inner map never saw is
+        // `SessionNotFound`, not a silent accept.
+        let manager = AuditedSessionManager::default();
+        let message = ClientJsonRpcMessage::notification(
+            ClientNotification::InitializedNotification(InitializedNotification::default()),
+        );
+        let outcome = manager
+            .accept_message(&SessionId::from("no-such-session"), message)
+            .await;
+        assert!(
+            matches!(outcome, Err(LocalSessionManagerError::SessionNotFound(_))),
+            "a message for an unknown session must be rejected, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_store_delegates_to_the_inner_manager() {
+        // The wrapper adds stamping, not storage policy: whatever the inner
+        // manager was wired with stays visible through it.
+        struct NoopStore;
+        #[async_trait::async_trait]
+        impl EventStore for NoopStore {
+            async fn store_event(
+                &self,
+                _stream_id: &str,
+                _event: &ServerSseMessage,
+            ) -> Result<EventId, EventStoreError> {
+                Err("noop store holds nothing".into())
+            }
+
+            async fn replay_events_after(
+                &self,
+                _last_event_id: &str,
+            ) -> Result<EventStream, EventStoreError> {
+                Err("noop store holds nothing".into())
+            }
+        }
+        let wired = AuditedSessionManager {
+            inner: LocalSessionManager::default().with_event_store(Arc::new(NoopStore)),
+        };
+        assert!(
+            wired.event_store().is_some(),
+            "a wired store must stay visible through the wrapper"
+        );
+        assert!(
+            AuditedSessionManager::default().event_store().is_none(),
+            "no store is wired by default"
+        );
     }
 }
