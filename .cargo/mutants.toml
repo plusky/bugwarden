@@ -110,7 +110,24 @@ exclude_re = [
     "audit\\.rs:1573:.*match guard.*with true",
     # The export-loss mirror is redundant single-threaded: peek>0 implies
     # the take below returns the same count and stores the same flag, so
-    # the peek branch cannot diverge. Kept for the nanosecond race it
-    # narrows; untestable by design.
+    # the peek branch cannot diverge (absorb_export_losses). Kept for the
+    # nanosecond race it narrows; untestable by design.
     "audit\\.rs:1657:.*> with <",
+    # Shutdown-tail inner tiers: the remainder is always length 1
+    # post-flush, so immediate-vs-final flushing ends with identical
+    # record sets and posts — timing only (1241/1264 audit/diag tiers).
+    "otel\\.rs:1241:33:.*> with (==|>=)",
+    "otel\\.rs:1264:33:.*> with (==|>=)",
+    # Bit-idiom pairs provable over their domains: bit 7 is always clear
+    # across the 128 varint inputs (`|` canonical), and tag shifts carry
+    # wire types 0-2 with zero low bits, so OR≡XOR in both.
+    "otel\\.rs:638:27:.*\\| with \\^",
+    "otel\\.rs:643:46:.*\\| with \\^",
+    # Hang mutants, hand-reproduced and documented (never tests — a hang
+    # test would park the suite): the probe counter frozen at 1 never
+    # reaches its bound (931), and the varint zero case loops pushing
+    # continuation bits forever (634). Excluded so the Saturday run does
+    # not pay the timeout floor weekly for a verdict already in hand.
+    "otel\\.rs:931:21:.*\\+= with \\*=",
+    "otel\\.rs:634:22:.*== with !=",
 ]
