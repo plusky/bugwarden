@@ -2030,6 +2030,19 @@ mod tests {
     }
 
     #[test]
+    fn wall_clock_reports_plausible_nanos() {
+        // Record timestamps must carry the wall clock, not a constant:
+        // a frozen clock stamps every record identically and breaks
+        // ordering downstream. cargo-mutants reaches this hole by
+        // replacing the clock with 1. The bound is September 2020, far
+        // enough back that no sane CI clock predates it.
+        assert!(
+            now_unix_nano() > 1_600_000_000_000_000_000,
+            "timestamps must track the wall clock"
+        );
+    }
+
+    #[test]
     fn varints_encode_the_way_protobuf_reads_them() {
         for value in [0u64, 1, 127, 128, 300, 16_383, 16_384, u64::MAX] {
             let mut buf = Vec::new();
