@@ -2628,6 +2628,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_lost_audit_batch_is_visible_to_peek_until_taken() {
+        // `peek_lost` is the fail-mode gate's view of the loss: it must
+        // read the same count `take_lost` drains, or a loss followed by a
+        // success would reopen the gate before the gap is accounted. A `0`
+        // stub hides the loss while `take_lost` still reports it.
+        let cfg = resolve(&env(&refused_base_url()))
+            .expect("resolves")
+            .expect("export is on");
+        let pipeline = Arc::new(Pipeline::start(cfg).expect("the pipeline must start"));
+        assert_eq!(pipeline.peek_lost(), 0, "no loss before any delivery");
+        pipeline
+            .accept(&event(tool_call(None)), b"{}")
+            .expect("an open queue takes custody");
+        // The batch interval plus a margin: enough for one failed post.
+        tokio::time::sleep(BATCH_INTERVAL * 3).await;
+        assert_eq!(
+            pipeline.peek_lost(),
+            1,
+            "a failed delivery must be visible to peek before it is taken"
+        );
+        assert_eq!(
+            pipeline.take_lost(),
+            1,
+            "the undelivered record must be surfaced for gap accounting"
+        );
+        assert_eq!(pipeline.peek_lost(), 0, "take_lost drains the peeked count");
+        pipeline.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn an_unreachable_collector_counts_diagnostics_as_drops() {
         let cfg = resolve(&env(&refused_base_url()))
             .expect("resolves")

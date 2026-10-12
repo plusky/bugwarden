@@ -4989,7 +4989,8 @@ wired, `server.rs` and `main.rs` are the reference.
   loop under test. Unit rows pin delivery-transition logging, burst
   coalescing with exact delivery counts, cleared-var and blank-name
   fallbacks, bridge bookkeeping omission, the batch-size constant,
-  Debug redaction, backoff span, and healthy states; the cleared-var
+  Debug redaction, backoff span, healthy states, wall-clock plausibility,
+  and peek/take loss-counter visibility; the cleared-var
   row lives in its own single-test binary, since process-environment
   mutation races any concurrent reader in a shared binary.
 - CI: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
