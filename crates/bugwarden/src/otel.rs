@@ -2920,7 +2920,11 @@ mod tests {
         pipeline.shutdown().await;
     }
 
-    #[tokio::test]
+    // `current_thread`: the drain task on a multi-threaded runtime can
+    // pull records before `shutdown()` and post a partial outer flush,
+    // so the split count depends on scheduling. Single-threaded, all
+    // records deterministically go through the shutdown tail.
+    #[tokio::test(flavor = "current_thread")]
     async fn shutdown_tail_splits_over_bound_batches_within_the_byte_bound() {
         // The shutdown tail re-checks both bounds while draining what is
         // already queued, so over-bound tails arrive as several posts each
