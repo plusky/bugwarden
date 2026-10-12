@@ -102,6 +102,10 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # `prost::Message` derives, so no `.proto`, no build script and no protoc.
 # Adds four crates (prost, prost-derive, itertools, either) to the dev graph
 # and nothing to the shipped binary.
+# `http_session`'s delegation test wires a no-op `EventStore` through
+# `LocalSessionManager::with_event_store`; the trait is `async_trait`, so
+# the test impl needs the macro too. Already in the lock file through rmcp.
+async-trait = "0.1"
 prost = "0.14"
 tempfile = "3"
 # `process` and `time`: binary_user_agent spawns the shipped executable

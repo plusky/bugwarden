@@ -4347,7 +4347,11 @@ wired, `server.rs` and `main.rs` are the reference.
   refusal is deliberately broader than rmcp's stateless routing — a
   declaration that stayed on the session branch is refused WITH its real
   id and joins its own `initialize`. That last arm is the only test
-  pinning it, and the comment asserting it has been wrong once.
+   pinning it, and the comment asserting it has been wrong once.
+   Unit rows in crates/bugwarden/src/http_session.rs pin the delegation the
+   wire rows ride on: an unknown id stays unknown, close deletes the entry
+   it closed, a message for an unknown id is `SessionNotFound`, and a wired
+   event store stays visible through the wrapper with none wired by default.
   The per-request lifecycle (#34 stage 2) is driven from the same raw
   harness, since no rmcp client sends the shape at all: a `tools/call`
   declaring `2026-07-28` and NO `clientInfo` anywhere is served, recorded
@@ -4806,9 +4810,15 @@ wired, `server.rs` and `main.rs` are the reference.
   `none` without one, and no decision beside an endpoint — the refused
   start names the configuration, made no Bugzilla or collector request,
   and left no audit file.
-  `WRITE_TOOLS` is additionally pinned against every tool's own
-  `read_only_hint` annotation, so the read scope cannot drift from what
-  clients are told.
+   `WRITE_TOOLS` is additionally pinned against every tool's own
+   `read_only_hint` annotation, so the read scope cannot drift from what
+   clients are told; `HttpEnv::is_empty` needs both slots empty (each
+   single-token row pinned), an emptied variable reads as unset through a
+   probe name nothing else reads, the four `AuthMode` display strings are
+   pinned verbatim, the first refusal logs `refused=1` (the `*1` the
+   bounded-log row still passes with), and the stdio ignore note fires on
+   exactly the rows where a token or the insecure flag was ignored while
+   the gate stays `None` on all four.
 - Process-shutdown and stdio frame-cap tests
   (crates/bugwarden/tests/binary_shutdown.rs, the
   SHIPPED BINARY, Unix only): SIGTERM and SIGINT on an idle HTTP listener

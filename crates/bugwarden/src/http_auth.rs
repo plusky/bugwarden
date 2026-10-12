@@ -538,6 +538,31 @@ mod tests {
     }
 
     #[test]
+    fn http_env_emptiness_needs_both_slots_empty() {
+        // One token set is not empty: the stdio note and the http refusal
+        // both read this, so each single-slot row pins its own side.
+        assert!(env(None, None).is_empty());
+        assert!(!env(Some(WRITE), None).is_empty());
+        assert!(!env(None, Some(READ)).is_empty());
+        assert!(!env(Some(WRITE), Some(READ)).is_empty());
+    }
+
+    #[test]
+    fn an_emptied_variable_counts_as_unset() {
+        // Unit files clear a variable by emptying it; the empty string must
+        // read as absence, or "cleared" parses as a token instead of
+        // refusing at startup. A probe name nothing else reads, so no other
+        // test can race this one.
+        const PROBE: &str = "BUGWARDEN_HTTP_TOKEN_PROBE_EMPTY_COUNTS_AS_UNSET";
+        std::env::set_var(PROBE, "");
+        assert_eq!(env_token(PROBE), None, "empty must read as absence");
+        std::env::set_var(PROBE, "x");
+        assert_eq!(env_token(PROBE), Some("x".to_owned()));
+        std::env::remove_var(PROBE);
+        assert_eq!(env_token(PROBE), None);
+    }
+
+    #[test]
     fn insecure_with_a_token_refuses_to_start() {
         for e in [env(Some(WRITE), None), env(None, Some(READ))] {
             assert_eq!(
@@ -763,6 +788,39 @@ mod tests {
     }
 
     #[test]
+    fn stdio_names_the_ignored_bearer_settings_only_when_there_are_any() {
+        // The debug note fires exactly when something was ignored: a token
+        // set, the insecure flag, or both. The gate itself is always None —
+        // the note is the only thing this condition moves.
+        for (world, insecure, expect_note) in [
+            (env(None, None), false, false),
+            (env(None, None), true, true),
+            (env(Some(WRITE), None), false, true),
+            (env(Some(WRITE), Some(READ)), true, true),
+        ] {
+            let (gate, logs) = crate::testlog::capture_logs(|| {
+                resolve_for(Transport::Stdio, &world, insecure).expect("stdio never refuses")
+            });
+            assert!(gate.is_none(), "stdio must resolve no bearer gate");
+            assert_eq!(
+                format!("{logs:?}").contains("transport is stdio; ignoring"),
+                expect_note,
+                "stdio ignore note for empty={} insecure={insecure}",
+                world.is_empty(),
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_refusal_logs_count_one() {
+        // The doubling log starts at 1: `fetch_add` returns the previous
+        // count, so the increment is added, never multiplied.
+        let auth = HttpAuth::resolve(&env(Some(WRITE), None), false).expect("resolve");
+        let ((), logs) = crate::testlog::capture_logs(|| auth.note_refusal());
+        crate::testlog::assert_logged(&logs, "refused=1");
+    }
+
+    #[test]
     fn refusal_logging_is_bounded_and_names_no_material() {
         let auth = HttpAuth::resolve(&env(Some(WRITE), None), false).expect("resolve");
         let ((), logs) = crate::testlog::capture_logs(|| {
@@ -781,6 +839,20 @@ mod tests {
         );
         crate::testlog::assert_logged(&logs, "refused=4");
         logs.assert_not_contains(WRITE);
+    }
+
+    #[test]
+    fn auth_mode_display_names_each_mode() {
+        // The startup line prints the mode, never a token; these strings are
+        // the interface a fleet configuration greps for.
+        for (mode, text) in [
+            (AuthMode::Insecure, "disabled"),
+            (AuthMode::Write, "bearer, write scope only"),
+            (AuthMode::Read, "bearer, read scope only"),
+            (AuthMode::WriteAndRead, "bearer, write and read scopes"),
+        ] {
+            assert_eq!(mode.to_string(), text);
+        }
     }
 
     #[test]
