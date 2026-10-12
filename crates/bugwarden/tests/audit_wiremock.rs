@@ -577,6 +577,46 @@ async fn refusal_paths_write_exactly_one_record_each() {
 }
 
 #[tokio::test]
+async fn unknown_attachment_id_records_a_ruleless_denial() {
+    // The padding assessment against bug id 0 decides nothing, so its
+    // denial carries no rule. cargo-mutants reaches this hole by forcing
+    // the `assess_id == 0` match guard false, which falls through to the
+    // unavailable-rule arm and names a rule on a verdict no rule decided.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/attachment/999"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "attachments": {} })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "bugs": [] })))
+        .mount(&mock)
+        .await;
+    let audited = audited_client_for("", &mock, "test-key").await;
+    let denied = call(
+        &audited.client,
+        "download_attachment",
+        json!({ "attachment_id": 999 }),
+    )
+    .await;
+    assert_eq!(denied.is_error, Some(true));
+    let events = read_events(&audited.audit_path);
+    let guard = last_tool_call(&events)
+        .guard
+        .as_ref()
+        .expect("the guard was consulted");
+    assert_eq!(guard.verdict, Verdict::Denied);
+    assert_eq!(
+        guard.rule.as_deref(),
+        None,
+        "a padding denial names no rule: {:?}",
+        guard.rule
+    );
+}
+
+#[tokio::test]
 async fn a_default_decided_call_records_the_literal_default_rule() {
     // Issue #67: the policy default is a NAMED decision. Both arms of it
     // write the literal "default" into the record — an absent rule means
