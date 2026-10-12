@@ -136,4 +136,12 @@ exclude_re = [
     # proven by 265k exhaustive + 200k random differential cases with zero
     # divergences.
     "policy\\.rs:171:26:.*\\+ with \\*",
+    # Typo-shaped ports are refused by exact refusal text the anchor tests
+    # pin; `>=` for `>` is identical (at equal lengths the byte lookup is
+    # None), so that one is documented in DESIGN.md, not tested.
+    "config\\.rs:330:20:.*> with >=",
+    # The contains(',') fast path is behaviorally invisible: a comma-less
+    # string splits to its one scalar either way (core custom_fields,
+    # link_values). Documented in DESIGN.md, not tested.
+    "custom_fields\\.rs:290:29:.*with true",
 ]

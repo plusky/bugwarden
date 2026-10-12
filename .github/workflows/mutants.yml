@@ -62,27 +62,34 @@ jobs:
       matrix:
         # 0-based, per cargo-mutants' k/n. The denominator is read back from
         # strategy.job-total, so this list is the only place to change it.
-        # Twelve shards for ~1060 mutants: at the measured ~80 s per mutant
+        # Sixteen shards for ~1640 mutants: at the measured ~80 s per mutant
         # on a 4-core runner each shard stays near two hours, inside the
         # timeout below even with a timeout-floor mutant or two per shard.
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     env:
       # Scope lives here, not in .cargo/mutants.toml, because it is a CI budget
       # decision and not a property of the tree: a hand-run must stay free to
-      # point anywhere. The workspace holds ~1180 mutants and server.rs alone
-      # 685; guard.rs is where the DESIGN.md invariants live, and main.rs is
+      # point anywhere. The workspace holds ~1700 mutants (1683 unfiltered
+      # at last --list) and server.rs alone 685; guard.rs is where the
+      # DESIGN.md invariants live, and main.rs is
       # the startup wiring (the I9 --read-only tightening, the audit sink
       # selection) that only a spawned process executes, so nearly nothing
       # there is reached in process -- `serve_loop_failure` is the
       # exception and its own unit tests kill both of its mutants.
       # main.rs's five survivors came out of a hand run (#269);
-      # this job saw none of them, because until now its scope was guard.rs
-      # alone. server.rs (685 mutants at last --list) joined once the
-      # triage campaign had closed every one of its survivors, and
-      # audit.rs (155) once its own triage landed. Space-separated,
+      # this job saw none of them while its scope was guard.rs alone.
+      # server.rs joined once the triage campaign had closed every one of
+      # its survivors, audit.rs (155) once its own triage landed, and the
+      # rest below once the 2026-10-11 campaign closed them. Space-separated,
       # one --file each below. Grow this by adding shards, not by dropping
       # the filter. Live counts: the Mutate summary.
-      MUTANTS_SCOPE: crates/bugwarden-core/src/guard.rs crates/bugwarden/src/main.rs crates/bugwarden/src/server.rs crates/bugwarden/src/audit.rs
+      # Per-file exclusion notes for the widened scope: otel.rs carries
+      # the tier/variant/tag exclusions, policy.rs the glob-advance one,
+      # client.rs none; the eight small files carry two
+      # documented-not-tested exclusions (config port >=, custom comma
+      # collapse) while the stdio delimiter hangs stay in scope and pay
+      # the floor weekly.
+      MUTANTS_SCOPE: crates/bugwarden-core/src/guard.rs crates/bugwarden/src/main.rs crates/bugwarden/src/server.rs crates/bugwarden/src/audit.rs crates/bugwarden/src/otel.rs crates/bugwarden-core/src/client.rs crates/bugwarden-core/src/policy.rs crates/bugwarden-core/src/custom_fields.rs crates/bugwarden/src/config.rs crates/bugwarden/src/http_auth.rs crates/bugwarden/src/stdio.rs crates/bugwarden/src/tracing_fields.rs crates/bugwarden/src/http_session.rs crates/bugwarden/src/panic_hook.rs crates/bugwarden-core/src/quoted.rs
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
