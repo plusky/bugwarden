@@ -1026,6 +1026,79 @@ async fn download_attachment_windowing_cannot_serve_an_over_cap_attachment() {
 }
 
 #[tokio::test]
+async fn download_attachment_at_exactly_the_cap_is_served() {
+    // Both size gates are exclusive: a blob of exactly the cap is
+    // served, not refused. cargo-mutants reaches this hole twice in
+    // the decoded re-check (`cap > 0` to `>=`, which caps the
+    // uncapped, and `decoded_len > cap` to `>=`, which refuses the
+    // exact fit).
+    use base64::{engine::general_purpose, Engine as _};
+    let mock = MockServer::start().await;
+    let text = "x".repeat(64);
+    let data = general_purpose::STANDARD.encode(&text);
+    Mock::given(method("GET"))
+        .and(path("/rest/bug"))
+        .and(query_param("id", "7"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "bugs": [world_readable_bug(7)] })),
+        )
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/bug/attachment/55"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "attachments": { "55": {
+                "id": 55,
+                "bug_id": 7,
+                "is_private": false,
+                "size": 64,
+                "file_name": "log.txt",
+                "content_type": "text/plain",
+                "data": data,
+            } }
+        })))
+        .expect(2)
+        .mount(&mock)
+        .await;
+    let client = client_for("[global]\nmax_attachment_bytes = 64\n", &mock).await;
+    let result = call(
+        &client,
+        "download_attachment",
+        json!({ "attachment_id": 55 }),
+    )
+    .await;
+    assert!(
+        !is_error(&result),
+        "an exactly-capped blob is served: {}",
+        text_of(&result)
+    );
+}
+
+#[tokio::test]
+async fn download_attachment_disabled_cap_serves_any_blob() {
+    // `max_attachment_bytes = 0` disables the cap: with no cap there is
+    // nothing to exceed. cargo-mutants reaches this hole by flipping
+    // the `cap > 0` guard to `>=`, which caps the uncapped.
+    use base64::{engine::general_purpose, Engine as _};
+    let mock = MockServer::start().await;
+    let text = "alpha\nbeta\ngamma\n";
+    let data = general_purpose::STANDARD.encode(text);
+    mount_download(&mock, "text/plain", &data).await;
+    let client = client_for("[global]\nmax_attachment_bytes = 0\n", &mock).await;
+    let result = call(
+        &client,
+        "download_attachment",
+        json!({ "attachment_id": 55 }),
+    )
+    .await;
+    assert!(
+        !is_error(&result),
+        "a disabled cap serves: {}",
+        text_of(&result)
+    );
+}
+
+#[tokio::test]
 async fn download_attachment_without_windowing_params_keeps_the_blob_shape() {
     use base64::{engine::general_purpose, Engine as _};
     let mock = MockServer::start().await;
