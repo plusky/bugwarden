@@ -503,6 +503,57 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn key_file_group_or_other_readable_warns_exactly_for_the_wide_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // `& 0o077` mangled to `|` or `^` warns on all three reads, `!=`
+        // mangled to `==` warns on the safe one only — so one capture over
+        // three reads kills all three. The other-writable file pins the
+        // `0o002` bit the group-readable one cannot distinguish.
+        let dir = tempfile::tempdir().expect("a temp key dir");
+        let safe = dir.path().join("600.key");
+        let wide = dir.path().join("640.key");
+        let other = dir.path().join("602.key");
+        for path in [&safe, &wide, &other] {
+            std::fs::write(path, "test-key\n").expect("write key file");
+        }
+        std::fs::set_permissions(&safe, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&wide, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o602)).unwrap();
+
+        let (_, logs) = crate::testlog::capture_logs(|| {
+            for path in [&safe, &wide, &other] {
+                let key = read_key_file(path).expect("a permitted key file must read");
+                assert_eq!(key, "test-key");
+            }
+        });
+
+        crate::testlog::assert_logged(&logs, "accessible by group or others");
+        let text = logs.as_str();
+        assert_eq!(
+            text.matches("accessible by group or others").count(),
+            2,
+            "exactly the two wide reads must warn: {text}"
+        );
+        let wide_path = wide.display().to_string();
+        let other_path = other.display().to_string();
+        let safe_path = safe.display().to_string();
+        assert!(
+            text.contains(&wide_path),
+            "one warning must name the 0o640 path: {text}"
+        );
+        assert!(
+            text.contains(&other_path),
+            "one warning must name the 0o602 path: {text}"
+        );
+        assert!(
+            !text.contains(&safe_path),
+            "no warning must name the 0o600 path: {text}"
+        );
+        logs.assert_not_contains("test-key");
+    }
+
+    #[test]
     fn http_with_startup_key_alone_stays_per_request() {
         // Warn-and-ignore, pinned: --api-key over http must NOT silently
         // upgrade to server-held custody.
@@ -729,6 +780,41 @@ mod tests {
                 "mcp.example.org",
             ])
         );
+    }
+
+    #[test]
+    fn a_written_port_that_is_not_a_u16_is_a_startup_error() {
+        // `host:` and `host:99999` parse with `port_u16() == None` and
+        // would match any port; the `entry.len() > host.len()` arm refuses
+        // them as typos instead. `>` mangled to `<` or `==`, or the `:`
+        // check flipped to `!=`, accepts the typo (`>=` is identical — at
+        // equal lengths the byte lookup is `None` — so that one is
+        // documented, not tested).
+        for entry in ["example.com:", "example.com:99999", "example.com:abc"] {
+            let mut cli = base_cli("http");
+            cli.allowed_hosts = vec![entry.to_owned()];
+            let err = cli
+                .checked_allowed_hosts()
+                .expect_err("a written port that is not a u16 is a typo");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("--allowed-hosts"),
+                "the error must name the flag: {msg}"
+            );
+            assert!(msg.contains(entry), "the error must name the entry: {msg}");
+        }
+
+        // Controls: a bare host and a valid u16 port stay matchable.
+        for entry in ["example.com", "example.com:8000", "[::1]:8000"] {
+            let mut cli = base_cli("http");
+            cli.allowed_hosts = vec![entry.to_owned()];
+            assert_eq!(
+                cli.checked_allowed_hosts()
+                    .unwrap_or_else(|e| panic!("{entry} must be matchable: {e:#}")),
+                Some(vec![entry]),
+                "{entry}"
+            );
+        }
     }
 
     #[test]

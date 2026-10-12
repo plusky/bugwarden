@@ -3949,10 +3949,16 @@ wired, `server.rs` and `main.rs` are the reference.
   --api-key alone stays `PerRequest` (warn-and-ignore pinned against a
   silent upgrade to server-held custody); an empty --api-key-file value
   counts as absent; the startup log line states mode and source, never key
-  material (I12); `Cli`'s Debug redacts the startup key (I12); and
+  material (I12); `Cli`'s Debug redacts the startup key (I12);
   server-held http custody under an identity-consulting policy warns at
   construction (crates/bugwarden/src/server.rs) that created_by_me now
-  describes the service account for every client.
+  describes the service account for every client; a written port that is not
+  a u16 (`host:`, `host:99999`, `host:abc`) is a startup error naming flag
+  and entry while a bare host and a u16 port stay matchable (`>=` for `>` is
+  identical — at equal lengths the byte lookup is `None` — so that one is
+  documented, not tested); and the key-file permission warn fires exactly
+  for group/other-readable files (0600 silent, 0640/0602 naming their paths,
+  key material never logged, I12).
 - Integration tests (crates/bugwarden-core/tests/guard_wiremock.rs, wiremock):
   quicksearch_window — pages stay full while visible bugs remain (no hole),
   consecutive pages tile the visible sequence disjointly (against a stable
@@ -4049,7 +4055,10 @@ wired, `server.rs` and `main.rs` are the reference.
   tainting the field and the first offending key named, and skips an
   Other field whatever it holds, and `candidate_ids` counts every id a
   value could name under any kind — scalars, array items and comma pieces
-   — as the request-only upper bound the cap is judged on.
+   — as the request-only upper bound the cap is judged on; and the
+  `contains(',')` fast path is behaviorally invisible (a comma-less string
+  splits to its one scalar either way), so the guard collapsed to `true` is
+  documented, not tested.
 - Integration tests (crates/bugwarden-core/tests/discovery_wiremock.rs,
   wiremock): the discovery endpoints answer their documented envelopes, a
   field name travels as one percent-encoded path segment, the names
@@ -4889,7 +4898,10 @@ wired, `server.rs` and `main.rs` are the reference.
   rmcp bump. `BugWarden::request_body_cap` is pinned equal to both
   `http_server_config()?.max_request_body_bytes` and the cap
   `stdio_transport()` hands the reader, across four policy values, so the
-  two transports cannot drift apart.
+  two transports cannot drift apart; and the delimiter advance (`newline +
+  1`) has no committed test — either arithmetic mutant hangs the scan
+  instead of failing it, verified by hand with the multi-frame drain under
+  `timeout 150`.
 - Unit tests (#[cfg(test)] in crates/bugwarden/src/otel.rs): configuration
   resolution — an unset, emptied or blank endpoint resolves to NO
   configuration and a bad protocol beside it is therefore not an error,
