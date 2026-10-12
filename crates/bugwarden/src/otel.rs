@@ -2919,4 +2919,280 @@ mod tests {
         );
         pipeline.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn shutdown_tail_splits_over_bound_batches_within_the_byte_bound() {
+        // The shutdown tail re-checks both bounds while draining what is
+        // already queued, so over-bound tails arrive as several posts each
+        // within the byte bound rather than one the collector refuses.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let collector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/logs"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&collector)
+            .await;
+        let cfg = resolve(&env(&collector.uri()))
+            .expect("resolves")
+            .expect("export is on");
+        let pipeline = Arc::new(Pipeline::start(cfg).expect("starts"));
+        let audits: usize = 40;
+        let diags: usize = 40;
+        let line = vec![b'x'; 128 * 1024];
+        for _ in 0..audits {
+            pipeline
+                .accept(&event(tool_call(None)), &line)
+                .expect("queue takes audit");
+        }
+        for _ in 0..diags {
+            pipeline.emit(LogEntry {
+                time_unix_nano: now_unix_nano(),
+                severity: Severity::Info,
+                body: "x".repeat(128 * 1024),
+                attrs: vec![("bugwarden.stream", AttrValue::Str("diagnostics".to_owned()))],
+                trace: None,
+            });
+        }
+        pipeline.shutdown().await;
+        let requests = collector
+            .received_requests()
+            .await
+            .expect("recording is on");
+        let mut total = 0;
+        let mut audit_total = 0;
+        let mut diag_total = 0;
+        for request in &requests {
+            assert!(
+                request.body.len() <= 4 * 1024 * 1024,
+                "each post must respect the byte bound: got {} bytes",
+                request.body.len()
+            );
+            let decoded = decode_request(&request.body);
+            for resource in &decoded.resource_logs {
+                for scope in &resource.scope_logs {
+                    for record in &scope.log_records {
+                        total += 1;
+                        let stream = record
+                            .attributes
+                            .iter()
+                            .find(|kv| kv.key == "bugwarden.stream")
+                            .and_then(|kv| any(&kv.value));
+                        match stream {
+                            Some(otlp::AnyValueKind::StringValue(s)) if s == "audit" => {
+                                audit_total += 1;
+                            }
+                            Some(otlp::AnyValueKind::StringValue(s)) if s == "diagnostics" => {
+                                diag_total += 1;
+                            }
+                            other => panic!("every record carries a stream: {other:?}"),
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            audit_total, audits,
+            "every accepted audit must be delivered"
+        );
+        assert_eq!(
+            diag_total, diags,
+            "every accepted diagnostic must be delivered"
+        );
+        assert_eq!(total, audits + diags, "nothing is lost in the tail");
+        assert!(
+            requests.len() >= 2,
+            "over-bound tails must split: got {} post(s)",
+            requests.len()
+        );
+        // Two posts per stream: 40x128 KiB is ~5 MiB a side, so each side
+        // splits once. A second-check `<` posts the leftover single alone
+        // for a fifth post instead of carrying it into the final flush.
+        assert!(
+            requests.len() <= 4,
+            "splits stay within the byte bound in a few posts: got {}",
+            requests.len()
+        );
+        assert_eq!(pipeline.take_lost(), 0, "split batches are not lost");
+        assert_eq!(pipeline.dropped(), 0, "split diagnostics are not dropped");
+    }
+
+    /// A line that, with two 1 KiB siblings, encodes to exactly the byte
+    /// bound. The encoding grows one byte per body byte in this range, so
+    /// one measuring step lands on it; the loop is only for the varint
+    /// width should the estimate sit on its edge.
+    fn exact_audit_huge_line() -> Vec<u8> {
+        let small = audit_entry(&event(tool_call(None)), &vec![b'x'; 1024]);
+        let mut len: usize = 4 * 1024 * 1024 - 4096;
+        for _ in 0..5 {
+            let huge = audit_entry(&event(tool_call(None)), &vec![b'x'; len]);
+            let batch = [small.clone(), small.clone(), huge];
+            let encoded = batch_encoded_len("bugwarden", &batch);
+            if encoded == MAX_BATCH_BYTES {
+                return vec![b'x'; len];
+            } else if encoded < MAX_BATCH_BYTES {
+                len += MAX_BATCH_BYTES - encoded;
+            } else {
+                len -= encoded - MAX_BATCH_BYTES;
+            }
+        }
+        panic!("no exact-size audit batch found");
+    }
+
+    /// A diagnostics body that, with two 1 KiB siblings, encodes to exactly
+    /// the byte bound, by the same one-byte-per-byte walk as audit.
+    fn exact_diag_huge_body() -> String {
+        let small = LogEntry {
+            time_unix_nano: 1_755_000_000_000_000_000,
+            severity: Severity::Info,
+            body: "x".repeat(1024),
+            attrs: vec![("bugwarden.stream", AttrValue::Str("diagnostics".to_owned()))],
+            trace: None,
+        };
+        let mut len: usize = 4 * 1024 * 1024 - 4096;
+        for _ in 0..5 {
+            let huge = LogEntry {
+                time_unix_nano: 1_755_000_000_000_000_000,
+                severity: Severity::Info,
+                body: "x".repeat(len),
+                attrs: vec![("bugwarden.stream", AttrValue::Str("diagnostics".to_owned()))],
+                trace: None,
+            };
+            let batch = [small.clone(), small.clone(), huge];
+            let encoded = batch_encoded_len("bugwarden", &batch);
+            if encoded == MAX_BATCH_BYTES {
+                return "x".repeat(len);
+            } else if encoded < MAX_BATCH_BYTES {
+                len += MAX_BATCH_BYTES - encoded;
+            } else {
+                len -= encoded - MAX_BATCH_BYTES;
+            }
+        }
+        panic!("no exact-size diagnostics batch found");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_tail_exact_size_audit_batch_posts_once() {
+        // A batch encoding to exactly the byte bound is not over it: the
+        // tail must carry it in one post, and a `>=` check splits it into
+        // two. Single-threaded, so the drain cannot race the three records
+        // into its own batch ahead of the shutdown tail.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let huge_line = exact_audit_huge_line();
+        let collector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/logs"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&collector)
+            .await;
+        let cfg = resolve(&env(&collector.uri()))
+            .expect("resolves")
+            .expect("export is on");
+        let pipeline = Arc::new(Pipeline::start(cfg).expect("starts"));
+        let small = vec![b'x'; 1024];
+        pipeline
+            .accept(&event(tool_call(None)), &small)
+            .expect("queue takes audit");
+        pipeline
+            .accept(&event(tool_call(None)), &small)
+            .expect("queue takes audit");
+        pipeline
+            .accept(&event(tool_call(None)), &huge_line)
+            .expect("queue takes audit");
+        pipeline.shutdown().await;
+        let requests = collector
+            .received_requests()
+            .await
+            .expect("recording is on");
+        assert_eq!(
+            requests.len(),
+            1,
+            "an exact-size batch is one post, not two: got {}",
+            requests.len()
+        );
+        assert_eq!(
+            requests[0].body.len(),
+            4 * 1024 * 1024,
+            "the single post carries exactly the bound"
+        );
+        let records: usize = requests
+            .iter()
+            .map(|r| {
+                decode_request(&r.body)
+                    .resource_logs
+                    .iter()
+                    .map(|rl| {
+                        rl.scope_logs
+                            .iter()
+                            .map(|s| s.log_records.len())
+                            .sum::<usize>()
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
+        assert_eq!(records, 3, "every accepted record must be delivered");
+        assert_eq!(pipeline.take_lost(), 0, "the batch is not lost");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_tail_exact_size_diag_batch_posts_once() {
+        // As for audit: an exactly-bound diagnostics batch is one post, and
+        // a `>=` check makes it two. Single-threaded for the same reason.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let huge_body = exact_diag_huge_body();
+        let collector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/logs"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&collector)
+            .await;
+        let cfg = resolve(&env(&collector.uri()))
+            .expect("resolves")
+            .expect("export is on");
+        let pipeline = Arc::new(Pipeline::start(cfg).expect("starts"));
+        for body in ["x".repeat(1024), "x".repeat(1024), huge_body] {
+            pipeline.emit(LogEntry {
+                time_unix_nano: now_unix_nano(),
+                severity: Severity::Info,
+                body,
+                attrs: vec![("bugwarden.stream", AttrValue::Str("diagnostics".to_owned()))],
+                trace: None,
+            });
+        }
+        pipeline.shutdown().await;
+        let requests = collector
+            .received_requests()
+            .await
+            .expect("recording is on");
+        assert_eq!(
+            requests.len(),
+            1,
+            "an exact-size batch is one post, not two: got {}",
+            requests.len()
+        );
+        assert_eq!(
+            requests[0].body.len(),
+            4 * 1024 * 1024,
+            "the single post carries exactly the bound"
+        );
+        let records: usize = requests
+            .iter()
+            .map(|r| {
+                decode_request(&r.body)
+                    .resource_logs
+                    .iter()
+                    .map(|rl| {
+                        rl.scope_logs
+                            .iter()
+                            .map(|s| s.log_records.len())
+                            .sum::<usize>()
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
+        assert_eq!(records, 3, "every accepted record must be delivered");
+        assert_eq!(pipeline.dropped(), 0, "the batch is not dropped");
+    }
 }

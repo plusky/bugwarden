@@ -4965,7 +4965,9 @@ wired, `server.rs` and `main.rs` are the reference.
   into several posts below the count limit, splits a count-full batch
   of large records by bytes, posts a lone oversized record alone, keeps
   audit first across a diagnostics byte split, and counts a 413 as
-  delivered with no gap and no loss (#326); an always-413 collector
+  delivered with no gap and no loss (#326); the shutdown tail splits
+  over-bound batches within the byte bound on both streams, and
+  exact-bound batches post once; an always-413 collector
   refuses the probe fast with the limit message on one attempt; and
   with no endpoint configured `resolve` yields
   nothing, no exporter is attached, the file still gets the record and a
