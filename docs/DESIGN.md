@@ -3769,7 +3769,8 @@ wired, `server.rs` and `main.rs` are the reference.
   read_only strips write caps — create and attach named explicitly, and a
   restrict grant of comment grants neither; default deny; summary redaction;
   comment filtering; validation errors (unknown TOML keys, restrict without
-  caps); may_create — a hidden product refuses filing, an omitted field the
+  caps); `Policy::load` warns exactly once, naming a group-writable file,
+  while a 0o600 file stays silent; may_create — a hidden product refuses filing, an omitted field the
   policy consults fails closed (I4), a claimed group list NEVER decides a
   group rule (omitted, `[]`, and non-matching claims are all refused alike;
   a group_restricted policy refuses all creation; a group rule ruled out by
@@ -4057,7 +4058,9 @@ wired, `server.rs` and `main.rs` are the reference.
    (Bugzilla routes that path form as a field id, issue #341) with
    `expect(0)` requests while a normal name still fetches, a degraded
    `server_info` endpoint leaves the fixed `unavailable` marker carrying
-   no upstream text (and the all-failed error neither), and no error
+   no upstream text (and the all-failed error neither), three failed legs
+   still serve the fourth with its three markers (the all-failed `&&` chain),
+   and no error
    text carries the API key (I12).
 - Integration tests (crates/bugwarden/tests/tools_wiremock.rs, wiremock +
   rmcp client over an in-memory duplex transport): the tools are CALLED
@@ -4628,7 +4631,8 @@ wired, `server.rs` and `main.rs` are the reference.
   ambient timing: a threshold over a localhost round trip is either
   flaky or so loose a constant passes it, so the assertion is that a
   delayed request's total EXCEEDS an undelayed one's by most of the
-  delay. The http `session.id` is now pinned end to end against the id on
+  delay, and that the same delay reports within absolute bounds (a
+  scale-invariant `*` passes the differential but not the window). The http `session.id` is now pinned end to end against the id on
   the wire (issue #180); `remote` is still observed only over a
   hand-built value, no harness serving with connect-info; stdio is
   pinned. The

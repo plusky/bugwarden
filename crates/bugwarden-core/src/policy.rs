@@ -2505,6 +2505,156 @@ products = ["SUSE*"]
         std::fs::remove_file(&path).ok();
     }
 
+    #[cfg(unix)]
+    thread_local! {
+        /// Where the calling thread's `Policy::load` warnings accumulate.
+        static LOAD_WARNINGS: std::cell::RefCell<Option<Vec<String>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The `message` and `path` fields of one `bugwarden_core` event.
+    #[cfg(unix)]
+    struct LoadEvent {
+        message: String,
+        path: String,
+    }
+
+    #[cfg(unix)]
+    impl tracing::field::Visit for LoadEvent {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            } else if field.name() == "path" {
+                self.path = format!("{value:?}");
+            }
+        }
+    }
+
+    /// Records `bugwarden_core` events on the capturing thread. Hand-rolled
+    /// rather than pulled in from tracing-subscriber: all it has to answer
+    /// is which paths warned.
+    #[cfg(unix)]
+    struct LoadCapture;
+
+    #[cfg(unix)]
+    impl tracing::Subscriber for LoadCapture {
+        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+            // WARN only: a future debug/info log on this path must not
+            // inflate the count the test below pins at exactly the warnings.
+            meta.target().starts_with("bugwarden_core") && *meta.level() == tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut collected = LoadEvent {
+                message: String::new(),
+                path: String::new(),
+            };
+            event.record(&mut collected);
+            let _ = LOAD_WARNINGS.try_with(|slot| {
+                if let Some(lines) = slot.borrow_mut().as_mut() {
+                    lines.push(format!("{} {}", collected.message, collected.path));
+                }
+            });
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Install the capture as this test binary's process-wide default, once.
+    /// Not a `with_default` scope: a callsite's `Interest` is cached from
+    /// the registering thread's default, so a parallel test with no
+    /// subscriber can cache `never` first and silence later captures.
+    #[cfg(unix)]
+    fn install_load_capture() {
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            tracing::subscriber::set_global_default(LoadCapture)
+                .expect("the capture must be this test binary's only global default");
+            tracing::callsite::rebuild_interest_cache();
+        });
+    }
+
+    /// Run `f`, returning what `bugwarden_core` logged on this thread.
+    #[cfg(unix)]
+    fn warnings_logged_by(f: impl FnOnce()) -> Vec<String> {
+        install_load_capture();
+        LOAD_WARNINGS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+        f();
+        LOAD_WARNINGS.with(|slot| slot.borrow_mut().take().unwrap_or_default())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_warns_exactly_once_for_group_writable_policy() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // `& 0o022` mangled to `|`, `^` or `==` warns on the wrong set:
+        // `|` warns on all three, `^` warns on all three, `==` warns on
+        // the safe one only — so one capture over three loads kills all
+        // three. The other-writable file pins the `0o002` bit the
+        // group-writable one cannot distinguish.
+        let tag = format!(
+            "bugwarden-policy-perm-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let dir = std::env::temp_dir();
+        let safe = dir.join(format!("{tag}-600.toml"));
+        let wide = dir.join(format!("{tag}-660.toml"));
+        let other = dir.join(format!("{tag}-602.toml"));
+        std::fs::write(&safe, "default_action = \"deny\"\n").unwrap();
+        std::fs::write(&wide, "default_action = \"deny\"\n").unwrap();
+        std::fs::write(&other, "default_action = \"deny\"\n").unwrap();
+        std::fs::set_permissions(&safe, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&wide, std::fs::Permissions::from_mode(0o660)).unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o602)).unwrap();
+
+        let warnings = warnings_logged_by(|| {
+            Policy::load(&safe).expect("safe policy must load");
+            Policy::load(&wide).expect("wide policy must load");
+            Policy::load(&other).expect("other-writable policy must load");
+        });
+
+        std::fs::remove_file(&safe).ok();
+        std::fs::remove_file(&wide).ok();
+        std::fs::remove_file(&other).ok();
+
+        assert_eq!(
+            warnings.len(),
+            2,
+            "exactly the two writable loads must warn: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("writable by group or others"),
+            "the warning must be the world-writable one: {:?}",
+            warnings[0]
+        );
+        let wide_path = wide.display().to_string();
+        let other_path = other.display().to_string();
+        let safe_path = safe.display().to_string();
+        assert!(
+            warnings.iter().any(|w| w.contains(&wide_path)),
+            "one warning must name the 0o660 path: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains(&other_path)),
+            "one warning must name the 0o602 path: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().all(|w| !w.contains(&safe_path)),
+            "no warning must name the 0o600 path: {warnings:?}"
+        );
+    }
+
     // ---------- classify ----------
 
     #[test]

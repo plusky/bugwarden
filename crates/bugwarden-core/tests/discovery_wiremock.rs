@@ -10,7 +10,7 @@
 //! contains the API key (I12).
 
 use bugwarden_core::client::BugzillaClient;
-use serde_json::json;
+use serde_json::{json, Value};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -336,6 +336,51 @@ async fn server_info_all_failed_error_carries_no_upstream_text() {
             "the aggregate error leaked upstream text or the key: {text}"
         );
     }
+}
+
+#[tokio::test]
+async fn server_info_three_failed_endpoints_still_serve_the_fourth() {
+    // The all-failed bail is a conjunction over the four legs: either `&&`
+    // flipped to `||` bails on a partial outage instead, so three down
+    // must still serve the one that answered.
+    let server = MockServer::start().await;
+    for endpoint in ["/rest/version", "/rest/extensions", "/rest/time"] {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "error": true, "code": 32000, "message": "down",
+            })))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/rest/parameters"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "parameters": { "maintainer": "qa@example.com" },
+        })))
+        .mount(&server)
+        .await;
+
+    let info = client(&server)
+        .server_info(KEY)
+        .await
+        .expect("three failed endpoints must still serve the fourth");
+    assert_eq!(
+        info["parameters"],
+        json!({ "maintainer": "qa@example.com" })
+    );
+    assert_eq!(info["version"], Value::Null);
+    assert_eq!(info["extensions"], json!({}));
+    assert_eq!(info["timezone"], Value::Null);
+    assert_eq!(info["time"], Value::Null);
+    assert_eq!(
+        info["unavailable"],
+        json!([
+            "/version: unavailable",
+            "/extensions: unavailable",
+            "/time: unavailable",
+        ])
+    );
 }
 
 #[tokio::test]
