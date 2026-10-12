@@ -1838,3 +1838,36 @@ async fn upstream_stats_latency_tracks_the_wait_and_not_a_constant() {
         quick_stats.latency_ms()
     );
 }
+
+#[tokio::test]
+async fn upstream_stats_latency_is_bounded_by_the_mounted_delay() {
+    // `latency_us / 1000` with `*` instead reports a million-fold wait; the
+    // differential above still passes (both sides scale), so the delay
+    // needs absolute bounds.
+    const DELAY_MS: u64 = 200;
+    const SLACK_MS: u64 = 5_000;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/version"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "version": "5.0" }))
+                .set_delay(std::time::Duration::from_millis(DELAY_MS)),
+        )
+        .mount(&server)
+        .await;
+
+    let stats = Arc::new(UpstreamStats::default());
+    with_upstream_stats(Arc::clone(&stats), async {
+        client(&server).version(KEY).await.expect("version");
+    })
+    .await;
+
+    assert_eq!(stats.requests(), 1);
+    let latency = stats.latency_ms();
+    assert!(
+        (DELAY_MS..=DELAY_MS + SLACK_MS).contains(&latency),
+        "a {DELAY_MS} ms delay must report within [{DELAY_MS}, {}] ms, got {latency} ms",
+        DELAY_MS + SLACK_MS,
+    );
+}
