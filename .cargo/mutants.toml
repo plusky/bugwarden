@@ -130,4 +130,10 @@ exclude_re = [
     # not pay the timeout floor weekly for a verdict already in hand.
     "otel\\.rs:931:21:.*\\+= with \\*=",
     "otel\\.rs:634:22:.*== with !=",
+    # The glob backtrack advance is unobservable: `p = star_pos` re-enters
+    # the `'*'` arm and lands on the identical (p, resume, s) state one
+    # iteration later (or skips the same `'*'` in the trailing-star loop),
+    # proven by 265k exhaustive + 200k random differential cases with zero
+    # divergences.
+    "policy\\.rs:171:26:.*\\+ with \\*",
 ]
