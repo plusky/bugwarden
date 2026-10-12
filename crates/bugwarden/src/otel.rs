@@ -2829,6 +2829,15 @@ mod tests {
                 "Pipeline's Debug must not carry {forbidden}: {rendered}"
             );
         }
+        // The absence checks above hold vacuously over an emptied `fmt`
+        // (which renders `""`), so the shape is pinned too: the struct and
+        // its two counters.
+        for present in ["Pipeline", "dropped", "healthy"] {
+            assert!(
+                rendered.contains(present),
+                "Pipeline's Debug must name {present}: {rendered}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3198,5 +3207,242 @@ mod tests {
             .sum();
         assert_eq!(records, 3, "every accepted record must be delivered");
         assert_eq!(pipeline.dropped(), 0, "the batch is not dropped");
+    }
+    #[test]
+    fn blank_service_name_falls_back_to_default() {
+        // Trimmed to nothing, the variable reads as unset rather than as
+        // an empty service name: an empty `service.name` is a broken
+        // resource, not a label.
+        let cfg = resolve(&OtelEnv {
+            service_name: Some("   ".to_owned()),
+            ..env("http://c:4318")
+        })
+        .expect("resolves")
+        .expect("export is on");
+        assert_eq!(cfg.service_name(), "bugwarden");
+    }
+
+    #[test]
+    fn bridged_log_record_omits_bridge_bookkeeping() {
+        // Every field `tracing-log` adds to a bridged `log` record is
+        // marked here; the visitor reroutes `log.target` to the target
+        // attribute and drops the rest, so no `log.module_path=`-style
+        // spelling may reach a body. Pinned on the predicate rather than
+        // through the bridge: emitting `log` records needs the
+        // process-wide subscriber the diagnostics binary owns.
+        for field in ["log.target", "log.module_path", "log.file", "log.line"] {
+            assert!(
+                is_log_bridge_field(field),
+                "{field} is bridge bookkeeping and must be marked"
+            );
+        }
+        for field in ["message", "answer", "bugwarden.stream"] {
+            assert!(
+                !is_log_bridge_field(field),
+                "{field} is event content and must survive"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn burst_coalesces_within_one_interval() {
+        // Ten records spaced 50 ms apart must ride at most two batch
+        // intervals, not one post each. The spacing is the point: a
+        // pre-queued burst is drained by one poll even with the deadline in
+        // the past, so only arrivals straddling polls tell a past deadline
+        // (every record flushed alone: ten posts) from a future one.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let collector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/logs"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&collector)
+            .await;
+        let cfg = resolve(&env(&collector.uri()))
+            .expect("resolves")
+            .expect("export is on");
+        let pipeline = Arc::new(Pipeline::start(cfg).expect("the pipeline must start"));
+        for _ in 0..10 {
+            pipeline
+                .accept(&event(tool_call(None)), b"{}")
+                .expect("an open queue takes custody");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let (requests, total) = {
+            let mut requests = Vec::new();
+            let mut total = 0;
+            for _ in 0..80 {
+                requests = collector
+                    .received_requests()
+                    .await
+                    .expect("recording is on");
+                total = 0;
+                for request in &requests {
+                    let decoded = decode_request(&request.body);
+                    for resource in &decoded.resource_logs {
+                        for scope in &resource.scope_logs {
+                            total += scope.log_records.len();
+                        }
+                    }
+                }
+                if total >= 10 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            (requests, total)
+        };
+        assert_eq!(
+            total, 10,
+            "all ten records must be delivered, not just awaited"
+        );
+        assert!(
+            requests.len() <= 2,
+            "ten records inside a batch interval must coalesce, not post one by one: {} posts",
+            requests.len()
+        );
+        pipeline.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dead_collector_backoff_spans_seconds() {
+        // Five attempts sleep `BACKOFF * attempt`: 0.5 + 1 + 1.5 + 2 s. A
+        // backoff that adds or divides instead collapses to ~1.5 s or less.
+        let cfg = resolve(&env(&refused_base_url()))
+            .expect("resolves")
+            .expect("export is on");
+        let pipeline = Arc::new(Pipeline::start(cfg).expect("the pipeline must start"));
+        let start = std::time::Instant::now();
+        pipeline
+            .probe()
+            .await
+            .expect_err("a dead collector must refuse startup");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(2500),
+            "the probe must back off across seconds, not fail fast: {elapsed:?}"
+        );
+        pipeline.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn healthy_reports_startup_state() {
+        // `healthy` has no other callers — the delivery gate reads the
+        // atomic directly — so this pins otherwise-dead surface: true
+        // before any attempt, false after a failed delivery. The refused
+        // address is probed, not a bare literal: this row posts, and a box
+        // filtering port 1 would cost the client timeout instead (#280).
+        let cfg = resolve(&env(&refused_base_url()))
+            .expect("resolves")
+            .expect("export is on");
+        let pipeline = Arc::new(Pipeline::start(cfg).expect("the pipeline must start"));
+        assert!(
+            pipeline.healthy(),
+            "delivery is assumed working until an attempt proves otherwise"
+        );
+        pipeline
+            .accept(&event(tool_call(None)), b"{}")
+            .expect("an open queue takes custody");
+        // The batch interval plus a margin: enough for one failed post.
+        tokio::time::sleep(BATCH_INTERVAL * 3).await;
+        assert!(
+            !pipeline.healthy(),
+            "a failed delivery must mark the pipeline unhealthy"
+        );
+        pipeline.shutdown().await;
+    }
+    #[tokio::test]
+    async fn mid_size_batch_posts_as_one() {
+        // A ~3 MiB burst sits between the shrunken bound a mutant makes of
+        // `MAX_BATCH_BYTES` (~1 MiB) and the real one (4 MiB): one post
+        // proves the bound is enforced where it is spelled. The value pin
+        // is the deterministic half; the burst is the behavioural one.
+        assert_eq!(
+            MAX_BATCH_BYTES,
+            4 * 1024 * 1024,
+            "the burst below relies on the 4 MiB batch bound"
+        );
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let collector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/logs"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&collector)
+            .await;
+        let cfg = resolve(&env(&collector.uri()))
+            .expect("resolves")
+            .expect("export is on");
+        let pipeline = Arc::new(Pipeline::start(cfg).expect("the pipeline must start"));
+        let line = vec![b'x'; 512 * 1024];
+        for _ in 0..6 {
+            pipeline
+                .accept(&event(tool_call(None)), &line)
+                .expect("an open queue takes custody");
+        }
+        let (requests, total) = {
+            let mut requests = Vec::new();
+            let mut total = 0;
+            for _ in 0..80 {
+                requests = collector
+                    .received_requests()
+                    .await
+                    .expect("recording is on");
+                total = 0;
+                for request in &requests {
+                    let decoded = decode_request(&request.body);
+                    for resource in &decoded.resource_logs {
+                        for scope in &resource.scope_logs {
+                            total += scope.log_records.len();
+                        }
+                    }
+                }
+                if total >= 6 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            (requests, total)
+        };
+        assert_eq!(
+            total, 6,
+            "all six records must be delivered, not just awaited"
+        );
+        assert_eq!(
+            requests.len(),
+            1,
+            "a ~3 MiB burst must ride a single post under the 4 MiB bound"
+        );
+        pipeline.shutdown().await;
+    }
+
+    #[test]
+    fn recovery_logs_only_on_false_to_true() {
+        // The test above does two successes, so a recovery logged on the
+        // wrong edge still counts one line there. One success from false
+        // must log exactly one line; the next, and one from a fresh true,
+        // must log none.
+        let healthy = AtomicBool::new(false);
+        let (_, first) = capture_logs(|| note_delivery(&healthy, true));
+        assert_eq!(
+            first.as_str().matches("otlp delivery recovered").count(),
+            1,
+            "the false-to-true edge must log exactly one recovery: {}",
+            first.as_str()
+        );
+        let (_, second) = capture_logs(|| {
+            note_delivery(&healthy, true);
+            tracing::info!("otel-recovery-marker");
+        });
+        assert_logged(&second, "otel-recovery-marker");
+        second.assert_not_contains("otlp delivery recovered");
+        let healthy = AtomicBool::new(true);
+        let (_, logs) = capture_logs(|| {
+            note_delivery(&healthy, true);
+            tracing::info!("otel-recovery-marker");
+        });
+        assert_logged(&logs, "otel-recovery-marker");
+        logs.assert_not_contains("otlp delivery recovered");
     }
 }

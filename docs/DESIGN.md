@@ -4986,7 +4986,12 @@ wired, `server.rs` and `main.rs` are the reference.
   between "the leak is plugged" and "the loop is dead". Its collector is a
   hand-rolled socket rather than a `MockServer` precisely because wiremock
   runs in-process and logs a line per request, which would feed the very
-  loop under test.
+  loop under test. Unit rows pin delivery-transition logging, burst
+  coalescing with exact delivery counts, cleared-var and blank-name
+  fallbacks, bridge bookkeeping omission, the batch-size constant,
+  Debug redaction, backoff span, and healthy states; the cleared-var
+  row lives in its own single-test binary, since process-environment
+  mutation races any concurrent reader in a shared binary.
 - CI: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace --locked`, `cargo deny check`, plus
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --locked`
