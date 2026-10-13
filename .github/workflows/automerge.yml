@@ -1,0 +1,132 @@
+---
+name: automerge
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+concurrency:
+  # Serialized per PR: a Dependabot push must never cancel an in-flight
+  # revoke run and re-enable over it. Runs take seconds, so queueing costs
+  # nothing.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    # fetch-metadata runs read-only here; the merge-capable token lives only
+    # in the enable/revoke jobs below, so a compromised pinned action
+    # cannot flip merge flags by itself.
+    if: github.actor == 'dependabot[bot]' && startsWith(github.head_ref, 'dependabot/cargo/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      deps: ${{ steps.metadata.outputs.updated-dependencies-json }}
+    steps:
+      - uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98  # v3.1.0
+        id: metadata
+
+  enable:
+    # Cargo bumps only. Actions bumps stay manual: the repo's sole defense
+    # for SHA-vs-tag drift is a human checking the bumped SHA against its
+    # `# vX.Y.Z` comment (dependabot.yml), and auto-merge would remove that
+    # review. Docker bumps were never in scope.
+    needs: metadata
+    if: needs.metadata.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - id: gate
+        # updated-dependencies-json covers grouped and ungrouped PRs alike:
+        # every entry must be minor/patch and none may be rmcp (an rmcp bump
+        # can never go green without a human DESIGN.md stamp push, so
+        # enabling on it is churn ending in manual merge anyway). Fail
+        # closed: unparsable or empty metadata reads "false".
+        shell: bash
+        run: |
+          set -euo pipefail
+          ok=$(printf '%s' "$DEPS" | jq -r '. // [] | if length > 0 and all(.updateType == "version-update:semver-minor" or .updateType == "version-update:semver-patch") and all(.dependencyName != "rmcp") then "true" else "false" end' 2>/dev/null || echo "false")
+          ok=${ok:-false}
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+        env:
+          DEPS: ${{ needs.metadata.outputs.deps }}
+      - if: steps.gate.outputs.ok == 'true'
+        # Branch protection holds the merge until every required check is
+        # green, so --auto cannot jump the gates; --rebase matches the
+        # repo's linear-history rule (Settings allows rebase merges only).
+        # The author check closes the rebase-after-human-push hole: a later
+        # Dependabot rebase preserves pushed commits, so re-enabling over
+        # them would auto-merge unreviewed code. Merges count as commits
+        # (an "evil merge" can carry content beyond its parents); a human
+        # "Update branch" click therefore vetoes until `@dependabot rebase`
+        # drops the merge commit and re-arms here. The login fallback is a
+        # constant (a free-form git name is spoofable); the oid guard narrows
+        # the check-then-act race. Silent skip on human commits: revoke owns
+        # that state. Tolerant enable: already-set, closed or conflicted are
+        # steady states a retry or a human resolves, not job failures.
+        shell: bash
+        run: |
+          set -euo pipefail
+          before=$(gh pr view "$PR_URL" --json headRefOid -q .headRefOid)
+          authors=$(gh api "repos/$REPO/pulls/$NUM/commits" --paginate | jq -sr 'add | [.[] | (.author.login // "UNKNOWN")] | unique | join(",")' 2>/dev/null || echo "UNKNOWN")
+          after=$(gh pr view "$PR_URL" --json headRefOid -q .headRefOid)
+          if [ "$before" != "$after" ]; then echo "HEAD moved during check; aborting"; exit 0; fi
+          if [ "$authors" = "dependabot[bot]" ]; then
+            if ! gh pr merge --auto --rebase "$PR_URL"; then echo "enable failed (already set, closed or conflicted?); leaving as-is"; fi
+          else
+            safe=$(printf '%s' "$authors" | tr '\r\n' '  ' | cut -c1-200)
+            echo "non-Dependabot commits present ($safe); leaving manual"
+          fi
+        env:
+          REPO: ${{ github.repository }}
+          NUM: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - if: steps.gate.outputs.ok != 'true'
+        # Sticky-flag cleanup: an earlier run may have enabled auto-merge
+        # while the group was eligible (no rmcp), and a later Dependabot
+        # push can flip the gate without any human synchronize for revoke
+        # to see. rmcp stays red via design-stamp-drift regardless, but the
+        # flag must not outlive eligibility.
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$(gh pr view "$PR_URL" --json autoMergeRequest -q '.autoMergeRequest != null')" = "true" ]; then
+            gh pr merge --disable-auto "$PR_URL"
+          fi
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  revoke:
+    # Auto-merge is sticky: a human push onto a Dependabot branch would
+    # otherwise inherit the flag and merge without review once CI goes
+    # green. Synchronize-only (opened/reopened add no commits); the
+    # github-actions[bot] exemption keeps automated branch updates from
+    # stalling the PR while any other bot still revokes; the idempotency
+    # guard keeps filtered-out PRs (majors, rmcp groups) from failing here
+    # on every push.
+    if: github.event.action == 'synchronize' && github.actor != 'dependabot[bot]' && github.actor != 'github-actions[bot]' && github.actor != 'web-flow' && github.event.pull_request.user.login == 'dependabot[bot]' && startsWith(github.head_ref, 'dependabot/cargo/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$(gh pr view "$PR_URL" --json autoMergeRequest -q '.autoMergeRequest != null')" = "true" ]; then
+            gh pr merge --disable-auto "$PR_URL"
+          fi
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
