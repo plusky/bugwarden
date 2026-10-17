@@ -812,6 +812,21 @@ Endpoint mapping:
 
 Auth per request: `use_auth_header` ? header `Authorization: Bearer {key}` :
 query param `api_key={key}`. Always `Accept: application/json`.
+
+The two placements are not interchangeable dialects of one form: stock
+Bugzilla and BMO honour the query parameter (under both the `api_key`
+and `Bugzilla_api_key` names), Red Hat Bugzilla requires the Bearer
+header, and stock Bugzilla's own header form (`X-Bugzilla-API-Key`) is
+not sent. Whichever form the path between the server and Bugzilla
+strips — a proxy dropping headers, a gateway rewriting query strings —
+every request lands anonymous, and Bugzilla's only signal is
+`login_required` (envelope code 410, answered as HTTP 401): reads
+silently narrow to the anonymous view and writes refuse. The client
+cannot detect the strip, so the diagnosis lives where an operator
+first meets a failure: the identity preflight names the anonymous
+landing and the placement whenever a probe meets code 410, and the
+`valid_login`-false bail names it as a possibility (see "Identity
+preflight").
 Errors: a non-2xx status, a body `{"error": true}` under any status, or a
 2xx body that is not JSON => a `BugzillaError` inside anyhow. Its Display is
 `bugzilla error (HTTP {status}): {message}` — the text the untyped error
@@ -1322,6 +1337,17 @@ custody:
 The failure path attaches the sanitized client error (I12: `whoami` /
 `valid_login` already strip the URL) as the `anyhow` error's source/context
 — no key material reaches the bailed-out message either.
+
+A probe refusal carrying envelope code 410 (`login_required`) is worded
+separately in both server-custody arms: the request reached Bugzilla
+anonymously, so the bail names the API key placement — the `api_key`
+query parameter by default, an `Authorization: Bearer` header under
+`--use-auth-header` — and the transit that can strip the chosen form,
+instead of the endpoint-existence (`whoami`) or wrong-login
+(`declared`) explanations a 410 is neither of. The `declared` arm's
+`false` bail names the same possibility: an anonymous `valid_login`
+answers `false`, so a placement the path strips reads exactly like a
+wrong account.
 
 Tool descriptions: concise and action-oriented; state the defaults and
 constraints the model must know.
@@ -4297,7 +4323,11 @@ wired, `server.rs` and `main.rs` are the reference.
   the `declared` arm — a correct declared login passes preflight via one
   `valid_login` request and zero whoami requests, a login the key does NOT
   authenticate as fails preflight naming that login, and a transport-level
-  `valid_login` failure fails preflight naming the endpoint.
+  `valid_login` failure fails preflight naming the endpoint; a
+  `login_required` (code 410) refusal on either probe fails preflight
+  naming the anonymous landing and the API key placement (for `whoami`,
+  without the endpoint-existence wording), and the `valid_login`-false
+  bail names the anonymous-landing possibility alongside the login.
 - Integration tests (crates/bugwarden/tests/http_transport_wiremock.rs,
   wiremock + rmcp client over REAL streamable HTTP — the only harness in
   which the per-request key header physically exists; the wiremock upstream
