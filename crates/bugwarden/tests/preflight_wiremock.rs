@@ -15,7 +15,12 @@
 //!   identity criterion (the laziness contract must hold at startup too);
 //! - `preflight` bailing under `KeyCustody::PerRequest` instead of
 //!   warning-and-continuing (there is no server-held key to probe with);
-//! - an API key leaking into a preflight error's text (I12).
+//! - an API key leaking into a preflight error's text (I12);
+//! - a `login_required` (code 410) refusal diagnosed with the generic
+//!   endpoint-existence or endpoint-failure context instead of the
+//!   anonymous-landing one naming the API key placement;
+//! - the `valid_login` `false` bail dropping its anonymous-landing
+//!   sentence (a stripped placement reads exactly like a wrong login).
 
 use std::sync::Arc;
 
@@ -308,5 +313,109 @@ async fn preflight_transport_error_does_not_leak_the_api_key_i12() {
     assert!(
         !msg.contains("SUPERSECRETKEY123"),
         "API key leaked into a preflight error: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn preflight_whoami_login_required_names_the_anonymous_landing() {
+    // The key never arrived in a form Bugzilla honours: whoami answers
+    // the login_required refusal (HTTP 401, envelope code 410). The bail
+    // must name the anonymous landing and the placement — this deployment
+    // HAS the endpoint, so the endpoint-existence context a 404 earns
+    // would send the operator debugging the wrong thing.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/whoami"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": true,
+            "code": 410,
+            "message": "You must log in before using this part of Bugzilla.",
+        })))
+        .mount(&mock)
+        .await;
+    let server = server_custody_server(IDENTITY_POLICY, &mock);
+
+    let err = server
+        .preflight()
+        .await
+        .expect_err("a login_required whoami refusal must fail preflight");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("anonymously"),
+        "preflight error must name the anonymous landing: {msg}"
+    );
+    assert!(
+        msg.contains("--use-auth-header"),
+        "preflight error must name the placement that decides it: {msg}"
+    );
+    assert!(
+        !msg.contains("does not define /rest/whoami"),
+        "a 410 is not an endpoint-existence failure: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn preflight_valid_login_login_required_names_the_anonymous_landing() {
+    // The same refusal on the declared arm: valid_login answers
+    // login_required instead of a result. The bail names the endpoint
+    // and the anonymous landing, not a generic endpoint failure.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/valid_login"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": true,
+            "code": 410,
+            "message": "You must log in before using this part of Bugzilla.",
+        })))
+        .mount(&mock)
+        .await;
+    let server = server_custody_server(DECLARED_IDENTITY_POLICY, &mock);
+
+    let err = server
+        .preflight()
+        .await
+        .expect_err("a login_required valid_login refusal must fail preflight");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("GET /rest/valid_login"),
+        "preflight error must name the failing endpoint: {msg}"
+    );
+    assert!(
+        msg.contains("anonymously"),
+        "preflight error must name the anonymous landing: {msg}"
+    );
+    assert!(
+        msg.contains("--use-auth-header"),
+        "preflight error must name the placement that decides it: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn preflight_declared_login_false_names_the_anonymous_possibility() {
+    // valid_login answering false is also what an anonymous request
+    // gets, so alongside the login the bail must name the placement
+    // that decides whether the key arrived at all — otherwise a
+    // stripped header or query string is indistinguishable from a
+    // wrong account and sends the operator after the wrong fix.
+    let mock = MockServer::start().await;
+    mount_valid_login(&mock, "svc@example.com", false, 1).await;
+    let server = server_custody_server(DECLARED_IDENTITY_POLICY, &mock);
+
+    let err = server
+        .preflight()
+        .await
+        .expect_err("a login the key does not own must fail preflight");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("svc@example.com"),
+        "preflight error must name the declared login: {msg}"
+    );
+    assert!(
+        msg.contains("anonymously"),
+        "preflight error must name the anonymous-landing possibility: {msg}"
+    );
+    assert!(
+        msg.contains("--use-auth-header"),
+        "preflight error must name the placement that decides it: {msg}"
     );
 }
