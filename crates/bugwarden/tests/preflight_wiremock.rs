@@ -276,6 +276,10 @@ async fn preflight_declared_login_transport_error_names_the_endpoint() {
         msg.contains("GET /rest/valid_login"),
         "preflight error must name the failing endpoint: {msg}"
     );
+    assert!(
+        !msg.contains("anonymously"),
+        "a transport failure must not be diagnosed as an anonymous landing: {msg}"
+    );
 }
 
 #[tokio::test]
