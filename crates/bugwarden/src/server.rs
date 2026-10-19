@@ -468,6 +468,21 @@ fn upstream_hint(tool: &str, code: i64, reach: UpstreamReach) -> Option<&'static
         .map(|row| row.text)
 }
 
+/// Bugzilla's `login_required` code: the refusal an anonymous request
+/// meets. Keyed on the envelope code, not the HTTP status — Bugzilla
+/// answers this one as HTTP 401.
+const LOGIN_REQUIRED_CODE: i64 = 410;
+
+/// Whether `err` is Bugzilla's `login_required` refusal: the request
+/// reached Bugzilla anonymously, whatever the operator configured —
+/// the API key did not arrive in a form the deployment honours, or
+/// did not arrive at all.
+fn login_required(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<bugwarden_core::client::BugzillaError>()
+        .and_then(|bz| bz.code())
+        == Some(LOGIN_REQUIRED_CODE)
+}
+
 /// A write tool's failure text for an upstream refusal: its fixed first
 /// line — the audit gate's refusal, so an unhinted failure and the gate
 /// refusal are byte-identical — plus the hint `code` selects, if any.
@@ -3522,6 +3537,17 @@ impl BugWarden {
     /// closed, distinct from a transport failure so the operator does not
     /// mistake a wrong login for a broken key); a transport/parse error
     /// bails naming the endpoint, the same as the `whoami` arm.
+    ///
+    /// A refusal carrying Bugzilla code 410 (`login_required`) is
+    /// diagnosed separately in both server-custody arms: the request
+    /// reached Bugzilla anonymously, so the bail names the API key
+    /// placement — the `api_key` query parameter by default, an
+    /// `Authorization: Bearer` header under `--use-auth-header` — and
+    /// the transit that can strip the chosen form, rather than the
+    /// endpoint-existence or wrong-login explanations a 410 is neither
+    /// of. A `valid_login` `false` can mean the same thing, so that
+    /// bail names the possibility too.
+    ///
     /// [`BugWarden::new`] already refuses to construct a declared-identity
     /// server under per-request custody (A5), so that combination cannot
     /// reach this method — the match below still names it explicitly
@@ -3539,16 +3565,29 @@ impl BugWarden {
                         tracing::info!(login, "identity endpoint verified");
                         Ok(())
                     }
-                    Err(err) => Err(err).context(
-                        "GET /rest/whoami failed during startup preflight; the guard policy \
-                         consults created_by_me, which needs this endpoint to resolve the \
-                         caller's identity. Stock Bugzilla Core v1 does not define /rest/whoami \
-                         (it is a fork/BMO extension) — if this deployment does not have it, \
-                         starting anyway would deny every access classification the policy's \
-                         identity rules reach (I4). Confirm the endpoint exists, set \
-                         global.identity_source = \"declared\" instead, or remove the \
-                         created_by_me criteria from the policy",
-                    ),
+                    Err(err) => {
+                        let context = if login_required(&err) {
+                            "GET /rest/whoami reached Bugzilla anonymously during startup \
+                             preflight: Bugzilla refused it with login_required (code 410), \
+                             so the configured API key did not authenticate the request. \
+                             The key travels as the api_key query parameter by default, or \
+                             as an Authorization: Bearer header with --use-auth-header; a \
+                             deployment honouring only the other form, or a proxy stripping \
+                             the chosen one in transit, produces exactly this refusal while \
+                             the key itself stays valid. Match the placement to the \
+                             deployment and the network path, then restart"
+                        } else {
+                            "GET /rest/whoami failed during startup preflight; the guard policy \
+                             consults created_by_me, which needs this endpoint to resolve the \
+                             caller's identity. Stock Bugzilla Core v1 does not define /rest/whoami \
+                             (it is a fork/BMO extension) — if this deployment does not have it, \
+                             starting anyway would deny every access classification the policy's \
+                             identity rules reach (I4). Confirm the endpoint exists, set \
+                             global.identity_source = \"declared\" instead, or remove the \
+                             created_by_me criteria from the policy"
+                        };
+                        Err(err).context(context)
+                    }
                 },
                 KeyCustody::PerRequest => {
                     tracing::warn!(
@@ -3595,13 +3634,38 @@ impl BugWarden {
                         "GET /rest/valid_login says the configured API key does not \
                          authenticate as \"{login}\" (global.identity_login); Bugzilla \
                          compares logins case-sensitively, so check for a case mismatch as \
-                         well as a wrong account. Fail closed: starting anyway would deny \
+                         well as a wrong account. A request that reaches Bugzilla \
+                         anonymously answers false here too: the key travels as the api_key \
+                         query parameter by default, or as an Authorization: Bearer header \
+                         with --use-auth-header, and a deployment honouring only the other \
+                         form, or a proxy stripping the chosen one in transit, makes a \
+                         valid key read exactly like a wrong account — check the \
+                         placement as well. Fail closed: starting anyway would deny \
                          every access classification the policy's identity rules reach (I4)",
                     ),
-                    Err(err) => Err(err).context(format!(
-                        "GET /rest/valid_login failed during startup preflight while \
-                         verifying the declared login \"{login}\" (global.identity_login)",
-                    )),
+                    Err(err) => {
+                        let context = if login_required(&err) {
+                            format!(
+                                "GET /rest/valid_login reached Bugzilla anonymously during \
+                                 startup preflight while verifying the declared login \
+                                 \"{login}\" (global.identity_login): Bugzilla refused it \
+                                 with login_required (code 410), so the configured API key \
+                                 did not authenticate the request. The key travels as the \
+                                 api_key query parameter by default, or as an Authorization: \
+                                 Bearer header with --use-auth-header; a deployment \
+                                 honouring only the other form, or a proxy stripping the \
+                                 chosen one in transit, produces exactly this refusal while \
+                                 the key itself stays valid. Match the placement to the \
+                                 deployment and the network path, then restart"
+                            )
+                        } else {
+                            format!(
+                                "GET /rest/valid_login failed during startup preflight while \
+                                 verifying the declared login \"{login}\" (global.identity_login)"
+                            )
+                        };
+                        Err(err).context(context)
+                    }
                 }
             }
         }
