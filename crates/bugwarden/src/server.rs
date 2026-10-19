@@ -3547,6 +3547,7 @@ impl BugWarden {
     /// endpoint-existence or wrong-login explanations a 410 is neither
     /// of. A `valid_login` `false` can mean the same thing, so that
     /// bail names the possibility too.
+    ///
     /// [`BugWarden::new`] already refuses to construct a declared-identity
     /// server under per-request custody (A5), so that combination cannot
     /// reach this method — the match below still names it explicitly
