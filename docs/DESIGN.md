@@ -831,6 +831,7 @@ first meets a failure: the identity preflight names the anonymous
 landing and the placement whenever a probe meets code 410, and the
 `valid_login`-false bail names it as a possibility (see "Identity
 preflight").
+
 Errors: a non-2xx status, a body `{"error": true}` under any status, or a
 2xx body that is not JSON => a `BugzillaError` inside anyhow. Its Display is
 `bugzilla error (HTTP {status}): {message}` — the text the untyped error
