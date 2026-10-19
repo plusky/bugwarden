@@ -814,9 +814,13 @@ Auth per request: `use_auth_header` ? header `Authorization: Bearer {key}` :
 query param `api_key={key}`. Always `Accept: application/json`.
 
 The two placements are not interchangeable dialects of one form: stock
-Bugzilla and BMO honour the query parameter (under both the `api_key`
-and `Bugzilla_api_key` names), Red Hat Bugzilla requires the Bearer
-header, and stock Bugzilla's own header form (`X-Bugzilla-API-Key`) is
+Bugzilla honours the query parameter (under both the `api_key` and
+`Bugzilla_api_key` names). BMO still accepts it, but documents it as
+deprecated — a stopgap for old callers; the forms it supports are its
+own `X-Bugzilla-API-Key` header and OAuth2 bearer tokens, so an API
+key carried as a Bearer token lands anonymous there too. Red Hat
+Bugzilla requires the Bearer header. Stock Bugzilla 5.0/5.2 has no
+header form at all; BMO's own header form (`X-Bugzilla-API-Key`) is
 not sent. Whichever form the path between the server and Bugzilla
 strips — a proxy dropping headers, a gateway rewriting query strings —
 every request lands anonymous, and Bugzilla's only signal is
