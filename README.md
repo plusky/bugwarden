@@ -391,11 +391,13 @@ this affects only server-to-Bugzilla authentication, not the client-facing
 header.
 
 Choose the placement the deployment in front of you honours: the query
-parameter is what stock Bugzilla and BMO accept, the Bearer header is
-the Red Hat form, and no other header form is sent. If the network path
-between bugwarden and Bugzilla strips the chosen form — a proxy dropping
-headers, a gateway rewriting query strings — every request arrives
-anonymous: reads quietly narrow to what an anonymous caller may see,
+parameter is what stock Bugzilla accepts, and what BMO still accepts
+but documents as deprecated — BMO's supported forms are its own
+`X-Bugzilla-API-Key` header and OAuth2 bearer tokens. The Bearer token
+is the Red Hat form, and no other header form is sent. If the network
+path between bugwarden and Bugzilla strips the chosen form — a proxy
+dropping headers, a gateway rewriting query strings — every request
+arrives anonymous: reads quietly narrow to what an anonymous caller may see,
 and writes fail with "You must log in before using this part of
 Bugzilla" (code 410). The key itself is fine in that state; switch the
 placement to the form that survives the path. When the guard policy
