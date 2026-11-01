@@ -87,8 +87,9 @@ jobs:
       # the tier/variant/tag exclusions, policy.rs the glob-advance one,
       # client.rs none; the eight small files carry two
       # documented-not-tested exclusions (config port >=, custom comma
-      # collapse) while the stdio delimiter hangs stay in scope and pay
-      # the floor weekly.
+      # collapse). Hand-reproduced cursor hangs (server, policy, guard,
+      # stdio) are excluded like otel's, so a verdict already in hand does
+      # not pay the floor weekly.
       MUTANTS_SCOPE: crates/bugwarden-core/src/guard.rs crates/bugwarden/src/main.rs crates/bugwarden/src/server.rs crates/bugwarden/src/audit.rs crates/bugwarden/src/otel.rs crates/bugwarden-core/src/client.rs crates/bugwarden-core/src/policy.rs crates/bugwarden-core/src/custom_fields.rs crates/bugwarden/src/config.rs crates/bugwarden/src/http_auth.rs crates/bugwarden/src/stdio.rs crates/bugwarden/src/tracing_fields.rs crates/bugwarden/src/http_session.rs crates/bugwarden/src/panic_hook.rs crates/bugwarden-core/src/quoted.rs
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
