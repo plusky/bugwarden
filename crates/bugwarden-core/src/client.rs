@@ -1047,4 +1047,24 @@ mod tests {
             "Debug keeps the status and the code: {own}"
         );
     }
+
+    /// Microseconds are summed across requests and reported as whole
+    /// milliseconds, so two sub-millisecond waits make one together; a `%`
+    /// or `*` in the scale reports 300 or 1_300_000 for the same pair.
+    #[test]
+    fn upstream_stats_sum_microseconds_into_whole_milliseconds() {
+        let stats = UpstreamStats::default();
+        stats.record(Duration::from_micros(600), Some(200));
+        stats.record(Duration::from_micros(700), None);
+        assert_eq!(stats.requests(), 2);
+        assert_eq!(stats.latency_ms(), 1);
+        assert_eq!(
+            stats.status(),
+            None,
+            "the last request produced no response"
+        );
+        stats.record(Duration::from_micros(2_345_678), Some(404));
+        assert_eq!(stats.latency_ms(), 2_346);
+        assert_eq!(stats.status(), Some(404));
+    }
 }
