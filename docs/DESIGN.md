@@ -11,7 +11,7 @@ Cargo workspace, two crates:
 
 - `crates/bugwarden-core` — guard policy engine + async Bugzilla REST client.
   MUST NOT depend on rmcp, axum, clap, or any MCP/transport crate.
-- `crates/bugwarden` — the binary: clap CLI, rmcp 3.5 MCP server, stdio and
+- `crates/bugwarden` — the binary: clap CLI, rmcp 3.7 MCP server, stdio and
   streamable-HTTP transports. Depends on `bugwarden-core`. The crate also
   has a lib target (`lib.rs` re-exporting `config` and `server`) consumed by
   `main.rs` and by the integration tests under `crates/bugwarden/tests/`,
@@ -1333,7 +1333,7 @@ constraints the model must know.
 | bug_comments | id, include_private: bool = false, new_since?, head?: u32, tail?: u32, max_comment_chars?: u32 | comments | filter_comments applied (I5). Optional windowing: with ANY of head/tail/max_comment_chars set the response is an envelope `{"comments":[..], "truncation":{"omitted_comments":N,"shown_comments":M}}`, else the bare array it always was. Windowing runs LAST, on the post-filter (I5), post-duplicate-marker-scrub (I14) list — `omitted_comments` counts only comments the client may see, so private-comment existence cannot leak by arithmetic. head keeps the first N (comment 0 is the report), tail the last N; overlap keeps everything and omits nothing. A comment capped by max_comment_chars carries a sibling `text_truncated: {"shown_chars","total_chars"}` — never an in-text marker, which free-form comment text would absorb. The name is max_comment_chars, not download_attachment's max_chars, on purpose: same unit, different scope — this caps EACH comment, that caps the WHOLE response — so do not converge the two into one name. summarize_bug is deliberately NOT windowed (its prompt needs every comment). Audit: `note_redacted_client_window("comments_window")` when omission or a cap actually fired — that note PRESERVES the granting rule, unlike the I5 suppression noted beside it (see "The `guard.rule` encoding") |
 | bugs_quicksearch | query, status: String = "ALL", include_fields: String = "id,product,component,assigned_to,status,resolution,summary,last_change_time", limit: u32 = 50, offset: u32 = 0, changed_since?: DateTime<Utc>, group_by?: String | post-filter | fetch include_fields = requested ∪ CLASSIFY_FIELDS; optional `changed_since` narrows upstream rows to bugs changed since then (Bugzilla `last_change_time`), so an unchanged watch costs exactly one scan request and classifies zero rows while the guard still classifies every returned row with no counts leaving the server (#315);    after filter, project kept bugs to requested fields (keep `_redacted` marker; `comment_count` always dropped, I5); envelope `{"bugs":[..]}` — or `{"groups":[..]}` under `group_by`, see below — only (I3), except an advisory `note` when the query is nothing but bug ids (comma/whitespace-separated, optional `#` per id) steering exact id sets to bug_info — the note is a pure function of the CLIENT'S REQUEST (the query and status strings), never of results, verdicts, or anything upstream said (no new oracle), and the `bugs` array is byte-identical with or without it (the query is still searched, never rerouted); its wording tracks the request: a non-empty status is prefixed to the query so upstream content-matches the whole expression, while an empty status sends the query bare and Bugzilla routes a bare all-number query to an exact id lookup (bug_id + anyexact) — on that path the note drops the content-matching claim — and a query naming more distinct ids than MAX_ASSESS_IDS steers to batched bug_info calls (the cap is already public in the too_many_ids refusal text) instead of straight into that refusal | **limit/offset address the bugs the client may SEE, not upstream rows** (Guard::quicksearch_window): filtering an already-paginated page left a hole exactly where a hidden bug sat — a short page the next offset contradicted — and since quicksearch matches summary text that hole was a probe for the hidden title, one word at a time. The guard now scans upstream from row 0 in 200-row chunks, classifies each, and fills the window from the survivors; rows are deduped on the server-reported id (relevance order is not stable between calls) and an id-less row is dropped (I4). A short page is NOT read as end-of-results — Bugzilla is free to cap a page below the requested chunk size (an admin-configured `max_search_results`, for instance), and that cap looks identical to a short page at the genuine end of a result set; only an empty page ends the scan early. Bounds, independent of each other: MAX_SEARCH_WINDOW=1000 addressable, 2000 rows scanned, and 10 sequential requests; hitting any of the three truncates, which looks exactly like the end of results. `limit` is honoured up to MAX_SEARCH_WINDOW and silently clamped above; prefer one call with a large `limit` and a lean `include_fields` over an offset walk — the walk re-scans from row zero, so one large call costs the server no more than the last page of the walk and the client one turn instead of N+1; a page short of `limit` is not the end of results. The objects returned are the ones classified. The scan target is quantised to whole chunks so the stopping point does not track the client's `limit`; without that, `limit` could be binary-searched against the clock to recover each block's exact hidden count. Residual, accepted: filling a window of VISIBLE bugs needs more rows when bugs are hidden, so a stopwatch still learns one bit per scanned block ("not entirely visible"). Removing that would mean scanning the worst case on every search, or letting pages go short again. Search failure returns a bare "Search failed"; the upstream text is logged server-side only (it can name a bug and say whether it exists). The scan's accounting — rows examined, verdict-dropped ids — goes to the audit record only (`guard.scan` plus the suppressed-ids machinery, issue #29); the response is byte-identical with or without drops. Optional `group_by` (issue #143): a comma-separated subset of GROUP_BY_FIELDS = product, component, status, resolution, severity, priority, deduped, unknown name refused BEFORE the upstream call (a silently ungrouped typo looks like a broken feature; the text quotes only what the client sent, so it is no oracle) while a spec naming NOTHING (`""`, bare commas) means "no grouping" rather than an error — that is what a client filling in every declared param sends, and the sibling `include_fields` reads an empty segment the same way. The response becomes `{"groups":[{"bugs":[..], <field>:<value>, ..}]}` and each grouped field is reported once per group instead of once per bug. Header key order is NOT caller order and is not promised anywhere client-facing: serde_json is built without `preserve_order`, so its Map is a BTreeMap and a header serializes with keys sorted, `bugs` first — `group_by=status,product` and `product,status` return identical bytes. GROUP_BY_FIELDS is a HAND-PICKED subset of the CLASSIFY_FIELDS ∩ SUMMARY_FIELDS intersection (which is all ten SUMMARY_FIELDS), restricted to low-cardinality enum-ish values; that membership is what makes grouping free of policy consequences — no extra upstream field is pulled, and a summary-redacted row carries all six so it buckets like any other row instead of needing one of its own. Membership is NOT the I14 argument: the same intersection holds `summary`, which routinely reads "regression from bug 12345". What keeps a header clean is ORDERING — a grouped field is FORCED into `requested` the way `id` is, so grouping runs on the served, link-scrubbed projection, a value can only reach a header by the same path that would have put it on the bug, and grouping never surfaces a field the projection dropped. Group order and within-group order are first appearance in the served window, so grouping cannot reorder by verdict, and a group exists only where a served bug put it: no empty buckets, no header naming a hidden bug's product (I3). It runs LAST, after the audit block has read the flat projection, so a call's record is identical whether or not the client asked for groups; `group_by` is in PARAM_ALLOWLIST (a vocabulary field, not free text) so the record carries it verbatim. The envelope key is `groups`, deliberately the same word as Bugzilla's per-bug `groups` security-group list which a client may project into the bugs nested inside it — parallel to `bugs` at the same level, and depth disambiguates; do not rename one to "fix" the collision without also moving the other. Predicate gate (#337): after group_by validation and before any request the query and the status prefix are tokenized quote-aware (double quotes always, single quotes only at word boundaries, backslash escapes; unbalanced refuses; split on Perl whitespace including vertical tab and form feed): bare terms, quoted phrases, `#`-id lists with `#` optional per comma piece, `P`-shorthands and exact (never prefix) predicates over product, component, status, resolution, severity, priority, summary (`short_desc` spelling included) pass — a field name in parens groups rather than names, so surrounding parens trim before the allowlist — everything else is refused with a fixed per-class text at zero requests — link (`depends_on`/`blocked`/`dupe`/`see_also`/`cf_*`), content (`comment`/`description`/`longdesc`), attachment, visibility (`group`/`flag`/`requestee`/`setter`), `# : @ [ ! ?` shortcuts (one leading `-` negates one comma piece, judged after the strip), mapping aliases of refused targets, unknown names and unbalanced quotes. A pseudo-quoted predicate is not a phrase. Masking allocation rides the transport body cap, so no separate query length cap. A pure request function, so hidden rows cannot move it; assignee-ish fields, keywords and whiteboard stay out because summary rows do not carry them |
 | create_bug | product, component, summary, version, description = "", severity?, priority?, op_sys?, platform?, keywords?: Vec<String>, groups?: Vec<String>, custom_fields?: JsonObject | create (write), judged on the prospective bug AS IT WILL BE FILED (Guard::may_create) | there is no bug id to assess, so the request itself is classified BEFORE any upstream call (I8): the rules that hide a product by name refuse filing into it, a field the request omits fails closed (I4), and a client-claimed `groups` list is never trusted — Bugzilla unions the product's mandatory groups in server-side, so may_create forces groups to unknown, which means a group-consulting rule refuses every create request that REACHES it — creation is possible only where an earlier rule covering the create operation grants it (a rule carrying `operations = ["create"]`, placed ahead of the group-consulting rules, is how an operator permits filing without that grant shadowing reads of existing bugs — issue #26), and a policy with no such grant refuses all creation. **Judged is filed.** Bugzilla rewrites a create request before it resolves anything: it trims names (Perl `\s`), turns every run of ASCII control characters in the summary into one space and trims it (`clean_text`), and skips a keyword that is `""` or `"0"` — testing that falsiness on the RAW element, before the trim it applies to the ones it goes on to resolve. Judged raw, `product: " Security Response"` walked past a `products = ["Security*"]` deny rule into the grant behind it and was filed into Security Response all the same. So `may_create` rewrites the payload the same way IN PLACE, classifies the rewrite, and create_bug POSTs that very object — the rewritten names are ones Bugzilla's own trim leaves alone, so the name Bugzilla looks up is the name that was judged; which object that lookup returns, and whether the priority survives, are the two limits below. The NAME trim is deliberately a SUPERSET of Bugzilla's: Unicode White_Space plus U+180E, which Perl counted as `\s` until 5.20 and Rust's `is_whitespace` does not — that arm is load-bearing, not decoration. A superset is safe only because the POST carries the trimmed value and a name resolves to its stored spelling anyway; trimming less is the bug. The SUMMARY is stored as sent, so it is trimmed with White_Space alone and nothing Bugzilla keeps is dropped: an edge U+180E stays in what is judged and POSTed, a Perl before 5.20 strips it itself and a later one keeps it, so on every Perl the stored summary is the one the raw request would have produced. The judged summary therefore contains the stored one, and `summary_contains` is a positive substring test, so every needle the filed summary carries the judged one carries too. WHICH fields are rewritten is a rule rather than a list: every field create_bug sends that a Matcher reads (product, component, summary, severity, priority, keywords). Bugzilla also trims version, op_sys and platform, which no criterion reads — rewriting them would decide nothing, and a new criterion over such a field must extend the rewrite with it or reopen this bug. Evidence also needs the SHAPE create_bug sends: BugMeta reads component and keywords leniently (a lone string, an array, `{"name": ..}` objects) where Bugzilla splits a keyword string, resolves such objects itself, and refuses a list where it wants a name — so a non-string component is unknown, a keyword element the trim would turn false stays exactly as it came for Bugzilla to resolve or refuse, and a list holding one is unknown as a whole (a partly rewritten list reads as a shorter one). A list Bugzilla would skip entirely is dropped, as create_bug drops an empty one. A rewritten field that came out empty is still POSTed, so the upstream refusal answers it — `require_summary`, `require_component`, and `object_not_specified` for product, severity and (with `letsubmitterchoosepriority` on; off, the second limit below applies) priority — behind the same refusal text at the same cost. The audit record keeps the client's RAW arguments while the POST carries the rewrite: audited is what was asked, filed is what was judged. Two known limits remain, both about what the filed bug ends up carrying. First, the lookup compares under the DATABASE's collation, which can treat two spellings as equal — or a character as weightless — where a glob cannot: measured on MariaDB 10.6, the stored `Security Response` is matched by `"Śecurity Response"` under `utf8mb3_general_ci`, and under the UCA `utf8mb4_unicode_ci` by its decomposed spelling and by a leading zero-width space, BOM, word joiner or RLO; this gate judges each of those as a different product and POSTs it verbatim. ASCII-only product names are therefore no protection either, and a name glob is not a boundary on such an instance. Components, keywords, severities and priorities are looked up by name through the same comparison (`Bugzilla::Object` via `sql_istrcmp`; a component by `name = ?`, which MySQL also compares under the collation), so by reading the code, not by measurement, the limit covers their criteria too. What narrows it is an allowlist-shaped create grant ahead of a rule refusing every other create request, as the shipped example does: a spelling the allowlist does not match is refused, which leaves only products whose names the database equates with a name the allowlist does match. A create-scoped grant on exact product names ahead of a default deny narrows it furthest: an equivalent spelling can then only be refused, never admitted — a denylist create rule, by contrast, stays bypassable by such a spelling. Issue #330 carried the measurements and the options; the steering rule above is its resolution: stripping or refusing such characters was rejected because it would change what the reporter filed, so nothing here closes the limit (PostgreSQL's `LOWER()` against Rust's `to_lowercase` is the same class, by reasoning, not measurement). Second, with `letsubmitterchoosepriority` off Bugzilla replaces the requested priority with `defaultpriority`, so a `priorities` criterion judges a priority the filed bug may not carry. **Every refusal is one refusal**: a policy refusal, a refused Bug ID custom field target, an unassessable custom field value and an upstream failure all return the same fixed create_denial text after the same upstream request count — the refused path burns one classify call against bug id 0 (never a valid id, creates nothing; download_attachment's padding precedent) instead of the POST. That count is a function of the request and the field kinds as learned (a failed lookup reads every field as Unknown, so a number anywhere becomes a target): `N = [one type lookup, when custom_fields is non-empty — at most 50 keys, the cap refusing more at zero requests] + [one whoami, when there are Bug ID targets and the policy consults identity through whoami] + [one classify per distinct target] + 1 (the POST, or the pad)`. No term depends on `may_create`'s verdict, on a target's verdict or existence, or on the POST's outcome — the targets are assessed even when the gate already refused, and a hidden target answers with create_denial, never with that bug's own uniform denial. Two texts, or differing counts, would be a free policy-enumeration oracle: send a guaranteed-invalid `version` plus a probe product and read the policy off which refusal (or which latency) comes back, with nothing created. Residual, accepted: a SUCCESSFUL create still confirms the product is allowed — that is the tool doing its job, and it costs a real, attributable bug; and the padding equalizes request count, not the upstream handler's exact latency (GET classify vs rejected POST). Bugzilla's failure message is logged server-side only (it can say whether a product/component exists). `custom_fields` keys must start with `cf_` (I7): the gate runs before `may_create` and errors with ZERO upstream requests on a non-`cf_` key — distinguishable from the padded create refusal on purpose, since it decides nothing about policy or Bugzilla; the 25-id cap over the custom field values that could name a bug and the 50-key cap on `custom_fields` refuse at zero requests the same way (I7). The caller is resolved for the targets only, never for the gate (see "Identity resolution"). No Matcher criterion reads `cf_*`, so a custom field cannot move a prospective bug between rules the way `product`/`component` do, and `may_create`'s rewrite never touches a `cf_*` value. `custom_fields` is not in `PARAM_ALLOWLIST`, so the audit stream records it as `_len`, same as the updater |
-| add_attachment | bug_id, data (base64), file_name, summary, content_type, comment = "", is_private = false, is_patch = false | attach (write) on bug_id | guard assessment before the upload (I8), uniform denial (I2); then global.max_attachment_bytes caps the DECODED size of `data` (0 = no cap) — the ceiling the operator set on downloads binds uploads through the same server too, measured after base64 expansion is stripped so encoding overhead cannot shrink it. The refusal names neither the payload's size nor the cap value (max_attachment_bytes is not I1-disclosable, exactly as on the download path). Over http that non-disclosure is partial and knowingly so: the transport's POST body cap is derived from this same value (#52), so its 413 boundary is probeable once the cap exceeds ~2.25 MiB decoded — accepted, with the reasoning, under "rmcp 3.5 usage notes" below. Nothing here changes: this refusal still names neither size nor cap. `comment` travels as a PLAIN string — Bug.add_attachment documents it so; the `{"comment": {"body": ..}}` shape belongs to Bug.update only |
+| add_attachment | bug_id, data (base64), file_name, summary, content_type, comment = "", is_private = false, is_patch = false | attach (write) on bug_id | guard assessment before the upload (I8), uniform denial (I2); then global.max_attachment_bytes caps the DECODED size of `data` (0 = no cap) — the ceiling the operator set on downloads binds uploads through the same server too, measured after base64 expansion is stripped so encoding overhead cannot shrink it. The refusal names neither the payload's size nor the cap value (max_attachment_bytes is not I1-disclosable, exactly as on the download path). Over http that non-disclosure is partial and knowingly so: the transport's POST body cap is derived from this same value (#52), so its 413 boundary is probeable once the cap exceeds ~2.25 MiB decoded — accepted, with the reasoning, under "rmcp 3.7 usage notes" below. Nothing here changes: this refusal still names neither size nor cap. `comment` travels as a PLAIN string — Bug.add_attachment documents it so; the `{"comment": {"body": ..}}` shape belongs to Bug.update only |
 | add_comment | bug_id, comment, is_private: bool = false | comment (write) | an upstream refusal is the fixed line plus at most one code-selected hint — see "Upstream failures of the write tools". Success serves the envelope with id-bearing `changes` scrubbed to the assessed bug (I14); the comment id itself names no bug |
 | update_bug_status | bug_id, status, resolution?, comment: String = "" | status (write) | payload always carries `status`; `resolution` only when the caller gives a non-empty one — no local workflow assumption, no synthesised empty resolution. Bugzilla enforces `missing_resolution` on a closing status with none, and auto-clears any resolution when the target status is open; an upstream refusal is the fixed line plus at most one code-selected hint, and a request carrying `resolution` gets none but 109 — see "Upstream failures of the write tools". Success serves Bugzilla's update envelope with id-bearing `changes` scrubbed to the assessed bug (I14) |
 | assign_bug | bug_id, assignee (email), comment = "" | assign (write) | payload `{"assigned_to": ..}`; an upstream refusal is the fixed line plus at most one code-selected hint — see "Upstream failures of the write tools". Success serves Bugzilla's update envelope with id-bearing `changes` scrubbed to the assessed bug (I14) |
@@ -2798,10 +2798,10 @@ names an endpoint.
   of the kind the invariant already names; the endpoint is the weaker bar
   stated under "What secrecy this actually buys".
 
-## rmcp 3.5 usage notes
+## rmcp 3.7 usage notes
 
 Reference source is the rmcp this workspace pins, unpacked in the local
-registry: `~/.cargo/registry/src/*/rmcp-3.5.1/` — today's version, and the
+registry: `~/.cargo/registry/src/*/rmcp-3.7.0/` — today's version, and the
 directory holding the `rmcp` package's `manifest_path` in `cargo metadata
 --format-version 1` on any day, so it follows `Cargo.lock` rather than a copy
 of it and is by construction the source this build compiles against. Every rmcp
@@ -2811,11 +2811,17 @@ routing traps), `handler/server/router/tool.rs` (`ToolRouter`, incl.
 `remove_route` / `has_route` — I13), `model.rs` and `model/serde_impl.rs`
 (`InitializeResult`, the `_meta` strip), `service.rs` (the serve loop); the
 `#[tool_router]` / `#[tool_handler]` expansions are in the sibling
-`rmcp-macros-3.5.1` tree. The published crate carries no `examples/` — those
-live upstream at the `rmcp-v3.5.1` tag — but for how this server is actually
+`rmcp-macros-3.7.0` tree. The published crate carries no `examples/` — those
+live upstream at the `rmcp-v3.7.0` tag — but for how this server is actually
 wired, `server.rs` and `main.rs` are the reference.
 
-- `rmcp = { version = "3.5", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }`
+- `rmcp = { version = "3.6", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }`
+  — `3.6` because `DiscoverAnswering::framed` calls
+  `AsyncRwTransport::with_max_line_length`, which 3.6 (#1049) introduced,
+  and nothing 3.7 added over 3.6 is compiled into this crate: that release
+  touched only the OAuth client (`auth`, GHSA-5p52-q7pq-9fq2) and the
+  reqwest client's 401/403 handling (#1341), neither of which this crate's
+  features build.
 - Protocol revisions: `SUPPORTED_PROTOCOL_VERSIONS` (server.rs) lists what
   this build serves and `supported_protocol_versions()` returns it, narrowing
   the SDK default of every revision it knows. What that override bounds is
@@ -2829,10 +2835,11 @@ wired, `server.rs` and `main.rs` are the reference.
   reads, so a record on that path names the caller or names nobody. Adoption
   ADDED it — `2024-11-05` through `2025-11-25` keep their handshakes and their
   sessions — so the two lifecycles are served side by side and
-  `DEFAULT_PROTOCOL_VERSION` stays `2025-11-25`, the revision rmcp 3.5 names
-  `LATEST_WITH_INITIALIZE`. What rmcp's own negotiation substitutes for a
-  fallback that has no handshake is the newest handshake-era entry of
-  `supported_protocol_versions()` — this build's list, equal to
+  `DEFAULT_PROTOCOL_VERSION` stays `2025-11-25`, the revision rmcp names
+  `LATEST_WITH_INITIALIZE` (since 3.5). What rmcp's own negotiation
+  substitutes for a fallback that has no handshake is the newest
+  handshake-era entry of `supported_protocol_versions()` — this build's
+  list, equal to
   `KNOWN_VERSIONS` today, with nothing enforcing that.
   `advertised_protocol_versions_are_the_ones_this_build_serves` pins the
   constant to the newest handshake-era revision in `KNOWN_VERSIONS`: a
@@ -2854,7 +2861,7 @@ wired, `server.rs` and `main.rs` are the reference.
   SDK's `negotiate_protocol_version` (`service/server.rs`), which rmcp 3.3
   wraps as `ServerHandler::negotiate_initialize`. The override does not
   call it and agrees with it only while `DEFAULT_PROTOCOL_VERSION` is
-  itself handshake-era, so re-read both on an rmcp bump (on 3.5 the
+  itself handshake-era, so re-read both on an rmcp bump (on 3.7 the
   SDK's predicate is `ProtocolVersion::has_initialize`, lexically
   `< 2026-07-28` — the comparison the override spells out — and a
   fallback without a handshake is replaced by the newest handshake-era
@@ -2884,7 +2891,7 @@ wired, `server.rs` and `main.rs` are the reference.
   which moves with the SDK — and did, in rmcp 3.5 (#1105), to `2026-07-28`,
   a revision with no handshake. The first handshake's wire answer would
   survive inheriting it, because the SDK re-runs `negotiate_protocol_version`
-  over the handler's result (`service/server.rs:658`; over http too, through
+  over the handler's result (`service/server.rs:692`; over http too, through
   `serve_server`). What the pin alone keeps handshake-era is this handler's
   OWN answer — the revision the `initialize` record names, and the reply to
   a second mid-session `initialize`, which nothing corrects. From that
@@ -2921,7 +2928,7 @@ wired, `server.rs` and `main.rs` are the reference.
   must likewise be built in this crate rather than in the library that
   holds the HTTP client (issue #55, "Caller identity on the wire" above).
 - **rmcp trap — the handshake-free lifecycle is chosen by `_meta` shape, not
-  by `SUPPORTED_PROTOCOL_VERSIONS`.** In rmcp 3.5.1 `is_legacy_request`
+  by `SUPPORTED_PROTOCOL_VERSIONS`.** In rmcp 3.7.0 `is_legacy_request`
   (`transport/streamable_http_server/tower.rs`) returns true — the session
   path — for **every** `initialize`, whatever `protocolVersion` it names
   and whatever `_meta` it carries (rmcp #1228: an initialize request
@@ -2936,7 +2943,7 @@ wired, `server.rs` and `main.rs` are the reference.
   (`missing_required_keys(&V_2026_07_28).is_empty()`). That helper is
   called with `V_2026_07_28` as the *schema* to check, not the request's
   declared revision, so **a pre-2026 non-`initialize` with both keys still
-  hits the stateless path** (#204; re-verified on 3.5.1). Version
+  hits the stateless path** (#204; re-verified on 3.7.0). Version
   otherwise comes from the `_meta` key, falling back to the
   `MCP-Protocol-Version` header and then `2025-03-26` — no longer from
   `initialize`'s `params.protocolVersion`, which the early return already
@@ -2967,8 +2974,8 @@ wired, `server.rs` and `main.rs` are the reference.
   that did complete a handshake too.
   **rmcp trap within the trap — `RequestContext::client_info()` is not a safe
   accessor.** It falls back to `peer_info().client_info` unless
-  `peer.request_metadata_required()`, which rmcp 3.5.1 sets on exactly one path
-  (`service/server.rs:668`, the stdio first-valid-non-`discover` case) and
+  `peer.request_metadata_required()`, which rmcp 3.7.0 sets on exactly one path
+  (`service/server.rs:653`, the stdio first-valid-non-`discover` case) and
   never over streamable http. Since #267 that stdio path no longer sees a
   `server/discover`: the transport answers it (`stdio::DiscoverAnswering`,
   next bullet) — and since #1248 rmcp itself answers a pre-init `discover`
@@ -3010,14 +3017,14 @@ wired, `server.rs` and `main.rs` are the reference.
   served per-request POST, which is why `client_of` never uses the convenience
   accessor.
 - **rmcp trap — over stdio, a non-`discover` first request CHOOSES the lifecycle
-  before it is answered.** `serve_server_with_ct_inner` (rmcp 3.5.1
-  `service/server.rs:559-688`) reads the session's lifecycle off the first
+  before it is answered.** `serve_server_with_ct_inner` (rmcp 3.7.0
+  `service/server.rs:544-672`) reads the session's lifecycle off the first
   non-`ping`, non-`discover` frame with complete `_meta` at a served revision:
   that request is taken as a commitment to the handshake-free one, and
-  `Peer::require_request_metadata()` (`:668`) is called BEFORE the handler
+  `Peer::require_request_metadata()` (`:653`) is called BEFORE the handler
   answers. That flag is a sticky `AtomicBool` — no
   later `initialize` clears it (a later `initialize` succeeds and stores peer
-  info, `handler/server.rs:323`, leaving it set), and both it and its reader are
+  info, `handler/server.rs:322`, leaving it set), and both it and its reader are
   `pub(crate)`, so nothing in this build can reset it.
   `handler/server.rs:78-100` then refuses every subsequent request but
   `initialize` that carries no `_meta` with -32602. A probe used to be exactly
@@ -3029,8 +3036,18 @@ wired, `server.rs` and `main.rs` are the reference.
   `ExpectedInitializeRequest` after answering, logging the whole frame on the
   way out (#261). Since #1248 rmcp answers a pre-init `discover` on a bootstrap
   peer without flipping the flag, and since #1322 it answers a `_meta`-free or
-  unserved request in-band and keeps waiting — so bare 3.5.1 no longer commits
-  on a probe nor ends the process for a refused request. What #1263
+  unserved request in-band and keeps waiting — so bare 3.7.0 no longer commits
+  on a probe nor ends the process for a refused request. Since 3.6 the same
+  is true of a frame that is not any one JSON-RPC shape (#1283): `method`
+  beside `result` or `error`, those two together, or `method` with an `id`
+  of `null`, is refused -32600 in-band with no id, where 3.5 read it as the
+  nearest shape — a request with a float or null id was a NOTIFICATION,
+  which before `initialize` ended the process (#261's path) and in-session
+  was dropped — and an integral float id (`1.0`) is read as that integer
+  (#1346). Pinned over the real pipes by
+  `stdio_a_pre_initialize_float_id_request_is_refused_in_band_and_the_session_survives`
+  and `stdio_an_in_session_frame_with_method_and_result_is_refused_not_served`,
+  both of which fail on a 3.5 lock. What #1263
   changed is where that committing request runs: rmcp 3.2 answered it
   ahead of the serve loop, before reading another frame, and rmcp 3.4
   dispatches it inside the loop like any later request. So it now honours
@@ -3040,7 +3057,11 @@ wired, `server.rs` and `main.rs` are the reference.
   abandoned when rmcp's 5 s drain runs out after stdin closes or an
   over-cap frame closes the transport — its upstream call can land with
   no reply and no record, the gap every later stdio call already had
-  (#319).
+  (#319). Since rmcp 3.6 (#1333) the drain's end also cancels every
+  outstanding request's `RequestContext.ct`; the handler future itself is
+  not dropped, this build's handlers read no `ct`, and the record is
+  written after the dispatch returns, so that cancellation changes nothing
+  here.
   **Decision:** a probe is a probe and must not pick a lifecycle, so over
   stdio it is answered by the transport
   ([`DiscoverAnswering`](../crates/bugwarden/src/stdio.rs), wrapped in `main`)
@@ -3053,7 +3074,7 @@ wired, `server.rs` and `main.rs` are the reference.
   refused -32601 by the per-request handler (`handler/server.rs:112-117`), where
   a probe used to leave it. The answer is QUEUED on the wrapper and driven by
   the next `receive`, never awaited inside one: rmcp polls `receive` as one arm
-  of a `select!` (`service.rs:1412`) and drops that future whenever another arm
+  of a `select!` (`service.rs:1398`) and drops that future whenever another arm
   wins, so an inline await loses the reply — and the probe with it — to any
   pipelined client (`a_pipelined_probe_is_answered_under_write_contention` and
   its binary twin; the inner transport survives the same cancellation only
@@ -3064,7 +3085,7 @@ wired, `server.rs` and `main.rs` are the reference.
   changes its default `discover`, or anything it does between handler and wire
   (`handler/server.rs:246-259`), fails there. `resultType` is NOT stripped for a
   legacy declaration because `strip_result_type_for_legacy_peer`
-  (`model.rs:4789`) has no `DiscoverResult` arm; no audit record, no guard, no
+  (`model.rs:4951`) has no `DiscoverResult` arm; no audit record, no guard, no
   router, as before; and rmcp keeps sole ownership of the per-request gate, so a
   `_meta`-free request on a handshake-free session is still refused. One refusal
   CODE moves: a MID-SESSION probe whose `_meta` is wrong two ways (an unserved
@@ -3089,9 +3110,22 @@ wired, `server.rs` and `main.rs` are the reference.
   `an_http_probe_never_commits_the_session_lifecycle` pins so an rmcp bump that
   changed it fails loudly.
 - **rmcp trap — `mcp-session-id` is a validated header on only one of the two
-  routes.** In rmcp 3.5.1 the session branch of `handle_post`
+  routes.** In rmcp 3.7.0 the session branch of `handle_post`
   (`transport/streamable_http_server/tower.rs`) checks the header against
-  `has_session` before it routes on it, and 404s an id it does not know; the
+  `has_session` before it routes on it, 404s an id it does not know, and
+  since rmcp 3.6 (#1377) answers a session-less POST that is not
+  `initialize` with 400 `Session ID is required` where 3.5 answered 422
+  `Unexpected message` — before any handler, so unrecorded either way, as
+  is the stateless branch's new 400/-32600 for a posted JSON-RPC response
+  or error, which 3.5 accepted with a 202 (both pinned by
+  `a_session_less_non_initialize_post_is_refused_400_before_any_handler`
+  and `a_posted_json_rpc_response_on_the_stateless_path_is_refused_400`,
+  which fail on a 3.5 lock). The #1283/#1346 shapes reach neither branch
+  over http: `expect_json` (`server_side_http.rs`) refuses them 415 `fail
+  to deserialize request body unrecognized JSON-RPC message` — the text
+  any non-JSON-RPC JSON object now draws (3.5's text named serde's untagged
+  enum, and 3.5 parsed these shapes, so they reached the branch) — never
+  -32600. The
   stateless branch has no such check and `serve_negotiated_request_directly`
   injects the request Parts verbatim, so on that route the header is client
   free text. On `initialize` there is no header at all — rmcp mints the id
@@ -3123,7 +3157,7 @@ wired, `server.rs` and `main.rs` are the reference.
   `COMPLETE`, and the SEP-2549 cache hints are gated on the request's
   revision. **rmcp trap — the version-shaped edits the SDK makes to a
   served result are stripping `resultType` and filling missing cache hints.**
-  In rmcp 3.5.1 `ServerResult::strip_result_type_for_legacy_peer` (`model.rs`)
+  In rmcp 3.7.0 `ServerResult::strip_result_type_for_legacy_peer` (`model.rs`)
   edits that one field for legacy peers, and `fill_missing_cache_hints`
   (`model.rs`, since #1308) fills absent `ttl_ms`/`cache_scope` with `0`/
   `Private` for 2026-07-28+ peers; the same `handle_request` version-gates other
@@ -3135,7 +3169,7 @@ wired, `server.rs` and `main.rs` are the reference.
   ours: `RequestContext::protocol_version()` — the request's own `_meta`
   revision, else the session's negotiated one, `None` when neither — at least
   `2026-07-28`, and `None` fails toward the legacy wire shape rather than
-  toward emission. That expression is a hand-copy of the one rmcp 3.5.1
+  toward emission. That expression is a hand-copy of the one rmcp 3.7.0
   computes `is_2026_07_28_or_later` from (`handler/server.rs`): the two agree
   today by inspection, share no constant, and no test pins the agreement.
   Re-read both on every rmcp bump — if upstream's predicate moves, this build
@@ -3148,7 +3182,7 @@ wired, `server.rs` and `main.rs` are the reference.
   nothing worth caching. The exact claim, which is about listings and not
   about peers: **no `tools/list` response this handler constructs carries the
   SEP-2549 pair unless the request's revision is at least 2026-07-28.** Not
-  about peers because in rmcp 3.5.1 `DiscoverResult` (`model.rs`) declares
+  about peers because in rmcp 3.7.0 `DiscoverResult` (`model.rs`) declares
   `ttl_ms: u64` and `cache_scope: CacheScope` as non-`Option` fields with no
   `skip_serializing_if`, hard-coded to `0`/`Private` by both constructors,
   and this build serves rmcp's default `server/discover` result on both
@@ -3166,12 +3200,12 @@ wired, `server.rs` and `main.rs` are the reference.
   them.
 - **rmcp trap — a panicking handler answers nothing, and rmcp catches
   nothing.** The serve loop dispatches each request through
-  `spawn_service_task` (`service.rs:1603`, a bare `tokio::spawn` at
-  `:1327`) and DROPS the returned `JoinHandle`; the reply is sent from
-  inside that task, at its end (`:1617`). Since rmcp 3.4 (#1263) that
+  `spawn_service_task` (`service.rs:1589`, a bare `tokio::spawn` at
+  `:1313`) and DROPS the returned `JoinHandle`; the reply is sent from
+  inside that task, at its end (`:1603`). Since rmcp 3.4 (#1263) that
   includes the first request of a stdio session opened without
   `initialize` (see the stdio trap above). There is no `catch_unwind`
-  anywhere in rmcp 3.5. So a tool handler that panics unwinds its own task
+  anywhere in rmcp 3.7. So a tool handler that panics unwinds its own task
   and nothing else: no error goes out, no transport closes, the session and
   every other request stay healthy — and the request that panicked is
   answered by nobody. An rmcp client then waits forever
@@ -3292,8 +3326,8 @@ wired, `server.rs` and `main.rs` are the reference.
   time; it does not stop the payload's other way out. After the stdio
   handshake rmcp runs the session loop — its own code, and with it
   `DiscoverAnswering` and `BoundedLines::poll_read` — in a spawned task,
-  and a panic there comes back from `RunningService::waiting` (rmcp 3.5.1
-  `service.rs:1099`) as tokio's `JoinError`, which quotes a string payload
+  and a panic there comes back from `RunningService::waiting` (rmcp 3.7.0
+  `service.rs:1085`) as tokio's `JoinError`, which quotes a string payload
   in its Display (`task N panicked with message "…"`) and in its Debug
   (`JoinError::Panic(Id(N), "…", …)`) alike. `?` on it put that text on
   the `Error:` line Rust writes for `main`'s returned error — fd 2, which
@@ -3415,26 +3449,34 @@ wired, `server.rs` and `main.rs` are the reference.
   behind a new knob cannot be skipped;
   `the_x_mcp_header_tripwire_fires_at_every_planted_position` is its canary,
   because a walk over zero annotations passes even when gutted. The check is
-  deliberately broader than rmcp's functional read, which in 3.5.1 is
-  top-level `properties`, string-valued only (`param_header_annotations`;
-  `validate_param_header_annotations` and `reject_nested_annotations` are the
-  client-side validation, and reject the key at ANY depth — but only down
-  chained `properties`, never through `items`, `$defs` or the other
-  applicators). Those depth rules are version-specific, so the key is banned
-  at any depth and any value type. There is no upstream constant for the
+  deliberately broader than rmcp's functional read, which in 3.7.0 is
+  every `properties` chain from the schema root, nested included since 3.6
+  (#1359), string-valued and non-empty only (`collect_property_annotations`
+  behind `param_header_annotations`; `validate_param_header_annotations` is
+  the client-side validation, and since #1359 rejects the key on the root
+  and anywhere OFF such a chain — under `items`, `$defs`, `definitions`,
+  `patternProperties`, `dependentSchemas`, a composition or a conditional
+  keyword — where 3.5 refused only nested `properties`). Those depth rules
+  are version-specific and have moved once already, so the key is banned at
+  any depth and any value type. There is no upstream constant for the
   spelling — the test declares its own — so re-grep the vendored tree for
   `x-mcp-header` on every rmcp bump.
 
   **The #116 record, closed here rather than fixed.** `ServerHandler::get_tool`
-  is still `fn get_tool(&self, name: &str) -> Option<Tool>` in 3.5.1: no
-  `RequestContext`, so the schema cache `tower.rs` builds for `Mcp-Param-*`
+  is still `fn get_tool(&self, name: &str) -> Option<Tool>` in 3.7.0: no
+  `RequestContext`, so the schema `tower.rs` reads for `Mcp-Param-*`
   validation answers per DEPLOYMENT — the I13-pruned instance router, pinned
   by `get_tool_serves_the_pruned_instance_router_i13` — and never per
-  credential. The bearer gate fronts the whole router, so no `Mcp-Param-*`
-  validation runs for an unauthenticated request. What remains is a
-  validate-vs-skip oracle: a caller sending `Mcp-Param-*` headers could in
-  principle tell a name whose schema the cache found from one it did not, by
-  the validation those headers do or do not trigger. It cannot while zero
+  credential. Since rmcp 3.6 (#1349) there is no schema cache: the stateless
+  path reads `get_tool` off the service the factory builds for that very
+  request, the session path builds one per lookup (`tool_schema`), and so
+  the factory — `server.clone()`, side-effect free, no record — now runs
+  BEFORE the SEP-2243 check on the stateless path. The bearer gate fronts the
+  whole router, so no `Mcp-Param-*` validation runs for an unauthenticated
+  request. What remains is a validate-vs-skip oracle: a caller sending
+  `Mcp-Param-*` headers could in principle tell a name whose schema
+  `get_tool` found from one it did not, by the validation those headers do
+  or do not trigger. It cannot while zero
   annotations are served — the validation loop iterates the annotated
   properties, of which there are none, so the headers are inert either way —
   which is what the tripwire above keeps true, and what
@@ -3465,7 +3507,7 @@ wired, `server.rs` and `main.rs` are the reference.
   follow-up. Counting them in prose is what let two fields go unlisted here
   before.
 
-  | field | rmcp 3.5 default | this build |
+  | field | rmcp 3.7 default | this build |
   |---|---|---|
   | `allowed_hosts` | `localhost`, `127.0.0.1`, `::1` | **set** — `disable_allowed_hosts()`, or the operator's `--allowed-hosts` / `MCP_ALLOWED_HOSTS` list when given |
   | `max_request_body_bytes` | 4 MiB | **set** — derived from `global.max_attachment_bytes`, floored at that same 4 MiB (see below) |
@@ -3525,9 +3567,23 @@ wired, `server.rs` and `main.rs` are the reference.
   counting the bytes since the last `\n` and failing the read past the cap
   (`<= cap` accepted, mirroring http's `<= max_bytes`; overshoot bounded by
   one 8 KiB `BufReader` chunk, since the count can only be taken on bytes
-  already delivered). Without it rmcp's `read_until(b'\n', &mut line_buf)`
-  grows an unbounded `Vec` for a peer that never sends a delimiter: the http
-  half was bounded and the stdio half was not. The stdio peer is the process
+  already delivered). Without it rmcp 3.5's `read_until(b'\n', &mut
+  line_buf)` grew an unbounded `Vec` for a peer that never sent a delimiter:
+  the http half was bounded and the stdio half was not. Since rmcp 3.6
+  (#1049) `AsyncRwTransport` bounds a line itself, at a fixed
+  `DEFAULT_MAX_LINE_LENGTH` of 16 MiB — and DISCARDS a longer one, logging
+  ERROR and reading on, which is the skip-and-resume rejected two bullets
+  down, at a number this build's derived cap may exceed (its ceiling is
+  64 MiB). `DiscoverAnswering::framed` therefore builds the transport with
+  `with_max_line_length(usize::MAX)`, rmcp's documented off switch, so
+  `BoundedLines` stays the one bound and a frame the policy admits is served
+  above 16 MiB as below it
+  (`a_frame_of_exactly_this_builds_cap_is_served_past_rmcps_line_bound` on
+  the constructor, and
+  `stdio_a_frame_over_rmcps_line_bound_is_served_when_the_policy_admits_it`
+  on the shipped binary, the one test `main`'s wiring can fail; the 3.7.0
+  adoption dump served a 17 MiB call under a 16 MiB attachment cap that
+  the bare transport dropped unanswered). The stdio peer is the process
   that spawned bugwarden and already owns its stdin, so this is a
   self-inflicted OOM rather than a remote one — closed for symmetry, because
   "the transport bounds what we buffer" should be true of both transports,
@@ -3586,9 +3642,10 @@ wired, `server.rs` and `main.rs` are the reference.
   `=warn` enables WARN *and* ERROR and leaves the line exactly where it was —
   measured both ways. Everything else that target logs is `debug!` or
   `trace!`, so under the default filter it shows nothing but ERROR, and of its
-  two ERROR sites only the read-error one is reachable through this transport:
-  the other sits behind a `Serde` arm that already catches every error
-  `try_parse_with_compatibility` can return. `off` therefore removes the echo
+  three ERROR sites only the read-error one is reachable through this
+  transport: one sits behind a `Serde` arm that already catches every error
+  `try_parse_with_compatibility` can return, and the over-long-line one
+  (#1049) needs the bound `framed` switches off. `off` therefore removes the echo
   and nothing else. What it does cost is stated here rather than paid by
   default: that ERROR is EVERY read error rmcp sees, not only a refused frame.
   A genuine stdin I/O failure after the handshake is the same line, and there
@@ -3659,7 +3716,7 @@ wired, `server.rs` and `main.rs` are the reference.
   comma-only now. An entry that is not a hostname or `host:port` — `*`, a
   scheme-carrying URL, `a;b`, a percent-encoded comma, zero-width unicode, a
   space-containing typo — is a startup error (`Cli::checked_allowed_hosts`);
-  rmcp 3.5.1's `parse_allowed_authority` would otherwise keep validation on
+  rmcp 3.7.0's `parse_allowed_authority` would otherwise keep validation on
   and store (or skip) a host no inbound `Host` matches, a silent deny-all
   discovered one 403 at a time. HTTP start logs one info line stating
   whether Host validation is on or off and, when on, the resolved list
@@ -3742,7 +3799,7 @@ wired, `server.rs` and `main.rs` are the reference.
   create_bug, add_attachment.
 - API key resolution: a match on `key_custody` (resolved once at startup, see Key custody — never re-read per request): `Server(key)` => the server's key, without touching the request at all; `PerRequest` => `ctx.extensions.get::<axum::http::request::Parts>()`, then `parts.headers.get(lowercased_header_name)`.
 - HTTP serving: `let config = server.http_server_config()?.with_cancellation_token(ct.child_token());` — built while `server` can still be borrowed, since the body cap comes from its own guard policy; errors on an unparsable `--allowed-hosts` entry and logs the effective Host-validation state — then `StreamableHttpService::new(move || Ok(server.clone()), AuditedSessionManager::default().into(), config)` — the wrapper since #180, not a bare `LocalSessionManager`, because the audit session id comes from its stamp and nowhere else — never a bare `StreamableHttpServerConfig::default()`, see the field table above — then `axum::Router::new().nest_service("/mcp", service)`, `tokio::net::TcpListener::bind`, graceful shutdown on SIGINT or SIGTERM cancelling `ct` (`shutdown_signal` in main.rs; issue #114).
-- Stdio serving: `let (stdin, stdout) = server.stdio_transport();` then `server.serve((stdin, stdout))`, never a bare `stdio()` — the same rule, and for the same reason, as never a bare `StreamableHttpServerConfig::default()`: rmcp's default reads a frame into an unbounded `Vec`, and the pair is built while `server` can still be borrowed because the frame cap comes from its own guard policy (#234, "rmcp 3.5 usage notes"). Stdio uses the same waiter across `serve` (the handshake wait an unused stdio container sits in) and `waiting`; a signal at either stage flushes the OTLP queue (when export is on) then `process::exit(0)`s, because rmcp's stdio transport reads stdin via `spawn_blocking` and that read does not unblock while the client holds the pipe — returning from `main` drops the runtime onto that thread. An over-cap frame is NOT that case and needs none of it: the refusal happens in a `poll_read` that just took a delivered chunk, so the blocking reader is idle with no `read(2)` outstanding and `main` returns normally, exit `1`, with the OTLP flush on the ordinary path.
+- Stdio serving: `let (stdin, stdout) = server.stdio_transport();` then `server.serve(DiscoverAnswering::framed(stdin, stdout, server.clone()))` — never a bare `stdio()`, and never the tuple form `server.serve((stdin, stdout))`: since rmcp 3.6 that tuple goes through `AsyncRwTransport::new`, whose fixed 16 MiB line bound DISCARDS a longer frame and reads on (3.5 read it into an unbounded `Vec`), so the policy's cap would stop working above 16 MiB; `framed` switches that bound off. The same rule, and for the same reason, as never a bare `StreamableHttpServerConfig::default()`, and the pair is built while `server` can still be borrowed because the frame cap comes from its own guard policy (#234, "rmcp 3.7 usage notes"). Stdio uses the same waiter across `serve` (the handshake wait an unused stdio container sits in) and `waiting`; a signal at either stage flushes the OTLP queue (when export is on) then `process::exit(0)`s, because rmcp's stdio transport reads stdin via `spawn_blocking` and that read does not unblock while the client holds the pipe — returning from `main` drops the runtime onto that thread. An over-cap frame is NOT that case and needs none of it: the refusal happens in a `poll_read` that just took a delivered chunk, so the blocking reader is idle with no `read(2)` outstanding and `main` returns normally, exit `1`, with the OTLP flush on the ordinary path.
 - Request `_meta` (SEP-414, e.g. `traceparent`): over every serialized
   transport the wire `params._meta` does NOT arrive in the params struct
   (`CallToolRequestParams.meta` stays `None`) — the SDK's custom
@@ -4787,7 +4844,7 @@ wired, `server.rs` and `main.rs` are the reference.
   was POSTed, and a read tool on the same session still serves; an oversized
   POST from a stranger is answered `401` by the gate and `413` only for a
   credentialed caller, which is what the 413-observability argument under
-  "rmcp 3.5 usage notes" rests on; a scope-refused call leaves exactly ONE
+  "rmcp 3.7 usage notes" rests on; a scope-refused call leaves exactly ONE
   audit record, with no guard verdict, no upstream leg and neither
   `principal` nor `work_context`;
   scopes

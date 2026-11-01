@@ -18,9 +18,10 @@ use std::time::Duration;
 
 /// Bound on every request one of these harnesses awaits an answer to.
 ///
-/// rmcp 3.5.0 sends with `PeerRequestOptions::default()`, whose `timeout`
-/// is `None` (`service.rs`), and the `initialize` handshake reads its
-/// response off the transport with no deadline either. So a request the
+/// rmcp 3.7.0's typed client calls send with
+/// `PeerRequestOptions::no_options()` — `Self::default()`, `timeout: None`
+/// (`service.rs`) — and the `initialize` handshake reads its response off
+/// the transport with no deadline either. So a request the
 /// server never answers waits forever: it hangs its test, its whole test
 /// binary, and — cargo runs the `bugwarden` crate's binaries before
 /// `bugwarden-core`'s — every binary queued behind it. A defect must fail

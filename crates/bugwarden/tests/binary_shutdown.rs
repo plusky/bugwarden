@@ -50,7 +50,7 @@
 //! - any `serve_failure` arm deleted so its failure falls to the wildcard,
 //!   or any two of its literals exchanged. Three arms have no row, and
 //!   cannot: `ExpectedInitializeRequest(None)` is constructed nowhere in
-//!   rmcp 3.5.0, `UnexpectedInitializeResponse` cannot happen while rmcp
+//!   rmcp 3.7.0, `UnexpectedInitializeResponse` cannot happen while rmcp
 //!   maps this handler's own `InitializeResult` into the result it then
 //!   checks, and `Cancelled` needs a cancellation token `ServiceExt::serve`
 //!   creates and never cancels. cargo-mutants reaches only the OUTER
@@ -118,8 +118,8 @@ fn the_scrub_list_covers_every_environment_fallback() {
 const STDIO_READY: &str = "Starting Bugzilla MCP server on stdio";
 
 /// Past the 4 MiB cap the default policy derives, and with no delimiter
-/// anywhere in it: an unbounded read is the defect, so the frame must be
-/// one the server can never complete.
+/// anywhere in it: the server must refuse it at the cap rather than wait
+/// for a delimiter that never comes.
 const OVER_CAP_FRAME: usize = 5 * 1024 * 1024;
 
 /// bugwarden's own refusal line, in full.
@@ -860,9 +860,9 @@ async fn stdio_sigterm_during_the_handshake_wait_exits_zero() {
 
 #[tokio::test]
 async fn stdio_an_over_cap_frame_before_the_handshake_exits_one() {
-    // Served on a bare `stdio()` this never returns: rmcp's `read_until`
-    // takes all 5 MiB into an unbounded `Vec` and waits for the delimiter,
-    // so `wait` times out instead of the process exiting (#234).
+    // Served on a bare `stdio()` this never returns: 5 MiB is under rmcp's
+    // own 16 MiB line bound, so it buffers the whole frame and waits for
+    // the delimiter; `wait` times out instead of the process exiting (#234).
     let mut server = spawn_stdio();
     server.wait_for_stderr(STDIO_READY).await;
     write_an_over_cap_frame(&mut server).await;
@@ -914,7 +914,7 @@ async fn stdio_an_over_cap_frame_after_initialize_exits_one() {
 
 #[tokio::test]
 async fn stdio_a_pre_initialize_tool_call_never_logs_the_frame() {
-    // rmcp 3.5.1 answers this frame in-band: one stdout -32602
+    // rmcp 3.7.0 answers this frame in-band: one stdout -32602
     // with a fixed `_meta` message, no client bytes, and the
     // session keeps waiting for `initialize`. The handler never
     // runs, stderr stays free of the frame, and the process only
@@ -1529,4 +1529,194 @@ async fn stdio_sigterm_mid_call_still_records_the_call() {
         "the shutdown path must log that it ran: {log}"
     );
     assert_one_error_record(&audit_path, "stdio SIGTERM mid-call");
+}
+
+/// The legacy handshake, as one frame.
+const INITIALIZE_FRAME: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"binary-shutdown-test","version":"0"}}}"#;
+
+/// A frame over rmcp's own 16 MiB line bound and under the cap
+/// [`wide_cap_policy`] derives.
+const WIDE_FRAME: usize = 17 * 1024 * 1024;
+
+/// Write a policy whose derived frame cap sits above rmcp's own line
+/// bound: a 16 MiB attachment cap derives one of ~22 MiB.
+fn wide_cap_policy(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let path = dir.path().join("policy.toml");
+    std::fs::write(&path, "[global]\nmax_attachment_bytes = 16777216\n")
+        .expect("the policy must be writable");
+    path
+}
+
+/// The next stdout line, under the shared call deadline.
+async fn next_reply(
+    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    what: &str,
+) -> String {
+    tokio::time::timeout(deadline::CALL_DEADLINE, lines.next_line())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{what}: the server must answer within {:?}",
+                deadline::CALL_DEADLINE
+            )
+        })
+        .expect("stdout must be readable")
+        .unwrap_or_else(|| panic!("{what}: the server must answer, not exit"))
+}
+
+/// Handshake the child and keep its stdout reader, for the rows that read
+/// replies after the handshake instead of draining them.
+async fn handshake_keeping_stdout(
+    server: &mut Server,
+) -> tokio::io::Lines<BufReader<tokio::process::ChildStdout>> {
+    let stdout = server.child.stdout.take().expect("stdout is piped");
+    let mut lines = BufReader::new(stdout).lines();
+    server.write_frame(INITIALIZE_FRAME).await;
+    let reply = next_reply(&mut lines, "the handshake").await;
+    assert!(
+        reply.contains("bugwarden"),
+        "initialize must complete before the test acts: {reply}"
+    );
+    server
+        .write_frame(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+        .await;
+    lines
+}
+
+/// Close stdin and require the clean exit a peer hangup after the
+/// handshake gets.
+async fn assert_hangup_exit(mut server: Server, what: &str) {
+    server.close_stdin();
+    let status = tokio::time::timeout(EXIT_TIMEOUT, server.child.wait())
+        .await
+        .unwrap_or_else(|_| {
+            panic!("{what}: the process must exit within {EXIT_TIMEOUT:?} of stdin closing")
+        })
+        .expect("the child must be waitable");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "{what}: a peer hangup after the handshake is a clean exit: status={status:?} stderr={log}",
+        log = server.log
+    );
+}
+
+#[tokio::test]
+async fn stdio_a_frame_over_rmcps_line_bound_is_served_when_the_policy_admits_it() {
+    // Pins main's wiring: stdin is framed through `DiscoverAnswering::framed`,
+    // which switches off rmcp's fixed 16 MiB line bound, so the policy's
+    // cap is the only one. Served on the bare transport this call is
+    // discarded with an rmcp ERROR and the reply never comes.
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let policy = wide_cap_policy(&dir);
+    let mut server = Server::spawn(&[
+        "--transport",
+        "stdio",
+        "--bugzilla-server",
+        "https://bugzilla.example.invalid",
+        "--api-key",
+        "test-key",
+        "--policy",
+        policy.to_str().expect("a utf-8 temp path"),
+    ]);
+    server.wait_for_stderr(STDIO_READY).await;
+    let mut lines = handshake_keeping_stdout(&mut server).await;
+    let frame = {
+        let head = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mcp_server_info","arguments":{"pad":""#;
+        let tail = "\"}}}\n";
+        format!(
+            "{head}{}{tail}",
+            run_of('x', WIDE_FRAME - head.len() - tail.len())
+        )
+    };
+    let stdin = server.stdin.as_mut().expect("stdin is piped");
+    tokio::time::timeout(deadline::CALL_DEADLINE, stdin.write_all(frame.as_bytes()))
+        .await
+        .expect("the child must keep reading the frame")
+        .expect("the child must take the whole frame");
+    let reply = next_reply(&mut lines, "a 17 MiB call under a wider cap").await;
+    let json: serde_json::Value = serde_json::from_str(&reply).expect("the reply must be JSON");
+    assert_eq!(
+        json["id"],
+        serde_json::json!(2),
+        "the reply must answer the call: {reply}"
+    );
+    assert_eq!(
+        json["result"]["isError"],
+        serde_json::json!(false),
+        "the call must be served, not refused: {reply}"
+    );
+    assert_hangup_exit(server, "stdio wide-cap frame").await;
+}
+
+#[tokio::test]
+async fn stdio_a_pre_initialize_float_id_request_is_refused_in_band_and_the_session_survives() {
+    // rmcp 3.6 (#1283) classifies a frame by its fields before reading the
+    // id, so a request whose id is `1.5` is refused -32600 with no id and
+    // the process keeps waiting for `initialize`; 3.5 read it as a
+    // notification and ended the process with no reply (#261's path).
+    let mut server = spawn_stdio();
+    server.wait_for_stderr(STDIO_READY).await;
+    let stdout = server.child.stdout.take().expect("stdout is piped");
+    let mut lines = BufReader::new(stdout).lines();
+    server
+        .write_frame(r#"{"jsonrpc":"2.0","id":1.5,"method":"tools/list","params":{}}"#)
+        .await;
+    let reply = next_reply(&mut lines, "a float-id request before initialize").await;
+    let json: serde_json::Value = serde_json::from_str(&reply).expect("the reply must be JSON");
+    assert_eq!(
+        json["error"]["code"],
+        serde_json::json!(-32600),
+        "refused as no JSON-RPC shape: {reply}"
+    );
+    assert!(
+        json.get("id").is_none(),
+        "an id that is neither integer nor string cannot be echoed: {reply}"
+    );
+    server.write_frame(INITIALIZE_FRAME).await;
+    let reply = next_reply(&mut lines, "initialize after a refused frame").await;
+    assert!(
+        reply.contains(r#""protocolVersion":"2025-11-25""#),
+        "the session must still open: {reply}"
+    );
+    server
+        .write_frame(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+        .await;
+    assert_hangup_exit(server, "stdio float-id then handshake").await;
+}
+
+#[tokio::test]
+async fn stdio_an_in_session_frame_with_method_and_result_is_refused_not_served() {
+    // rmcp 3.6 (#1283): a frame carrying `method` beside `result` is no
+    // JSON-RPC shape at all, so it is refused -32600 in-band with no id,
+    // where 3.5 took it for the request its `method` named and served it.
+    let mut server = spawn_stdio();
+    server.wait_for_stderr(STDIO_READY).await;
+    let mut lines = handshake_keeping_stdout(&mut server).await;
+    server
+        .write_frame(r#"{"jsonrpc":"2.0","id":2,"method":"ping","result":{}}"#)
+        .await;
+    let reply = next_reply(&mut lines, "a method-and-result frame").await;
+    let json: serde_json::Value = serde_json::from_str(&reply).expect("the reply must be JSON");
+    assert_eq!(
+        json["error"]["code"],
+        serde_json::json!(-32600),
+        "refused, not served as the ping it names: {reply}"
+    );
+    assert!(
+        json.get("id").is_none() && json.get("result").is_none(),
+        "a refusal with nothing of the frame in it: {reply}"
+    );
+    server
+        .write_frame(r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#)
+        .await;
+    let reply = next_reply(&mut lines, "a ping after the refusal").await;
+    let json: serde_json::Value = serde_json::from_str(&reply).expect("the reply must be JSON");
+    assert_eq!(json["id"], serde_json::json!(3), "{reply}");
+    assert_eq!(
+        json["result"],
+        serde_json::json!({}),
+        "the session survives the refused frame: {reply}"
+    );
+    assert_hangup_exit(server, "stdio method-and-result frame").await;
 }

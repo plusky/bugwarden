@@ -454,7 +454,7 @@ async fn guard_denies_uniformly_over_http() {
 
 #[tokio::test]
 async fn a_client_addressing_the_server_by_name_is_served() {
-    // rmcp 3.5's `allowed_hosts` default is loopback only, so inheriting it
+    // rmcp 3.7's `allowed_hosts` default is loopback only, so inheriting it
     // would answer every request whose `Host` is the name the operator
     // actually deployed under — every containerised one — with a rejection.
     // main.rs disables that validation by name; this pins the decision,
@@ -576,7 +576,7 @@ async fn an_allowed_hosts_entry_naming_no_host_leaves_validation_off() {
 
 #[tokio::test]
 async fn an_unparsable_allowed_hosts_entry_is_a_startup_error() {
-    // The same path `serve_http` and `main` take: rmcp 3.5.0 would store
+    // The same path `serve_http` and `main` take: rmcp 3.7.0 would store
     // `*` as a host that matches only `Host: *`, turning validation on as
     // a silent deny-all. Refusing here is what the operator sees instead
     // of one 403 at a time.
@@ -599,7 +599,7 @@ async fn an_unparsable_allowed_hosts_entry_is_a_startup_error() {
 
 #[tokio::test]
 async fn a_handshake_free_call_is_refused_and_never_names_a_client() {
-    // rmcp 3.5.0 routes to its handshake-free lifecycle when the request's
+    // rmcp 3.7.0 routes to its handshake-free lifecycle when the request's
     // revision is 2026-07-28 or newer, or `_meta` carries BOTH
     // `protocolVersion` and `clientCapabilities` — not for `initialize`,
     // which always takes the session path (#1228). The body below sends
@@ -892,7 +892,7 @@ async fn traceparent_over_http_lands_in_the_audit_record() {
     // `CallToolRequestParams.meta` arrives `None` here — and delivers it
     // to the handler as the extensions-backed `RequestContext.meta`, so
     // this test pins the `context.meta` fallback that every serialized
-    // transport depends on (see the rmcp 3.5 usage notes in DESIGN.md).
+    // transport depends on (see the rmcp 3.7 usage notes in DESIGN.md).
     let mock = MockServer::start().await;
     mount_bug_for_key(&mock, world_readable_bug(7), "srv-key").await;
 
@@ -1525,7 +1525,7 @@ async fn a_per_request_call_naming_no_client_is_served_and_names_no_placeholder(
     // The mutation this kills is `client_of` reading `ctx.client_info()` or
     // `peer_info()` on this path: rmcp synthesises the stateless peer with
     // `Implementation::default()`, so either would put
-    // `{"name":"rmcp","version":"3.5.0"}` into the record — not a missing
+    // `{"name":"rmcp","version":"3.7.0"}` into the record — not a missing
     // field but a plausible wrong one. The whole file is checked for the
     // string, not just this record's field, because a placeholder that
     // leaked into any other record would be the same defect.
@@ -2410,5 +2410,87 @@ async fn a_stray_mcp_param_header_is_inert_on_the_per_request_path() {
         mock.received_requests().await.unwrap_or_default().len(),
         before,
         "a refused call contacts no upstream, canary header or not"
+    );
+}
+
+#[tokio::test]
+async fn a_session_less_non_initialize_post_is_refused_400_before_any_handler() {
+    // rmcp 3.6 (#1377): the session branch answers a POST that carries no
+    // `mcp-session-id` and is not `initialize` with 400 and a fixed body,
+    // where 3.5 said 422 `Unexpected message, expect initialize request`.
+    // The transport's own answer: no handler, no record, no upstream.
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("audit temp dir");
+    let file = key_file("srv-key\n");
+    let (addr, audit_path) = served_with_audit(&mock, &dir, &file).await;
+    let before = mock.received_requests().await.unwrap_or_default().len();
+    let response = raw_client()
+        .post(format!("http://{addr}/mcp"))
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .json(&json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {} }))
+        .send()
+        .await
+        .expect("the session-less POST must reach the server");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "refused before any handler"
+    );
+    assert_eq!(
+        response.text().await.expect("a body"),
+        "Bad Request: Session ID is required"
+    );
+    assert!(
+        !audit_path.exists() || audit_events(&audit_path).is_empty(),
+        "a request the handler never saw records nothing"
+    );
+    assert_eq!(
+        mock.received_requests().await.unwrap_or_default().len(),
+        before,
+        "and contacts no upstream"
+    );
+}
+
+#[tokio::test]
+async fn a_posted_json_rpc_response_on_the_stateless_path_is_refused_400() {
+    // #1377's other half: a JSON-RPC response POSTed at 2026-07-28 answers
+    // no request this server made, so the stateless branch refuses it
+    // -32600 where 3.5 took it with a 202. Transport-level again: no
+    // handler, no record, no upstream.
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("audit temp dir");
+    let file = key_file("srv-key\n");
+    let (addr, audit_path) = served_with_audit(&mock, &dir, &file).await;
+    let before = mock.received_requests().await.unwrap_or_default().len();
+    let response = raw_client()
+        .post(format!("http://{addr}/mcp"))
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .header("MCP-Protocol-Version", PER_REQUEST_REVISION)
+        .json(&json!({ "jsonrpc": "2.0", "id": 9, "result": {} }))
+        .send()
+        .await
+        .expect("the posted response must reach the server");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "refused before any handler"
+    );
+    let body: Value = response.json().await.expect("a JSON-RPC error body");
+    assert_eq!(body["error"]["code"], json!(-32600), "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        json!("stateless server does not accept JSON-RPC responses"),
+        "{body}"
+    );
+    assert!(
+        !audit_path.exists() || audit_events(&audit_path).is_empty(),
+        "a request the handler never saw records nothing"
+    );
+    assert_eq!(
+        mock.received_requests().await.unwrap_or_default().len(),
+        before,
+        "and contacts no upstream"
     );
 }
