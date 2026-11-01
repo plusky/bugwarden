@@ -130,12 +130,45 @@ exclude_re = [
     # not pay the timeout floor weekly for a verdict already in hand.
     "otel\\.rs:931:21:.*\\+= with \\*=",
     "otel\\.rs:634:22:.*== with !=",
+    # The quicksearch byte scanners' cursor hangs, hand-reproduced test by
+    # test under a 10s timeout: `i *= 1` leaves the index where it is, so
+    # the loop re-runs the same byte in the same state forever; `i -= 1`
+    # (`-= 2` past an escape) steps back onto a byte the preceding branch
+    # advances over again, so the pair cycles (on other inputs it
+    # underflows, and those tests fail). Each one hangs at least one test
+    # in the same binary, which then never exits, so no added test can
+    # turn it into a kill.
+    "server\\.rs:2044:15:.*\\+= with -=",
+    "server\\.rs:2052:15:.*\\+= with (-=|\\*=)",
+    "server\\.rs:2063:15:.*\\+= with \\*=",
+    "server\\.rs:2078:15:.*\\+= with (-=|\\*=)",
+    "server\\.rs:2082:11:.*\\+= with (-=|\\*=)",
+    "server\\.rs:2099:11:.*\\+= with \\*=",
+    "server\\.rs:2116:15:.*\\+= with (-=|\\*=)",
+    "server\\.rs:2132:11:.*\\+= with (-=|\\*=)",
+    "server\\.rs:2144:11:.*\\+= with \\*=",
+    # The foreign-host skip `at = pos + 1`: `pos - 1` and `pos * 1` both
+    # re-find the occurrence just rejected, so the scan never passes it
+    # (embedded_scan_needs_a_domain_boundary_on_the_left hangs).
+    "guard\\.rs:942:26:.*\\+ with (-|\\*)",
+    # The stdio delimiter advance `newline + 1` (DESIGN.md): `- 1` and
+    # `* 1` leave the newline inside `rest`, so the frame loop finds it
+    # again forever (the multi-frame drain hangs; `- 1` on a bare newline
+    # underflows instead, in the same binary).
+    "stdio\\.rs:196:34:.*\\+ with (-|\\*)",
     # The glob backtrack advance is unobservable: `p = star_pos` re-enters
     # the `'*'` arm and lands on the identical (p, resume, s) state one
     # iteration later (or skips the same `'*'` in the trailing-star loop),
     # proven by 265k exhaustive + 200k random differential cases with zero
     # divergences.
     "policy\\.rs:171:26:.*\\+ with \\*",
+    # Its three advances frozen by `*= 1` — the `'*'` skip (164), the
+    # backtrack resume (172) and the trailing-star drain (180) — never
+    # move p or resume, so every glob test with a `*` hangs; reproduced
+    # by hand like the otel hangs above.
+    "policy\\.rs:164:15:.*\\+= with \\*=",
+    "policy\\.rs:172:20:.*\\+= with \\*=",
+    "policy\\.rs:180:11:.*\\+= with \\*=",
     # Typo-shaped ports are refused by exact refusal text the anchor tests
     # pin; `>=` for `>` is identical (at equal lengths the byte lookup is
     # None), so that one is documented in DESIGN.md, not tested.
