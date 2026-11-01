@@ -3957,8 +3957,11 @@ wired, `server.rs` and `main.rs` are the reference.
   Display is the unchanged text; the code is read only inside an
   `"error": true` envelope (a proxy's non-2xx JSON, a string code and a float
   code give none); a gateway's HTML under 502 and a 200 non-JSON body are
-  typed with no code; and neither the type's Debug nor anyhow's alternate
-  Debug carries the message.
+  typed with no code; neither the type's Debug nor anyhow's alternate
+  Debug carries the message; and `UpstreamStats` sums microseconds across
+  requests into whole milliseconds (two sub-millisecond waits make one, so
+  neither a `%` nor a `*` scale passes), the last status winning and a
+  response-less request reading `None`.
 - Unit tests (#[cfg(test)] in crates/bugwarden/src/server.rs): assemble_bug_info
   re-classification — a body embargoed after the verdict is refused, a body
   that now earns only summary is downgraded, a body granting neither read nor
