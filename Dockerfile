@@ -21,7 +21,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Both FROMs carry a digest for the same reason the workflows SHA-pin actions:
 # the release's two architecture legs run on separate runners, and a tag
 # republished between them would build each from different base contents.
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329
 ARG VERSION=dev
 LABEL org.opencontainers.image.source="https://github.com/plusky/bugwarden" \
       org.opencontainers.image.description="MCP server for Bugzilla with operator-controlled security guards" \
