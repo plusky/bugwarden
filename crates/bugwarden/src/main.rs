@@ -259,11 +259,12 @@ async fn main() -> anyhow::Result<()> {
                 // anything that then races an unhandled signal (#173).
                 let shutdown = shutdown_signal();
                 tokio::pin!(shutdown);
-                // Bounded stdin, never rmcp's bare `stdio()`: it reads a
-                // frame into an unbounded `Vec` (#234). Built here for the
-                // same reason `http_server_config()` is built in the other
-                // arm — the cap comes from `server`'s own policy, and
-                // `serve` takes it by value.
+                // Bounded stdin, never rmcp's bare `stdio()`: 3.5 read a
+                // frame into an unbounded `Vec` (#234), 3.6+ drops one over
+                // its own 16 MiB. Built here for the same reason
+                // `http_server_config()` is built in the other arm — the
+                // cap comes from `server`'s own policy, and `serve` takes
+                // it by value.
                 let (stdin, stdout) = server.stdio_transport();
                 // rmcp maps every read error to `receive() -> None`, which
                 // the service reports as an ordinary close. Two flags tell
@@ -473,8 +474,8 @@ const INPUT_STREAM_FAILED: &str = "the input stream failed before initialize";
 /// A fixed, server-authored classification of a failed stdio handshake —
 /// the only thing either exit path may say about one (#261).
 ///
-/// rmcp 3.5.0's `ServerInitializeError`
-/// (`service/server.rs:83-105`, `#[non_exhaustive]`) puts the client's
+/// rmcp 3.7.0's `ServerInitializeError`
+/// (`service/server.rs:70-91`, `#[non_exhaustive]`) puts the client's
 /// whole first frame into `ExpectedInitializeRequest`, and its
 /// `#[error("expect initialized request, but received: {0:?}")]` puts it
 /// into DISPLAY as well as `Debug` — so neither the error nor its Display
@@ -521,7 +522,8 @@ fn serve_failure(error: &rmcp::service::ServerInitializeError) -> &'static str {
             Frame::Response(_) => "the first frame was a response, not initialize",
             Frame::Error(_) => "the first frame was an error reply, not initialize",
         },
-        // Unreachable on rmcp 3.5.0: both construction sites pass `Some`.
+        // Unreachable on rmcp 3.7.0: the one construction site
+        // (`service/server.rs:667`) passes `Some`.
         Failure::ExpectedInitializeRequest(None) => "no first frame was received",
         // EOF before initialize. A read error and this build's own
         // frame-cap refusal reach the same variant; the caller names

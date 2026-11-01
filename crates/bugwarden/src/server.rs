@@ -841,7 +841,7 @@ fn allowlisted(params: Option<&JsonObject>) -> BTreeMap<String, Value> {
 /// * [`Lifecycle::PerRequest`] — the request's own `_meta`. **Never
 ///   `ctx.client_info()`**: that convenience accessor falls back to
 ///   `peer_info().client_info` unless `request_metadata_required()`, which
-///   rmcp 3.5.0 sets only on the stdio handshake-free path
+///   rmcp 3.7.0 sets only on the stdio handshake-free path
 ///   (`service/server.rs`), so over streamable http it IS the
 ///   `{"name":"rmcp",…}` placeholder rmcp synthesises for a peer that
 ///   never handshook (`peer_info_for_stateless_request`, #34 §3c) — and
@@ -973,7 +973,7 @@ enum Lifecycle {
 /// what gets served and who gets recorded cannot diverge by call-site
 /// ordering.
 ///
-/// rmcp 3.5.0 routes on `_meta` shape, not on the negotiated revision and
+/// rmcp 3.7.0 routes on `_meta` shape, not on the negotiated revision and
 /// not on [`SUPPORTED_PROTOCOL_VERSIONS`]: `is_legacy_request`
 /// (`transport/streamable_http_server/tower.rs`) returns true — the session
 /// path — for every `initialize` (rmcp #1228), and otherwise sends a POST
@@ -1048,7 +1048,7 @@ fn read_scope_serves(tool: &str) -> bool {
 /// The refusal for a tool this request's credential does not reach.
 ///
 /// Byte-identical to what `ToolRouter` answers for a name it does not route
-/// (rmcp 3.5 `handler/server/router/tool.rs`), so a scope-hidden tool is
+/// (rmcp 3.7 `handler/server/router/tool.rs`), so a scope-hidden tool is
 /// indistinguishable from one that does not exist — the same
 /// indistinguishability read-only mode already gives every caller (I13), and
 /// no oracle about which tools the deployment serves (I2).
@@ -3365,7 +3365,7 @@ impl BugWarden {
     /// there is one place where the policy field is read. Call it before
     /// the server moves into the service closure.
     ///
-    /// These rmcp 3.5 defaults are set by name rather than inherited,
+    /// These rmcp 3.7 defaults are set by name rather than inherited,
     /// because inheriting them changes how a deployment behaves without
     /// anyone choosing it:
     ///
@@ -3409,7 +3409,7 @@ impl BugWarden {
     /// have recorded the attempt — though rmcp's own refusal body prints
     /// the number outright. That the boundary is observable to an
     /// unauthenticated client, and what it discloses, is recorded in
-    /// DESIGN.md under "rmcp 3.5 usage notes".
+    /// DESIGN.md under "rmcp 3.7 usage notes".
     ///
     /// `allowed_origins` is the browser-facing sibling of `allowed_hosts`
     /// and the same reasoning covers it, but it is left inherited: its
@@ -3417,7 +3417,7 @@ impl BugWarden {
     /// nothing. Anything that changes the `allowed_hosts` call below should
     /// decide this one too rather than leave it behind. The remaining
     /// fields, and why each stays inherited, are inventoried in DESIGN.md
-    /// under "rmcp 3.5 usage notes"; the caller in `main` adds
+    /// under "rmcp 3.7 usage notes"; the caller in `main` adds
     /// `cancellation_token` so a SIGINT or SIGTERM reaches the live
     /// transport (issue #114).
     ///
@@ -3460,9 +3460,12 @@ impl BugWarden {
     /// The stdio transport pair to serve, in place of rmcp's bare
     /// `stdio()`.
     ///
-    /// Stdin is wrapped in [`BoundedLines`] at `request_body_cap`:
-    /// rmcp reads a frame into an unbounded `Vec` (#234), so without this
-    /// the transport buffers whatever a peer writes before a newline.
+    /// Stdin is wrapped in [`BoundedLines`] at `request_body_cap`: rmcp
+    /// 3.5 read a frame into an unbounded `Vec` (#234), and rmcp 3.6+
+    /// bounds one at its own fixed 16 MiB and skips it, which
+    /// `DiscoverAnswering::framed` switches off — so without this the
+    /// transport either buffers whatever a peer writes before a newline or
+    /// answers a policy-admitted frame with silence.
     /// Stdout is untouched — it carries this server's own output, which the
     /// `FramedWrite` half already frames.
     ///
@@ -6114,7 +6117,7 @@ impl ServerHandler for BugWarden {
             Reach::ReadOnly => tools.retain(|tool| read_scope_serves(&tool.name)),
             Reach::Nothing => tools.clear(),
         }
-        // The SEP-2549 hints are ours to gate: rmcp 3.5.0 strips
+        // The SEP-2549 hints are ours to gate: rmcp 3.7.0 strips
         // `resultType` for a legacy peer and leaves these two alone. The
         // predicate is HAND-COPIED from its `sep_2322_supported` — no shared
         // constant, no test pinning the agreement — so re-read both on an
@@ -7718,12 +7721,12 @@ mod tests {
         }
     }
 
-    /// SEP-2243's schema annotation, byte-exact as rmcp 3.5.0 reads it —
+    /// SEP-2243's schema annotation, byte-exact as rmcp 3.7.0 reads it —
     /// `schema.get("x-mcp-header")` in `transport/common/mcp_headers.rs`
-    /// (`param_header_annotations`, `validate_param_header_annotations`,
-    /// `reject_nested_annotations`). Upstream exports no constant for the
-    /// spelling, so this is our own copy: re-grep the vendored tree on every
-    /// rmcp bump.
+    /// (`collect_property_annotations`, behind `param_header_annotations`
+    /// and `validate_param_header_annotations`). Upstream exports no
+    /// constant for the spelling, so this is our own copy: re-grep the
+    /// vendored tree on every rmcp bump.
     const X_MCP_HEADER: &str = "x-mcp-header";
 
     /// The forbidden annotation anywhere in a serialized tool definition, as
@@ -7736,12 +7739,13 @@ mod tests {
     /// with no recursion arms to keep in lockstep, which is the maintenance
     /// surface `schema_portability_error` above has to carry.
     ///
-    /// Deliberately broader than rmcp's functional read, which in 3.5.0 is
-    /// top-level `properties` and string-valued only: the key is banned
+    /// Deliberately broader than rmcp's functional read, which in 3.7.0 is
+    /// every `properties` chain from the root (nested since 3.6, #1359;
+    /// top-level only before) and string-valued only: the key is banned
     /// everywhere, at any value type, because upstream's depth rules are
-    /// version-specific. It will also trip on the substring appearing in a
-    /// description or a property name — accepted; a tripwire fails loud and
-    /// a human looks.
+    /// version-specific and have moved once. It will also trip on the
+    /// substring appearing in a description or a property name — accepted;
+    /// a tripwire fails loud and a human looks.
     fn x_mcp_header_smell(name: &str, tool_json: &Value) -> Option<String> {
         let serialized = tool_json.to_string();
         serialized.contains(X_MCP_HEADER).then(|| {

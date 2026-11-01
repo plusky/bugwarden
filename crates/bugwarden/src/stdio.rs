@@ -1,11 +1,15 @@
 //! What wraps rmcp's stdio transport: a frame bound ([`BoundedLines`])
 //! and a `server/discover` answer ([`DiscoverAnswering`]).
 //!
-//! rmcp's `AsyncRwTransport` reads a newline-delimited frame with
+//! rmcp 3.5's `AsyncRwTransport` read a newline-delimited frame with
 //! `read_until(b'\n', &mut self.line_buf)` into a `Vec<u8>` it never
-//! bounds, so a peer that writes bytes and no `\n` grows that buffer until
-//! the allocator gives up (#234). HTTP has the derived POST cap and a
-//! `413`; stdio had nothing.
+//! bounded, so a peer that wrote bytes and no `\n` grew that buffer until
+//! the allocator gave up (#234). HTTP has the derived POST cap and a
+//! `413`; stdio had nothing. rmcp 3.6 (#1049) added a bound of its own, a
+//! fixed 16 MiB that DISCARDS the frame and reads on;
+//! [`DiscoverAnswering::framed`] switches it off, because the cap here is
+//! the operator's and may exceed it, and because skipping is what the next
+//! paragraph rejects.
 //!
 //! [`BoundedLines`] is that missing half: an [`AsyncRead`] wrapper that
 //! counts the bytes since the last `\n` and fails the read past the cap.
@@ -208,9 +212,9 @@ type QueuedSend<E> = Pin<Box<dyn Future<Output = Result<(), E>> + Send>>;
 ///
 /// `server/discover` is a probe, but over stdio rmcp lets it CHOOSE the
 /// session lifecycle before anyone answers it: `serve_server_with_ct_inner`
-/// (rmcp 3.5.0 `service/server.rs:559-636`) takes any first non-`ping`
+/// (rmcp 3.7.0 `service/server.rs:544-672`) takes any first non-`ping`
 /// frame that is not `initialize` as a commitment to the handshake-free
-/// lifecycle and calls `Peer::require_request_metadata()` (`:625`) — a
+/// lifecycle and calls `Peer::require_request_metadata()` (`:653`) — a
 /// sticky `AtomicBool` that no later `initialize` clears and no public API
 /// can reset, both methods being `pub(crate)`. Every subsequent request
 /// but `initialize` that carries no `_meta` is then refused -32602
@@ -236,11 +240,11 @@ pub struct DiscoverAnswering<T: Transport<RoleServer>> {
     server: BugWarden,
     /// A discover reply whose write has not finished, parked across
     /// `receive` calls because `receive` is one arm of rmcp's `select!`
-    /// (`service.rs:1412`) and is dropped whenever another arm wins. A
+    /// (`service.rs:1398`) and is dropped whenever another arm wins. A
     /// reply awaited on that stack dies with the frame that asked for it —
     /// consumed, never answered, the client hung on that id — while the
     /// inner transport survives the same cancellation by keeping its
-    /// partial line in `line_buf` (`transport/async_rw.rs:126-131`).
+    /// partial line in `line_buf` (`transport/async_rw.rs:247-256`).
     pending: Option<QueuedSend<T::Error>>,
     /// Set once a probe's reply has reached the peer, served or refused.
     /// See [`DiscoverAnswering::answered`].
@@ -270,9 +274,9 @@ impl<T: Transport<RoleServer>> DiscoverAnswering<T> {
     }
 
     /// rmcp's own answer for one discover request, in rmcp's own order:
-    /// the pre-`initialize` metadata check (`service/server.rs:604-619`,
-    /// its text at `:528`), then the declared-revision check
-    /// (`handler/server.rs:64-72`), then that file's default result (`:397`).
+    /// the pre-`initialize` metadata check (`service/server.rs:588-604`,
+    /// its text at `:516`), then the declared-revision check
+    /// (`handler/server.rs:64-72`), then that file's default result (`:396`).
     ///
     /// That order is the pre-`initialize` path's, which is the one this
     /// replaces; rmcp's in-session handler runs the two the other way
@@ -282,7 +286,7 @@ impl<T: Transport<RoleServer>> DiscoverAnswering<T> {
     /// required key declares no lifecycle worth reading a version out of.
     ///
     /// Not stripped for a legacy peer: `strip_result_type_for_legacy_peer`
-    /// (`model.rs:4789`) has no `DiscoverResult` arm, so `resultType`
+    /// (`model.rs:4951`) has no `DiscoverResult` arm, so `resultType`
     /// stays on the wire whatever revision the probe declares.
     fn discover_reply(&self, request: &ClientRequest, id: RequestId) -> ServerJsonRpcMessage {
         let meta = request.get_meta();
@@ -325,8 +329,16 @@ where
 {
     /// The same wrapper over a newline-framed pair, so `main` frames stdio
     /// through rmcp rather than naming rmcp's transport itself.
+    ///
+    /// rmcp's own line bound is switched off: since 3.6 it drops a frame
+    /// over a fixed 16 MiB and reads on — the skip-and-resume this module
+    /// rejects, at a number the operator's cap may exceed. [`BoundedLines`]
+    /// is the one bound, and it closes.
     pub fn framed(read: R, write: W, server: BugWarden) -> Self {
-        Self::new(AsyncRwTransport::new_server(read, write), server)
+        Self::new(
+            AsyncRwTransport::new_server(read, write).with_max_line_length(usize::MAX),
+            server,
+        )
     }
 }
 
@@ -639,6 +651,7 @@ mod discover {
     use rmcp::model::{
         ClientJsonRpcMessage, ClientRequest, DiscoverResult, ProtocolVersion, ServerJsonRpcMessage,
     };
+    use rmcp::transport::async_rw::DEFAULT_MAX_LINE_LENGTH;
     use rmcp::transport::Transport as _;
     use rmcp::{RoleServer, ServerHandler as _, ServiceExt as _};
     use serde_json::{json, Value};
@@ -646,7 +659,7 @@ mod discover {
         AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, DuplexStream, ReadHalf, WriteHalf,
     };
 
-    use super::DiscoverAnswering;
+    use super::{BoundedLines, DiscoverAnswering};
     use crate::pinned_cli::pinned;
     use crate::server::{bugzilla_client, BugWarden, SUPPORTED_PROTOCOL_VERSIONS};
 
@@ -666,6 +679,10 @@ mod discover {
     const PIPE: usize = 8 * 1024;
 
     fn test_server() -> BugWarden {
+        test_server_with_policy("")
+    }
+
+    fn test_server_with_policy(policy: &str) -> BugWarden {
         let cfg = Arc::new(pinned(&[
             "bugwarden",
             "--bugzilla-server",
@@ -676,7 +693,7 @@ mod discover {
             "test-key",
         ]));
         let guard = Arc::new(Guard {
-            policy: Policy::from_toml_str("").expect("the empty policy must parse"),
+            policy: Policy::from_toml_str(policy).expect("the test policy must parse"),
         });
         let bz = Arc::new(bugzilla_client(&cfg).expect("client must build"));
         BugWarden::new(cfg, guard, bz).expect("server must build")
@@ -906,7 +923,7 @@ mod discover {
     async fn a_pipelined_probe_is_answered_under_write_contention() {
         // The one thing this wrapper does that the inner transport does
         // not: hold a reply. rmcp polls `receive` as one arm of a
-        // `select!` (rmcp 3.5.0 `service.rs:1412`) and drops the future
+        // `select!` (rmcp 3.7.0 `service.rs:1398`) and drops the future
         // whenever another arm wins, so a reply awaited on `receive`'s own
         // stack dies with the frame that asked for it — consumed, never
         // answered, the client hung on that id while every other reply
@@ -1061,7 +1078,7 @@ mod discover {
             "the probe must name this build, and nothing else: {probe}"
         );
         // Present whatever revision the probe declares:
-        // `strip_result_type_for_legacy_peer` (rmcp 3.5.0 model.rs) has no
+        // `strip_result_type_for_legacy_peer` (rmcp 3.7.0 model.rs) has no
         // `DiscoverResult` arm, so rmcp never stripped it here either.
         assert_eq!(probe["result"]["resultType"], "complete", "{probe}");
     }
@@ -1381,5 +1398,53 @@ mod discover {
         assert!(!SUPPORTED_PROTOCOL_VERSIONS
             .iter()
             .any(|version| version.as_str() == UNSERVED));
+    }
+
+    #[tokio::test]
+    async fn a_frame_of_exactly_this_builds_cap_is_served_past_rmcps_line_bound() {
+        // `framed` switches off rmcp's fixed 16 MiB line bound, so a frame
+        // the policy's cap admits reaches rmcp whatever its size. Any rmcp
+        // bound below the derived cap fails this: without the override
+        // `receive` discards the frame and reports the EOF behind it.
+        let server = test_server_with_policy("[global]\nmax_attachment_bytes = 16777216\n");
+        let cap = server.stdio_transport().0.cap();
+        assert!(
+            cap > DEFAULT_MAX_LINE_LENGTH,
+            "the premise: a cap above rmcp's own"
+        );
+        // Exactly the cap before the delimiter: the largest frame accepted.
+        let frame = {
+            let head = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mcp_server_info","arguments":{"pad":""#;
+            let tail = "\"}}}";
+            format!(
+                "{head}{}{tail}\n",
+                "x".repeat(cap - head.len() - tail.len())
+            )
+        };
+        assert_eq!(frame.len() - 1, cap);
+        let (mut peer, ours) = tokio::io::duplex(64 * 1024);
+        let mut transport =
+            DiscoverAnswering::framed(BoundedLines::new(ours, cap), tokio::io::sink(), server);
+        // A 22 MiB write through a 64 KiB duplex completes only as the
+        // transport reads it, so the writer runs beside the read.
+        let writer = tokio::spawn(async move {
+            peer.write_all(frame.as_bytes())
+                .await
+                .expect("the duplex must take the frame");
+        });
+        let received = tokio::time::timeout(REPLY_BUDGET, transport.receive())
+            .await
+            .expect("the transport must answer within the budget");
+        match received {
+            Some(ClientJsonRpcMessage::Request(request)) => assert!(
+                matches!(request.request, ClientRequest::CallToolRequest(_)),
+                "the frame must come through as the call it is"
+            ),
+            other => panic!("a frame the policy admits must reach rmcp, got {other:?}"),
+        }
+        tokio::time::timeout(REPLY_BUDGET, writer)
+            .await
+            .expect("the writer must finish within the budget")
+            .expect("the writer must not panic");
     }
 }
