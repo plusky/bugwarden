@@ -18,7 +18,7 @@ use std::time::Duration;
 
 /// Bound on every request one of these harnesses awaits an answer to.
 ///
-/// rmcp 3.7.0's typed client calls send with
+/// rmcp 3.8.0's typed client calls send with
 /// `PeerRequestOptions::no_options()` — `Self::default()`, `timeout: None`
 /// (`service.rs`) — and the `initialize` handshake reads its response off
 /// the transport with no deadline either. So a request the
