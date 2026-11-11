@@ -20,7 +20,10 @@
 //!   endpoint-existence or endpoint-failure context instead of the
 //!   anonymous-landing one naming the API key placement;
 //! - the `valid_login` `false` bail dropping its anonymous-landing
-//!   sentence (a stripped placement reads exactly like a wrong login).
+//!   sentence (a stripped placement reads exactly like a wrong login);
+//! - a non-`login_required` refusal (another envelope code, another
+//!   status, or a transport failure) diagnosed as an anonymous landing:
+//!   the decision keys on the envelope code, never the HTTP status.
 
 use std::sync::Arc;
 
@@ -278,6 +281,43 @@ async fn preflight_declared_login_transport_error_names_the_endpoint() {
     );
     assert!(
         !msg.contains("anonymously"),
+        "a non-login_required refusal must not be diagnosed as an anonymous landing: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn preflight_declared_login_true_transport_error_is_not_an_anonymous_landing() {
+    // The 500 above locks code-None vs 410 apart; this locks a true
+    // transport failure (no BugzillaError at all) apart on the same arm:
+    // an unreachable route is a broken path, not a stripped placement.
+    let base = refused::refused_base_url();
+
+    let cfg: Arc<Cli> = Arc::new(pinned(&[
+        "bugwarden",
+        "--bugzilla-server",
+        &base,
+        "--transport",
+        "stdio",
+        "--api-key",
+        "test-key",
+    ]));
+    let guard = Arc::new(Guard {
+        policy: Policy::from_toml_str(DECLARED_IDENTITY_POLICY).expect("test policy must parse"),
+    });
+    let bz = Arc::new(BugzillaClient::new(&base, false, USER_AGENT).expect("client must build"));
+    let server = BugWarden::new(cfg, guard, bz).expect("server must build");
+
+    let err = tokio::time::timeout(common::REFUSED_CONNECT_BUDGET, server.preflight())
+        .await
+        .expect("connect to the refused privileged port must not hang")
+        .expect_err("an unreachable valid_login endpoint must fail preflight");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("GET /rest/valid_login"),
+        "preflight error must name the failing endpoint: {msg}"
+    );
+    assert!(
+        !msg.contains("anonymously"),
         "a transport failure must not be diagnosed as an anonymous landing: {msg}"
     );
 }
@@ -315,6 +355,10 @@ async fn preflight_transport_error_does_not_leak_the_api_key_i12() {
         "expected a whoami transport error (I12), got: {msg}"
     );
     assert!(
+        !msg.contains("anonymously"),
+        "a transport failure must not be diagnosed as an anonymous landing: {msg}"
+    );
+    assert!(
         !msg.contains("SUPERSECRETKEY123"),
         "API key leaked into a preflight error: {msg}"
     );
@@ -345,6 +389,10 @@ async fn preflight_whoami_login_required_names_the_anonymous_landing() {
         .expect_err("a login_required whoami refusal must fail preflight");
     let msg = format!("{err:#}");
     assert!(
+        msg.contains("GET /rest/whoami"),
+        "preflight error must name the failing endpoint: {msg}"
+    );
+    assert!(
         msg.contains("anonymously"),
         "preflight error must name the anonymous landing: {msg}"
     );
@@ -359,6 +407,68 @@ async fn preflight_whoami_login_required_names_the_anonymous_landing() {
 }
 
 #[tokio::test]
+async fn preflight_whoami_other_code_is_not_an_anonymous_landing() {
+    // The same 401 status with another envelope code must earn the generic
+    // context: the decision keys on the code, never the status.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/whoami"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": true,
+            "code": 100,
+            "message": "Some other refusal.",
+        })))
+        .mount(&mock)
+        .await;
+    let server = server_custody_server(IDENTITY_POLICY, &mock);
+
+    let err = server
+        .preflight()
+        .await
+        .expect_err("a non-login_required whoami refusal must fail preflight");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("GET /rest/whoami"),
+        "preflight error must name the failing endpoint: {msg}"
+    );
+    assert!(
+        !msg.contains("anonymously"),
+        "only code 410 names the anonymous landing: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn preflight_whoami_login_required_on_another_status_names_the_anonymous_landing() {
+    // The reverse: code 410 answered on a non-401 status is still the
+    // anonymous landing — a status-keyed check would miss it.
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/whoami"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": true,
+            "code": 410,
+            "message": "You must log in before using this part of Bugzilla.",
+        })))
+        .mount(&mock)
+        .await;
+    let server = server_custody_server(IDENTITY_POLICY, &mock);
+
+    let err = server
+        .preflight()
+        .await
+        .expect_err("a login_required whoami refusal must fail preflight");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("anonymously"),
+        "preflight error must name the anonymous landing: {msg}"
+    );
+    assert!(
+        msg.contains("--use-auth-header"),
+        "preflight error must name the placement that decides it: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn preflight_valid_login_login_required_names_the_anonymous_landing() {
     // The same refusal on the declared arm: valid_login answers
     // login_required instead of a result. The bail names the endpoint
@@ -366,6 +476,7 @@ async fn preflight_valid_login_login_required_names_the_anonymous_landing() {
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/rest/valid_login"))
+        .and(query_param("login", "svc@example.com"))
         .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
             "error": true,
             "code": 410,
@@ -387,6 +498,10 @@ async fn preflight_valid_login_login_required_names_the_anonymous_landing() {
     assert!(
         msg.contains("anonymously"),
         "preflight error must name the anonymous landing: {msg}"
+    );
+    assert!(
+        !msg.contains("failed during startup"),
+        "a 410 is not a generic endpoint failure: {msg}"
     );
     assert!(
         msg.contains("--use-auth-header"),
