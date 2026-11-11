@@ -841,7 +841,7 @@ fn allowlisted(params: Option<&JsonObject>) -> BTreeMap<String, Value> {
 /// * [`Lifecycle::PerRequest`] — the request's own `_meta`. **Never
 ///   `ctx.client_info()`**: that convenience accessor falls back to
 ///   `peer_info().client_info` unless `request_metadata_required()`, which
-///   rmcp 3.8.0 sets only on the stdio handshake-free path
+///   rmcp 3.9.0 sets only on the stdio handshake-free path
 ///   (`service/server.rs`), so over streamable http it IS the
 ///   `{"name":"rmcp",…}` placeholder rmcp synthesises for a peer that
 ///   never handshook (`peer_info_for_stateless_request`, #34 §3c) — and
@@ -973,7 +973,7 @@ enum Lifecycle {
 /// what gets served and who gets recorded cannot diverge by call-site
 /// ordering.
 ///
-/// rmcp 3.8.0 routes on `_meta` shape, not on the negotiated revision and
+/// rmcp 3.9.0 routes on `_meta` shape, not on the negotiated revision and
 /// not on [`SUPPORTED_PROTOCOL_VERSIONS`]: `is_legacy_request`
 /// (`transport/streamable_http_server/tower.rs`) returns true — the session
 /// path — for every `initialize` (rmcp #1228), and otherwise sends a POST
@@ -1048,7 +1048,7 @@ fn read_scope_serves(tool: &str) -> bool {
 /// The refusal for a tool this request's credential does not reach.
 ///
 /// Byte-identical to what `ToolRouter` answers for a name it does not route
-/// (rmcp 3.8 `handler/server/router/tool.rs`), so a scope-hidden tool is
+/// (rmcp 3.9 `handler/server/router/tool.rs`), so a scope-hidden tool is
 /// indistinguishable from one that does not exist — the same
 /// indistinguishability read-only mode already gives every caller (I13), and
 /// no oracle about which tools the deployment serves (I2).
@@ -3365,7 +3365,7 @@ impl BugWarden {
     /// there is one place where the policy field is read. Call it before
     /// the server moves into the service closure.
     ///
-    /// These rmcp 3.8 defaults are set by name rather than inherited,
+    /// These rmcp 3.9 defaults are set by name rather than inherited,
     /// because inheriting them changes how a deployment behaves without
     /// anyone choosing it:
     ///
@@ -3409,7 +3409,7 @@ impl BugWarden {
     /// have recorded the attempt — though rmcp's own refusal body prints
     /// the number outright. That the boundary is observable to an
     /// unauthenticated client, and what it discloses, is recorded in
-    /// DESIGN.md under "rmcp 3.8 usage notes".
+    /// DESIGN.md under "rmcp 3.9 usage notes".
     ///
     /// `allowed_origins` is the browser-facing sibling of `allowed_hosts`
     /// and the same reasoning covers it, but it is left inherited: its
@@ -3417,7 +3417,7 @@ impl BugWarden {
     /// nothing. Anything that changes the `allowed_hosts` call below should
     /// decide this one too rather than leave it behind. The remaining
     /// fields, and why each stays inherited, are inventoried in DESIGN.md
-    /// under "rmcp 3.8 usage notes"; the caller in `main` adds
+    /// under "rmcp 3.9 usage notes"; the caller in `main` adds
     /// `cancellation_token` so a SIGINT or SIGTERM reaches the live
     /// transport (issue #114).
     ///
@@ -6117,7 +6117,7 @@ impl ServerHandler for BugWarden {
             Reach::ReadOnly => tools.retain(|tool| read_scope_serves(&tool.name)),
             Reach::Nothing => tools.clear(),
         }
-        // The SEP-2549 hints are ours to gate: rmcp 3.8.0 strips
+        // The SEP-2549 hints are ours to gate: rmcp 3.9.0 strips
         // `resultType` for a legacy peer and leaves these two alone. The
         // predicate is HAND-COPIED from its `is_2026_07_28_or_later` — no
         // shared constant, no test pinning the agreement — so re-read both on
@@ -7721,7 +7721,7 @@ mod tests {
         }
     }
 
-    /// SEP-2243's schema annotation, byte-exact as rmcp 3.8.0 reads it —
+    /// SEP-2243's schema annotation, byte-exact as rmcp 3.9.0 reads it —
     /// `schema.get("x-mcp-header")` in `transport/common/mcp_headers.rs`
     /// (`collect_property_annotations`, behind `param_header_annotations`
     /// and `validate_param_header_annotations`). Upstream exports no
@@ -7739,7 +7739,7 @@ mod tests {
     /// with no recursion arms to keep in lockstep, which is the maintenance
     /// surface `schema_portability_error` above has to carry.
     ///
-    /// Deliberately broader than rmcp's functional read, which in 3.8.0 is
+    /// Deliberately broader than rmcp's functional read, which in 3.9.0 is
     /// every `properties` chain from the root (nested since 3.6, #1359;
     /// top-level only before) and string-valued only: the key is banned
     /// everywhere, at any value type, because upstream's depth rules are
