@@ -50,7 +50,7 @@
 //! - any `serve_failure` arm deleted so its failure falls to the wildcard,
 //!   or any two of its literals exchanged. Three arms have no row, and
 //!   cannot: `ExpectedInitializeRequest(None)` is constructed nowhere in
-//!   rmcp 3.8.0, `UnexpectedInitializeResponse` cannot happen while rmcp
+//!   rmcp 3.9.0, `UnexpectedInitializeResponse` cannot happen while rmcp
 //!   maps this handler's own `InitializeResult` into the result it then
 //!   checks, and `Cancelled` needs a cancellation token `ServiceExt::serve`
 //!   creates and never cancels. cargo-mutants reaches only the OUTER
@@ -914,7 +914,7 @@ async fn stdio_an_over_cap_frame_after_initialize_exits_one() {
 
 #[tokio::test]
 async fn stdio_a_pre_initialize_tool_call_never_logs_the_frame() {
-    // rmcp 3.8.0 answers this frame in-band: one stdout -32602
+    // rmcp 3.9.0 answers this frame in-band: one stdout -32602
     // with a fixed `_meta` message, no client bytes, and the
     // session keeps waiting for `initialize`. The handler never
     // runs, stderr stays free of the frame, and the process only
