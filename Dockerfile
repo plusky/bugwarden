@@ -4,7 +4,7 @@
 # so a floating `rust:1` would silently build releases with an unpinned
 # compiler. Bump this tag and rust-toolchain.toml together; the
 # toolchain-drift job fails when they disagree.
-FROM rust:1.99.1-alpine@sha256:7e9e2d068a107a2adafd19930011178d14a78326053cd4c3a9f7ad3fd049557d AS build
+FROM rust:1.100.0-alpine@sha256:de1e0058543a81ed7b046629167db587c67a94bdf37cce14eb27f0ec83baaffb AS build
 # gcc and musl-dev are already in the base; aws-lc-sys (the rustls crypto
 # provider) compiles C from source and needs cmake plus a make generator.
 RUN apk add --no-cache cmake make
