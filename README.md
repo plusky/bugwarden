@@ -24,6 +24,97 @@ the agent may only read summaries and leave comments", "nothing younger than a
 week exists"), and every tool call is checked against it before Bugzilla is
 touched or data is returned.
 
+## Getting started
+
+The shortest path to a working setup: the MCP client launches bugwarden
+itself (the stdio transport), read-only, under a policy that hides every bug
+that is not world-readable.
+
+1. **Install it.** `sudo zypper install bugwarden` on openSUSE Tumbleweed,
+   or `cargo install bugwarden` (needs a C compiler and `cmake`). Packages,
+   the container image and source builds are under
+   [Installation](#installation).
+
+2. **Create a Bugzilla API key**, in Bugzilla under *Preferences → API
+   Keys*. bugwarden acts as that account; the policy can only narrow what
+   the account may do.
+
+3. **Write a policy**, for example `~/.config/bugwarden/policy.toml`:
+
+   ```toml
+   # What happens to a bug no rule matches.
+   default_action = "allow"
+
+   [global]
+   read_only = true            # offer no write tools at all
+
+   [[rule]]
+   name = "restricted-bugs"
+   action = "deny"             # answered as if the bug did not exist
+   [rule.match]
+   group_restricted = true     # every bug that is not world-readable
+   ```
+
+   The file is read once, at startup: restart the server after editing it.
+   Without `--policy` an allow-all policy applies — every bug the key can
+   reach, writes included — so always name a file.
+
+4. **Register it with your MCP client.** The format varies by client. Give
+   the policy as an absolute path — the client starts the server without a
+   shell, so `~` is not expanded — and the binary by its full path if it is
+   not on the client's `PATH`:
+
+   ```json
+   {
+     "mcpServers": {
+       "bugzilla": {
+         "command": "bugwarden",
+         "args": [
+           "--bugzilla-server", "https://bugzilla.opensuse.org",
+           "--transport", "stdio",
+           "--policy", "/home/you/.config/bugwarden/policy.toml"
+         ],
+         "env": {
+           "BUGZILLA_API_KEY": "YOUR_BUGZILLA_API_KEY"
+         }
+       }
+     }
+   }
+   ```
+
+   This guards what the model does through MCP. A client that also gives
+   its model shell or file access as your user lets it read the key and the
+   policy from disk; there, run the [HTTP transport](#http-transport-default)
+   with a [server-held key](#server-held-key-mode-fleet-deployments) under
+   another account.
+
+5. **Try it.** Ask the model to call `mcp_server_info`: its `policy` block
+   reports `rule_count: 1` and `read_only: true`. Then ask for a public bug
+   you know exists. A bug the policy hides is answered
+   `Bug {id} is not accessible through this server`, exactly like one that
+   does not exist, and is absent from search results.
+
+   If the server does not show up in the client, run the same command with
+   the same environment in a terminal: the startup error is on stderr. If
+   *every* bug is not accessible, the key or the server URL is wrong — the
+   answer is the same by design, and `RUST_LOG=bugwarden=debug` puts the
+   reason on stderr.
+
+Where to go from here:
+
+- **Hide or restrict more.** [`examples/policy.toml`](examples/policy.toml)
+  is a commented worked example; the [Policy file
+  reference](#policy-file-reference) lists every key.
+- **Let the model write.** Remove `read_only`. `allow` then grants every
+  write to an existing bug; filing stays refused while a rule consults
+  `group_restricted` (see `create` under [capabilities](#capabilities)). To
+  grant less, use `restrict` rules, whose list is the whole grant, reads
+  included.
+- **Serve several users from one server.** The [HTTP
+  transport](#http-transport-default) and the [container image](#container).
+- **See what the guard decided and hid.** The [Audit stream](#audit-stream).
+- **Know what the guard promises.** The [Security model](#security-model).
+
 ## Features
 
 - **Complete Bugzilla tool surface**: bug details, history, comments,
