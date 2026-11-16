@@ -474,16 +474,17 @@ const INPUT_STREAM_FAILED: &str = "the input stream failed before initialize";
 /// A fixed, server-authored classification of a failed stdio handshake —
 /// the only thing either exit path may say about one (#261).
 ///
-/// rmcp 3.9.0's `ServerInitializeError`
+/// rmcp 3.10.0's `ServerInitializeError`
 /// (`service/server.rs:77-98`, `#[non_exhaustive]`) puts the client's
 /// whole first frame into `ExpectedInitializeRequest`, and its
 /// `#[error("expect initialized request, but received: {0:?}")]` puts it
 /// into DISPLAY as well as `Debug` — so neither the error nor its Display
 /// may be logged, and it may not be propagated into `main`'s
 /// `anyhow::Result` either, since Rust prints `Error: {:?}` of that and
-/// anyhow's `Debug` opens with the same Display. A 100 000-char `query` in
-/// a pre-`initialize` `tools/call` measured 100 403 and 100 365 chars on
-/// those two lines, bounded only by the transport's frame cap.
+/// anyhow's `Debug` opens with the same Display. Before rmcp #1322 a
+/// 100 000-char `query` in a pre-`initialize` `tools/call` measured 100 403
+/// and 100 365 chars on those two lines; a non-request frame still lands
+/// there whole, bounded only by the transport's frame cap.
 ///
 /// Every arm returns a literal, so both lines are bounded by this file. The
 /// frame's KIND is named because it is the diagnostic an operator needs and
@@ -514,15 +515,15 @@ fn serve_failure(error: &rmcp::service::ServerInitializeError) -> &'static str {
 
     match error {
         Failure::ExpectedInitializeRequest(Some(frame)) => match frame {
-            // A request here is never `initialize` (it would have been
-            // served) and never `ping` (rmcp answers those in its
-            // pre-init loop).
+            // Unreachable on rmcp 3.10.0: its pre-init loop answers or
+            // serves every request (`service/server.rs:573-672`), so only
+            // the three kinds below arrive here.
             Frame::Request(_) => "the first frame was a request other than initialize",
             Frame::Notification(_) => "the first frame was a notification, not initialize",
             Frame::Response(_) => "the first frame was a response, not initialize",
             Frame::Error(_) => "the first frame was an error reply, not initialize",
         },
-        // Unreachable on rmcp 3.9.0: the one construction site
+        // Unreachable on rmcp 3.10.0: the one construction site
         // (`service/server.rs:674`) passes `Some`.
         Failure::ExpectedInitializeRequest(None) => "no first frame was received",
         // EOF before initialize. A read error and this build's own

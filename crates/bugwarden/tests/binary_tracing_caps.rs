@@ -1047,8 +1047,8 @@ async fn an_over_long_request_id_is_cut_at_the_sink() {
 /// bytes this workspace never formats — which is where a level filter
 /// would have been the wrong fix and the sink is the right one.
 ///
-/// `service.rs:1563` logs the whole request at debug, `params` and every
-/// argument included. `transport/async_rw.rs:335` logs the whole
+/// `service.rs:1588` logs the whole request at debug, `params` and every
+/// argument included. `transport/async_rw.rs:478` logs the whole
 /// UNPARSABLE line at debug, once per malformed line — and it is the
 /// `message` field, so only a sink that budgets `message` bounds it.
 /// Measured on this branch's parent at `RUST_LOG=debug`: 100 330
@@ -1543,7 +1543,7 @@ async fn a_cut_client_field_still_closes_its_own_quote() {
 }
 
 /// The same forgery through rmcp's `message`, which no field name of this
-/// workspace fronts: `transport/async_rw.rs:335` echoes an unparsable
+/// workspace fronts: `transport/async_rw.rs:478` echoes an unparsable
 /// line whole at debug, and only a sink that escapes `message` bounds it.
 ///
 /// CR and not LF, because rmcp's reader is line-delimited: an LF ends the
