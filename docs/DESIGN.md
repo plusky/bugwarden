@@ -336,7 +336,7 @@ pub struct Matcher {
     #[serde(default)] pub whiteboard_contains: Vec<String>,// case-insensitive substrings
     #[serde(default)] pub summary_contains: Vec<String>,   // case-insensitive substrings in the one-line summary
     #[serde(default)] pub group_restricted: Option<bool>,  // true: readable only via >=1 Bugzilla group; false: world-readable
-    #[serde(default)] pub younger_than_days: Option<i64>,  // creation_time newer than now-N days
+    #[serde(default)] pub younger_than_days: Option<i64>,  // creation_time newer than now-N days; N < 0 is refused at load
     // The one identity-relative criterion: true selects bugs AUTHORED by the
     // requesting account, false everyone else's (see "Identity resolution").
     // TOML spelling `created_by_me = true|false`; absent = not consulted.
@@ -397,7 +397,7 @@ impl Rule {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlobalGuards {
-    #[serde(default)] pub min_bug_age_days: i64,        // 0 = disabled
+    #[serde(default)] pub min_bug_age_days: i64,        // 0 = disabled; negative is refused at load
     #[serde(default)] pub allow_private_comments: bool, // default false
     #[serde(default)] pub read_only: bool,
     #[serde(default)] pub disabled_tools: Vec<String>,
@@ -425,8 +425,10 @@ impl Policy {
     // comparisons are exact, so "Default" and " default" stay legal, while
     // the blank check trims; Restrict rules need >=1 capability; Allow/Deny
     // rules must have empty capabilities; default_action must not be
-    // Restrict; a written `operations = []` is an error (a rule applying to
-    // no operation is dead configuration); a Restrict rule scoped to ONLY
+    // Restrict; neither day count (global.min_bug_age_days, a rule's
+    // younger_than_days) may be negative; a written `operations = []` is
+    // an error (a rule applying to no operation is dead configuration); a
+    // Restrict rule scoped to ONLY
     // `create` must grant exactly the `create` capability (without it the
     // rule could grant nothing reachable, and any other capability it named
     // would be dead — the create gate consults only `create`); a Restrict
@@ -2479,6 +2481,16 @@ pinned by the in-crate capture test under "Testing". create_bug's single `warn` 
     this stream must not err in. Recorded on `RequestInfo::id`: records
     are per-ATTEMPT, and `request.id` is a client-chosen correlation hint
     and never an identity.
+- **Day counts must not be negative.** `Policy::validate` rejects a negative
+  `global.min_bug_age_days`, and a negative `younger_than_days` on any rule,
+  which the error names. A negative `younger_than_days` asks for a cutoff in
+  the future, so the rule matched nothing, until the count was large enough
+  for the subtraction to overflow: the matcher read an unrepresentable
+  cutoff as "every bug is young", and the rule then matched every bug. Where
+  that happened was set by the date library's range. A negative
+  `min_bug_age_days` was inert, because the gate only runs for a positive
+  count, and is refused so that one sign rule covers both. Refusing the sign
+  at load leaves no such value to interpret.
 - **Rule names the operator may not take (issue #84).** `Policy::validate`
   rejects a rule named `"default"`, `"min_bug_age_days"` or
   `"unavailable"`, a rule whose name ends in `":unreadable-metadata"`, a
@@ -3871,7 +3883,8 @@ wired, `server.rs` and `main.rs` are the reference.
 
 - Unit tests (#[cfg(test)] in policy.rs/guard.rs): glob matching; first-match
   ordering; embargo group deny; min_bug_age_days incl. missing creation_time
-  (fail closed); younger_than_days matcher; restrict caps; read-implies-summary;
+  (fail closed); younger_than_days matcher; a negative day count in either
+  refused at load, zero accepted; restrict caps; read-implies-summary;
   read_only strips write caps — create and attach named explicitly, and a
   restrict grant of comment grants neither; default deny; summary redaction;
   comment filtering; validation errors (unknown TOML keys, restrict without
