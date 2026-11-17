@@ -33,7 +33,7 @@ gen = ["dep:clap_complete", "dep:clap_mangen"]
 workspace = true
 
 [dependencies]
-bugwarden-core = { path = "../bugwarden-core", version = "0.7.1" }
+bugwarden-core = { path = "../bugwarden-core", version = "0.8.0" }
 
 rmcp = { version = "3.6", features = [
     "server",
