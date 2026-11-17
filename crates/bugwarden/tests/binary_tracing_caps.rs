@@ -494,7 +494,7 @@ fn longest_run(text: &str, probe: char) -> usize {
 ///
 /// "In any line's text" is the honest scope. `log` was assembled from
 /// tokio's `Lines`, which pops a trailing `\n` and then a trailing `\r`
-/// (tokio 1.53 `io/util/lines.rs:126-129`), so a CR sitting immediately
+/// (tokio 1.54 `io/util/lines.rs:130-133`), so a CR sitting immediately
 /// before a line end is gone before this function ever sees it. Both
 /// #275 rows put their CR in the middle of a value, where that blind
 /// spot does not reach.
