@@ -628,6 +628,10 @@ and adds a read-only root filesystem, `cap_drop: ALL` and
 docker compose up
 ```
 
+To run it as a rootless systemd service under Podman instead, use the
+Quadlet unit [`contrib/quadlet/bugwarden.container`](contrib/quadlet/bugwarden.container);
+its header lists the setup steps.
+
 Gotchas specific to the image:
 
 - **The policy mount is mandatory.** Run without `--policy` and the bare

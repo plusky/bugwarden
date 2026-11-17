@@ -9,6 +9,7 @@ docs
 assets
 examples
 scripts
+contrib
 # Local run artifacts from the README/compose examples. No COPY reaches them,
 # but a token file has no business in a build context.
 bugwarden.env
