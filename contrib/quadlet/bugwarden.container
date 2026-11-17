@@ -1,0 +1,64 @@
+# Podman Quadlet unit: bugwarden as a rootless systemd user service.
+#
+# From a checkout of this repository, as the user who will run it:
+#
+#   umask 077
+#   mkdir -p ~/.config/containers/systemd ~/.config/bugwarden ~/.local/state/bugwarden
+#   cp contrib/quadlet/bugwarden.container ~/.config/containers/systemd/
+#   cp examples/policy.toml examples/audit.toml ~/.config/bugwarden/
+#   printf 'BUGWARDEN_HTTP_TOKEN=%s\nBUGWARDEN_HTTP_READ_TOKEN=%s\n' \
+#     "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > ~/.config/bugwarden/bugwarden.env
+#
+# Then set BUGZILLA_SERVER in the installed copy of this file, edit
+# ~/.config/bugwarden/policy.toml to suit, and start the service:
+#
+#   systemctl --user daemon-reload
+#   systemctl --user start bugwarden
+#
+# `systemctl --user status bugwarden` shows whether it stayed up, and
+# `journalctl --user -u bugwarden` why not. It starts at login from then on;
+# `loginctl enable-linger` starts it at boot instead.
+#
+# Clients reach http://127.0.0.1:8000/mcp, sending one of the two tokens as
+# "Authorization: Bearer <token>" and their own Bugzilla API key in the
+# "ApiKey" header. README.md, "Container", explains the settings used here.
+
+[Unit]
+Description=bugwarden MCP server for Bugzilla
+
+[Container]
+# Pulled on the first start only. To update, `podman pull` it and restart
+# the service.
+Image=ghcr.io/plusky/bugwarden:latest
+ContainerName=bugwarden
+Environment=BUGZILLA_SERVER=https://bugzilla.example.org
+# Environment=MCP_READ_ONLY=true
+Environment=BUGWARDEN_AUDIT_CONFIG=/etc/bugwarden/audit.toml
+# The bearer tokens live in a file only you can read. An Environment= line
+# would put them in this file and on podman's command line.
+EnvironmentFile=%h/.config/bugwarden/bugwarden.env
+# The image runs as uid 65532. Map your own account onto it, so the files
+# below need no chown and the audit records stay yours.
+UserNS=keep-id:uid=65532,gid=65532
+# The image presets BUGWARDEN_POLICY to this path and refuses to start
+# without the mount.
+Volume=%h/.config/bugwarden/policy.toml:/etc/bugwarden/policy.toml:ro,z
+Volume=%h/.config/bugwarden/audit.toml:/etc/bugwarden/audit.toml:ro,z
+# Where examples/audit.toml writes the audit stream.
+Volume=%h/.local/state/bugwarden:/var/log/bugwarden:z
+# Loopback only: the token authenticates callers, it does not make the port
+# safe to expose. The transport is plain HTTP, so read README.md,
+# "Authentication and scopes", before publishing it on another address.
+PublishPort=127.0.0.1:8000:8000
+RunInit=true
+ReadOnly=true
+DropCapability=ALL
+NoNewPrivileges=true
+
+[Service]
+Restart=always
+# The first start pulls the image, which can outlast systemd's 90 seconds.
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target
