@@ -789,7 +789,14 @@ warning at startup if the policy file is group- or other-writable.
 this one from starting at all — if it names a rule `default`,
 `min_bug_age_days` or `unavailable`, ends a name with `:unreadable-metadata`,
 leaves a name blank, or uses one name twice. The error names the offending
-rule; rename it and the file loads unchanged. Nothing else about the file's
+rule; rename it and the file loads unchanged. A negative `min_bug_age_days`
+or `younger_than_days` is refused the same way. For `min_bug_age_days` write
+`0` or remove the key; a negative value was already inert. For
+`younger_than_days` the two are not the same: `0` keeps the rule from
+matching anything but a bug dated in the future, much as a small negative
+count did, while removing the key makes the rule match on its other
+criteria, or every bug if it has none.
+Decide which was meant, or delete the rule. Nothing else about the file's
 meaning changed.
 
 A complete, commented example ships in
@@ -805,7 +812,7 @@ A complete, commented example ships in
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `min_bug_age_days` | integer | `0` (disabled) | Bugs created less than N days ago are **invisible** — treated exactly like nonexistent bugs, evaluated before any rule. A bug whose `creation_time` is missing or unparsable is denied (fail closed) |
+| `min_bug_age_days` | integer | `0` (disabled) | Bugs created less than N days ago are **invisible** — treated exactly like nonexistent bugs, evaluated before any rule. A bug whose `creation_time` is missing or unparsable is denied (fail closed). A negative value is refused at startup |
 | `allow_private_comments` | boolean | `false` | Master switch for **all** private content: comments, attachment metadata, and attachment downloads. Even when `true`, each call must also pass `include_private = true`. On an attachment download a *missing* privacy flag counts as private |
 | `read_only` | boolean | `false` | Strip write capabilities from every grant and remove write tools from the tool listing. The `--read-only` flag ORs into this |
 | `disabled_tools` | array of strings | `[]` | Tool names to remove from the tool listing entirely |
@@ -854,7 +861,7 @@ write two consecutive rules.
 | `whiteboard_contains` | array of strings | case-insensitive substring search in the whiteboard |
 | `summary_contains` | array of strings | case-insensitive substring search in the bug's one-line summary |
 | `group_restricted` | boolean | `true` matches bugs readable only through at least one Bugzilla group, `false` matches world-readable bugs |
-| `younger_than_days` | integer | matches bugs created within the last N days |
+| `younger_than_days` | integer | matches bugs created within the last N days; a negative N is refused at startup |
 | `created_by_me` | boolean | whether the caller's account authored the bug, compared case-insensitively to the bug's creator. `true` matches the caller's own reports, `false` everyone else's. How the caller's login is resolved depends on `global.identity_source` (default `whoami`): see the source × custody table below. Either source costs at most one lookup per tool call — `whoami` a fresh `GET /rest/whoami`, `declared` zero HTTP requests, since it was verified once at startup — and none at all under a policy without an access-covering `created_by_me` rule (a rule scoped to `operations = ["create"]` alone never triggers one). An unresolvable identity makes the criterion **unknown**, which denies (see Unreadable metadata); a policy that consults this criterion therefore denies everything it reaches while identity cannot be resolved. In the create gate the prospective bug always counts as created by the caller — no lookup happens there (a `create_bug` whose custom fields name Bug ID targets resolves the caller once, for those existing bugs only). Older bugwarden versions reject a policy using this key, or `global.identity_source`/`global.identity_login`, at startup (strict parsing fails closed) |
 
 Identity resolution by source and API-key custody:

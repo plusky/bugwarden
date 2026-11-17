@@ -284,7 +284,8 @@ pub struct Matcher {
     ///
     /// A bug with a missing/unparsable `creation_time` has no age to
     /// compare, so the criterion is undecidable and resolves fail-closed
-    /// (I4), exactly like every other unreadable field.
+    /// (I4), exactly like every other unreadable field. A negative count
+    /// is refused when the policy loads.
     #[serde(default)]
     pub younger_than_days: Option<i64>,
 }
@@ -561,7 +562,8 @@ pub enum IdentitySource {
 pub struct GlobalGuards {
     /// Deny every bug younger than this many days; `0` disables the gate.
     /// This runs BEFORE any rule, and a missing `creation_time` while the
-    /// gate is active means Denied (fail closed, I4).
+    /// gate is active means Denied (fail closed, I4). A negative count is
+    /// refused when the policy loads.
     #[serde(default)]
     pub min_bug_age_days: i64,
     /// Whether private comments may ever be returned. Even when `true` a
@@ -706,6 +708,8 @@ impl Policy {
     /// - `allow`/`deny` rules carry no capabilities (a capability list on
     ///   them would be dead configuration masking operator intent);
     /// - `default_action` is not `restrict`;
+    /// - neither day count is negative: `global.min_bug_age_days` and every
+    ///   rule's `younger_than_days`;
     /// - `operations`, when written, is non-empty (`operations = []` would
     ///   apply the rule to no operation at all);
     /// - a `restrict` rule scoped to ONLY the `create` operation grants
@@ -781,6 +785,13 @@ impl Policy {
             }
             _ => {}
         }
+        if self.global.min_bug_age_days < 0 {
+            anyhow::bail!(
+                "global.min_bug_age_days = {} is negative; it counts days back \
+                 from now and must be 0 or more (0 disables the quarantine)",
+                self.global.min_bug_age_days
+            );
+        }
         // A rule name has to identify exactly one thing: it is the only
         // field in an audit record saying what decided an assessment, and I3
         // keeps that fact out of the client's reach entirely, so the stream
@@ -850,6 +861,14 @@ impl Policy {
                     );
                 }
                 _ => {}
+            }
+            if let Some(days) = rule.matcher.younger_than_days.filter(|d| *d < 0) {
+                anyhow::bail!(
+                    "rule \"{}\": younger_than_days = {} is negative; it counts \
+                     days back from now and must be 0 or more",
+                    rule.name,
+                    days
+                );
             }
             if let Some(ops) = &rule.operations {
                 if ops.is_empty() {
@@ -1931,6 +1950,61 @@ products = ["SUSE*"]
     fn reject_unknown_action_name() {
         let s = "[[rule]]\nname = \"r\"\naction = \"permit\"\n";
         assert!(Policy::from_toml_str(s).is_err());
+    }
+
+    #[test]
+    fn reject_negative_younger_than_days() {
+        // Under each action and scope, on the first rule and on a later
+        // one: the check is per rule, whatever else the rule says.
+        let shapes = [
+            "action = \"deny\"\n",
+            "action = \"allow\"\n",
+            "action = \"restrict\"\ncapabilities = [\"summary\"]\n",
+            "action = \"deny\"\noperations = [\"access\"]\n",
+            "action = \"deny\"\noperations = [\"create\"]\n",
+        ];
+        for (shape, first) in shapes.into_iter().flat_map(|s| [(s, true), (s, false)]) {
+            let policy = |days: i64| {
+                let plain = "[[rule]]\nname = \"plain\"\naction = \"deny\"\n";
+                let fresh = format!(
+                    "[[rule]]\nname = \"fresh\"\n{shape}\
+                     [rule.match]\nyounger_than_days = {days}\n"
+                );
+                if first {
+                    fresh + plain
+                } else {
+                    plain.to_string() + &fresh
+                }
+            };
+            for days in [-1, -2_912_428, -95_005_769, i64::MIN] {
+                let msg = format!("{:#}", Policy::from_toml_str(&policy(days)).unwrap_err());
+                let want = format!("rule \"fresh\": younger_than_days = {days} is negative");
+                assert!(msg.contains(&want), "unexpected error: {msg}");
+            }
+            // Zero is the edge of the window, not a sign error.
+            Policy::from_toml_str(&policy(0)).unwrap();
+        }
+    }
+
+    #[test]
+    fn reject_negative_min_bug_age_days() {
+        for days in [-1, -2_912_428, -95_005_769, i64::MIN] {
+            let s = format!("[global]\nmin_bug_age_days = {days}\n");
+            let msg = format!("{:#}", Policy::from_toml_str(&s).unwrap_err());
+            let want = format!("global.min_bug_age_days = {days} is negative");
+            assert!(msg.contains(&want), "unexpected error: {msg}");
+        }
+        Policy::from_toml_str("[global]\nmin_bug_age_days = 0\n").unwrap();
+        // Built past the loader, a negative count leaves the gate off: an
+        // active gate would deny a bug whose age it cannot read.
+        for days in [-1, i64::MIN] {
+            let mut p = Policy::default();
+            p.global.min_bug_age_days = days;
+            let mut bug = meta();
+            bug.creation_time = None;
+            let access = p.classify(&bug, now(), Operation::Access);
+            assert!(access.allows(Capability::Read), "{days}: {access:?}");
+        }
     }
 
     #[test]
