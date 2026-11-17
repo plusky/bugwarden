@@ -2,7 +2,7 @@
 //! link scrub. No network. Wall-clock is Bugzilla wait; these pin the
 //! in-process work a 25-id assess or a fat bug_info actually does.
 //!
-//! Linux + valgrind only (`iai-callgrind`). Behind `--features iai` so
+//! Linux + valgrind only (`gungraun`). Behind `--features iai` so
 //! `cargo test --all-targets` does not run the harness.
 
 use std::collections::BTreeSet;
@@ -10,7 +10,7 @@ use std::hint::black_box;
 
 use bugwarden_core::guard::Guard;
 use bugwarden_core::policy::{BugMeta, Operation, Policy};
-use iai_callgrind::{
+use gungraun::{
     library_benchmark, library_benchmark_group, main, Callgrind, EventKind, LibraryBenchmarkConfig,
 };
 use jiff::Timestamp;

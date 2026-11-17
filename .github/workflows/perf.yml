@@ -39,16 +39,26 @@ jobs:
           # Restore main's registry so the bench crate compiles; do not write
           # — a weekly job must not LRU-evict the rust job's target/.
           save-if: false
-      - name: Cache iai results
+      - name: Cache gungraun results
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
-          path: target/iai
+          path: target/gungraun
           # Same lockfile + pin: compare this week to last. A lockfile bump
           # starts a new baseline instead of failing on compiler noise.
-          key: iai-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: gungraun-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - name: Install valgrind
         run: sudo apt-get update && sudo apt-get install -y valgrind
-      - name: Install iai-callgrind-runner
-        run: cargo install iai-callgrind-runner --locked --version 0.16.1
+      - name: Install gungraun-runner
+        # The runner refuses a library of another version, so take the
+        # version from the lock instead of repeating it here.
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -nE '/^name = "gungraun"$/{n;s/^version = "([^"]*)"$/\1/p;}' Cargo.lock)"
+          if [ -z "$version" ] || [ "$(printf '%s\n' "$version" | wc -l)" -ne 1 ]; then
+            echo "::error::cannot read one gungraun version from Cargo.lock (got '$version')"
+            exit 1
+          fi
+          cargo install gungraun-runner --locked --version "$version"
       - name: Instruction-count benches
         run: cargo bench -p bugwarden-core --bench guard --features iai --locked
