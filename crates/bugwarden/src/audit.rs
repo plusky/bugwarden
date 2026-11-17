@@ -1440,7 +1440,7 @@ impl AuditSink {
         let seq = state.seq + 1;
         let event = AuditEvent {
             v: SCHEMA_VERSION,
-            ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            ts: format!("{:.3}", jiff::Timestamp::now()),
             seq,
             session,
             kind,

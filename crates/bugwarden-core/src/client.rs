@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::Value;
 
 tokio::task_local! {
@@ -351,12 +351,12 @@ impl BugzillaClient {
         &self,
         key: &str,
         id: u64,
-        new_since: Option<DateTime<Utc>>,
+        new_since: Option<Timestamp>,
     ) -> Result<Value> {
         let path = format!("/bug/{id}/history");
         let mut query: Vec<(&str, String)> = Vec::new();
         if let Some(ts) = new_since {
-            query.push(("new_since", ts.format(TIMESTAMP_FORMAT).to_string()));
+            query.push(("new_since", ts.strftime(TIMESTAMP_FORMAT).to_string()));
         }
         let v = self.get_json(key, &path, &query).await?;
         Ok(v.get("bugs")
@@ -374,12 +374,12 @@ impl BugzillaClient {
         &self,
         key: &str,
         id: u64,
-        new_since: Option<DateTime<Utc>>,
+        new_since: Option<Timestamp>,
     ) -> Result<Vec<Value>> {
         let path = format!("/bug/{id}/comment");
         let mut query: Vec<(&str, String)> = Vec::new();
         if let Some(ts) = new_since {
-            query.push(("new_since", ts.format(TIMESTAMP_FORMAT).to_string()));
+            query.push(("new_since", ts.strftime(TIMESTAMP_FORMAT).to_string()));
         }
         let v = self.get_json(key, &path, &query).await?;
         let id_key = id.to_string();
@@ -422,7 +422,7 @@ impl BugzillaClient {
         include_fields: &str,
         limit: u32,
         offset: u32,
-        changed_since: Option<DateTime<Utc>>,
+        changed_since: Option<Timestamp>,
     ) -> Result<Value> {
         let quicksearch = if status.is_empty() {
             query.to_string()
@@ -437,7 +437,10 @@ impl BugzillaClient {
             ("order", "relevance".to_string()),
         ];
         if let Some(ts) = changed_since {
-            params.push(("last_change_time", ts.format(TIMESTAMP_FORMAT).to_string()));
+            params.push((
+                "last_change_time",
+                ts.strftime(TIMESTAMP_FORMAT).to_string(),
+            ));
         }
         self.get_json(key, "/bug", &params).await
     }
@@ -852,7 +855,6 @@ fn parse_response(status: reqwest::StatusCode, body: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use reqwest::StatusCode;
 
     /// Stands in for a real program's identity, naming neither this crate
@@ -903,9 +905,9 @@ mod tests {
 
     #[test]
     fn timestamp_format_renders_utc_z() {
-        let ts = Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap();
+        let ts: Timestamp = "2024-01-02T05:04:05.999+02:00".parse().unwrap();
         assert_eq!(
-            ts.format(TIMESTAMP_FORMAT).to_string(),
+            ts.strftime(TIMESTAMP_FORMAT).to_string(),
             "2024-01-02T03:04:05Z"
         );
     }

@@ -69,8 +69,8 @@ serde_json = "1"
 # Attachment windowing decodes the base64 Bugzilla serves. Already in the
 # lock file through rmcp; this makes the dependency the one it is used as.
 base64 = "0.23.1"
-schemars = { version = "1", features = ["chrono04"] }
-chrono = { version = "0.4", features = ["serde"] }
+schemars = { version = "1", features = ["jiff02"] }
+jiff = { version = "0.2.46", default-features = false, features = ["std", "serde"] }
 sha2 = "0.11"
 # Constant-time byte comparison for the HTTP bearer tokens. Already in the
 # lock file through rustls; this makes the dependency the one it is used as.

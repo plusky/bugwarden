@@ -10,10 +10,10 @@ use std::hint::black_box;
 
 use bugwarden_core::guard::Guard;
 use bugwarden_core::policy::{BugMeta, Operation, Policy};
-use chrono::{DateTime, Utc};
 use iai_callgrind::{
     library_benchmark, library_benchmark_group, main, Callgrind, EventKind, LibraryBenchmarkConfig,
 };
+use jiff::Timestamp;
 use serde_json::{json, Value};
 
 const POLICY: &str = r#"
@@ -33,10 +33,8 @@ capabilities = ["summary"]
 products = ["SUSE*"]
 "#;
 
-fn now() -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339("2026-01-15T00:00:00Z")
-        .expect("fixed instant")
-        .with_timezone(&Utc)
+fn now() -> Timestamp {
+    "2026-01-15T00:00:00Z".parse().expect("fixed instant")
 }
 
 fn meta(product: Option<&str>, groups: Option<&[&str]>, creation: Option<&str>) -> BugMeta {
@@ -51,11 +49,7 @@ fn meta(product: Option<&str>, groups: Option<&[&str]>, creation: Option<&str>) 
         keywords: Some(vec![]),
         groups: groups.map(|g| g.iter().map(|s| (*s).to_owned()).collect()),
         whiteboard: Some(String::new()),
-        creation_time: creation.map(|s| {
-            DateTime::parse_from_rfc3339(s)
-                .expect("fixture time")
-                .with_timezone(&Utc)
-        }),
+        creation_time: creation.map(|s| s.parse().expect("fixture time")),
         created_by_me: Some(false),
     }
 }
@@ -63,7 +57,7 @@ fn meta(product: Option<&str>, groups: Option<&[&str]>, creation: Option<&str>) 
 struct ClassifyFix {
     policy: Policy,
     bug: BugMeta,
-    now: DateTime<Utc>,
+    now: Timestamp,
 }
 
 fn classify_allow() -> ClassifyFix {

@@ -130,9 +130,8 @@ groups = ["*security*", "*embargo*"]
 #[tokio::test]
 async fn assess_min_bug_age_denies_young_and_missing_creation_time() {
     let server = MockServer::start().await;
-    let now = chrono::Utc::now();
-    let young = (now - chrono::Duration::days(1))
-        .format("%Y-%m-%dT%H:%M:%SZ")
+    let young = (jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24))
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
     Mock::given(method("GET"))
         .and(path("/rest/bug"))

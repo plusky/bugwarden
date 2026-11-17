@@ -23,7 +23,7 @@ use bugwarden_core::custom_fields::{
 use bugwarden_core::guard::{Guard, SearchRequest, SearchWindow};
 use bugwarden_core::policy::{Access, Action, Capability, IdentitySource};
 use bugwarden_core::quoted::QuotedError;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
     model::*,
@@ -2794,7 +2794,7 @@ pub struct BugHistoryParams {
     pub id: u64,
     /// Only return history newer than this date.
     #[serde(default)]
-    pub new_since: Option<DateTime<Utc>>,
+    pub new_since: Option<Timestamp>,
     /// Keep only the first N history entries.
     #[serde(default)]
     pub head: Option<u32>,
@@ -2812,7 +2812,7 @@ pub struct BugCommentsParams {
     pub include_private: bool,
     /// Only return comments newer than this date.
     #[serde(default)]
-    pub new_since: Option<DateTime<Utc>>,
+    pub new_since: Option<Timestamp>,
     /// Keep the first N comments (comment 0 is the report — keep it in
     /// the window on large threads).
     #[serde(default)]
@@ -2858,7 +2858,7 @@ pub struct QuicksearchParams {
     pub offset: u32,
     /// Only return bugs changed since this date.
     #[serde(default)]
-    pub changed_since: Option<DateTime<Utc>>,
+    pub changed_since: Option<Timestamp>,
     /// Optional comma-separated list of fields to group the results by:
     /// product, component, status, resolution, severity, priority. Omit it
     /// (or send an empty string) for a flat `{"bugs": [...]}` response.

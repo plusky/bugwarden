@@ -49,7 +49,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::Context as _;
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::Value;
 
 /// A capability a policy grant can carry.
@@ -198,12 +198,13 @@ fn contains_any(needles: &[String], haystack: &str) -> bool {
     needles.iter().any(|n| hay.contains(&n.to_lowercase()))
 }
 
-/// `now - days`, or `None` when the subtraction is not representable.
+/// `now - days`, or `None` when that is outside representable time.
 ///
-/// Callers must treat `None` as "the cutoff cannot be computed" and fail
-/// closed (I4).
-fn age_cutoff(now: DateTime<Utc>, days: i64) -> Option<DateTime<Utc>> {
-    Duration::try_days(days).and_then(|d| now.checked_sub_signed(d))
+/// What `None` means is the caller's to say: the age quarantine denies
+/// (I4), the matcher reads the sign of `days`.
+fn age_cutoff(now: Timestamp, days: i64) -> Option<Timestamp> {
+    let secs = days.checked_mul(86_400)?;
+    now.checked_sub(SignedDuration::from_secs(secs)).ok()
 }
 
 /// Bug-matching criteria of a rule.
@@ -325,7 +326,7 @@ impl Matcher {
     /// be evaluated and yields [`MatchOutcome::Unknown`], unless some other
     /// criterion already ruled the bug out (a definitive `No` wins, because
     /// then the unreadable field cannot change the answer).
-    pub fn evaluate(&self, bug: &BugMeta, now: DateTime<Utc>) -> MatchOutcome {
+    pub fn evaluate(&self, bug: &BugMeta, now: Timestamp) -> MatchOutcome {
         let mut unknown = false;
 
         // Globs against a single value.
@@ -414,12 +415,15 @@ impl Matcher {
             match (bug.creation_time, age_cutoff(now, days)) {
                 // Age unreadable: undecidable like any other missing field.
                 (None, _) => unknown = true,
-                // Cutoff not representable: the window covers all of
-                // representable time, so every bug counts as young.
+                // Cutoff after all representable time, which takes a
+                // negative count: no bug is younger than that.
+                (Some(_), None) if days.is_negative() => return MatchOutcome::No,
+                // Cutoff before all representable time: the window covers
+                // all of it, so every bug counts as young.
                 (Some(_), None) => {}
                 (Some(ct), Some(cutoff)) => {
                     if ct <= cutoff {
-                        // Strictly older than N days => not "younger than".
+                        // N days old or older => not "younger than".
                         return MatchOutcome::No;
                     }
                 }
@@ -946,7 +950,7 @@ impl Policy {
     ///
     /// Every grant — from a rule or from the default — has write capabilities
     /// stripped when `global.read_only` is set.
-    pub fn classify(&self, bug: &BugMeta, now: DateTime<Utc>, op: Operation) -> Access {
+    pub fn classify(&self, bug: &BugMeta, now: Timestamp, op: Operation) -> Access {
         if self.global.min_bug_age_days > 0 {
             let too_young = match (
                 bug.creation_time,
@@ -1079,7 +1083,7 @@ pub struct BugMeta {
     /// Whiteboard text.
     pub whiteboard: Option<String>,
     /// Creation time; `None` when absent or unparsable.
-    pub creation_time: Option<DateTime<Utc>>,
+    pub creation_time: Option<Timestamp>,
     /// Whether the requesting account authored this bug. `Some(true/false)`
     /// is an established relationship; `None` means it cannot be known —
     /// the bug's `creator` was unreadable, OR the caller's identity was not
@@ -1170,8 +1174,7 @@ impl BugMeta {
             creation_time: v
                 .get("creation_time")
                 .and_then(Value::as_str)
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Utc)),
+                .and_then(|s| s.parse::<Timestamp>().ok()),
             created_by_me: match (caller, str_field(v, "creator")) {
                 (Some(login), Some(creator)) => {
                     Some(login.to_lowercase() == creator.to_lowercase())
@@ -1229,12 +1232,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn t(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    fn t(s: &str) -> Timestamp {
+        s.parse().unwrap()
     }
 
     /// Fixed "now" so age arithmetic is deterministic.
-    fn now() -> DateTime<Utc> {
+    fn now() -> Timestamp {
         t("2026-01-15T12:00:00Z")
     }
 
@@ -1817,13 +1820,74 @@ mod tests {
     }
 
     #[test]
-    fn matcher_younger_than_days_huge_value_fails_closed() {
-        // Unrepresentable cutoff => every bug counts as young.
-        let m = Matcher {
-            younger_than_days: Some(i64::MAX),
+    fn matcher_younger_than_days_before_all_time_matches_every_bug() {
+        // A cutoff before representable time, by subtraction or by seconds
+        // that overflow an i64: every bug with an age counts as young.
+        for days in [4_392_055, 5_000_000, i64::MAX] {
+            let m = Matcher {
+                younger_than_days: Some(days),
+                ..Default::default()
+            };
+            let mut bug = meta();
+            for ct in [t("2025-06-01T00:00:00Z"), Timestamp::MIN] {
+                bug.creation_time = Some(ct);
+                assert!(m.evaluate(&bug, now()).is_yes(), "{days}");
+            }
+        }
+    }
+
+    #[test]
+    fn matcher_negative_younger_than_days_matches_only_past_its_cutoff() {
+        // No policy file gets here (validate refuses the sign); the public
+        // struct does. The cutoff then lies in the future.
+        let matcher = |days| Matcher {
+            younger_than_days: Some(days),
             ..Default::default()
         };
-        assert!(m.evaluate(&meta(), now()).is_yes());
+        let mut bug = meta();
+        assert_eq!(matcher(-1).evaluate(&bug, now()), MatchOutcome::No);
+        bug.creation_time = Some(t("2026-01-17T12:00:00Z"));
+        assert!(matcher(-1).evaluate(&bug, now()).is_yes());
+        bug.creation_time = None;
+        assert_eq!(matcher(-1).evaluate(&bug, now()), MatchOutcome::Unknown);
+        // Past representable time nothing is younger, not everything.
+        for days in [-5_000_000, i64::MIN] {
+            bug.creation_time = Some(Timestamp::MAX);
+            assert_eq!(matcher(days).evaluate(&bug, now()), MatchOutcome::No);
+            bug.creation_time = None;
+            assert_eq!(matcher(days).evaluate(&bug, now()), MatchOutcome::Unknown);
+        }
+    }
+
+    #[test]
+    fn age_cutoff_is_none_outside_representable_time() {
+        assert_eq!(age_cutoff(now(), 0), Some(now()));
+        assert_eq!(age_cutoff(now(), 7), Some(t("2026-01-08T12:00:00Z")));
+        assert_eq!(age_cutoff(now(), -1), Some(t("2026-01-16T12:00:00Z")));
+        let half = t("2026-01-15T12:00:00.5Z");
+        assert_eq!(age_cutoff(half, 7), Some(t("2026-01-08T12:00:00.5Z")));
+        // The last count that can still be subtracted from this `now`, one
+        // more, and one whose seconds overflow an i64; then the future.
+        assert!(age_cutoff(now(), 4_392_054).is_some());
+        for days in [4_392_055, i64::MAX, -5_000_000, i64::MIN] {
+            assert_eq!(age_cutoff(now(), days), None, "{days}");
+        }
+    }
+
+    #[test]
+    fn classify_min_bug_age_unrepresentable_cutoff_fails_closed() {
+        for days in [4_392_055, 5_000_000, i64::MAX] {
+            let toml = format!("[global]\nmin_bug_age_days = {days}\n");
+            let p = Policy::from_toml_str(&toml).unwrap();
+            let mut bug = meta();
+            for ct in [t("2025-01-01T00:00:00Z"), Timestamp::MIN] {
+                bug.creation_time = Some(ct);
+                match p.classify(&bug, now(), Operation::Access) {
+                    Access::Denied { rule } => assert_eq!(rule, "min_bug_age_days"),
+                    other => panic!("no cutoff must deny (I4), got {other:?} for {days}"),
+                }
+            }
+        }
     }
 
     // ---------- Policy parsing + validation ----------
@@ -3432,6 +3496,35 @@ capabilities = ["summary", "create", "attach"]
         assert!(m.creation_time.is_none());
         let m = BugMeta::from_json(&json!({"creation_time": 1700000000}), None);
         assert!(m.creation_time.is_none());
+    }
+
+    #[test]
+    fn bugmeta_creation_time_is_the_instant_or_nothing() {
+        let read = |s: &str| BugMeta::from_json(&json!({"creation_time": s}), None).creation_time;
+        // Bugzilla's own shape, checked against the epoch and not the parser.
+        let filed = Timestamp::from_second(1_411_499_537).unwrap();
+        assert_eq!(read("2014-09-23T19:12:17Z"), Some(filed));
+        assert_eq!(read("2014-09-23T21:12:17+02:00"), Some(filed));
+        assert_eq!(read("2014-09-23T17:12:17-02:00"), Some(filed));
+        let half = Timestamp::new(1_411_499_537, 500_000_000).unwrap();
+        assert_eq!(read("2014-09-23T19:12:17.5Z"), Some(half));
+        // jiff has no leap second: a second 60 reads as the 59th.
+        let last = Timestamp::from_second(1_411_499_579).unwrap();
+        assert_eq!(read("2014-09-23T19:12:60Z"), Some(last));
+        // No instant without an offset, a time or a clean string, and none
+        // from another notation.
+        for s in [
+            "2014-09-23T19:12:17",
+            "2014-09-23",
+            "2014-09-23T19:12:17Z ",
+            " 2014-09-23T19:12:17Z",
+            "",
+            "Tue, 23 Sep 2014 19:12:17 GMT",
+            "2014-266T19:12:17Z",
+            "2014-W39-2T19:12:17Z",
+        ] {
+            assert_eq!(read(s), None, "{s:?}");
+        }
     }
 
     #[test]
