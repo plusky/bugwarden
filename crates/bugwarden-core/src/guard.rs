@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{Map, Value};
 
 use crate::client::{BugzillaClient, CLASSIFY_FIELDS};
@@ -85,7 +85,7 @@ pub struct SearchRequest<'a> {
     /// How many visible bugs to skip.
     pub offset: u32,
     /// Only bugs changed since then; narrows upstream rows.
-    pub changed_since: Option<DateTime<Utc>>,
+    pub changed_since: Option<Timestamp>,
 }
 
 /// What one [`Guard::quicksearch_window`] scan produced: the window the
@@ -175,7 +175,7 @@ impl Guard {
         if ids.is_empty() {
             return out;
         }
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         // Classification objects fetched from Bugzilla, keyed by the id the
         // SERVER reported. Requested ids are only trusted when the response
@@ -468,7 +468,7 @@ impl Guard {
         ids: &BTreeSet<u64>,
         caller: Option<&str>,
     ) -> BTreeSet<u64> {
-        let now = Utc::now();
+        let now = Timestamp::now();
         // Bug id 0 never exists, so an empty candidate set still costs one
         // request: otherwise "this bug has no links" and "every link is
         // hidden" would be told apart by the clock (I2).
@@ -1264,7 +1264,7 @@ impl Guard {
     pub fn may_create(&self, requested: &mut Value) -> bool {
         normalize_create_request(requested);
         let mut meta = BugMeta::from_json(requested, None);
-        meta.creation_time = Some(Utc::now());
+        meta.creation_time = Some(Timestamp::now());
         // Bugzilla augments the group list server-side on creation; the
         // request's claim about it is not knowledge (see above).
         meta.groups = None;
@@ -1283,7 +1283,7 @@ impl Guard {
         // Every other field the request does not mention is unknown, not
         // empty, and classification fails closed on it (I4).
         self.policy
-            .classify(&meta, Utc::now(), Operation::Create)
+            .classify(&meta, Timestamp::now(), Operation::Create)
             .allows(Capability::Create)
     }
 
@@ -1394,7 +1394,7 @@ impl Guard {
         bugs: Vec<Value>,
         caller: Option<&str>,
     ) -> (Vec<Value>, Vec<u64>) {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let mut kept = Vec::new();
         let mut dropped = Vec::new();
         for bug in bugs {
@@ -3306,7 +3306,7 @@ products = ["NoView*"]
         );
         assert!(
             g.policy
-                .classify(&public, Utc::now(), Operation::Access)
+                .classify(&public, Timestamp::now(), Operation::Access)
                 .allows(Capability::Read),
             "existing desktop bugs must stay fully readable"
         );
@@ -3329,7 +3329,7 @@ products = ["NoView*"]
         assert!(
             matches!(
                 g.policy
-                    .classify(&restricted, Utc::now(), Operation::Access),
+                    .classify(&restricted, Timestamp::now(), Operation::Access),
                 Access::Denied { .. }
             ),
             "group-restricted desktop bugs must stay denied"
@@ -3350,7 +3350,7 @@ products = ["NoView*"]
         assert!(
             matches!(
                 g.policy
-                    .classify(&own_restricted, Utc::now(), Operation::Access),
+                    .classify(&own_restricted, Timestamp::now(), Operation::Access),
                 Access::Denied { .. }
             ),
             "shipped policy denies the caller's own group-restricted bug too: \
@@ -3408,7 +3408,7 @@ products = ["NoView*"]
         assert!(
             matches!(
                 g.policy
-                    .classify(&restricted, Utc::now(), Operation::Access),
+                    .classify(&restricted, Timestamp::now(), Operation::Access),
                 Access::Denied { .. }
             ),
             "group-restricted bugs someone else filed must stay denied"
@@ -3422,7 +3422,7 @@ products = ["NoView*"]
         let own_restricted = BugMeta::from_json(&own_restricted_json, caller);
         let own_access = g
             .policy
-            .classify(&own_restricted, Utc::now(), Operation::Access);
+            .classify(&own_restricted, Timestamp::now(), Operation::Access);
         for cap in [
             Capability::Read,
             Capability::Comments,
@@ -3463,7 +3463,8 @@ products = ["NoView*"]
             let unknown = BugMeta::from_json(bug_json, None);
             assert!(
                 matches!(
-                    g.policy.classify(&unknown, Utc::now(), Operation::Access),
+                    g.policy
+                        .classify(&unknown, Timestamp::now(), Operation::Access),
                     Access::Denied { .. }
                 ),
                 "identity-unknown must deny (blackout), bug {}",
@@ -3510,7 +3511,7 @@ products = ["NoView*"]
         let full = policy(&toml);
         assert!(
             matches!(
-                full.classify(&bug, Utc::now(), Operation::Access),
+                full.classify(&bug, Timestamp::now(), Operation::Access),
                 Access::Denied { .. }
             ),
             "shipped policy must deny a security-group bug"
@@ -3528,7 +3529,7 @@ products = ["NoView*"]
                 .find("[[rule]]")
                 .expect("a rule must follow the broad rule");
         let narrowed = policy(&format!("{}{}", &toml[..start], &toml[end..]));
-        match narrowed.classify(&bug, Utc::now(), Operation::Access) {
+        match narrowed.classify(&bug, Timestamp::now(), Operation::Access) {
             Access::Denied { rule } => assert_eq!(
                 rule, "security-groups",
                 "the named-group rule itself must be the one denying"
@@ -3560,14 +3561,14 @@ products = ["NoView*"]
         );
         assert!(
             matches!(
-                full.classify(&partner, Utc::now(), Operation::Access),
+                full.classify(&partner, Timestamp::now(), Operation::Access),
                 Access::Denied { .. }
             ),
             "shipped policy hides every restricted bug"
         );
         assert!(
             matches!(
-                narrowed.classify(&partner, Utc::now(), Operation::Access),
+                narrowed.classify(&partner, Timestamp::now(), Operation::Access),
                 Access::Granted { .. }
             ),
             "narrowing is meant to expose non-security restricted bugs"
@@ -3925,7 +3926,10 @@ group_restricted = true
             }),
             None,
         );
-        match g.policy.classify(&public, Utc::now(), Operation::Access) {
+        match g
+            .policy
+            .classify(&public, Timestamp::now(), Operation::Access)
+        {
             Access::Granted { rule, .. } => assert_eq!(rule, "default"),
             other => panic!("non-restricted bug must stay readable, got {other:?}"),
         }
@@ -3945,7 +3949,7 @@ group_restricted = true
         );
         match g
             .policy
-            .classify(&restricted, Utc::now(), Operation::Access)
+            .classify(&restricted, Timestamp::now(), Operation::Access)
         {
             Access::Denied { rule } => assert_eq!(rule, "group-restricted"),
             other => panic!("group-restricted bug must stay denied, got {other:?}"),
