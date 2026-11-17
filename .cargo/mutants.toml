@@ -53,8 +53,13 @@ minimum_test_timeout = 720
 # InitializeResult, and ServiceExt::serve never cancels its token. Deleting
 # them is a no-op (the wildcard still compiles) so they survive every week
 # and the scheduled job emails a false gap. Reachable arms stay in scope
-# (Some(frame), ConnectionClosed, InitializeFailed, TransportError). Drop
-# these if rmcp starts constructing the variants.
+# (Some(frame), ConnectionClosed, InitializeFailed, TransportError). rmcp
+# does construct UnexpectedInitializeResponse and Cancelled, and since 3.9
+# an http session's handshake can end in Cancelled inside rmcp. Neither can
+# reach serve_failure, which sees only the stdio handshake. Drop one when its
+# premise goes: a construction site passing None, an initialize answer not
+# mapped to InitializeResult, or a stdio serve whose token can fire
+# during the handshake.
 #
 # Proven-equivalent mutants, 2026-10-11 campaign: each entry below was found
 # by a scheduled run, hand-proved behaviorally identical, and pinned by an

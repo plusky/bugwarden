@@ -2885,12 +2885,22 @@ wired, `server.rs` and `main.rs` are the reference.
   none of which this crate's features build. 3.9 is the RUSTSEC-2026-0462
   fix (unbounded Streamable HTTP client response buffering, now 16 MiB /
   64 KiB caps): the client, auth and child-process parts it changes are
-  not built here either; the server parts it does build — discover-session
+  not built here either; of the server parts it does build, discover-session
   rejection, the serialize-contract `outputSchema` generator, media-type
-  matching, `Mcp-Param` rejection — change no served shape (full suite
+  matching and `Mcp-Param` rejection change no served shape (full suite
   green on a 3.9 lock with no test touched), the skills extension stays
   undeclared, and of the stamped notes below only the inline-version
-  flag's mechanism moved. 3.10 changes no code the shipped binary builds:
+  flag's mechanism moved. Built here as well: stateful session workers now
+  follow `config.cancellation_token` (#1427,
+  `transport/streamable_http_server/tower.rs`), which does change what a
+  client is served around a shutdown and which that suite cannot see, its
+  http shutdown rows asserting a clean exit and bugwarden's own log line;
+  the note on the token below has the measurements. The in-band `-32600`
+  for a protocol-error frame is queued, so a cancelled `receive` no longer
+  loses it (#1370, `transport/async_rw.rs`), a case no test here forces.
+  And two `Deserialize` fixes in `model.rs` (#1405, #1383) touch types
+  this server never deserializes. 3.10 changes no code the shipped binary
+  builds:
   its doc comments aside, it adds a `skills-fs` catalog behind a feature
   left off and fixes the client's `x-mcp-header` validation (#1428,
   `client-side-sse` — built into this crate's test targets by the
@@ -3772,7 +3782,21 @@ wired, `server.rs` and `main.rs` are the reference.
   out. If a per-caller identity (#32) changes this calculus, revisit here
   and at the add_attachment row together. The `cancellation_token` is named so
   SIGINT and SIGTERM tear the live transport down with the process instead of
-  leaving it to outlive the shutdown.
+  leaving it to outlive the shutdown. Since rmcp 3.9 (#1427) that cancel
+  reaches each stateful session's worker too, which until then ran on a
+  token of its own: the serve loop stops at the signal, waits up to 2 s for
+  calls in flight, and rmcp then closes the session. Measured on the binary
+  against a 3.8 lock: the session dispatches nothing that completes after
+  the signal, where a 3.8 lock kept dispatching until the process exited;
+  such a request is answered an empty `200` during the wait and `404`
+  (`Session not found`) once the session is closed. An `initialize` still
+  inside its handler at the signal is answered `500`, where the handshake
+  used to complete. rmcp's own lines for this are `task cancelled` and
+  `serve finished quit_reason=Cancelled` at INFO, a WARN when the wait runs
+  out, and two ERROR lines beside that `500`. The same on both locks in
+  every case measured: the exit code, the time to exit, the fate of a
+  session call in flight at the signal (no reply, the same audit record),
+  and the handshake-free path.
 
   An operator who does know the authorities their deployment answers to names
   them with a repeated `--allowed-hosts`, or with `MCP_ALLOWED_HOSTS` as one
