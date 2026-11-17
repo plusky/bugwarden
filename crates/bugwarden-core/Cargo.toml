@@ -33,10 +33,11 @@ reqwest = { version = "0.13", default-features = false, features = [
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 wiremock = "0.6"
-iai-callgrind = "0.16.1"
+# The lock keeps its bincode-next at 2.x: 3.1 needs Rust 1.90.
+gungraun = "0.20.0"
 
 # Off unless `--features iai`: `cargo test --all-targets` would otherwise
-# run this harness (no valgrind) and fail the required rust job.
+# run this harness (no gungraun-runner) and fail the required rust job.
 [features]
 iai = []
 
