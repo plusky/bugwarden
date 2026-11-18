@@ -562,11 +562,16 @@ impl Guard {
         // see_also with the host as the user typed it, so scheme and case
         // vary freely for the same instance. An instance reachable under a
         // second hostname is still missed — recorded in I14, not fixed here.
+        // Lowercase FIRST: the scheme strip is case-sensitive, so an
+        // uppercase scheme ("HTTP://...") would survive it and the host
+        // prefix would never match, leaving a link to a hidden bug
+        // unscrubbed (I14).
         let strip_scheme = |u: &str| {
-            u.trim()
+            let lower = u.trim().to_ascii_lowercase();
+            lower
                 .trim_start_matches("https://")
                 .trim_start_matches("http://")
-                .to_ascii_lowercase()
+                .to_string()
         };
         let base = strip_scheme(base_url);
         let base = base.trim_end_matches('/');
@@ -874,11 +879,15 @@ impl Guard {
     /// sits in the text. The whole-value match alone misses a
     /// second URL, so each local marker is scanned for.
     fn embedded_local_ids(value: &str, base_url: &str) -> BTreeSet<u64> {
+        // Lowercase first, as in `see_also_local_id`: the scheme strip is
+        // case-sensitive, so an uppercase scheme in the base URL would
+        // survive it and no embedded URL would ever match.
         let strip = |u: &str| {
-            u.trim()
+            let lower = u.trim().to_ascii_lowercase();
+            lower
                 .trim_start_matches("https://")
                 .trim_start_matches("http://")
-                .to_ascii_lowercase()
+                .to_string()
         };
         let base = strip(base_url);
         let base = base.trim_end_matches('/');
@@ -2528,6 +2537,11 @@ mod tests {
             "http://bugzilla.example.com/show_bug.cgi?id=7",
             "https://BUGZILLA.EXAMPLE.COM/show_bug.cgi?id=7",
             "https://bugzilla.example.com/show_bug.cgi?id=7",
+            // An uppercase SCHEME must match too: the scheme strip is
+            // case-sensitive, so without lowercasing first it survives and
+            // the host prefix never matches (I14 bypass).
+            "HTTP://bugzilla.example.com/show_bug.cgi?id=7",
+            "HTTPS://BUGZILLA.EXAMPLE.COM/show_bug.cgi?id=7",
         ] {
             assert_eq!(
                 Guard::see_also_local_id(entry, BASE),
