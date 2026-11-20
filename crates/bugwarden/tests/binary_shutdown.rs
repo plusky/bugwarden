@@ -30,6 +30,11 @@
 //! - stdio wrapping only `serve` and not `waiting()`;
 //! - HTTP SIGTERM returning without `ct.cancel()`, leaving an open MCP
 //!   session to outlive the shutdown;
+//! - HTTP graceful shutdown without the deadline (#435), which lets a
+//!   half-sent request hold the process past the signal until the peer
+//!   closes it;
+//! - the deadline arm skipping the OTLP flush, which loses the deadline
+//!   warn the collector must receive (#435);
 //! - stdio served on a bare `stdio()` instead of the bounded reader, which
 //!   buffers the whole frame and never exits;
 //! - stdio dropping the over-cap flag `main` checks after `waiting()`,
@@ -259,6 +264,18 @@ impl Server {
 
     /// [`Self::spawn`] with both pipes chosen by the caller.
     fn spawn_with_io(args: &[&str], stdin: Stdio, stdout: Stdio) -> Self {
+        Self::spawn_with_io_env(args, stdin, stdout, &[])
+    }
+
+    /// [`Self::spawn_with_io`] with extra environment variables set on
+    /// the child after the ambient scrub — for the row that needs an
+    /// OTLP endpoint the scrub would otherwise remove (#435).
+    fn spawn_with_io_env(
+        args: &[&str],
+        stdin: Stdio,
+        stdout: Stdio,
+        envs: &[(&str, &str)],
+    ) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_bugwarden"));
         cmd.args(args)
             .stdin(stdin)
@@ -268,6 +285,9 @@ impl Server {
             cmd.env_remove(var);
         }
         cmd.env("RUST_LOG", "info");
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
         cmd.kill_on_drop(true);
         let mut child = cmd.spawn().expect("the built binary must start");
         let stdin = child.stdin.take();
@@ -795,6 +815,40 @@ async fn spawn_http() -> (Server, SocketAddr) {
     (server, addr)
 }
 
+/// [`spawn_http`] with an OTLP collector attached and the audit sink
+/// OTLP-only, for the row that proves the shutdown flush ran (#435).
+/// Returns the server, its address, and the collector the flush must
+/// reach.
+async fn spawn_http_with_collector() -> (Server, SocketAddr, MockServer) {
+    let collector = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/logs"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&collector)
+        .await;
+    let collector_uri = collector.uri();
+    let mut server = Server::spawn_with_io_env(
+        &[
+            "--bugzilla-server",
+            "https://bugzilla.example.invalid",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--insecure-no-auth",
+            "--audit-config",
+            "none",
+        ],
+        Stdio::piped(),
+        Stdio::piped(),
+        &[("OTEL_EXPORTER_OTLP_ENDPOINT", collector_uri.as_str())],
+    );
+    let line = server.wait_for_stderr(HTTP_READY).await;
+    let addr = startup_line::parse_bound_addr(&line);
+    wait_for_tcp(addr).await;
+    (server, addr, collector)
+}
+
 async fn wait_for_tcp(addr: SocketAddr) {
     let ready = tokio::time::timeout(EXIT_TIMEOUT, async {
         loop {
@@ -843,6 +897,78 @@ async fn http_sigterm_cancels_a_live_session() {
     server
         .assert_graceful_exit("http live-session SIGTERM")
         .await;
+}
+
+#[tokio::test]
+async fn http_sigterm_ends_a_half_sent_request_and_still_flushes_otlp() {
+    // #435: axum's graceful shutdown waits for in-flight connections,
+    // and hyper's waits for an unfinished request head — which a peer
+    // that never finishes never completes. A half-sent request held the
+    // process until the peer closed it; the graceful wait is now
+    // bounded, so the process exits on the deadline. The deadline warn
+    // is logged at the deadline and only the OTLP shutdown flush can
+    // deliver it before the process exits, so the collector receiving
+    // it proves the flush still ran rather than the process just
+    // exiting.
+    let (server, addr, collector) = spawn_http_with_collector().await;
+    // The startup probe must have delivered before the signal: the
+    // pipeline is healthy, so a later delivery is the flush, not a
+    // probe that only just arrived.
+    let probed = tokio::time::timeout(EXIT_TIMEOUT, async {
+        loop {
+            if !collector
+                .received_requests()
+                .await
+                .expect("recording")
+                .is_empty()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        probed.is_ok(),
+        "the OTLP probe must deliver to the collector"
+    );
+
+    // A half-sent request: headers without the terminating blank line,
+    // so the request head is incomplete and axum is still reading it.
+    // The socket is held open across the signal — closing it would let
+    // the connection finish and hide the bug. The request needs no
+    // token: the bearer gate runs on a complete request head.
+    let mut half_sent = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("the half-sent connection must connect");
+    half_sent
+        .write_all(b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 10\r\n")
+        .await
+        .expect("the half-sent head must write");
+    server.signal("TERM");
+    server
+        .assert_graceful_exit("http half-sent-request SIGTERM")
+        .await;
+    // The socket stays open until here: the process exited while the
+    // request was still unfinished, which is the fix.
+    drop(half_sent);
+
+    // The deadline warn is logged at the deadline and delivered only by
+    // the shutdown flush: the process exits milliseconds later, before
+    // any periodic flush could carry it. The body is OTLP protobuf, but
+    // the message text rides verbatim in it, so a byte search is the
+    // assertion — no protobuf decode in the test.
+    let delivered = collector.received_requests().await.expect("recording");
+    let saw_warn = delivered.iter().any(|req| {
+        req.body
+            .windows(b"graceful shutdown did not finish within".len())
+            .any(|w| w == b"graceful shutdown did not finish within")
+    });
+    assert!(
+        saw_warn,
+        "the OTLP flush must deliver the deadline warn: the process exited          but the collector never saw it; {} requests recorded",
+        delivered.len()
+    );
 }
 
 #[tokio::test]
