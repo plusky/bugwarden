@@ -423,19 +423,50 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("Starting Bugzilla MCP server on {bound}");
                 // Connect-info makes the remote peer address available in the
                 // request extensions, where the audit session info reads it.
-                axum::serve(
-                    tcp_listener,
-                    router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-                )
-                .with_graceful_shutdown(async move {
-                    shutdown.await;
-                    tracing::info!("received shutdown signal");
-                    // Tear the live streamable-HTTP transport down with the
-                    // listener: axum's graceful shutdown alone waits for
-                    // in-flight connections, and an open MCP session is one.
-                    ct.cancel();
-                })
-                .await?;
+                // The graceful wait is bounded (#435): the oneshot fires
+                // when the signal does, and the serve has
+                // GRACEFUL_SHUTDOWN_DEADLINE from there to drain its
+                // connections. Past that the serve future is dropped —
+                // abandoning the stuck connections — and the OTLP flush
+                // below still runs.
+                let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
+                // `WithGracefulShutdown` is `IntoFuture`, not `Future`,
+                // so the `select!` below needs a real future: the async
+                // block is it.
+                let serve = async move {
+                    axum::serve(
+                        tcp_listener,
+                        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(async move {
+                        shutdown.await;
+                        tracing::info!("received shutdown signal");
+                        // Tear the live streamable-HTTP transport down with the
+                        // listener: axum's graceful shutdown alone waits for
+                        // in-flight connections, and an open MCP session is one.
+                        ct.cancel();
+                        // Arm the deadline: from the signal, not from when the
+                        // serve started.
+                        let _ = deadline_tx.send(());
+                    })
+                    .await
+                };
+                tokio::pin!(serve);
+                tokio::select! {
+                    result = &mut serve => result?,
+                    () = async {
+                        // Reachable only once the signal has fired: the
+                        // serve resolves only after it, so the deadline
+                        // cannot arm before the signal.
+                        let _ = deadline_rx.await;
+                        tokio::time::sleep(GRACEFUL_SHUTDOWN_DEADLINE).await;
+                    } => {
+                        tracing::warn!(
+                            "graceful shutdown did not finish within {:?}; closing connections",
+                            GRACEFUL_SHUTDOWN_DEADLINE
+                        );
+                    }
+                }
             }
         }
         Ok(())
@@ -470,6 +501,19 @@ const OVER_CAP_CLOSE: &str = "stdio transport closed: an inbound frame exceeded 
 /// read failed, so the caller names a failed stream rather than an
 /// ended one (#285). Post-handshake the same error still exits 0 (#272).
 const INPUT_STREAM_FAILED: &str = "the input stream failed before initialize";
+
+/// How long the HTTP graceful shutdown waits for in-flight connections
+/// after the signal, before the serve is abandoned (#435).
+///
+/// axum's graceful shutdown waits for every connection with a request
+/// in progress, and hyper's waits for an unfinished request head to
+/// complete — which a peer that never finishes never does. Without a
+/// bound a half-sent request holds the process until the peer closes
+/// it, and only the supervisor's stop timeout (10 s for `podman stop`,
+/// 90 s for systemd) ends it, skipping the OTLP flush below. Two
+/// seconds is the bound the abandoned-call flush already uses, and
+/// well under the supervisor timeouts.
+const GRACEFUL_SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A fixed, server-authored classification of a failed stdio handshake —
 /// the only thing either exit path may say about one (#261).
