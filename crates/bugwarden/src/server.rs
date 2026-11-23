@@ -2788,12 +2788,23 @@ pub struct BugInfoParams {
     pub detail: Option<bool>,
 }
 
+/// JSON schema for a `jiff::Timestamp` tool parameter: an RFC 3339 string.
+/// schemars implements `JsonSchema` for jiff 0.2 only, so the timestamp
+/// parameters pin their schema here.
+fn timestamp_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "format": "date-time"
+    })
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct BugHistoryParams {
     /// Bug id.
     pub id: u64,
     /// Only return history newer than this date.
     #[serde(default)]
+    #[schemars(schema_with = "timestamp_schema")]
     pub new_since: Option<Timestamp>,
     /// Keep only the first N history entries.
     #[serde(default)]
@@ -2812,6 +2823,7 @@ pub struct BugCommentsParams {
     pub include_private: bool,
     /// Only return comments newer than this date.
     #[serde(default)]
+    #[schemars(schema_with = "timestamp_schema")]
     pub new_since: Option<Timestamp>,
     /// Keep the first N comments (comment 0 is the report — keep it in
     /// the window on large threads).
@@ -2858,6 +2870,7 @@ pub struct QuicksearchParams {
     pub offset: u32,
     /// Only return bugs changed since this date.
     #[serde(default)]
+    #[schemars(schema_with = "timestamp_schema")]
     pub changed_since: Option<Timestamp>,
     /// Optional comma-separated list of fields to group the results by:
     /// product, component, status, resolution, severity, priority. Omit it
@@ -8074,6 +8087,25 @@ mod tests {
             new_since,
             json!({
                 "description": "Only return comments newer than this date.",
+                "format": "date-time",
+                "type": "string",
+            }),
+            "new_since must be a plain nullable-free date-time string"
+        );
+    }
+
+    #[test]
+    fn bug_history_new_since_is_a_plain_date_time() {
+        let (cfg, guard, bz) = parts("[global]\nallow_discovery = true\n");
+        let server = BugWarden::new(cfg, guard, bz).expect("server builds");
+        let tool = server
+            .get_tool("bug_history")
+            .expect("bug_history is routed");
+        let new_since = tool.input_schema["properties"]["new_since"].clone();
+        assert_eq!(
+            new_since,
+            json!({
+                "description": "Only return history newer than this date.",
                 "format": "date-time",
                 "type": "string",
             }),

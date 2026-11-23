@@ -3892,7 +3892,7 @@ wired, `server.rs` and `main.rs` are the reference.
   `sse_retry` set response framing and SSE liveness — client-visible timing,
   with no guard or operator-visible limit riding on them.
 - axum MUST be 0.8 (rmcp's version — extension extraction breaks otherwise);
-  schemars 1.x with feature `jiff02`; tokio 1; tokio-util 0.7.
+  schemars 1.x; tokio 1; tokio-util 0.7.
 - Server struct: `#[derive(Clone)] pub struct BugWarden { cfg: Arc<Cli>, guard: Arc<Guard>, bz: Arc<BugzillaClient>, tool_router: ToolRouter<Self>, key_custody: KeyCustody, audit: Option<Arc<AuditState>> }`
 - `BugWarden::new` builds `Self::tool_router()` then `remove_route` for write
   tools when read-only and for every `global.disabled_tools` entry (I13).
